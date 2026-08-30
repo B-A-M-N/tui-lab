@@ -28,7 +28,7 @@ pub struct SemanticScreen {
     pub controls: Vec<Control>,
     pub focus: FocusInfo,
     /// Spatial relationships between controls.
-    pub relationships: Vec<(String, String, Relationship)>,
+    pub relationships: Vec<(String, String, Vec<Relationship>)>,
 }
 
 /// Build a semantic screen from a raw [`ScreenState`].
