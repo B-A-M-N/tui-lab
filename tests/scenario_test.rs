@@ -84,9 +84,7 @@ fn scenario_runner_executes_steps() {
         .expect("start");
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let report = ScenarioRunner::run(&scenario, sess, |_params, _screen| {
-        unreachable!("assertion_fn is legacy; runner evaluates via run_assertion")
-    });
+    let report = ScenarioRunner::run(&scenario, sess);
 
     assert_eq!(report.scenario_name, "runner-test");
     assert_eq!(report.steps_total, 3);
@@ -118,9 +116,7 @@ fn scenario_runner_detects_failures() {
         .expect("start");
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let report = ScenarioRunner::run(&scenario, sess, |_params, _screen| {
-        unreachable!("assertion_fn is legacy; runner evaluates via run_assertion")
-    });
+    let report = ScenarioRunner::run(&scenario, sess);
 
     assert_eq!(report.steps_total, 2);
     assert_eq!(report.steps_passed, 1, "act passes: {:?}", report.step_results);
@@ -146,9 +142,7 @@ fn scenario_runner_actually_sends_input() {
         .expect("start");
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let report = ScenarioRunner::run(&scenario, sess, |_params, _screen| {
-        unreachable!("assertion_fn is legacy")
-    });
+    let report = ScenarioRunner::run(&scenario, sess);
     assert_eq!(report.steps_failed, 0, "{:?}", report.step_results);
 
     let screen = mgr.resolve_mut(Some(&id)).unwrap().observe(40).unwrap();

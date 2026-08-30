@@ -35,7 +35,6 @@ impl ScenarioRunner {
     pub fn run(
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
-        _assertion_fn: impl Fn(&serde_json::Value, &crate::screen::ScreenState) -> (bool, String),
     ) -> ScenarioRunReport {
         let mut results = Vec::new();
         let mut passed = 0;
