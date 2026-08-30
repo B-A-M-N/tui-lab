@@ -221,6 +221,18 @@ impl TuiLabServer {
                     .filter(|r| r.kind == semantic::RegionKind::Dialog)
                     .count();
                 let focused = sem.focus.control.clone();
+                // Run focus graph: ledger this observation's focus against
+                // the previous observation's (per session).
+                {
+                    let prev_focus = sess
+                        .previous()
+                        .map(|p| semantic::analyze(p).focus.control);
+                    self.run.lock().unwrap().record_focus_transition(
+                        &sess.id,
+                        prev_focus.unwrap_or(None),
+                        focused.clone(),
+                    );
+                }
                 ok(json!({
                     "screen": format!("{}x{}", screen.cols, screen.rows),
                     "title": screen.title,
@@ -666,36 +678,49 @@ impl TuiLabServer {
                     let r = rec.lock().expect("recorder");
                     (r.event_count(), r.to_ndjson())
                 };
-                let run = self.run.lock().unwrap();
-                let path = match run.run_dir() {
-                    Some(dir) => {
-                        let rec_dir = dir.join("recordings");
-                        let _ = std::fs::create_dir_all(&rec_dir);
-                        let file = rec_dir.join(format!(
-                            "{}-{}.cast",
-                            sess.id,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0)
-                        ));
-                        match std::fs::write(&file, ndjson.join("\n") + "\n") {
-                            Ok(()) => Some(file.to_string_lossy().to_string()),
-                            Err(e) => {
-                                return err(
-                                    ErrorCategory::BackendError,
-                                    format!("recording flush failed: {}", e),
-                                )
+                let body = ndjson.join("\n") + "\n";
+                let file_name = format!(
+                    "{}-{}.cast",
+                    sess.id,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                );
+                // Persistent run: write straight into the artifact root.
+                // Ephemeral run: retain in run memory so a later `tui_run
+                // persist` carries the recording into the durable root
+                // (goal spec: promotion preserves "recordings already held
+                // in memory") — the content is also returned inline.
+                let path = {
+                    let mut run = self.run.lock().unwrap();
+                    match run.run_dir().cloned() {
+                        Some(dir) => {
+                            let rec_dir = dir.join("recordings");
+                            let _ = std::fs::create_dir_all(&rec_dir);
+                            let file = rec_dir.join(&file_name);
+                            match std::fs::write(&file, &body) {
+                                Ok(()) => Some(file.to_string_lossy().to_string()),
+                                Err(e) => {
+                                    return err(
+                                        ErrorCategory::BackendError,
+                                        format!("recording flush failed: {}", e),
+                                    )
+                                }
                             }
                         }
+                        None => {
+                            run.hold_recording(file_name, body.clone());
+                            None
+                        }
                     }
-                    None => None,
                 };
                 ok(json!({
                     "recording": "stopped",
                     "events": events,
                     "saved_to": path,
-                    "note": path.is_none().then(|| "ephemeral run: content returned inline, not persisted".to_string()),
+                    "held_in_run": path.is_none(),
+                    "note": path.is_none().then(|| "ephemeral run: held in run memory; tui_run persist will write it to the durable root".to_string()),
                     "inline_events": path.is_none().then_some(ndjson),
                 }))
             }

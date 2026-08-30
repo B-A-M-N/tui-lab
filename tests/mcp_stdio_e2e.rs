@@ -397,6 +397,13 @@ fn stdio_e2e_full_lifecycle() {
         rstop["data"]["events"].as_u64().unwrap_or(0) > 0,
         "PTY recording must capture events: {rstop}"
     );
+    // Ephemeral run: the recording is HELD in run memory (goal spec:
+    // promotion preserves "recordings already held in memory"), verified
+    // after persist below.
+    assert_eq!(
+        rstop["data"]["held_in_run"], true,
+        "ephemeral stop must hold the recording: {rstop}"
+    );
 
     // --- exploration (re-review items 12/13): live transitions + real budget
     // Explore a session that reacts to keys so transitions actually occur.
@@ -554,6 +561,19 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(
         cp_d2["category"], "success",
         "checkpoint must survive promotion: {cp_d2}"
+    );
+    // The PTY recording stopped while ephemeral must be flushed into the
+    // durable recordings dir (goal spec: "recordings already held in memory").
+    let recordings_dir = expected_root.join("recordings");
+    let cast_count = std::fs::read_dir(&recordings_dir)
+        .expect("recordings dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".cast"))
+        .count();
+    assert!(
+        cast_count > 0,
+        "held recording must be flushed at promotion: {:?}",
+        std::fs::read_dir(&recordings_dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
     );
 
     // Status now reports persistent.
