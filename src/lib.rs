@@ -8,6 +8,7 @@ pub mod checkpoint;
 pub mod coverage;
 pub mod design;
 pub mod error;
+pub mod events;
 pub mod execution;
 pub mod exploration;
 pub mod framework;

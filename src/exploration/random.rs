@@ -37,20 +37,26 @@ pub enum ExplorationCompletionReason {
 }
 
 /// One executed exploration step, recorded while it happened (item 12).
+///
+/// Identity-bearing (re-review P0 fix 3): before/after are full
+/// [`StateIdentity`] values, not bare structure hashes, so the graph
+/// distinguishes states that differ only in interaction state (same text,
+/// focus on "Save" vs focus on "Cancel"). Semantic analysis runs per step —
+/// the same `analyze` the MCP observe path uses.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExplorationStep {
     /// Ordered execution index (0-based).
     pub seq: u64,
     /// Canonical action name that was sent.
     pub action: String,
-    /// Structure hash observed immediately before the action.
-    pub before: String,
-    /// Structure hash observed after the action settled.
-    pub after: String,
-    /// Whether the screen actually changed (before != after).
+    /// Layered identity observed immediately before the action.
+    pub before: crate::exploration::state_graph::StateIdentity,
+    /// Layered identity observed after the action settled.
+    pub after: crate::exploration::state_graph::StateIdentity,
+    /// Whether the screen actually changed (before.id() != after.id()).
     pub changed: bool,
-    /// Whether the action's anchored settle wait reached stability.
-    pub settled: bool,
+    /// How the action's anchored settle wait resolved (re-review P1 fix 8).
+    pub settle: crate::execution::SettleStatus,
     /// Settle wait elapsed time in ms.
     pub elapsed_ms: u64,
     /// Novelty of the after-state at execution time (true = first visit).
@@ -65,7 +71,9 @@ pub struct ExploreReport {
     pub actions_run: u32,
     pub actions_requested: u32,
     pub screens_seen: usize,
-    pub structure_hashes: Vec<String>,
+    /// Every unique layered identity seen (P0 fix 3) — interaction-distinct
+    /// states count separately, matching what the graph records.
+    pub unique_state_identities: Vec<crate::exploration::state_graph::StateIdentity>,
     /// Ordered record of every executed step (item 12).
     pub steps: Vec<ExplorationStep>,
     /// Why the loop actually stopped (item 13).
@@ -173,11 +181,11 @@ pub fn run(
 ) -> anyhow::Result<ExploreReport> {
     let started = Instant::now();
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut hashes: Vec<String> = Vec::new();
+    let mut identities: Vec<crate::exploration::state_graph::StateIdentity> = Vec::new();
     let mut steps: Vec<ExplorationStep> = Vec::new();
     let mut exits = Vec::new();
     let mut novel = 0u32;
-    let mut last_hash: Option<String> = None;
+    let mut last_id: Option<crate::exploration::state_graph::StateId> = None;
     let mut relaunches = 0u32;
     let mut terminated_early = false;
 
@@ -196,7 +204,7 @@ pub fn run(
             reason = ExplorationCompletionReason::RelaunchBudget;
             break;
         }
-        if hashes.len() as u32 >= budget.max_unique_states {
+        if identities.len() as u32 >= budget.max_unique_states {
             reason = ExplorationCompletionReason::UniqueStateBudget;
             break;
         }
@@ -226,28 +234,35 @@ pub fn run(
             }
         };
 
-        let settled = tx.settled;
-        let after = tx.after.clone();
+        let settled = tx.settle;
+        let after = tx.after().clone();
         let elapsed_ms = tx.elapsed_ms;
-        let before_hash = tx.before.structure_hash.clone();
 
-        let novel_state = !hashes.contains(&after.structure_hash);
+        // Layered identity for both frames (re-review P0 fix 3): semantic
+        // analysis runs per step so interaction state (focus/selection)
+        // participates in the identity — the same `analyze` the MCP observe
+        // path uses. This is what stops the graph from collapsing
+        // "same text, focus=Save" and "same text, focus=Cancel".
+        let before_identity = identity_of(tx.before());
+        let after_identity = identity_of(&after);
+
+        let novel_state = !identities.contains(&after_identity);
         if novel_state {
-            hashes.push(after.structure_hash.clone());
+            identities.push(after_identity.clone());
         }
-        if last_hash.as_deref() != Some(&after.structure_hash) {
+        if last_id.as_ref() != Some(&after_identity.id()) {
             novel += 1;
-            last_hash = Some(after.structure_hash.clone());
+            last_id = Some(after_identity.id());
         }
 
         // Ordered step record — emitted while the action happened (item 12).
         steps.push(ExplorationStep {
             seq: i as u64,
             action: name.to_string(),
-            before: before_hash.clone(),
-            after: after.structure_hash.clone(),
-            changed: before_hash != after.structure_hash,
-            settled,
+            before: before_identity,
+            after: after_identity,
+            changed: tx.before().structure_hash != after.structure_hash,
+            settle: settled,
             elapsed_ms,
             novel_state,
             process_running: after.process.running,
@@ -279,7 +294,7 @@ pub fn run(
                     relaunches += 1;
                     // Post-restart frame is the new baseline.
                     let _ = session.observe(30)?;
-                    last_hash = None;
+                    last_id = None;
                 }
                 Err(_e) => {
                     terminated_early = true;
@@ -312,8 +327,8 @@ pub fn run(
         seed,
         actions_run: steps.len() as u32,
         actions_requested: budget.max_actions,
-        screens_seen: hashes.len(),
-        structure_hashes: hashes,
+        screens_seen: identities.len(),
+        unique_state_identities: identities,
         steps,
         completion_reason: reason,
         relaunches,
@@ -326,13 +341,25 @@ pub fn run(
     })
 }
 
+/// Layered [`StateIdentity`] for one frame (P0 fix 3): structure + visual
+/// hashes plus the interaction layer from semantic analysis, built with the
+/// same `analyze` used everywhere else.
+fn identity_of(
+    screen: &crate::screen::ScreenState,
+) -> crate::exploration::state_graph::StateIdentity {
+    let sem = crate::semantic::analyze(screen);
+    crate::exploration::state_graph::StateIdentity::with_semantic(screen, &sem)
+}
+
 /// Feed executed steps into the run's state graph — from the ordered record
-/// of what actually happened, not from reconstructed hashes (item 12).
+/// of what actually happened, keyed by layered identity, not by bare
+/// structure hashes (item 12 + re-review P0 fix 3). Interaction-distinct
+/// states (same text, different focus/selection) become separate nodes.
 pub fn record_steps(
     graph: &mut crate::exploration::state_graph::StateGraph,
     steps: &[ExplorationStep],
 ) {
     for s in steps {
-        graph.record_transition(&s.before, &s.after, &s.action);
+        graph.record_transition_identity(&s.before, &s.after, &s.action);
     }
 }

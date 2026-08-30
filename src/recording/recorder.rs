@@ -28,6 +28,18 @@ pub struct AsciicastRecorder {
     start_time: Option<std::time::Instant>,
     /// Whether to record input events (may contain secrets).
     record_input: bool,
+    /// Temporary suppression of input recording (re-review P0 leak fix).
+    /// Raised around sends of sensitive payloads so their bytes never reach
+    /// the cast file; cleared immediately after. Not serialized —
+    /// suppression is per-send, never a durable mode.
+    suppress_input: bool,
+    /// Temporary suppression of OUTPUT recording (leak fix, echo half).
+    /// The tty line discipline echoes typed bytes back as output, so
+    /// suppressing the input event alone would still leave the payload in
+    /// the cast via the echo. During a sensitive transaction's window both
+    /// streams are suppressed; the application's own (masked) rendering
+    /// resumes after.
+    suppress_output: bool,
 }
 
 impl AsciicastRecorder {
@@ -38,11 +50,43 @@ impl AsciicastRecorder {
             events: Vec::new(),
             start_time: None,
             record_input,
+            suppress_input: false,
+            suppress_output: false,
         }
     }
 
-    /// Record an output event (terminal bytes).
+    /// Raise/lower the input-recording suppression gate (leak fix).
+    ///
+    /// While suppressed, [`Self::record_input`] is a no-op even when
+    /// `record_input` is enabled. Output and resize events are unaffected:
+    /// the screen echo a TUI draws in response to a sensitive input is
+    /// masked by the application itself (e.g. password fields) and remains
+    /// part of the visual record; the raw keystrokes do not.
+    pub fn suppress_input(&mut self) {
+        self.suppress_input = true;
+    }
+
+    pub fn resume_input(&mut self) {
+        self.suppress_input = false;
+    }
+
+    /// Raise/lower the OUTPUT-recording suppression gate (leak fix, echo
+    /// half). While raised, [`Self::record_output`] is a no-op: a tty echo
+    /// of sensitive keystrokes is the payload in disguise.
+    pub fn suppress_output(&mut self) {
+        self.suppress_output = true;
+    }
+
+    pub fn resume_output(&mut self) {
+        self.suppress_output = false;
+    }
+
+    /// Record an output event (terminal bytes). Suppressed while the
+    /// output gate is raised (sensitive transaction window).
     pub fn record_output(&mut self, bytes: &[u8]) {
+        if self.suppress_output {
+            return;
+        }
         if self.start_time.is_none() {
             self.start_time = Some(std::time::Instant::now());
         }
@@ -51,9 +95,12 @@ impl AsciicastRecorder {
             .push((t, RecordingEvent::Output(bytes.to_vec())));
     }
 
-    /// Record an input event (bytes sent to terminal).
+    /// Record an input event (bytes sent to terminal). No-op when input
+    /// recording is disabled **or** currently suppressed (leak fix: the
+    /// suppression gate outranks the `record_input` policy — a sensitive
+    /// send must never land in the cast even with input recording on).
     pub fn record_input(&mut self, bytes: &[u8]) {
-        if !self.record_input {
+        if !self.record_input || self.suppress_input {
             return;
         }
         if self.start_time.is_none() {
@@ -218,6 +265,47 @@ mod tests {
 
         let lines = rec.to_ndjson();
         assert_eq!(lines.len(), 2); // header + 1 event (input ignored)
+    }
+
+    /// The suppression gate outranks `record_input=true`: a sensitive send's
+    /// bytes must never reach the cast (re-review P0 leak fix, recording
+    /// half). Normal input before/after the gate is still recorded.
+    /// The output gate blocks tty echo of a sensitive payload (leak fix):
+    /// the echo IS the payload in disguise.
+    #[test]
+    fn test_recorder_output_gate_blocks_echo() {
+        let mut rec = AsciicastRecorder::new(80, 24, true);
+        rec.record_output(b"prompt> ");
+        rec.suppress_output();
+        rec.record_output(b"super-secret-password\r\n");
+        rec.resume_output();
+        rec.record_output(b"after\r\n");
+
+        let body = rec.to_ndjson().join("\n");
+        assert!(body.contains("prompt>"));
+        assert!(body.contains("after"));
+        assert!(
+            !body.contains("super-secret-password"),
+            "echoed sensitive output must not leak into the cast"
+        );
+    }
+
+    #[test]
+    fn test_recorder_suppression_gate_blocks_sensitive_input() {
+        let mut rec = AsciicastRecorder::new(80, 24, true);
+        rec.record_input(b"normal\n");
+        rec.suppress_input();
+        rec.record_input(b"super-secret-password\n");
+        rec.resume_input();
+        rec.record_input(b"normal-again\n");
+
+        let body = rec.to_ndjson().join("\n");
+        assert!(body.contains("normal"), "pre-gate input kept");
+        assert!(body.contains("normal-again"), "post-gate input kept");
+        assert!(
+            !body.contains("super-secret-password"),
+            "suppressed input must not leak into the cast"
+        );
     }
 
     #[test]

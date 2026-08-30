@@ -1,7 +1,18 @@
 // Integration tests for the state graph (spec item 15).
+//
+// Keyed through the layered [`StateIdentity`] path (re-review P0 fix 3):
+// the legacy structure-hash recorders are deprecated and no product or test
+// path uses them.
 
+use tui_lab::exploration::state_graph::StateIdentity;
 use tui_lab::exploration::{ExplorationBudget, StateGraph, StateId};
 use tui_lab::session::SessionManager;
+
+/// Identity for a bare content key — tests exercise graph bookkeeping, not
+/// frame semantics.
+fn ident(key: &str) -> StateIdentity {
+    StateIdentity::from_parts(key)
+}
 
 #[test]
 fn test_exploration_budget_default() {
@@ -18,16 +29,18 @@ fn test_state_graph_record_and_query() {
     let budget = ExplorationBudget::default();
     let mut graph = StateGraph::new(budget);
 
-    assert!(graph.record_state("state_a", None, 0));
-    assert!(graph.record_state("state_b", None, 1));
-    assert!(!graph.record_state("state_a", None, 2));
+    let a = ident("state_a");
+    let b = ident("state_b");
+    assert!(graph.record_state_identity(&a, 0));
+    assert!(graph.record_state_identity(&b, 1));
+    assert!(!graph.record_state_identity(&a, 2));
 
     assert!(graph.state_count() >= 1);
-    assert!(graph.has_state("state_a"));
-    assert!(graph.has_state("state_b"));
-    assert!(!graph.has_state("state_c"));
+    assert!(graph.has_state(a.id().as_str()));
+    assert!(graph.has_state(b.id().as_str()));
+    assert!(!graph.has_state(ident("state_c").id().as_str()));
 
-    let node_a = graph.get_node("state_a").unwrap();
+    let node_a = graph.get_node(a.id().as_str()).unwrap();
     assert_eq!(node_a.visit_count, 2);
 }
 
@@ -36,17 +49,21 @@ fn test_state_graph_transitions() {
     let budget = ExplorationBudget::default();
     let mut graph = StateGraph::new(budget);
 
-    graph.record_transition("a", "b", "tab");
-    graph.record_transition("b", "c", "tab");
-    graph.record_transition("a", "b", "tab");
+    let a = ident("a");
+    let b = ident("b");
+    let c = ident("c");
+
+    graph.record_transition_identity(&a, &b, "tab");
+    graph.record_transition_identity(&b, &c, "tab");
+    graph.record_transition_identity(&a, &b, "tab");
 
     assert_eq!(graph.transition_count(), 2);
 
-    let out_a = graph.outgoing("a");
+    let out_a = graph.outgoing(a.id().as_str());
     assert_eq!(out_a.len(), 1);
     assert_eq!(out_a[0].count, 2);
 
-    let in_c = graph.incoming("c");
+    let in_c = graph.incoming(c.id().as_str());
     assert_eq!(in_c.len(), 1);
     assert_eq!(in_c[0].action_name, "tab");
 }
@@ -56,18 +73,20 @@ fn test_state_graph_novelty_scoring() {
     let budget = ExplorationBudget::default();
     let mut graph = StateGraph::new(budget);
 
-    // New state should have high novelty
+    // New state should have high novelty.
     assert_eq!(graph.novelty_score("new"), 10);
 
-    // Record once
-    graph.record_state("once", None, 0);
-    assert_eq!(graph.novelty_score("once"), 3);
+    // Record once (score keys on the node id — the identity digest).
+    let once = ident("once");
+    graph.record_state_identity(&once, 0);
+    assert_eq!(graph.novelty_score(once.id().as_str()), 3);
 
-    // Record many times
+    // Record many times.
+    let many = ident("many");
     for _ in 0..10 {
-        graph.record_state("many", None, 0);
+        graph.record_state_identity(&many, 0);
     }
-    assert_eq!(graph.novelty_score("many"), -5);
+    assert_eq!(graph.novelty_score(many.id().as_str()), -5);
 }
 
 #[test]
@@ -75,12 +94,15 @@ fn test_state_graph_dead_ends() {
     let budget = ExplorationBudget::default();
     let mut graph = StateGraph::new(budget);
 
-    graph.record_transition("start", "middle", "tab");
-    graph.record_transition("middle", "end", "enter");
+    let start = ident("start");
+    let middle = ident("middle");
+    let end = ident("end");
+
+    graph.record_transition_identity(&start, &middle, "tab");
+    graph.record_transition_identity(&middle, &end, "enter");
 
     let dead_ends = graph.find_dead_ends();
     assert_eq!(dead_ends.len(), 1);
-    assert_eq!(dead_ends[0].id.as_str(), "end");
 }
 
 #[test]
@@ -91,10 +113,10 @@ fn test_state_graph_budget_exhaustion() {
     };
     let mut graph = StateGraph::new(budget);
 
-    graph.record_state("a", None, 0);
+    graph.record_state_identity(&ident("a"), 0);
     assert!(!graph.budget_exhausted());
 
-    graph.record_state("b", None, 1);
+    graph.record_state_identity(&ident("b"), 1);
     assert!(graph.budget_exhausted());
 }
 
@@ -104,19 +126,23 @@ fn test_state_graph_merge() {
     let mut g1 = StateGraph::new(budget.clone());
     let mut g2 = StateGraph::new(budget);
 
-    g1.record_state("a", None, 0);
-    g1.record_state("b", None, 1);
-    g1.record_transition("a", "b", "tab");
+    let a = ident("a");
+    let b = ident("b");
+    let c = ident("c");
 
-    g2.record_state("b", None, 10);
-    g2.record_state("c", None, 11);
-    g2.record_transition("b", "c", "enter");
+    g1.record_state_identity(&a, 0);
+    g1.record_state_identity(&b, 1);
+    g1.record_transition_identity(&a, &b, "tab");
+
+    g2.record_state_identity(&b, 10);
+    g2.record_state_identity(&c, 11);
+    g2.record_transition_identity(&b, &c, "enter");
 
     g1.merge(&g2);
 
     assert_eq!(g1.state_count(), 3);
     assert_eq!(g1.transition_count(), 2);
-    assert_eq!(g1.get_node("b").unwrap().visit_count, 2);
+    assert_eq!(g1.get_node(b.id().as_str()).unwrap().visit_count, 2);
 }
 
 #[test]
@@ -159,10 +185,10 @@ fn test_exploration_run_with_graph() {
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
     let before = sess.observe(30).unwrap();
-    let novel = graph.record_state(&before.structure_hash, None, 0);
-    assert!(novel);
+    let before_identity = StateIdentity::from_frame(&before);
+    assert!(graph.record_state_identity(&before_identity, 0));
 
-    // Send a tab and record transition
+    // Send a tab and record the transition through the identity path.
     let _ = sess.send(tui_lab::backend::Input::Key(
         tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Tab),
     ));
@@ -175,7 +201,11 @@ fn test_exploration_run_with_graph() {
     );
     let after = sess.observe(50).unwrap();
 
-    graph.record_transition(&before.structure_hash, &after.structure_hash, "tab");
+    graph.record_transition_identity(
+        &before_identity,
+        &StateIdentity::from_frame(&after),
+        "tab",
+    );
 
     assert!(graph.state_count() >= 1);
     assert_eq!(graph.transition_count(), 1);

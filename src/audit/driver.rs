@@ -95,7 +95,7 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             }
         };
         successful_tabs += 1;
-        let after = tx.after;
+        let after = tx.after().clone();
         let sem_after = semantic::analyze(&after);
         let focus_after = sem_after.focus.control.clone();
 
@@ -245,7 +245,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             Ok(tx) => tx,
             Err(_) => return findings,
         };
-        let after = tx.after;
+        let after = tx.after().clone();
         let sem_after = semantic::analyze(&after);
 
         if sem_after.focus.control.as_ref() == Some(&focus_before) {
