@@ -9,6 +9,7 @@ pub mod coverage;
 pub mod design;
 pub mod error;
 pub mod exploration;
+pub mod execution;
 pub mod framework;
 pub mod mcp;
 pub mod recording;

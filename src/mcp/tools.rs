@@ -114,9 +114,17 @@ impl TuiLabServer {
                         let version = sess.backend_version();
                         let kind = sess.backend_kind.clone();
                         let generation = sess.generation;
+                        // Attach the launch spec to the run (audit re-review
+                        // item 1: the run owns session/launch correlation, so
+                        // relaunches and artifacts share one identity).
+                        if let Some(spec) = launch.clone() {
+                            self.run.lock().unwrap().set_launch_spec(spec);
+                        }
+                        let run_id = self.run.lock().unwrap().id.clone();
                         ok(json!({
                             "session": id,
                             "generation": generation,
+                            "run": run_id,
                             "backend": { "name": kind, "version": version },
                             "capabilities": caps,
                             "launch": launch,
@@ -287,35 +295,24 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        let before = match sess.last().cloned() {
-            Some(s) => s,
-            None => match sess.observe(0) {
-                Ok(s) => s,
-                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-            },
-        };
         let input = match build_input_from_request(&p) {
             Ok(i) => i,
             Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
         };
-        if let Err(e) = sess.send(input) {
-            return err(ErrorCategory::BackendError, e.to_string());
-        }
-        // default: wait for idle + capture transition
-        if !p.no_wait() {
-            let _ = sess.wait(
-                crate::backend::WaitCond::ScreenStable {
-                    quiet_for: std::time::Duration::from_millis(p.wait_ms().unwrap_or(150)),
-                    after_screen_seq: None,
-                },
-                p.wait_ms().unwrap_or(150) + 1000,
-            );
-        }
-        let after = match sess.observe(p.wait_ms().unwrap_or(150)) {
-            Ok(s) => s,
+        // The one canonical executor (re-review item 4): anchored settle wait
+        // (item 8) + honest settle reporting (item 9).
+        let quiet = p.wait_ms().unwrap_or(150);
+        let tx = match crate::execution::execute_act(
+            sess,
+            p.action_name(),
+            input,
+            quiet,
+            quiet.saturating_add(1000),
+            p.no_wait(),
+        ) {
+            Ok(t) => t,
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
-        let tr = diff(&before, &after);
         // Scenario recording in progress? Append this act (audit: scenarios
         // capture real tool traffic; sensitive payloads are not recorded).
         if !p.sensitive() {
@@ -328,8 +325,14 @@ impl TuiLabServer {
             }
         }
         ok(json!({
-            "action": p.action_name(),
-            "transition": tr,
+            "action": tx.action,
+            "settled": tx.settled,
+            "settle_reason": tx.settle_reason,
+            "elapsed_ms": tx.elapsed_ms,
+            "warnings": if tx.settled { Vec::<String>::new() } else {
+                vec!["screen did not reach the requested stability within the settle budget".to_string()]
+            },
+            "transition": tx.transition,
         }))
     }
 
