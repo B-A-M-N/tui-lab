@@ -44,6 +44,10 @@ pub struct RunContext {
     pub checkpoints: CheckpointStore,
     /// Scenario recorders by name (recording in progress).
     recorders: HashMap<String, ScenarioRecorder>,
+    /// Completed scenarios for this run. Memory is canonical during the live
+    /// run (so ephemeral runs still list/export); persistence to the run dir
+    /// is an artifact layer on top, not the source of truth.
+    saved_scenarios: HashMap<String, crate::scenario::model::Scenario>,
     /// Exploration state graph (owned here so audits/exploration share it).
     pub state_graph: StateGraph,
     /// Findings emitted during this run (audit results).
@@ -60,6 +64,7 @@ impl RunContext {
             launch_spec: None,
             checkpoints: CheckpointStore::new(),
             recorders: HashMap::new(),
+            saved_scenarios: HashMap::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
             findings: Vec::new(),
         }
@@ -77,6 +82,9 @@ impl RunContext {
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
         std::fs::create_dir_all(root.join("findings"))?;
+        run.checkpoints = CheckpointStore::with_run_dir(
+            root.join("checkpoints").to_string_lossy().to_string(),
+        );
         run.run_dir = Some(root);
         run.write_manifest()?;
         Ok(run)
@@ -151,26 +159,47 @@ impl RunContext {
     }
 
     /// Save a completed scenario to the run's `scenarios/` directory as JSON.
-    pub fn save_scenario(&self, scenario: &crate::scenario::model::Scenario) -> anyhow::Result<PathBuf> {
-        let dir = self.scenario_dir()?;
-        let path = dir.join(format!("{}.json", sanitize(&scenario.name)));
+    /// Save a scenario: memory first (canonical), then disk when the run is
+    /// persistent. Returns the artifact path when persistence happened, so
+    /// ephemeral runs report `saved_to: null` honestly but the scenario is
+    /// still listed and exportable.
+    pub fn save_scenario(
+        &mut self,
+        scenario: crate::scenario::model::Scenario,
+    ) -> Option<PathBuf> {
+        self.saved_scenarios
+            .insert(scenario.name.clone(), scenario);
+        let dir = self.run_dir.as_ref()?.join("scenarios");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{}.json", sanitize(&self.saved_scenarios
+            .values()
+            .last()
+            .expect("just inserted")
+            .name)));
         // Atomic write: temp file then rename (audit item 16).
+        let scenario = self.saved_scenarios.values().last().expect("just inserted");
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(scenario)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(path)
+        std::fs::write(&tmp, serde_json::to_vec_pretty(scenario).ok()?).ok()?;
+        std::fs::rename(&tmp, &path).ok()?;
+        Some(path)
     }
 
-    /// List saved scenarios in this run.
+    /// List saved scenarios in this run: the in-memory canonical set plus
+    /// anything persisted in the run dir (deduplicated).
     pub fn list_saved_scenarios(&self) -> anyhow::Result<Vec<String>> {
-        let dir = self.scenario_dir()?;
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    out.push(stem.to_string());
+        let mut out: Vec<String> = self.saved_scenarios.keys().cloned().collect();
+        if let Some(root) = self.run_dir.as_ref() {
+            let dir = root.join("scenarios");
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            if !out.iter().any(|n| n == stem) {
+                                out.push(stem.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -178,11 +207,14 @@ impl RunContext {
         Ok(out)
     }
 
-    /// Load a saved scenario by name.
+    /// Load a scenario by name: memory first, then the run dir.
     pub fn load_scenario(
         &self,
         name: &str,
     ) -> anyhow::Result<crate::scenario::model::Scenario> {
+        if let Some(s) = self.saved_scenarios.get(name) {
+            return Ok(s.clone());
+        }
         let dir = self.scenario_dir()?;
         let path = dir.join(format!("{}.json", sanitize(name)));
         let bytes = std::fs::read(&path)
@@ -285,7 +317,7 @@ mod tests {
         let scenario = crate::scenario::model::Scenario::new("roundtrip")
             .act(serde_json::json!({"action": "key", "key": "enter"}))
             .wait(serde_json::json!({"condition": "text", "text": "SAVED"}));
-        let path = run.save_scenario(&scenario).expect("save");
+        let path = run.save_scenario(scenario).expect("save");
         assert!(path.exists());
 
         let names = run.list_saved_scenarios().expect("list");

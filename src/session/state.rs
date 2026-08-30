@@ -141,6 +141,22 @@ impl Session {
         }
     }
 
+    /// Stop recording and return the recorder so the caller can export it.
+    ///
+    /// Detaches the PTY hook first (no further events), then `take()`s the
+    /// sink — unlike `disable_recording`, which drops it, this hands the
+    /// completed recording back to the caller (audit re-review item 2: stop
+    /// must not destroy the recorder before retrieval).
+    pub fn stop_recording(
+        &mut self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>> {
+        // Detach the hook so the reader thread stops feeding events.
+        if let Ok(mut slot) = self.recording_slot.lock() {
+            *slot = None;
+        }
+        self.recorder.take()
+    }
+
     /// Access the recorder (shared, interior-mutable).
     pub fn recorder(
         &self,
