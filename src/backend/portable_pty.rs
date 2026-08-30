@@ -25,8 +25,9 @@ use vt100::Parser;
 
 use crate::backend::{
     trait_def::TerminalBackend, BackendError, BackendResult, Capabilities, Input, InputModes,
-    KeyCode, KeyEvent, MouseEncoding, MouseEvent, MouseMode, ScrollDirection,
-    TerminalEventState, WaitCond, WaitOutcome, WaitReason,
+    KeyEvent, KeyModifiers, MouseEncoding, MouseEvent, MouseMode,
+    ScrollDirection, TerminalEventState, WaitCond, WaitOutcome, WaitReason,
+    new_recording_hook_slot, RecordingHookSlot, RecordingHook, ObserveResult,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -65,6 +66,10 @@ pub struct PortablePtyBackend {
     // Reader thread -> main parse loop.
     reader_handle: Option<thread::JoinHandle<()>>,
     chunk_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    // Recording hook slot (audit item 24/25/26).
+    recording_slot: RecordingHookSlot,
+    // Hook clone carried into the reader thread at start().
+    reader_recording_hook: Option<super::RecordingHookSlot>,
     // Event sequencing state (spec section 1).
     output_seq: u64,
     screen_seq: u64,
@@ -93,6 +98,8 @@ impl PortablePtyBackend {
             writer: None,
             reader_handle: None,
             chunk_rx: None,
+            recording_slot: new_recording_hook_slot(),
+            reader_recording_hook: None,
             output_seq: 0,
             screen_seq: 0,
             content_seq: 0,
@@ -107,11 +114,14 @@ impl PortablePtyBackend {
     }
 
     /// Drain buffered PTY bytes, feed the parser, and bump `screen_seq` on
-    /// visible changes. Returns the (previous, current) raw hashes so the
-    /// caller can detect screen mutations. This is the single funnel through
-    /// which all terminal bytes and screen re-evaluation pass.
+    /// fingerprint change (cell text + style + cursor state), bumping
+    /// `content_seq` on text-only change. Returns (before_fp, after_fp) hashes
+    /// so the caller can detect screen mutations. This is the single funnel
+    /// through which all terminal bytes and screen re-evaluation pass
+    /// (audit items 1/2).
     fn pump(&mut self) -> BackendResult<(String, String)> {
-        let before = self.parser.screen().contents();
+        let before_contents = self.parser.screen().contents();
+        let before_fp = self.interaction_fingerprint();
         if let Some(rx) = self.chunk_rx.as_ref() {
             // Non-blocking drain of everything currently buffered.
             while let Ok(chunk) = rx.try_recv() {
@@ -121,13 +131,76 @@ impl PortablePtyBackend {
                 self.last_output_instant = Instant::now();
             }
         }
-        let after = self.parser.screen().contents();
-        if before != after {
+        let after_contents = self.parser.screen().contents();
+        let after_fp = self.interaction_fingerprint();
+        // content_seq bumps when text changed
+        if before_contents != after_contents {
+            self.content_seq += 1;
+        }
+        // screen_seq bumps when the fingerprint changed (text or style)
+        if before_fp != after_fp {
             self.screen_seq += 1;
             self.last_screen_change_at_ms = now_ms();
             self.last_screen_change_instant = Instant::now();
         }
-        Ok((before, after))
+        Ok((before_fp, after_fp))
+    }
+
+    /// Notify the recording hook if attached (audit item 24).
+    /// Locks the slot and calls `f`; ignores poisoned mutex.
+    fn notify<F: FnOnce(&dyn RecordingHook)>(&self, f: F) {
+        if let Ok(slot) = self.recording_slot.lock() {
+            if let Some(ref hook) = *slot {
+                f(hook.as_ref());
+            }
+        }
+    }
+
+    /// Compute an interaction fingerprint over the vt100 screen.
+    ///
+    /// Hashes every cell's text, fg, bg, bold, underline, reverse, plus cursor
+    /// position, cursor visibility, and (cols, rows) dimensions via blake3.
+    /// A change in reverse-video styling alone will change the fingerprint
+    /// (audit item 1).
+    fn interaction_fingerprint(&self) -> String {
+        let screen = self.parser.screen();
+        let mut hasher = blake3::Hasher::new();
+        let rows = screen.size().0;
+        let cols = screen.size().1;
+        hasher.update(b"fp:v1:");
+        hasher.update(&cols.to_le_bytes());
+        hasher.update(&rows.to_le_bytes());
+        for y in 0..rows {
+            for x in 0..cols {
+                if let Some(cell) = screen.cell(y, x) {
+                    hasher.update(cell.contents().as_bytes());
+                    hasher.update(&color_to_u32(cell.fgcolor()).to_le_bytes());
+                    hasher.update(&color_to_u32(cell.bgcolor()).to_le_bytes());
+                    hasher.update(&[cell.bold() as u8]);
+                    hasher.update(&[cell.underline() as u8]);
+                    hasher.update(&[cell.inverse() as u8]);
+                } else {
+                    hasher.update(b"\0");
+                }
+            }
+        }
+        let cursor = screen.cursor_position();
+        hasher.update(&cursor.0.to_le_bytes());
+        hasher.update(&cursor.1.to_le_bytes());
+        hasher.update(&[!screen.hide_cursor() as u8]);
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Pull bell/title counters out of the parser callbacks (shared by
+    /// `state()`, `wait()` and `send_input`).
+    fn sync_parser_counters(&mut self) {
+        let cb = self.parser.callbacks();
+        if cb.audible_bells > self.bell_seq {
+            self.bell_seq = cb.audible_bells;
+        }
+        if cb.title_seq > self.title_seq {
+            self.title_seq = cb.title_seq;
+        }
     }
 
     fn current_modes(&self) -> InputModes {
@@ -139,6 +212,26 @@ impl PortablePtyBackend {
             mouse_encoding: screen.mouse_protocol_encoding().into(),
             cursor_visible: !screen.hide_cursor(),
         }
+    }
+
+    /// Write bytes to the PTY via the writer and notify the recording hook
+    /// (audit item 24).
+    fn write_input(&mut self, bytes: &[u8]) -> BackendResult<()> {
+        let writer = match self.writer.as_mut() {
+            Some(w) => w,
+            None => return Err(BackendError::NoSession),
+        };
+        writer.write_all(bytes).map_err(BackendError::Io)?;
+        writer.flush().map_err(BackendError::Io)?;
+        // Notify input hook via the reader thread's hook clone.
+        if let Some(ref hook) = self.reader_recording_hook {
+            if let Ok(slot) = hook.lock() {
+                if let Some(ref h) = *slot {
+                    h.on_input(bytes);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -187,22 +280,47 @@ impl TerminalBackend for PortablePtyBackend {
             .try_clone_reader()
             .map_err(|e| BackendError::Io(std::io::Error::other(e.to_string())))?;
         let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+        // Clone the recording hook slot for the reader thread (audit item 24).
+        let reader_hook_for_thread = self.recording_slot.clone();
+        let reader_hook_for_struct = self.recording_slot.clone();
         let rh = thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        if std::env::var("TUI_LAB_DEBUG_PTY").is_ok() {
+                            eprintln!("[tui-lab reader] EOF");
+                        }
+                        break;
+                    }
                     Ok(n) => {
-                        if chunk_tx.send(buf[..n].to_vec()).is_err() {
+                        let chunk = buf[..n].to_vec();
+                        // Feed the recording hook if attached.
+                        if let Ok(slot) = reader_hook_for_thread.lock() {
+                            if let Some(ref hook) = *slot {
+                                hook.on_output(&chunk);
+                            }
+                        }
+                        if chunk_tx.send(chunk).is_err() {
+                            if std::env::var("TUI_LAB_DEBUG_PTY").is_ok() {
+                                eprintln!("[tui-lab reader] channel closed, terminating");
+                            }
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        if std::env::var("TUI_LAB_DEBUG_PTY").is_ok() {
+                            eprintln!("[tui-lab reader] read error, terminating: {e}");
+                        }
+                        break;
+                    }
                 }
             }
         });
         self.reader_handle = Some(rh);
         self.chunk_rx = Some(chunk_rx);
+        // Also store the hook clone on the struct for write_input usage.
+        self.reader_recording_hook = Some(reader_hook_for_struct);
 
         // take writer
         let writer = pair
@@ -252,6 +370,7 @@ impl TerminalBackend for PortablePtyBackend {
             let _ = h.join();
         }
         self.chunk_rx = None;
+        self.reader_recording_hook = None;
         self.child_pid = None;
         Ok(())
     }
@@ -275,74 +394,114 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn send_input(&mut self, input: Input) -> BackendResult<()> {
+        // Drain any pending PTY output FIRST: the application may have just
+        // negotiated a mode (mouse/paste/application cursor) whose escape
+        // sequence is still sitting in the channel. Encoding must reflect the
+        // negotiated state at the moment of the send, not one pump behind.
+        let _ = self.pump();
+        self.sync_parser_counters();
         // Resolve negotiated modes up front (clone, so no lingering borrow).
         let modes = self.current_modes();
-        let writer = match self.writer.as_mut() {
-            Some(w) => w,
-            None => return Err(BackendError::NoSession),
-        };
+        if self.writer.is_none() {
+            return Err(BackendError::NoSession);
+        }
         // For Keys we parse ergonomic strings into typed KeyEvents at the
         // session boundary, so here we already operate on typed KeyEvents.
         match input {
             Input::Key(kev) => {
-                let bytes = encode_key(&kev);
-                writer.write_all(&bytes).map_err(BackendError::Io)?;
-                writer.flush().map_err(BackendError::Io)?;
+                let bytes = encode_key(&kev, &modes)?;
+                self.write_input( &bytes)?;
             }
             Input::Keys(keys) => {
                 // Execute the complete sequence (spec section 32).
                 for kev in keys {
-                    let bytes = encode_key(&kev);
-                    writer.write_all(&bytes).map_err(BackendError::Io)?;
-                    writer.flush().map_err(BackendError::Io)?;
+                    let bytes = encode_key(&kev, &modes)?;
+                    self.write_input( &bytes)?;
                 }
             }
             Input::Text(t) => {
-                writer.write_all(t.as_bytes()).map_err(BackendError::Io)?;
-                writer.flush().map_err(BackendError::Io)?;
+                let bytes = t.into_bytes();
+                self.write_input( &bytes)?;
             }
             Input::Paste(p) => {
                 if modes.bracketed_paste {
                     let mut v = b"\x1b[200~".to_vec();
                     v.extend_from_slice(p.as_bytes());
                     v.extend_from_slice(b"\x1b[201~");
-                    writer.write_all(&v).map_err(BackendError::Io)?;
-                    writer.flush().map_err(BackendError::Io)?;
+                    self.write_input( &v)?;
                 } else {
                     // No bracketed paste mode: send raw text (do not lie about
                     // the protocol).
-                    writer.write_all(p.as_bytes()).map_err(BackendError::Io)?;
-                    writer.flush().map_err(BackendError::Io)?;
+                    self.write_input( p.as_bytes())?;
                 }
             }
             Input::Raw(b) => {
-                writer.write_all(&b).map_err(BackendError::Io)?;
-                writer.flush().map_err(BackendError::Io)?;
+                self.write_input( &b)?;
             }
             Input::MouseClick { button, x, y } => {
+                // Enforce mouse mode gating for press.
+                match modes.mouse_mode {
+                    MouseMode::None => {
+                        return Err(BackendError::Unsupported(
+                            "mouse reporting is not enabled by the application".into(),
+                        ));
+                    }
+                    MouseMode::Press | MouseMode::PressRelease | MouseMode::ButtonMotion
+                    | MouseMode::AnyMotion => {} // press is allowed
+                }
                 // A click is press + release back-to-back (audit item 8).
                 let press = encode_mouse_event(
                     &MouseEvent::Press { button, x, y },
                     modes.mouse_encoding,
-                );
+                )?;
+                self.write_input( &press)?;
+                // Enforce mouse mode gating for release.
+                match modes.mouse_mode {
+                    MouseMode::Press | MouseMode::ButtonMotion => {
+                        // Press mode: only press and scroll allowed; release is unsupported.
+                        return Err(BackendError::Unsupported(
+                            "mouse release not supported in negotiated mouse mode".into(),
+                        ));
+                    }
+                    _ => {} // release allowed
+                }
                 let release = encode_mouse_event(
                     &MouseEvent::Release { button, x, y },
                     modes.mouse_encoding,
-                );
-                writer.write_all(&press).map_err(BackendError::Io)?;
-                writer.flush().map_err(BackendError::Io)?;
-                writer.write_all(&release).map_err(BackendError::Io)?;
-                writer.flush().map_err(BackendError::Io)?;
+                )?;
+                self.write_input( &release)?;
             }
             Input::Mouse(ev) => {
+                // Enforce mouse mode gating.
+                let is_press = matches!(ev, MouseEvent::Press { .. });
+                let is_release = matches!(ev, MouseEvent::Release { .. });
+                let is_scroll = matches!(ev, MouseEvent::Scroll { .. });
+                let is_move = matches!(ev, MouseEvent::Move { .. });
+                let is_drag = matches!(ev, MouseEvent::Drag { .. });
+                let _ = (&is_move, &is_drag); // used in mode gating below
+
                 if modes.mouse_mode == MouseMode::None {
                     return Err(BackendError::Unsupported(
                         "mouse reporting is not enabled by the application".into(),
                     ));
                 }
-                let bytes = encode_mouse_event(&ev, modes.mouse_encoding);
-                writer.write_all(&bytes).map_err(BackendError::Io)?;
-                writer.flush().map_err(BackendError::Io)?;
+                let allowed = match modes.mouse_mode {
+                    MouseMode::Press => is_press || is_scroll,
+                    MouseMode::PressRelease => is_press || is_release || is_scroll,
+                    MouseMode::ButtonMotion => is_press || is_scroll || is_drag,
+                    MouseMode::AnyMotion => true,
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(BackendError::Unsupported(
+                        format!(
+                            "{:?} not supported in negotiated mouse mode {:?}",
+                            ev, modes.mouse_mode
+                        ),
+                    ));
+                }
+                let bytes = encode_mouse_event(&ev, modes.mouse_encoding)?;
+                self.write_input( &bytes)?;
             }
             Input::Resize { cols, rows } => {
                 return self.resize(cols, rows);
@@ -390,6 +549,8 @@ impl TerminalBackend for PortablePtyBackend {
         // Resize the vt100 parser as well so our parsed screen matches the
         // child's notion of dimensions (spec section 3).
         self.parser.screen_mut().set_size(rows, cols);
+        // Notify resize hook (audit item 24).
+        self.notify(|hook| hook.on_resize(cols, rows));
         Ok(())
     }
 
@@ -397,33 +558,12 @@ impl TerminalBackend for PortablePtyBackend {
         let start = Instant::now();
         let baseline_bell_seq = self.bell_seq;
 
-        // For screen-change we need the baseline *visual* hash now.
+        // For screen-change we need the baseline *interaction fingerprint*
+        // now (style-only changes count as changes; audit item 3).
         let baseline_hash = {
             let _ = self.pump();
-            self.parser.screen().contents()
+            self.interaction_fingerprint()
         };
-
-        // Capture the monotonic Instants at wait-start. Subsequent mutations
-        // in `pump()` will advance these Instants, so we can detect whether
-        // any event happened *during this wait*.
-        let baseline_last_output = self.last_output_instant;
-        let baseline_last_screen_change = self.last_screen_change_instant;
-
-        let quiet = match &cond {
-            WaitCond::ScreenStable { quiet_for, .. } => *quiet_for,
-            WaitCond::Idle { quiet_for, .. } => *quiet_for,
-            _ => Duration::from_millis(60),
-        };
-        // Track the instant of the last observed activity *during this wait*.
-        // Initialized to `start` so the quiet interval is measured from wait
-        // begin, not from the last-ever event before the wait.
-        let mut last_activity_during_wait = start;
-        // For ScreenStable/Idle we also need to know whether a mutation
-        // happened *at all* during this wait. We use the captured baselines
-        // for that: if the current Instant is strictly greater, a mutation
-        // occurred since the wait started.
-        let mut saw_screen_change_during_wait = false;
-        let mut saw_output_during_wait = false;
 
         loop {
             // Pump new bytes first.
@@ -453,23 +593,26 @@ impl TerminalBackend for PortablePtyBackend {
                     WaitReason::TextAbsent,
                 ),
                 WaitCond::ScreenChange => {
-                    let cur = self.parser.screen().contents();
-                    (cur != baseline_hash, WaitReason::ScreenChange)
+                    let cur_fp = self.interaction_fingerprint();
+                    (cur_fp != baseline_hash, WaitReason::ScreenChange)
                 }
-                WaitCond::ScreenStable { .. } => {
-                    // Detect whether a screen mutation happened during this wait.
-                    if self.last_screen_change_instant > baseline_last_screen_change {
-                        saw_screen_change_during_wait = true;
-                        last_activity_during_wait = Instant::now();
-                    }
-                    // Stable only if we've seen at least one mutation (so we
-                    // know the screen is real) AND no mutation for `quiet`.
-                    if saw_screen_change_during_wait && last_activity_during_wait.elapsed() >= quiet
-                    {
-                        (true, WaitReason::ScreenStable)
-                    } else {
-                        (false, WaitReason::ScreenStable)
-                    }
+                WaitCond::ScreenStable {
+                    quiet_for,
+                    after_screen_seq,
+                } => {
+                    // Generic stability: the screen has simply been quiet for
+                    // `quiet_for`. NO fresh mutation is required — a one-frame
+                    // reaction that arrived *before* wait() was entered must
+                    // still resolve (audit items 1/2/70).
+                    // Anchored stability: additionally require a screen change
+                    // with sequence strictly greater than the captured baseline
+                    // (wait_after / anchored_to).
+                    let anchored_ok = match after_screen_seq {
+                        Some(seq) => self.screen_seq > *seq,
+                        None => true,
+                    };
+                    let quiet_ok = self.last_screen_change_instant.elapsed() >= *quiet_for;
+                    (anchored_ok && quiet_ok, WaitReason::ScreenStable)
                 }
                 WaitCond::ProcessExit => (!screen.process.running, WaitReason::ProcessExit),
                 WaitCond::Title(t) => (
@@ -477,17 +620,19 @@ impl TerminalBackend for PortablePtyBackend {
                     WaitReason::Title,
                 ),
                 WaitCond::Bell => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
-                WaitCond::Idle { .. } => {
-                    // Idle = no PTY output for quiet_for.
-                    if self.last_output_instant > baseline_last_output {
-                        saw_output_during_wait = true;
-                        last_activity_during_wait = Instant::now();
-                    }
-                    if saw_output_during_wait && last_activity_during_wait.elapsed() >= quiet {
-                        (true, WaitReason::Idle)
-                    } else {
-                        (false, WaitReason::Idle)
-                    }
+                WaitCond::Idle {
+                    quiet_for,
+                    after_output_seq,
+                } => {
+                    // Same shape as ScreenStable, keyed on PTY output chunks:
+                    // quiet interval suffices without an anchor; with an
+                    // anchor, require output strictly newer than the baseline.
+                    let anchored_ok = match after_output_seq {
+                        Some(seq) => self.output_seq > *seq,
+                        None => true,
+                    };
+                    let quiet_ok = self.last_output_instant.elapsed() >= *quiet_for;
+                    (anchored_ok && quiet_ok, WaitReason::Idle)
                 }
             };
 
@@ -575,6 +720,53 @@ impl TerminalBackend for PortablePtyBackend {
             last_screen_change_at: self.last_screen_change_at_ms,
         }
     }
+
+    /// Attach or detach the raw PTY recording hook (audit item 24).
+    /// Stores the slot so the struct can forward on_input/on_resize events.
+    fn set_recording_hook(&mut self, hook: super::RecordingHookSlot) {
+        self.recording_slot = hook;
+    }
+
+    /// Observe current terminal state with optional idle-wait.
+    ///
+    /// Overrides the default fallback: captures state immediately, then if
+    /// `idle > 0` waits for ScreenStable with the quieter budget, returning
+    /// the final screen and whether it went stable (audit item 4).
+    fn observe(&mut self, idle: std::time::Duration) -> BackendResult<ObserveResult> {
+        // Capture state immediately.
+        let initial = self.state()?;
+        if idle == Duration::ZERO {
+            return Ok(ObserveResult {
+                screen: initial,
+                stable: false,
+                stable_ms: 0,
+            });
+        }
+        let quiet = idle.min(Duration::from_millis(120));
+        let start = Instant::now();
+        let outcome = self.wait(
+            WaitCond::ScreenStable {
+                quiet_for: quiet,
+                after_screen_seq: None,
+            },
+            idle + Duration::from_millis(500),
+        )?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ObserveResult {
+            screen: outcome.state,
+            stable: outcome.met,
+            stable_ms: elapsed_ms,
+        })
+    }
+}
+
+/// Convert a vt100 color to a u32 for hashing.
+fn color_to_u32(c: vt100::Color) -> u32 {
+    match c {
+        vt100::Color::Default => 0,
+        vt100::Color::Idx(i) => 1 + (i as u32),
+        vt100::Color::Rgb(r, g, b) => 0x1000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -591,48 +783,68 @@ fn exit_status_parts(status: portable_pty::ExitStatus) -> (i32, Option<String>) 
 }
 
 /// Encode a typed [`KeyEvent`] into raw terminal bytes (xterm-style).
-/// Handles Ctrl/Alt/Shift modifiers and function keys correctly (spec section 6).
-fn encode_key(kev: &KeyEvent) -> Vec<u8> {
+///
+/// Mode-aware: arrow keys and Home/End switch between SS3 and CSI based on
+/// application cursor mode; Shift+ASCII letter emits the uppercase byte;
+/// SUPER is rejected (unsupported without kitty keyboard protocol)
+/// (audit item 6).
+fn encode_key(kev: &KeyEvent, modes: &InputModes) -> BackendResult<Vec<u8>> {
     use crate::backend::KeyCode::*;
     let KeyEvent { code, modifiers } = kev;
+
+    // Reject SUPER — cannot encode without the kitty keyboard protocol.
+    if modifiers.contains(KeyModifiers::SUPER) {
+        return Err(BackendError::Unsupported(
+            "super/meta is not encodable without the kitty keyboard protocol".into(),
+        ));
+    }
 
     // C0 control from Ctrl+letter/control char.
     if modifiers.ctrl() {
         match code {
             Char(c) if c.is_ascii_lowercase() => {
-                return vec![*c as u8 - b'a' + 1];
+                return Ok(vec![*c as u8 - b'a' + 1]);
             }
             Char(c) if c.is_ascii_uppercase() => {
                 // Ctrl+Shift+Letter: send the uppercase control byte.
-                return vec![*c as u8 - b'A' + 1];
+                return Ok(vec![*c as u8 - b'A' + 1]);
             }
-            Char(' ') => return vec![0x00], // Ctrl+Space
-            Char('@') => return vec![0x00],
-            Char('2') => return vec![0x00],             // Ctrl+@
-            Char('[') | Char('{') => return vec![0x1b], // Ctrl+[
-            Char(']') | Char('}') => return vec![0x1d],
-            Char('\\') => return vec![0x1c],
-            Char('^') => return vec![0x1e],
-            Char('_') => return vec![0x1f],
+            Char(' ') => return Ok(vec![0x00]),   // Ctrl+Space
+            Char('@') => return Ok(vec![0x00]),
+            Char('2') => return Ok(vec![0x00]),     // Ctrl+@
+            Char('[') | Char('{') => return Ok(vec![0x1b]),  // Ctrl+[
+            Char(']') | Char('}') => return Ok(vec![0x1d]),
+            Char('\\') => return Ok(vec![0x1c]),
+            Char('^') => return Ok(vec![0x1e]),
+            Char('_') => return Ok(vec![0x1f]),
             _ => {}
         }
     }
 
-    // Alternate/escape-prefixed encodings.
+    let app_cursor = modes.application_cursor;
+    let shift = modifiers.shift();
     let alt = modifiers.alt();
 
     let base: Vec<u8> = match code {
         Char(c) if *c == ' ' => b" ".to_vec(),
         Char(c) => {
-            let ch = *c;
-            // Shift+letter keeps the uppercase char; plain char is itself.
-            let mut s = String::new();
-            s.push(ch);
-            s.into_bytes()
+            // Shift+ASCII letter → uppercase byte (audit item 6).
+            if shift && c.is_ascii_alphabetic() {
+                vec![c.to_ascii_uppercase() as u8]
+            } else if shift {
+                // Non-letter shift: send the character as-is.
+                let mut s = String::new();
+                s.push(*c);
+                s.into_bytes()
+            } else {
+                let mut s = String::new();
+                s.push(*c);
+                s.into_bytes()
+            }
         }
         Enter => b"\r".to_vec(),
         Tab => {
-            if modifiers.shift() {
+            if shift {
                 b"\x1b[Z".to_vec() // Shift+Tab
             } else {
                 b"\t".to_vec()
@@ -640,17 +852,25 @@ fn encode_key(kev: &KeyEvent) -> Vec<u8> {
         }
         Backspace => b"\x7f".to_vec(),
         Escape => b"\x1b".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Function(n) => match n {
+        // Arrow keys: SS3 in application cursor mode, CSI otherwise (audit item 6).
+        Up if app_cursor => b"\x1bOA".to_vec(),
+        Down if app_cursor => b"\x1bOB".to_vec(),
+        Right if app_cursor => b"\x1bOC".to_vec(),
+        Left if app_cursor => b"\x1bOD".to_vec(),
+        Up => b"\x1b[A".to_vec(),
+        Down => b"\x1b[B".to_vec(),
+        Right => b"\x1b[C".to_vec(),
+        Left => b"\x1b[D".to_vec(),
+        // Home/End: SS3 variants in application cursor mode (audit item 6).
+        Home if app_cursor => b"\x1bOH".to_vec(),
+        End if app_cursor => b"\x1bOF".to_vec(),
+        Home => b"\x1b[H".to_vec(),
+        End => b"\x1b[F".to_vec(),
+        PageUp => b"\x1b[5~".to_vec(),
+        PageDown => b"\x1b[6~".to_vec(),
+        Insert => b"\x1b[2~".to_vec(),
+        Delete => b"\x1b[3~".to_vec(),
+        Function(n) => match n {
             1 => b"\x1bOP".to_vec(),
             2 => b"\x1bOQ".to_vec(),
             3 => b"\x1bOR".to_vec(),
@@ -671,19 +891,19 @@ fn encode_key(kev: &KeyEvent) -> Vec<u8> {
         // ESC-prefix for Alt+key (xterm default).
         let mut v = b"\x1b".to_vec();
         v.extend_from_slice(&base);
-        v
+        Ok(v)
     } else {
-        base
+        Ok(base)
     }
 }
 
 /// Encode a typed [`MouseEvent`] into the negotiated protocol bytes.
-/// For now the only fully-wired protocol is SGR (1006); we also emit Default
-/// (X10/SGR-style) as 1006 since that is what the previous encoder produced,
-/// but crucially we only do so when the application enabled mouse reporting.
-fn encode_mouse_event(ev: &MouseEvent, _encoding: MouseEncoding) -> Vec<u8> {
-    // SGR 1006 encoding: ESC [ < C ; X ; Y M/m
-    // C encodes button + motion/release bits.
+///
+/// Dispatches SGR (1006), X10 (1000/Default), and UTF-8 (1005) encodings.
+/// X10 coordinates are clamped to <= 222; values > 222 return
+/// `Err(Unsupported)` (audit item 7).
+fn encode_mouse_event(ev: &MouseEvent, encoding: MouseEncoding) -> BackendResult<Vec<u8>> {
+    // Compute Cb button code, coords (1-based for SGR), and release flag.
     let (button_base, x, y, release, motion) = match ev {
         MouseEvent::Press { button, x, y } => (button.sgr_base(), *x, *y, false, false),
         MouseEvent::Release { button, x, y } => (button.sgr_base(), *x, *y, true, false),
@@ -697,15 +917,62 @@ fn encode_mouse_event(ev: &MouseEvent, _encoding: MouseEncoding) -> Vec<u8> {
             (base, *x, *y, false, false)
         }
     };
-    let mut b = button_base & 0x3f;
-    if motion {
-        b |= 0x20;
+
+    match encoding {
+        MouseEncoding::Sgr => {
+            // SGR 1006: ESC [ < Cb ; X ; Y M/m  (1-based coords).
+            let mut b = button_base & 0x3f;
+            if motion {
+                b |= 0x20;
+            }
+            if release {
+                return Ok(format!("\x1b[<{};{};{}m", b, x + 1, y + 1).into_bytes());
+            }
+            Ok(format!("\x1b[<{};{};{}M", b, x + 1, y + 1).into_bytes())
+        }
+        MouseEncoding::Default => {
+            // X10 1000: ESC [ M Cb' X' Y'  where each byte = value + 32.
+            // Release: Cb = button_base + 3 (32 offset applied below).
+            // Move with no button: Cb base is 3.
+            let cb_base = match ev {
+                MouseEvent::Move { .. } => 3, // move with no button
+                MouseEvent::Release { .. } => button_base + 3,
+                _ => button_base,
+            };
+            // X10 clamps coordinates > 222 (255 - 32).
+            if x > 222 || y > 222 {
+                return Err(BackendError::Unsupported(
+                    "x10 mouse encoding cannot express coordinates > 222".into(),
+                ));
+            }
+            // Coordinates were clamped <= 222 above, so 32+value fits a byte.
+            let cb = cb_base + 32;
+            let cx = (x + 32) as u8;
+            let cy = (y + 32) as u8;
+            Ok(vec![0x1b, b'[', b'M', cb, cx, cy])
+        }
+        MouseEncoding::Utf8 => {
+            // UTF-8 xterm extension (1005): ESC [ M then each of Cb, X, Y
+            // encoded as UTF-8 codepoint (32 + value).
+            let cb_base = match ev {
+                MouseEvent::Move { .. } => 3,
+                MouseEvent::Release { .. } => button_base + 3,
+                _ => button_base,
+            };
+            if x > 222 || y > 222 {
+                return Err(BackendError::Unsupported(
+                    "x10 mouse encoding cannot express coordinates > 222".into(),
+                ));
+            }
+            // Coordinates were clamped <= 222 above; each value is a single
+            // UTF-8 byte at codepoint 32+value.
+            let mut out = vec![0x1b, b'[', b'M'];
+            out.push(cb_base + 32);
+            out.push((x + 32) as u8);
+            out.push((y + 32) as u8);
+            Ok(out)
+        }
     }
-    if release {
-        // release uses lowercase 'm'
-        return format!("\x1b[<{};{};{}m", b, x + 1, y + 1).into_bytes();
-    }
-    format!("\x1b[<{};{};{}M", b, x + 1, y + 1).into_bytes()
 }
 
 // `chunk_rx` is stored on the struct (declared near top) and drained in `pump`.
