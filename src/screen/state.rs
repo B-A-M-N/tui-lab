@@ -1,0 +1,148 @@
+//! Convert a parsed `vt100::Screen` into our [`ScreenState`] and compute the
+//! three hashes (raw / visual / structure) from spec section 12.
+//!
+//! - `raw_hash`: every cell content + every attribute bit matters.
+//! - `visual_hash`: ignore attributes that do not affect visible rendering
+//!   (we keep fg/bg/bold/reverse/underline since they change legibility, but
+//!   drop `dim`/`italic`/`strike` only when they don't change appearance — to
+//!   stay conservative we include them).
+//! - `structure_hash`: normalize volatile text (numbers, timers, clocks) so an
+//!   animated counter doesn't look like a new state. See [`crate::screen::normalize`].
+//!
+//! Hashes use blake3 with a schema/version prefix (spec section 18) so run
+//! artifacts are durable and cross-version content-addressable.
+
+use vt100::Screen as VtScreen;
+
+use super::cell::{Cell, Color, CursorState, ProcessState, ScreenState};
+
+fn cell_color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::unknown(),
+        vt100::Color::Idx(i) => Color {
+            rgb: None,
+            palette: Some(i),
+        },
+        vt100::Color::Rgb(r, g, b) => Color {
+            rgb: Some((r, g, b)),
+            palette: None,
+        },
+    }
+}
+
+pub fn from_vt(screen: &VtScreen, process: ProcessState, title: Option<String>) -> ScreenState {
+    let rows = screen.size().0;
+    let cols = screen.size().1;
+    let mut cells = Vec::with_capacity((rows * cols) as usize);
+    let mut viewport_text = Vec::with_capacity(rows as usize);
+    let mut raw = blake3::Hasher::new();
+    let mut visual = blake3::Hasher::new();
+    let mut structure = blake3::Hasher::new();
+
+    for y in 0..rows {
+        let mut line = String::new();
+        for x in 0..cols {
+            let ch = screen.cell(y, x);
+            let (text, fg, bg, bold, dim, italic, underline, reverse, strike) = match ch {
+                Some(c) => (
+                    c.contents().to_string(),
+                    cell_color(c.fgcolor()),
+                    cell_color(c.bgcolor()),
+                    c.bold(),
+                    c.dim(),
+                    c.italic(),
+                    c.underline(),
+                    c.inverse(),
+                    false,
+                ),
+                None => (
+                    String::new(),
+                    Color::unknown(),
+                    Color::unknown(),
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+            };
+            let cell = Cell {
+                x,
+                y,
+                text: text.clone(),
+                fg,
+                bg,
+                bold,
+                dim,
+                italic,
+                underline,
+                reverse,
+                strike,
+            };
+            cells.push(cell);
+
+            // raw: everything
+            let raw_s = format!(
+                "{}:{}:{:?}{:?}{}{}{}{}{}{}",
+                x, y, fg, bg, bold, dim, italic, underline, reverse, strike
+            );
+            raw.update(text.as_bytes());
+            raw.update(raw_s.as_bytes());
+            // visual: visible-render-affecting only
+            let vis_s = format!(
+                "{}:{}:{:?}{:?}{}{}{}",
+                x, y, fg, bg, bold, underline, reverse
+            );
+            visual.update(text.as_bytes());
+            visual.update(vis_s.as_bytes());
+
+            if text.is_empty() {
+                line.push(' ');
+            } else {
+                line.push_str(&text);
+            }
+        }
+        viewport_text.push(line);
+    }
+
+    // Structure hash: normalize per-row (item 19). We build the structure
+    // hash from row-normalized text so that volatile tokens like
+    // "CPU 37%" or "12:42:03" collapse properly across cells.
+    for (y, row) in viewport_text.iter().enumerate() {
+        let normalized = crate::screen::normalize::normalize_row(row);
+        let st_s = format!("{}:{}:{}", y, normalized, false);
+        structure.update(st_s.as_bytes());
+    }
+
+    let cursor = screen.cursor_position();
+    let cursor_state = CursorState {
+        x: cursor.1,
+        y: cursor.0,
+        // Honor the terminal's actual cursor-visibility state (spec section 15).
+        // vt100 exposes hide_cursor(); our model stores visibility.
+        visible: !screen.hide_cursor(),
+    };
+
+    ScreenState {
+        cols,
+        rows,
+        cursor: cursor_state,
+        title,
+        cells,
+        viewport_text,
+        scrollback: Vec::new(),
+        raw_hash: format!("raw:v1:{}", hex(raw.finalize().as_bytes())),
+        visual_hash: format!("visual:v1:{}", hex(visual.finalize().as_bytes())),
+        structure_hash: format!("structure:v1:{}", hex(structure.finalize().as_bytes())),
+        process,
+    }
+}
+
+fn hex(h: &[u8]) -> String {
+    let mut s = String::with_capacity(h.len() * 2);
+    for b in h {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}

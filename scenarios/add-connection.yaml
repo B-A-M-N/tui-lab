@@ -1,0 +1,16 @@
+# Example regression scenario: discovered interaction turned into a reusable test.
+# Generated from exploration; replayable with: tui_scenario action=run name=add-connection
+name: add-connection
+steps:
+  - expect:
+      text: "Connections"
+  - key: "n"
+  - expect:
+      text: "Add Connection"
+  - type: "localhost"
+  - key: "tab"
+  - type: "8080"
+  - key: "tab"
+  - key: "enter"
+  - expect:
+      text: "localhost"

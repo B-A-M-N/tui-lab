@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# TUI-Lab run artifacts
+.tui-lab/
+*.cast
+*.apng
+*.gif
+*.mp4
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep test fixtures
+!/fixtures/
+
+# nested leftover scaffold repo (not part of this crate)
+/tui-lab/
