@@ -364,6 +364,12 @@ pub enum WaitCond {
 impl WaitCond {
     /// Fill in the action-baseline from a captured event state, for conditions
     /// that carry a causality anchor but were built without one.
+    ///
+    /// `ScreenChange` is anchored by rewriting it into an anchored
+    /// `ScreenStable` (a screen change with seq > baseline followed by the
+    /// quiet interval): "the reaction to my action settled" is what action
+    /// callers actually mean, and it removes the entry-pump race where the
+    /// action's output is consumed by the wait's own baseline capture.
     pub fn anchored_to(mut self, baseline: &TerminalEventState) -> Self {
         match &mut self {
             WaitCond::ScreenStable {
@@ -379,6 +385,12 @@ impl WaitCond {
                 if after_output_seq.is_none() {
                     *after_output_seq = Some(baseline.output_seq);
                 }
+            }
+            WaitCond::ScreenChange => {
+                return WaitCond::ScreenStable {
+                    quiet_for: Duration::from_millis(40),
+                    after_screen_seq: Some(baseline.screen_seq),
+                };
             }
             _ => {}
         }

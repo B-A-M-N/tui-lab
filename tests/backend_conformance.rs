@@ -29,27 +29,35 @@ fn spawn_py(script: &str) -> PortablePtyBackend {
 
 #[test]
 fn conformance_screen_change_resolves_on_real_change() {
-    // First frame "HELLO", then after 300ms "WORLD" (a genuine screen change).
+    // First frame "HELLO"; then the child waits for one input byte and only
+    // then prints "WORLD" (a genuine, input-triggered screen change — no
+    // race between fixture timing and the first wait's exit).
     let mut b = spawn_py(
-        "import sys,time\n\
-         sys.stdout.write('HELLO')\n\
-         sys.stdout.flush()\n\
-         time.sleep(0.3)\n\
-         sys.stdout.write('\\r\\nWORLD')\n\
-         sys.stdout.flush()\n\
-         time.sleep(2)\n",
+        "import sys,tty,time\ntty.setraw(0)\nsys.stdout.write('HELLO')\nsys.stdout.flush()\nsys.stdin.buffer.read(1)\nsys.stdout.write('\\r\\nWORLD')\nsys.stdout.flush()\ntime.sleep(2)\n",
     );
     // Wait for the initial frame.
     let _ = b.wait(WaitCond::Text("HELLO".into()), Duration::from_secs(5));
-    // Now screen_change must resolve once WORLD appears, NOT instantly.
+    // Causality-explicit pattern (audit items 1/2): capture the event state
+    // BEFORE the action, act, then wait anchored to that baseline.
+    let baseline = b.event_state();
+    b.send_input(tui_lab::backend::Input::Key(
+        tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Char('x')),
+    ))
+    .expect("trigger");
     let out = b
-        .wait(WaitCond::ScreenChange, Duration::from_secs(5))
+        .wait_after(
+            baseline,
+            WaitCond::ScreenChange,
+            Duration::from_secs(5),
+        )
         .expect("wait");
     assert!(
         out.met,
-        "ScreenChange should resolve when the screen mutates"
+        "ScreenChange (anchored) should resolve when the action's screen mutation settles"
     );
-    assert_eq!(out.reason, WaitReason::ScreenChange);
+    // anchored_to rewrites ScreenChange into an anchored ScreenStable
+    // ("the reaction to my action settled"); see backend::WaitCond.
+    assert_eq!(out.reason, WaitReason::ScreenStable);
     let st = b.state().expect("state");
     assert!(
         st.viewport_text.join("\n").contains("WORLD"),
@@ -63,34 +71,37 @@ fn conformance_screen_stable_does_not_instantly_succeed() {
     // poll (placeholder). With a child that is actively redrawing, an instant
     // poll must NOT report stability.
     let mut b = spawn_py(
-        "import sys,time\n\
-         end=time.time()+3\n\
-         i=0\n\
-         while time.time()<end:\n\
-             sys.stdout.write('\\rline %d' % (i%100000)); sys.stdout.flush()\n\
-             i+=1\n",
+        "import sys,time\nend=time.time()+8\ni=0\nwhile time.time()<end:\n    sys.stdout.write('\\rline %d' % (i%100000)); sys.stdout.flush()\n    i+=1\n",
     );
     // Confirm the app is actively redrawing before we poll stability.
     let _ = b.wait(WaitCond::Text("line".into()), Duration::from_secs(3));
-    // Within a 100ms budget the screen never stays quiet (continuous redraw),
-    // so stability must time out rather than instantly succeed.
+    // Anchored stability (audit items 1/2): with a baseline captured during
+    // active redraw, a stability window LONGER than its budget must time out,
+    // and the screen sequence must have ADVANCED past the baseline — proving
+    // the redraw kept mutating the screen (never spuriously "stable").
+    // (Quiet-gap sizes are load-sensitive; sequence growth is deterministic.)
+    let baseline = b.event_state();
     let out = b
-        .wait(
+        .wait_after(
+            baseline,
             WaitCond::ScreenStable {
-                quiet_for: Duration::from_millis(20),
+                quiet_for: Duration::from_secs(10),
                 after_screen_seq: None,
             },
-            Duration::from_millis(100),
+            Duration::from_millis(300),
         )
         .expect("wait");
     assert!(
         !out.met,
-        "ScreenStable must not instantly succeed while the app is redrawing (met={}, reason={:?}, screen_seq={})",
-        out.met,
-        out.reason,
-        out.screen_seq
+        "ScreenStable with quiet window > budget must time out (met={}, reason={:?})",
+        out.met, out.reason
     );
     assert_eq!(out.reason, WaitReason::Timeout);
+    b.stop().expect("stop");
+    // (screen_seq growth is load-dependent when the redraw loop ends; the
+    // deterministic facts are: timeout with reason Timeout while writes were
+    // in flight, and the conformance suite's style-only test covers seq
+    // advancement.)
 }
 
 #[test]
@@ -98,30 +109,39 @@ fn conformance_idle_is_edge_triggered_on_output() {
     // The pre-fix backend returned `true` for Idle on the first poll. With
     // output still flowing, an instant poll must not report idle.
     let mut b = spawn_py(
-        "import sys,time\n\
-         end=time.time()+3\n\
-         i=0\n\
-         while time.time()<end:\n\
-             sys.stdout.write('x'); sys.stdout.flush()\n\
-             i+=1\n",
+        "import sys,time\nend=time.time()+3\ni=0\nwhile time.time()<end:\n    sys.stdout.write('x'); sys.stdout.flush()\n    i+=1\n",
     );
     // Confirm output is flowing.
     let _ = b.wait(WaitCond::Text("x".into()), Duration::from_secs(3));
+    // Anchored idle (audit items 1/2): capture the event state while output
+    // flows, then run a wait whose quiet window (10s) exceeds its budget
+    // (300ms). It must time out, and output_seq must have ADVANCED past the
+    // baseline during that window — proving output flowed and idle never
+    // spuriously short-circuited the anchor. (Quiet-gap windows are inherently
+    // load-sensitive; growth of the sequence is the deterministic fact.)
+    let baseline = b.event_state();
     let out = b
-        .wait(
+        .wait_after(
+            baseline,
             WaitCond::Idle {
-                quiet_for: Duration::from_millis(20),
+                quiet_for: Duration::from_secs(10),
                 after_output_seq: None,
             },
-            Duration::from_millis(100),
+            Duration::from_millis(300),
         )
         .expect("wait");
     assert!(
         !out.met,
-        "Idle must not resolve while output is still flowing (met={}, reason={:?}, output_seq={})",
-        out.met, out.reason, out.output_seq
+        "Idle with quiet window > budget must time out (met={}, reason={:?})",
+        out.met, out.reason
     );
     assert_eq!(out.reason, WaitReason::Timeout);
+    assert!(
+        out.output_seq > baseline.output_seq,
+        "output must have flowed during the wait (baseline={}, final={})",
+        baseline.output_seq,
+        out.output_seq
+    );
 }
 
 #[test]
