@@ -139,7 +139,7 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({
             "action": "start",
             "command": "python3",
-            "args": ["-c", "print('READY'); import time; time.sleep(30)"],
+            "args": ["-c", "print('READY'); import time; time.sleep(300)"],
             "cols": 80, "rows": 24,
         }),
     );
@@ -217,13 +217,15 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "mode": "screen", "id": sess_c }),
     );
     assert_eq!(obs_c0["category"], "success", "obs C0: {obs_c0}");
-    // Wait for the async DELTA-7 to land (screen_change at backend level).
+    // Wait for the async DELTA-7 to land, by text (robust: the change may
+    // land before the wait's baseline is captured, in which case a
+    // change-since-now wait would never fire).
     let wc = mcp.tool(
         "tui_wait",
-        serde_json::json!({ "condition": "screen_change", "budget_ms": 10000, "id": sess_c }),
+        serde_json::json!({ "condition": "text", "text": "DELTA-7", "budget_ms": 15000, "id": sess_c }),
     );
-    assert_eq!(wc["category"], "success", "screen_change wait: {wc}");
-    assert_eq!(wc["data"]["met"], true, "screen_change must fire: {wc}");
+    assert_eq!(wc["category"], "success", "text wait: {wc}");
+    assert_eq!(wc["data"]["met"], true, "DELTA-7 must appear: {wc}");
     // Now diff: previous observation (pre-DELTA) → current (DELTA-7).
     let obs2 = mcp.tool(
         "tui_observe",
@@ -383,6 +385,96 @@ fn stdio_e2e_full_lifecycle() {
     assert!(!b_step.contains("\"tab\""), "B absorbed A's traffic: {b_step}");
 
     let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_b }));
+
+    // --- scenario replay through MCP (regression path: record → run) ---
+    // Record a real scenario: the child echoes typed text, so the assert
+    // passes when replayed against an identical fresh session.
+    let start_r = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "start", "command": "python3",
+            "args": ["-c", "import time; time.sleep(60)"] }),
+    );
+    assert_eq!(start_r["category"], "success", "replay target start: {start_r}");
+    let sess_r = start_r["data"]["session"].as_str().unwrap().to_string();
+
+    let rec_r = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "record_start", "name": "echo-flow", "id": sess_r }),
+    );
+    assert_eq!(rec_r["category"], "success", "rec R: {rec_r}");
+    let id_r = rec_r["data"]["recording_id"].as_str().unwrap().to_string();
+    let _ = mcp.tool(
+        "tui_act",
+        serde_json::json!({ "action": "type", "text": "regression-marker", "id": sess_r }),
+    );
+    let asrt_r = mcp.tool(
+        "tui_assert",
+        serde_json::json!({ "assertion": "text", "text": "regression-marker", "id": sess_r }),
+    );
+    assert_eq!(asrt_r["category"], "success", "recorded assert must pass: {asrt_r}");
+    let stop_r = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "record_stop", "recording_id": id_r }),
+    );
+    assert_eq!(stop_r["category"], "success", "stop R: {stop_r}");
+    assert_eq!(stop_r["data"]["steps"], 2, "recorded act+assert: {stop_r}");
+
+    // Replay the SAVED scenario against the same session: must pass.
+    let run_ok = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "run", "name": "echo-flow", "id": sess_r }),
+    );
+    assert_eq!(run_ok["category"], "success", "run pass case: {run_ok}");
+    assert_eq!(run_ok["data"]["passed"], true, "replay must pass: {run_ok}");
+    assert_eq!(run_ok["data"]["steps_total"], 2);
+    assert_eq!(run_ok["data"]["steps_failed"], 0);
+
+    // Replay against a FRESH session (same launch): must still pass —
+    // scenarios are portable across generations/sessions of the same app.
+    let start_r2 = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "start", "command": "python3",
+            "args": ["-c", "import time; time.sleep(60)"] }),
+    );
+    assert_eq!(start_r2["category"], "success", "replay target 2: {start_r2}");
+    let sess_r2 = start_r2["data"]["session"].as_str().unwrap().to_string();
+    let run_ok2 = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "run", "name": "echo-flow", "id": sess_r2 }),
+    );
+    assert_eq!(run_ok2["category"], "success", "run cross-session: {run_ok2}");
+    assert_eq!(
+        run_ok2["data"]["passed"], true,
+        "same-app fresh session must pass: {run_ok2}"
+    );
+
+    // A scenario asserting text that never appears must FAIL for real.
+    // Steps are stored flat ({kind, ...params}) — the same shape replay parses.
+    let save_fail = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "save", "name": "failing-flow",
+            "steps": [
+                { "kind": "assert", "assertion": "text", "text": "never-appears-xyz" }
+            ] }),
+    );
+    assert_eq!(save_fail["category"], "success", "save failing scenario: {save_fail}");
+    let run_bad = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "run", "name": "failing-flow", "id": sess_r2 }),
+    );
+    assert_eq!(run_bad["category"], "success", "transport stays success: {run_bad}");
+    assert_eq!(run_bad["data"]["passed"], false, "regression must be detected: {run_bad}");
+    assert_eq!(run_bad["data"]["steps_total"], 1);
+    assert_eq!(run_bad["data"]["steps_failed"], 1, "{run_bad}");
+    // The failure detail must name the expectation, not say "executed".
+    let detail = run_bad["data"]["step_results"][0]["detail"].to_string();
+    assert!(
+        detail.contains("never-appears-xyz"),
+        "assert detail must state the expectation: {detail}"
+    );
+
+    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_r }));
+    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_r2 }));
 
     // --- recording lifecycle (PTY boundary) ---
     let rstart = mcp.tool("tui_record", serde_json::json!({ "format": "start", "id": session }));

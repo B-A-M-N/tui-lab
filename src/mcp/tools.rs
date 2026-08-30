@@ -593,12 +593,40 @@ impl TuiLabServer {
                 let steps = p.steps.clone().unwrap_or_default();
                 let mut recorder = crate::scenario::recorder::ScenarioRecorder::new(name.clone());
                 for s in &steps {
+                    // Canonical step shape = flat ({kind, ...params}), the
+                    // same shape record_stop emits and replay parses. A
+                    // nested {kind, params} object is also accepted so
+                    // hand-authored round-trips of an exported scenario's
+                    // internal form keep working.
                     let kind = s
                         .get("kind")
                         .and_then(|k| k.as_str())
                         .unwrap_or("act")
                         .to_string();
-                    let params = s.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                    let params = match s.get("params") {
+                        Some(nested) if nested.is_object() => {
+                            let mut flat = s.clone();
+                            if let Some(obj) = flat.as_object_mut() {
+                                obj.remove("kind");
+                                obj.remove("params");
+                            }
+                            let mut merged = nested.as_object().cloned().unwrap_or_default();
+                            if let Some(flat_obj) = flat.as_object() {
+                                for (k, v) in flat_obj {
+                                    merged.entry(k.clone()).or_insert(v.clone());
+                                }
+                            }
+                            serde_json::Value::Object(merged)
+                        }
+                        _ => {
+                            // Flat: everything except `kind`.
+                            let mut flat = s.clone();
+                            if let Some(obj) = flat.as_object_mut() {
+                                obj.remove("kind");
+                            }
+                            flat
+                        }
+                    };
                     match kind.as_str() {
                         "act" => recorder.record_act(params),
                         "wait" => recorder.record_wait(params),
@@ -628,6 +656,58 @@ impl TuiLabServer {
                         json!({ "name": name, "scenario": serde_json::to_value(&scenario).unwrap_or_default() }),
                     ),
                     Err(e) => err(ErrorCategory::InvalidRequest, format!("no such scenario: {}", e)),
+                }
+            }
+            // Replay a saved scenario against a session through the one
+            // canonical executor — the regression path: record once, run
+            // again later, get a real pass/fail per step.
+            "run" => {
+                let name = match &p.name {
+                    Some(n) => n.clone(),
+                    None => {
+                        return err(ErrorCategory::InvalidRequest, "run requires 'name'")
+                    }
+                };
+                let scenario = match run.load_scenario(&name) {
+                    Ok(sc) => sc,
+                    Err(e) => {
+                        return err(ErrorCategory::InvalidRequest, format!("no such scenario: {}", e))
+                    }
+                };
+                drop(run);
+                let mut mgr = self.manager.lock().unwrap();
+                let sess = match mgr.resolve_mut(p.id.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                };
+                let report = crate::scenario::runner::ScenarioRunner::run(&scenario, sess);
+                let (sid, gen) = (sess.id.clone(), sess.generation);
+                drop(mgr);
+                self.run.lock().unwrap().bump_transaction();
+                if report.steps_failed == 0 {
+                    ok(json!({
+                        "name": report.scenario_name,
+                        "session": sid,
+                        "generation": gen,
+                        "passed": true,
+                        "steps_total": report.steps_total,
+                        "steps_passed": report.steps_passed,
+                        "steps_failed": 0,
+                        "step_results": report.step_results,
+                    }))
+                } else {
+                    // Real regression: envelope stays success (transport ok),
+                    // payload reports the failure honestly.
+                    ok(json!({
+                        "name": report.scenario_name,
+                        "session": sid,
+                        "generation": gen,
+                        "passed": false,
+                        "steps_total": report.steps_total,
+                        "steps_passed": report.steps_passed,
+                        "steps_failed": report.steps_failed,
+                        "step_results": report.step_results,
+                    }))
                 }
             }
             other => err(
