@@ -86,7 +86,7 @@ impl RunContext {
     pub fn persistent(base: Option<&std::path::Path>) -> anyhow::Result<Self> {
         let mut run = RunContext::ephemeral();
         let root = match base {
-            Some(b) => b.join(".tui-lab").join("runs").join(&run.id),
+            Some(b) => Self::runs_dir_for(b, &run.id),
             None => PathBuf::from(".tui-lab").join("runs").join(&run.id),
         };
         std::fs::create_dir_all(root.join("checkpoints"))?;
@@ -344,12 +344,17 @@ impl RunContext {
     }
 
     /// Status snapshot for `tui_run status` (goal spec shape).
-    pub fn status(&self) -> serde_json::Value {
+    ///
+    /// `sessions` comes from the caller: the run records the primary launch
+    /// spec; the live session list lives in the SessionManager, which the run
+    /// does not own. The MCP layer fills it in.
+    pub fn status(&self, sessions: Vec<serde_json::Value>) -> serde_json::Value {
         json!({
             "run_id": self.id,
             "mode": if self.run_dir.is_some() { "persistent" } else { "ephemeral" },
             "persistent": self.run_dir.is_some(),
             "artifact_root": self.run_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "sessions": sessions,
             "started_at": self.started_at,
             "closed": self.closed,
             "primary_session_cwd": self.primary_session_cwd().map(str::to_string),
@@ -412,17 +417,36 @@ impl RunContext {
         Ok(())
     }
 
+    /// Resolve the per-run artifact directory from a caller-supplied base.
+    ///
+    /// A base whose last component is `runs` is treated as the runs directory
+    /// itself (the goal spec's persist example) and holds the run directly:
+    /// `<base>/<run-id>`. Any other base is a repo root:
+    /// `<base>/.tui-lab/runs/<run-id>`. Session-cwd resolution always lands
+    /// on the repo-root form.
+    fn runs_dir_for(base: &std::path::Path, id: &str) -> PathBuf {
+        let is_runs_dir = base
+            .file_name()
+            .map(|f| f == std::ffi::OsStr::new("runs"))
+            .unwrap_or(false);
+        if is_runs_dir {
+            base.join(id)
+        } else {
+            base.join(".tui-lab").join("runs").join(id)
+        }
+    }
+
     /// Promote this SAME run from ephemeral to persistent (goal spec:
     /// identity + all accumulated state preserved; future writes go to disk).
     ///
-    /// `base` is the artifact root's parent — resolved by the caller from the
-    /// primary session's `LaunchSpec.cwd` or an explicit request root, never
-    /// from this process's cwd.
+    /// `base` is resolved by the caller from the primary session's
+    /// `LaunchSpec.cwd` or an explicit request root — never from this
+    /// process's cwd.
     pub fn promote(&mut self, base: &std::path::Path) -> anyhow::Result<PathBuf> {
         if let Some(existing) = &self.run_dir {
             return Ok(existing.clone());
         }
-        let root = base.join(".tui-lab").join("runs").join(&self.id);
+        let root = Self::runs_dir_for(base, &self.id);
         std::fs::create_dir_all(root.join("checkpoints"))?;
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
@@ -614,16 +638,17 @@ mod tests {
     #[test]
     fn status_reports_ephemeral_and_persistent_modes() {
         let eph = RunContext::ephemeral();
-        let st = eph.status();
+        let st = eph.status(Vec::new());
         assert_eq!(st["mode"], "ephemeral");
         assert_eq!(st["persistent"], false);
         assert!(st["artifact_root"].is_null());
 
         let base = tempfile::tempdir().expect("base");
         let per = RunContext::persistent(Some(base.path())).expect("persistent");
-        let st2 = per.status();
+        let st2 = per.status(vec![serde_json::Value::String("sess-x".into())]);
         assert_eq!(st2["mode"], "persistent");
         assert_eq!(st2["persistent"], true);
+        assert_eq!(st2["sessions"], serde_json::json!(["sess-x"]));
         assert!(st2["artifact_root"].as_str().is_some());
     }
 }
