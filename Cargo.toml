@@ -1,0 +1,46 @@
+[package]
+name = "tui-lab"
+version = "0.1.0"
+edition = "2021"
+description = "Agent-native TUI instrumentation, testing, exploration, and UX evaluation harness (MCP server)"
+license = "MIT"
+
+[[bin]]
+name = "hermes-tui-lab"
+path = "src/main.rs"
+
+[dependencies]
+# MCP server SDK (pinned per spec section 39)
+rmcp = { version = "3.1.4", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bitflags = "2"
+
+# Terminal engine substrate (Rust-native, spec section 36/37 fallback).
+# tui-test-rs (beta, in rewrite) is kept behind a feature flag and is NOT
+# the default engine because its types are unstable (spec section 2).
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+anyhow = "1.0.104"
+regex = "1"
+rand = "0.8"
+blake3 = "1"      # durable, cross-version content hashes (spec section 18)
+uuid = "1"        # collision-resistant session ids (spec section 12)
+libc = "0.2"      # Unix process-group signal delivery (spec section 7)
+toml = "0.8"      # parse Cargo.toml manifests properly (spec section 64)
+clap = { version = "4", features = ["derive"] }  # CLI subcommands (spec section 77)
+
+# Optional framework probes invoke project-local tooling; not runtime deps.
+
+[features]
+default = []
+# Enables the tui-test-rs adapter once that crate stabilizes. Off by default.
+tui_test_backend = []
+
+[dev-dependencies]
+tempfile = "3"

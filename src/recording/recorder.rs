@@ -1,0 +1,231 @@
+//! Asciinema v3 cast format recorder (spec item 40).
+//!
+//! Captures the raw PTY byte stream and input events to produce a valid
+//! `.cast` file compatible with asciinema player.
+
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+
+/// A single event in the recording.
+#[derive(Debug, Clone)]
+pub enum RecordingEvent {
+    /// Terminal output bytes at a given time.
+    Output(Vec<u8>),
+    /// Input bytes sent to the terminal at a given time.
+    Input(Vec<u8>),
+    /// Resize event at a given time.
+    Resize(u16, u16),
+    /// Marker event.
+    Marker(String),
+}
+
+/// Recorder that captures events and writes them in asciinema v3 format.
+pub struct AsciicastRecorder {
+    cols: u16,
+    rows: u16,
+    events: Vec<(f64, RecordingEvent)>,
+    start_time: Option<std::time::Instant>,
+    /// Whether to record input events (may contain secrets).
+    record_input: bool,
+}
+
+impl AsciicastRecorder {
+    pub fn new(cols: u16, rows: u16, record_input: bool) -> Self {
+        AsciicastRecorder {
+            cols,
+            rows,
+            events: Vec::new(),
+            start_time: None,
+            record_input,
+        }
+    }
+
+    /// Record an output event (terminal bytes).
+    pub fn record_output(&mut self, bytes: &[u8]) {
+        if self.start_time.is_none() {
+            self.start_time = Some(std::time::Instant::now());
+        }
+        let t = self.elapsed_secs();
+        self.events
+            .push((t, RecordingEvent::Output(bytes.to_vec())));
+    }
+
+    /// Record an input event (bytes sent to terminal).
+    pub fn record_input(&mut self, bytes: &[u8]) {
+        if !self.record_input {
+            return;
+        }
+        if self.start_time.is_none() {
+            self.start_time = Some(std::time::Instant::now());
+        }
+        let t = self.elapsed_secs();
+        self.events.push((t, RecordingEvent::Input(bytes.to_vec())));
+    }
+
+    /// Record a resize event.
+    pub fn record_resize(&mut self, cols: u16, rows: u16) {
+        if self.start_time.is_none() {
+            self.start_time = Some(std::time::Instant::now());
+        }
+        let t = self.elapsed_secs();
+        self.events.push((t, RecordingEvent::Resize(cols, rows)));
+        self.cols = cols;
+        self.rows = rows;
+    }
+
+    /// Record a marker.
+    pub fn record_marker(&mut self, text: &str) {
+        let t = self.elapsed_secs();
+        self.events
+            .push((t, RecordingEvent::Marker(text.to_string())));
+    }
+
+    /// Get the recorded events as NDJSON lines.
+    pub fn to_ndjson(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        // Header
+        let header = serde_json::json!({
+            "version": 3,
+            "width": self.cols,
+            "height": self.rows,
+            "timestamp": 0,
+        });
+        lines.push(header.to_string());
+
+        for (t, event) in &self.events {
+            match event {
+                RecordingEvent::Output(data) => {
+                    let escaped = String::from_utf8_lossy(data);
+                    let ev = serde_json::json!([t, "o", escaped]);
+                    lines.push(ev.to_string());
+                }
+                RecordingEvent::Input(data) => {
+                    let escaped = String::from_utf8_lossy(data);
+                    let ev = serde_json::json!([t, "i", escaped]);
+                    lines.push(ev.to_string());
+                }
+                RecordingEvent::Resize(cols, rows) => {
+                    let ev = serde_json::json!([t, "r", format!("{}x{}", cols, rows)]);
+                    lines.push(ev.to_string());
+                }
+                RecordingEvent::Marker(text) => {
+                    let ev = serde_json::json!([t, "m", text]);
+                    lines.push(ev.to_string());
+                }
+            }
+        }
+        lines
+    }
+
+    /// Write the recording to a `.cast` file.
+    pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        for line in self.to_ndjson() {
+            writeln!(file, "{}", line)?;
+        }
+        Ok(())
+    }
+
+    /// Get the number of events recorded.
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Get the duration of the recording in seconds.
+    pub fn duration_secs(&self) -> f64 {
+        self.events.last().map(|(t, _)| *t).unwrap_or(0.0)
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.start_time
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+}
+
+impl Drop for AsciicastRecorder {
+    fn drop(&mut self) {
+        // Nothing special needed — events are owned by the struct.
+    }
+}
+
+/// Privacy/sanitization policy for recordings.
+#[derive(Debug, Clone)]
+pub struct RecordingPolicy {
+    pub record_input: bool,
+    pub redact_patterns: Vec<String>,
+}
+
+impl Default for RecordingPolicy {
+    fn default() -> Self {
+        RecordingPolicy {
+            record_input: false,
+            redact_patterns: vec![
+                r"(?i)password\s*[:=]\s*\S+".to_string(),
+                r"(?i)secret\s*[:=]\s*\S+".to_string(),
+                r"(?i)token\s*[:=]\s*\S+".to_string(),
+                r"(?i)key\s*[:=]\s*\S+".to_string(),
+            ],
+        }
+    }
+}
+
+impl RecordingPolicy {
+    /// Apply redaction to a string.
+    pub fn redact(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        for pattern in &self.redact_patterns {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                result = re.replace_all(&result, "[REDACTED]").to_string();
+            }
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_recorder_basic() {
+        let mut rec = AsciicastRecorder::new(80, 24, false);
+        rec.record_output(b"Hello World");
+        rec.record_resize(120, 40);
+        rec.record_marker("test marker");
+
+        let lines = rec.to_ndjson();
+        assert!(lines.len() >= 4); // header + 3 events
+        assert!(lines[0].contains("\"version\":3"));
+    }
+
+    #[test]
+    fn test_recorder_with_input() {
+        let mut rec = AsciicastRecorder::new(80, 24, true);
+        rec.record_output(b"prompt> ");
+        rec.record_input(b"ls\n");
+
+        let lines = rec.to_ndjson();
+        assert_eq!(lines.len(), 3); // header + 2 events
+    }
+
+    #[test]
+    fn test_recorder_no_input() {
+        let mut rec = AsciicastRecorder::new(80, 24, false);
+        rec.record_output(b"prompt> ");
+        rec.record_input(b"ls\n"); // should be ignored
+
+        let lines = rec.to_ndjson();
+        assert_eq!(lines.len(), 2); // header + 1 event (input ignored)
+    }
+
+    #[test]
+    fn test_policy_redaction() {
+        let policy = RecordingPolicy::default();
+        let text = "password: secret123 token: abc456 normal text";
+        let redacted = policy.redact(text);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("normal text"));
+    }
+}
