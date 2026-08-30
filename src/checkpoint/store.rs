@@ -43,6 +43,43 @@ impl CheckpointStore {
         }
     }
 
+    /// Re-root this store onto a new run directory, carrying over every
+    /// in-memory checkpoint (run promotion: the SAME run gains durable
+    /// storage; nothing accumulated while ephemeral may be lost).
+    pub fn reroot(&mut self, run_dir: String) {
+        let _ = fs::create_dir_all(&run_dir);
+        self.run_dir = Some(run_dir);
+        // Persist every carried-over checkpoint into the new root.
+        let session_ids: Vec<String> = self.checkpoints.keys().cloned().collect();
+        for sid in session_ids {
+            let names: Vec<String> = self
+                .checkpoints
+                .get(&sid)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            for name in names {
+                let cp = self
+                    .checkpoints
+                    .get(&sid)
+                    .and_then(|m| m.get(&name))
+                    .cloned();
+                if let Some(cp) = cp {
+                    if let Err(e) = self.persist(&sid, &cp) {
+                        eprintln!(
+                            "tui-lab: checkpoint re-persist failed for '{}': {}",
+                            name, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Total checkpoints across all sessions.
+    pub fn count(&self) -> usize {
+        self.checkpoints.values().map(|m| m.len()).sum()
+    }
+
     /// Save a checkpoint. Returns the checkpoint's name.
     pub fn save(
         &mut self,

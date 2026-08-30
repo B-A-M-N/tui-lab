@@ -63,6 +63,11 @@ impl ScenarioRecorder {
         };
     }
 
+    /// Number of steps recorded so far (live progress reporting).
+    pub fn step_count_hint(&self) -> usize {
+        self.scenario.steps.len()
+    }
+
     /// Build the recorded scenario.
     pub fn build(self) -> Scenario {
         self.scenario

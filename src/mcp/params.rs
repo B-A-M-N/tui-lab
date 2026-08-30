@@ -544,6 +544,13 @@ pub struct TuiScenarioParams {
     pub action: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Target session (record_start resolves id + generation from it).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Opaque recording identity from record_start (preferred over name for
+    /// record_stop; names are display labels, not identities).
+    #[serde(default)]
+    pub recording_id: Option<String>,
     #[serde(default)]
     pub steps: Option<Vec<serde_json::Value>>,
 }
@@ -554,6 +561,21 @@ pub struct TuiRecordParams {
     pub format: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
+}
+
+/// Run lifecycle (goal spec): status / persist / close. Ephemeral by default;
+/// `persist` promotes the SAME run to durable storage.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TuiRunParams {
+    pub action: String,
+    /// persist: explicit artifact root. When omitted, resolved from the
+    /// primary session's `LaunchSpec.cwd` — never this process's cwd.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// close: kill sessions too? (default false — close never touches
+    /// sessions unless explicitly told to).
+    #[serde(default)]
+    pub kill_sessions: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]

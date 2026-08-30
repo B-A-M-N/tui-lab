@@ -193,15 +193,6 @@ impl Session {
         }
     }
 
-    /// Record a resize event (manual path).
-    pub fn record_resize(&mut self, cols: u16, rows: u16) {
-        if let Some(rec) = self.recorder.as_ref() {
-            if let Ok(mut r) = rec.lock() {
-                r.record_resize(cols, rows);
-            }
-        }
-    }
-
     /// Get the recorded events as NDJSON lines.
     pub fn recording_ndjson(&self) -> Vec<String> {
         match self.recorder.as_ref() {
@@ -355,10 +346,10 @@ impl Session {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Backend owns resize recording (re-review item 3): the hook fires
+        // only after the PTY resize actually succeeded, so a failed resize
+        // is never recorded. The Session-level record here was a duplicate.
         self.backend.resize(cols, rows)?;
-        // Record resize at the recorder level as well (the raw hook only sees
-        // PTY bytes, not resize intent; audit item 26).
-        self.record_resize(cols, rows);
         if let Some(spec) = self.launch.as_mut() {
             spec.cols = cols;
             spec.rows = rows;
