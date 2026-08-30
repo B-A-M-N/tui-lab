@@ -285,8 +285,8 @@ pub fn detect_regions(screen: &ScreenState) -> Vec<Region> {
 
     assign_hierarchy(&mut regions);
 
-    for i in 0..regions.len() {
-        regions[i].kind = infer_role(&regions[i], cols as u16, rows as u16);
+    for region in regions.iter_mut() {
+        region.kind = infer_role(region, cols as u16, rows as u16);
     }
 
     regions
@@ -317,27 +317,13 @@ fn trace_rectangle(
         }
     }
 
-    let mut valid_bottom = true;
-    for x in start_x..=top_right {
-        match conn[bottom_y][x] {
-            Some(c) if c.left || c.right => {}
-            _ => {
-                valid_bottom = false;
-                break;
-            }
-        }
-    }
+    let valid_bottom = (start_x..=top_right).all(|x| {
+        matches!(conn[bottom_y][x], Some(c) if c.left || c.right)
+    });
 
-    let mut valid_left = true;
-    for y in start_y..=bottom_y {
-        match conn[y][start_x] {
-            Some(c) if c.up || c.down => {}
-            _ => {
-                valid_left = false;
-                break;
-            }
-        }
-    }
+    let valid_left = (start_y..=bottom_y).all(|y| {
+        matches!(conn[y][start_x], Some(c) if c.up || c.down)
+    });
 
     if !valid_bottom || !valid_left {
         return None;
@@ -346,9 +332,9 @@ fn trace_rectangle(
     let width = (top_right - start_x + 1) as u16;
     let height = (bottom_y - start_y + 1) as u16;
 
-    for y in start_y..=bottom_y {
-        for x in start_x..=top_right {
-            visited[y][x] = true;
+    for row in &mut visited[start_y..=bottom_y] {
+        for cell in &mut row[start_x..=top_right] {
+            *cell = true;
         }
     }
 
@@ -427,17 +413,28 @@ fn check_clipping(x: usize, y: usize, w: u16, h: u16, cols: u16, rows: u16) -> C
 }
 
 fn assign_hierarchy(regions: &mut [Region]) {
-    for i in 0..regions.len() {
-        for j in 0..regions.len() {
-            if i == j {
-                continue;
-            }
-            if contains_bounds(&regions[j].bounds, &regions[i].bounds) {
-                regions[i].parent_id = Some(regions[j].id.clone());
-                regions[j].child_ids.push(regions[i].id.clone());
-                break;
+    // Compute parent choices immutably first (parent = first container in
+    // area-sorted order), then apply the parent/child links.
+    let links: Vec<(usize, usize)> = {
+        let mut links = Vec::new();
+        for (i, inner) in regions.iter().enumerate() {
+            for (j, outer) in regions.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if contains_bounds(&outer.bounds, &inner.bounds) {
+                    links.push((i, j));
+                    break;
+                }
             }
         }
+        links
+    };
+    for (i, j) in links {
+        let parent_id = regions[j].id.clone();
+        let child_id = regions[i].id.clone();
+        regions[i].parent_id = Some(parent_id);
+        regions[j].child_ids.push(child_id);
     }
 }
 

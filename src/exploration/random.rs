@@ -63,7 +63,10 @@ fn key(code: crate::backend::KeyCode) -> Input {
     Input::Key(KeyEvent::new(code))
 }
 
-const ACTION_POOL: &[(&str, fn() -> Input)] = &[
+/// An action factory: name + zero-arg input constructor.
+type ActionFactory = (&'static str, fn() -> Input);
+
+const ACTION_POOL: &[ActionFactory] = &[
     ("tab", || key(crate::backend::KeyCode::Tab)),
     ("shift+tab", || {
         Input::Key(KeyEvent::with_modifiers(
@@ -119,6 +122,7 @@ pub fn run(
         let _ = session.wait(
             crate::backend::WaitCond::ScreenStable {
                 quiet_for: std::time::Duration::from_millis(120),
+                after_screen_seq: None,
             },
             120,
         );

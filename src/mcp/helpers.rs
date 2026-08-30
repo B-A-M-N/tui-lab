@@ -4,7 +4,7 @@
 use crate::error::{Envelope, ErrorCategory};
 use crate::screen::ScreenState;
 
-use crate::backend::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
+use crate::backend::{KeyEvent, KeyModifiers, MouseButton};
 
 /// Render a success envelope.
 pub fn ok(data: serde_json::Value) -> String {
@@ -34,7 +34,7 @@ pub fn err_continued(cat: ErrorCategory, detail: String) -> String {
 pub fn build_input_from_request(
     p: &crate::mcp::params::TuiActRequest,
 ) -> Result<crate::backend::Input, String> {
-    use crate::backend::{Input, KeyCode, KeyEvent, MouseButton, MouseEvent, ScrollDirection};
+    use crate::backend::{Input, MouseEvent, ScrollDirection};
     match p {
         crate::mcp::params::TuiActRequest::Key { key, .. } => Ok(Input::Key(parse_key(key)?)),
         crate::mcp::params::TuiActRequest::Keys { keys, .. } => {
@@ -173,6 +173,7 @@ pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backen
         "screen_change" => Some(WaitCond::ScreenChange),
         "screen_stable" => Some(WaitCond::ScreenStable {
             quiet_for: std::time::Duration::from_millis(80),
+            after_screen_seq: None,
         }),
         "process_exit" => Some(WaitCond::ProcessExit),
         "title" => p.title.clone().map(WaitCond::Title),
@@ -289,9 +290,9 @@ pub fn run_assertion(
             match (&p.text, p.x, p.y) {
                 (Some(t), Some(x), Some(y)) => {
                     let row = screen.viewport_text.get(y as usize);
-                    let ok = row.map_or(false, |r| {
+                    let ok = row.is_some_and(|r| {
                         r.get((x as usize)..(x as usize + t.len()))
-                            .map_or(false, |s| s == t)
+                            .is_some_and(|s| s == t)
                     });
                     (
                         ok,

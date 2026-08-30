@@ -5,7 +5,6 @@
 //! and observing state transitions.
 
 use crate::backend::{Input, KeyCode, KeyEvent, WaitCond};
-use crate::screen::ScreenState;
 use crate::semantic;
 use crate::session::state::Session;
 use serde_json::json;
@@ -17,7 +16,7 @@ const RESIZE_MATRIX: &[(u16, u16)] = &[(60, 20), (80, 24), (100, 30), (120, 40),
 /// Run keyboard audit: traverse focus using Tab (item 52).
 pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let baseline = match session.observe(50) {
+    let _baseline = match session.observe(50) {
         Ok(s) => s,
         Err(e) => {
             findings.push(Finding {
@@ -59,6 +58,7 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         let _ = session.wait(
             WaitCond::ScreenStable {
                 quiet_for: std::time::Duration::from_millis(80),
+                after_screen_seq: None,
             },
             500,
         );
@@ -122,6 +122,7 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         let _ = session.wait(
             WaitCond::ScreenStable {
                 quiet_for: std::time::Duration::from_millis(80),
+                after_screen_seq: None,
             },
             500,
         );
@@ -191,6 +192,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
         let _ = session.wait(
             WaitCond::ScreenStable {
                 quiet_for: std::time::Duration::from_millis(80),
+                after_screen_seq: None,
             },
             500,
         );
@@ -256,6 +258,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
         let _ = session.wait(
             WaitCond::ScreenStable {
                 quiet_for: std::time::Duration::from_millis(150),
+                after_screen_seq: None,
             },
             2000,
         );
@@ -327,6 +330,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
     let _ = session.wait(
         WaitCond::ScreenStable {
             quiet_for: std::time::Duration::from_millis(150),
+            after_screen_seq: None,
         },
         2000,
     );

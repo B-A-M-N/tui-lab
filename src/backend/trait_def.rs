@@ -5,10 +5,11 @@
 //! screen actually stayed quiet.
 
 use super::{
-    BackendResult, Capabilities, Input, InputModes, ObserveResult, TerminalEventState, WaitCond,
-    WaitOutcome,
+    BackendResult, Capabilities, Input, InputModes, ObserveResult, TerminalEventState,
+    WaitCond, WaitOutcome,
 };
 use crate::screen::{ProcessState, ScreenState};
+use std::time::Duration;
 
 pub trait TerminalBackend: Send {
     /// Start the target process under a PTY at the given size.
@@ -29,16 +30,28 @@ pub trait TerminalBackend: Send {
     fn state(&mut self) -> BackendResult<ScreenState>;
 
     /// Convenience: observe + wait for stability. Returns the settled screen.
+    ///
+    /// The default is a *fallback only* (a bounded quiet-poll, no fixed sleep
+    /// longer than one poll interval). Backends with an event sequencer MUST
+    /// override this so ordinary `session.observe(...)` synchronizes on real
+    /// terminal events (audit item 4).
     fn observe(&mut self, idle: std::time::Duration) -> BackendResult<ObserveResult> {
-        let screen = self.state()?;
-        // Cheap settle: re-parse once after the idle window.
-        std::thread::sleep(idle);
-        let screen2 = self.state()?;
-        let stable = screen.raw_hash == screen2.raw_hash;
+        // Fallback: bounded quiet-poll using state snapshots. Overridden by
+        // PortablePtyBackend with the event-sequenced wait machinery.
+        let start = std::time::Instant::now();
+        let _ = self.state()?;
+        let quiet_budget = idle.max(Duration::from_millis(30));
+        let out = self.wait(
+            WaitCond::ScreenStable {
+                quiet_for: quiet_budget.min(Duration::from_millis(120)),
+                after_screen_seq: None,
+            },
+            quiet_budget + Duration::from_millis(500),
+        )?;
         Ok(ObserveResult {
-            screen: screen2,
-            stable,
-            stable_ms: idle.as_millis() as u64,
+            screen: out.state,
+            stable: out.met,
+            stable_ms: start.elapsed().as_millis() as u64,
         })
     }
 
@@ -52,6 +65,25 @@ pub trait TerminalBackend: Send {
     /// Block until a wait condition holds or the budget elapses. Returns a rich
     /// outcome describing what resolved and at what state (spec section 1).
     fn wait(&mut self, cond: WaitCond, budget: std::time::Duration) -> BackendResult<WaitOutcome>;
+
+    /// Causality-explicit wait: capture the event state *before* an action,
+    /// send the action, then call this with that baseline. Stability conditions
+    /// then require a screen change with sequence > baseline.screen_seq (or
+    /// output > baseline.output_seq for [`WaitCond::Idle`]) followed by the
+    /// quiet interval. This is the canonical action→settle primitive; `wait`
+    /// remains for generic conditions (audit items 1/2).
+    fn wait_after(
+        &mut self,
+        baseline: TerminalEventState,
+        cond: WaitCond,
+        budget: std::time::Duration,
+    ) -> BackendResult<WaitOutcome> {
+        self.wait(cond.anchored_to(&baseline), budget)
+    }
+
+    /// Attach or detach the raw PTY recording hook (audit item 24). `None`
+    /// detaches. The default ignores it (backends without a byte boundary).
+    fn set_recording_hook(&mut self, _hook: super::RecordingHookSlot) {}
 
     /// Current snapshot (alias for `state`, kept for API clarity).
     fn snapshot(&mut self) -> BackendResult<ScreenState> {

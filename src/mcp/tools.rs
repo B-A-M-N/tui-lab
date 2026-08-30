@@ -89,7 +89,6 @@ impl TuiLabServer {
                     .env
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(k, v)| (k, v))
                     .collect();
                 match mgr.start(
                     &command,
@@ -102,7 +101,7 @@ impl TuiLabServer {
                     &isolation,
                 ) {
                     Ok(id) => {
-                        let sess = mgr.get(&id).expect("just started");
+                        let sess = mgr.get_mut(&id).expect("just started");
                         let caps = sess.capabilities();
                         let launch = sess.launch().cloned();
                         let version = sess.backend_version();
@@ -128,7 +127,7 @@ impl TuiLabServer {
                 // reusing the stored LaunchSpec (spec section 13).
                 match mgr.restart(&id) {
                     Ok((new_id, generation)) => {
-                        let sess = mgr.get(&new_id).expect("just restarted");
+                        let sess = mgr.get_mut(&new_id).expect("just restarted");
                         let caps = sess.capabilities();
                         ok(json!({
                             "session": new_id,
@@ -300,6 +299,7 @@ impl TuiLabServer {
             let _ = sess.wait(
                 crate::backend::WaitCond::ScreenStable {
                     quiet_for: std::time::Duration::from_millis(p.wait_ms().unwrap_or(150)),
+                    after_screen_seq: None,
                 },
                 p.wait_ms().unwrap_or(150) + 1000,
             );
@@ -332,8 +332,22 @@ impl TuiLabServer {
             None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),
         };
         match sess.wait(cond, p.budget_ms.unwrap_or(5000)) {
-            Ok(true) => ok(json!({ "met": true })),
-            Ok(false) => ok(json!({ "met": false, "timeout": true })),
+            Ok(out) => ok(json!({
+                "met": out.met,
+                "timeout": !out.met,
+                "reason": format!("{:?}", out.reason),
+                "elapsed_ms": out.elapsed_ms,
+                "screen_seq": out.screen_seq,
+                "output_seq": out.output_seq,
+                "state": {
+                    "structure_hash": out.state.structure_hash,
+                    "visual_hash": out.state.visual_hash,
+                    "process": {
+                        "running": out.state.process.running,
+                        "exit_code": out.state.process.exit_code,
+                    },
+                },
+            })),
             Err(e) => err(ErrorCategory::BackendError, e.to_string()),
         }
     }

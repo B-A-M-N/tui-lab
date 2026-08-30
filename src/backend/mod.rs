@@ -289,6 +289,14 @@ pub enum Input {
     Paste(String),
     Raw(Vec<u8>),
     Mouse(MouseEvent),
+    /// A full click: the backend emits press AND release back-to-back in the
+    /// negotiated mouse protocol (audit item 8). Never silently degrade to
+    /// press-only.
+    MouseClick {
+        button: MouseButton,
+        x: u16,
+        y: u16,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -298,10 +306,25 @@ pub enum Input {
 }
 
 /// Per-event-sequence counters used for edge-triggered waits (spec section 1).
+///
+/// Sequence semantics (frozen contract):
+///   * `output_seq`    — +1 per PTY byte chunk received from the child.
+///   * `content_seq`   — +1 when the *text* contents of the screen change.
+///   * `screen_seq`    — +1 when the *interaction fingerprint* changes: cell
+///     text, fg/bg, bold/underline/reverse, cursor position/visibility, or
+///     dimensions. This is a superset of `content_seq`: a style-only change
+///     (e.g. reverse-video focus moving) bumps `screen_seq` even when the text
+///     is identical. `visual_seq` is kept as an explicit alias so callers can
+///     name the concept they mean.
+///   * `interaction_seq` — +1 whenever any user-observable event fires
+///     (screen_seq, bell, or title).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TerminalEventState {
     pub output_seq: u64,
     pub screen_seq: u64,
+    pub content_seq: u64,
+    pub visual_seq: u64,
+    pub interaction_seq: u64,
     pub bell_seq: u64,
     pub title_seq: u64,
     pub last_output_at: u64,
@@ -311,16 +334,79 @@ pub struct TerminalEventState {
 /// Wait conditions (spec section 13 `tui_wait`). All conditions are now real:
 /// `ScreenChange` and `ScreenStable` are driven by the event sequencer rather
 /// than constant `false`/`true` placeholders.
+///
+/// Causality (frozen contract): `after_screen_seq` / `after_output_seq` make
+/// "stability *following an action*" expressible without requiring activity to
+/// begin after `wait()` is entered. `None` means a generic stability wait ("the
+/// screen has been quiet for `quiet_for`"). `Some(seq)` means "a screen change
+/// with sequence > seq must have occurred, and the screen must then have been
+/// quiet for `quiet_for`". Callers capture
+/// `backend.event_state()` (or `Session::event_state()`) *before* sending the
+/// action and pass it as the baseline — see [`TerminalBackend::wait_after`].
 #[derive(Debug, Clone)]
 pub enum WaitCond {
     Text(String),
     TextAbsent(String),
     ScreenChange,
-    ScreenStable { quiet_for: Duration },
+    ScreenStable {
+        quiet_for: Duration,
+        after_screen_seq: Option<u64>,
+    },
     ProcessExit,
     Title(String),
     Bell,
-    Idle { quiet_for: Duration },
+    Idle {
+        quiet_for: Duration,
+        after_output_seq: Option<u64>,
+    },
+}
+
+impl WaitCond {
+    /// Fill in the action-baseline from a captured event state, for conditions
+    /// that carry a causality anchor but were built without one.
+    pub fn anchored_to(mut self, baseline: &TerminalEventState) -> Self {
+        match &mut self {
+            WaitCond::ScreenStable {
+                after_screen_seq, ..
+            } => {
+                if after_screen_seq.is_none() {
+                    *after_screen_seq = Some(baseline.screen_seq);
+                }
+            }
+            WaitCond::Idle {
+                after_output_seq, ..
+            } => {
+                if after_output_seq.is_none() {
+                    *after_output_seq = Some(baseline.output_seq);
+                }
+            }
+            _ => {}
+        }
+        self
+    }
+}
+
+/// A recording sink that receives the *raw* PTY byte stream at the byte
+/// boundary (spec item 24). Implementations must be cheap and non-blocking:
+/// the PTY reader thread calls `on_output` for every chunk it reads.
+///
+/// Security note: `on_input` receives the exact bytes sent to the child. When
+/// sensitive input must not be recorded, the *caller* must not attach a hook
+/// that stores it (see `RecordingPolicy`); the backend always delivers.
+pub trait RecordingHook: Send + Sync + 'static {
+    fn on_output(&self, bytes: &[u8]);
+    fn on_input(&self, bytes: &[u8]);
+    fn on_resize(&self, cols: u16, rows: u16);
+}
+
+/// Shared slot through which a [`RecordingHook`] is attached to a backend.
+/// The PTY reader thread keeps a clone of the slot and locks it per chunk, so
+/// a hook can be attached/detached while a session is running.
+pub type RecordingHookSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn RecordingHook>>>>;
+
+/// Create an empty recording hook slot.
+pub fn new_recording_hook_slot() -> RecordingHookSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
 }
 
 /// The reason a wait resolved (spec section 1). Hermes should know *what*

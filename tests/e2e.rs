@@ -36,7 +36,7 @@ fn e2e_launch_observe_semantic_act() {
         let out = sess
             .wait(tui_lab::backend::WaitCond::Text("Settings".into()), 5000)
             .expect("wait for dialog");
-        assert!(out, "dialog title never appeared");
+        assert!(out.met, "dialog title never appeared");
     }
 
     let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
@@ -84,7 +84,7 @@ fn e2e_launch_observe_semantic_act() {
         let out = sess
             .wait(tui_lab::backend::WaitCond::Text("saved.".into()), 5000)
             .expect("wait for saved");
-        assert!(out, "Enter did not produce 'saved.' on screen");
+        assert!(out.met, "Enter did not produce 'saved.' on screen");
     }
     let after = mgr
         .resolve_mut(Some(&id))
@@ -114,7 +114,7 @@ fn e2e_transition_diff_after_key() {
         let out = sess
             .wait(tui_lab::backend::WaitCond::Text("Settings".into()), 5000)
             .expect("wait for dialog");
-        assert!(out);
+        assert!(out.met);
     }
     {
         let sess = mgr.resolve_mut(Some(&id)).expect("resolve");

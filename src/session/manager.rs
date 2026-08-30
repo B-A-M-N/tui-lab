@@ -31,6 +31,9 @@ impl SessionManager {
     }
 
     /// Create and start a new session. Returns its id.
+    // Spec section 13 defines the full 9-arg start surface; refactor to a
+    // LaunchSpec-taking variant is tracked with the Wave-3 executor work.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
         command: &str,

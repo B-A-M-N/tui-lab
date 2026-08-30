@@ -3,7 +3,7 @@
 //! Replays a recorded scenario against a session, executing each step
 //! and reporting pass/fail for assertions.
 
-use super::model::{Scenario, ScenarioStep, StepKind};
+use super::model::{Scenario, StepKind};
 
 #[derive(Debug, serde::Serialize)]
 pub struct StepResult {

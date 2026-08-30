@@ -78,6 +78,7 @@ fn conformance_screen_stable_does_not_instantly_succeed() {
         .wait(
             WaitCond::ScreenStable {
                 quiet_for: Duration::from_millis(20),
+                after_screen_seq: None,
             },
             Duration::from_millis(100),
         )
@@ -110,6 +111,7 @@ fn conformance_idle_is_edge_triggered_on_output() {
         .wait(
             WaitCond::Idle {
                 quiet_for: Duration::from_millis(20),
+                after_output_seq: None,
             },
             Duration::from_millis(100),
         )
