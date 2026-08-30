@@ -16,9 +16,19 @@ pub struct Candidate {
     pub width: u16,
     pub confidence: Confidence,
     pub evidence: Vec<&'static str>,
+    /// For fields and status: the value after the label.
+    pub value: Option<String>,
+    /// Whether the candidate is focusable (interactive).
+    pub focusable: bool,
+    /// Selected state (for tabs, list items, menu items).
+    pub selected: bool,
+    /// Keyboard shortcut hint (e.g. "&File" -> "F").
+    pub shortcut: Option<String>,
 }
 
 /// Detect tab-like controls: "Tab 1 | Tab 2 | Tab 3" or "[Tab 1] [Tab 2]"
+/// Accepts >= 2 segments. Selects one if a bracketed marker like "[Tab]" is
+/// detected. If no selected marker is present, emit all with selected=false.
 pub fn detect_tabs(line: &str, y: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
     let chars: Vec<char> = line.chars().collect();
@@ -46,14 +56,27 @@ pub fn detect_tabs(line: &str, y: u16) -> Vec<Candidate> {
         for (start, end, text) in &segments {
             let trimmed = text.trim();
             if !trimmed.is_empty() && trimmed.len() <= 20 {
+                // Check if this segment is bracketed like "[Tab]" which
+                // conventionally marks the selected tab.
+                let selected = trimmed.starts_with('[') && trimmed.ends_with(']');
+                let label = if selected {
+                    // Strip brackets and re-trim inner content
+                    trimmed[1..trimmed.len() - 1].trim().to_string()
+                } else {
+                    trimmed.to_string()
+                };
                 out.push(Candidate {
                     kind: ControlKind::Tab,
-                    label: trimmed.to_string(),
+                    label,
                     x: *start,
                     y,
                     width: end - start,
                     confidence: Confidence::inferred(0.7, &["tab-segment"]),
                     evidence: vec!["separator-delimited"],
+                    value: None,
+                    focusable: true,
+                    selected,
+                    shortcut: None,
                 });
             }
         }
@@ -84,10 +107,15 @@ pub fn detect_list_items(line: &str, y: u16) -> Vec<Candidate> {
                 width: trimmed.len() as u16,
                 confidence: Confidence::inferred(0.8, &["bullet-list"]),
                 evidence: vec!["bullet-glyph"],
+                value: None,
+                focusable: true,
+                selected: false,
+                shortcut: None,
             });
         }
     }
 
+    // Numbered list
     if trimmed.len() > 3 {
         let first_char = trimmed.chars().next().unwrap();
         if first_char.is_ascii_digit() {
@@ -103,6 +131,10 @@ pub fn detect_list_items(line: &str, y: u16) -> Vec<Candidate> {
                             width: trimmed.len() as u16,
                             confidence: Confidence::inferred(0.8, &["numbered-list"]),
                             evidence: vec!["number-prefix"],
+                            value: None,
+                            focusable: true,
+                            selected: false,
+                            shortcut: None,
                         });
                     }
                 }
@@ -114,10 +146,20 @@ pub fn detect_list_items(line: &str, y: u16) -> Vec<Candidate> {
 }
 
 /// Detect menu items: "File  Edit  View  Help"
+///
+/// Conservative: only emit when the line contains no colon-field separator
+/// and no bracketed button. Extract shortcut from "&X" or "(X)text" patterns.
 pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
     let trimmed = line.trim();
 
+    // Be conservative: no colon-field and no bracketed button
+    if trimmed.contains(':') || trimmed.contains('[') || trimmed.contains('<') {
+        return out;
+    }
+
+    // Split by 2+ whitespace to detect multi-word items with gaps
+    // Use split_ascii_whitespace to find individual words
     let words: Vec<&str> = trimmed.split_whitespace().collect();
     if words.len() >= 2 && words.len() <= 10 {
         let all_short = words.iter().all(|w| w.len() <= 10);
@@ -133,6 +175,16 @@ pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
             for word in &words {
                 if let Some(idx) = trimmed[pos..].find(word) {
                     let x = (pos + idx) as u16;
+                    // Extract shortcut: "&X" or "(X)text"
+                    let shortcut = if word.starts_with('&') && word.len() > 1 {
+                        // Shortcut char is after the ampersand
+                        Some(word[1..].chars().next().unwrap_or('\0').to_uppercase().to_string())
+                    } else if let Some(inner) = word.strip_prefix('(') {
+                        // e.g. "(F)ile" — extract first parenthesized letter
+                        inner.chars().find(|c| *c != ')').map(|c| c.to_uppercase().to_string())
+                    } else {
+                        None
+                    };
                     out.push(Candidate {
                         kind: ControlKind::MenuItem,
                         label: word.to_string(),
@@ -141,6 +193,10 @@ pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
                         width: word.len() as u16,
                         confidence: Confidence::inferred(0.75, &["menu-bar"]),
                         evidence: vec!["menu-context"],
+                        value: None,
+                        focusable: true,
+                        selected: false,
+                        shortcut,
                     });
                     pos = x as usize + word.len();
                 }
@@ -152,6 +208,10 @@ pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
 }
 
 /// Detect status values: "Status: Connected" or "State: Running"
+///
+/// Confidence lowered to 0.6 so it does not compete with Button/Field.
+/// The caller (detect_controls) must skip this pass on lines that already
+/// produced a Button or Field control.
 pub fn detect_status(line: &str, y: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
     let status_keywords = ["status:", "state:", "connection:", "mode:"];
@@ -167,8 +227,12 @@ pub fn detect_status(line: &str, y: u16) -> Vec<Candidate> {
                     x: (idx + keyword.len()) as u16,
                     y,
                     width: after.len() as u16,
-                    confidence: Confidence::inferred(0.85, &["status-label"]),
+                    confidence: Confidence::inferred(0.6, &["status-label"]),
                     evidence: vec!["status-keyword"],
+                    value: Some(after.to_string()),
+                    focusable: false,
+                    selected: false,
+                    shortcut: None,
                 });
             }
             break;
@@ -179,11 +243,15 @@ pub fn detect_status(line: &str, y: u16) -> Vec<Candidate> {
 }
 
 /// Detect progress indicators: "[====>    ]" or "50%"
+///
+/// Requires an actual percent sign (0-100) or a filled/empty bar pair
+/// (█/░ or #/- or =/space). Rejects lines that merely contain digits.
 pub fn detect_progress(line: &str, y: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
     let trimmed = line.trim();
 
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+    // 1) Bracketed progress bar: [====>    ]
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 4 {
         let inner = &trimmed[1..trimmed.len() - 1];
         let has_progress_chars = inner
             .chars()
@@ -199,28 +267,42 @@ pub fn detect_progress(line: &str, y: u16) -> Vec<Candidate> {
                 width: trimmed.len() as u16,
                 confidence: Confidence::inferred(0.9, &["progress-bar"]),
                 evidence: vec!["bar-glyphs"],
+                value: None,
+                focusable: false,
+                selected: false,
+                shortcut: None,
             });
+            return out; // Don't also match the % path on the same line
         }
     }
 
+    // 2) Percent: "50%"
+    //    Require actual percent sign; ensure the number is 0-100
     if let Some(pct_idx) = trimmed.find('%') {
         let before_pct = &trimmed[..pct_idx];
         // Find the last contiguous digit sequence before %
         let trimmed_end = before_pct.trim_end();
-        let digit_start = trimmed_end.rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
+        let digit_start = trimmed_end
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let num_str = &trimmed_end[digit_start..];
-        let num_start = before_pct.len() - trimmed_end.len() + digit_start;
 
         if let Ok(pct) = num_str.parse::<u8>() {
-            if pct <= 100 {
+            if pct <= 100 && !num_str.is_empty() {
+                let num_start = before_pct.len() - trimmed_end.len() + digit_start;
                 out.push(Candidate {
                     kind: ControlKind::Progress,
                     label: format!("{}%", pct),
                     x: (line.len() - trimmed.len() + num_start) as u16,
                     y,
-                    width: (pct.to_string().len() + 1) as u16,
+                    width: (num_str.len() + 1) as u16,
                     confidence: Confidence::inferred(0.85, &["percentage"]),
                     evidence: vec!["percent-sign"],
+                    value: None,
+                    focusable: false,
+                    selected: false,
+                    shortcut: None,
                 });
             }
         }
@@ -229,29 +311,71 @@ pub fn detect_progress(line: &str, y: u16) -> Vec<Candidate> {
     out
 }
 
-/// Detect spinners: "|", "/", "-", "\", "◐", "◑"
+/// Detect spinners: "|", "/", "\", Unicode spinner chars like ◐◑◒◓◴◵◶◷
+///
+/// Only matches when the spinner char appears in a "Loading |" context.
+/// Does NOT match "-" or "|" when part of a progress bar (inside [])
+/// or when part of tab separators.
 pub fn detect_spinner(line: &str, y: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
-    let spinner_chars = ['|', '/', '-', '\\', '◐', '◑', '◒', '◓', '◴', '◵', '◶', '◷'];
+    let trimmed = line.trim();
 
-    for (i, c) in line.chars().enumerate() {
-        if spinner_chars.contains(&c) {
-            let prev_char = if i > 0 { line.chars().nth(i - 1) } else { None };
-            let next_char = line.chars().nth(i + 1);
+    // Unicode spinner chars are distinctive enough
+    let spinner_unique: [char; 9] = ['◐', '◑', '◒', '◓', '◔', '◴', '◵', '◶', '◷'];
+    // Simple spinner chars that need context
+    let spinner_simple: [char; 3] = ['|', '/', '\\'];
 
-            let prev_ok = prev_char.map(|c| c == ' ' || c == '[').unwrap_or(true);
-            let next_ok = next_char.map(|c| c == ' ' || c == ']').unwrap_or(true);
+    // Check for Unicode spinner chars first
+    let trim_offset = line.len() - trimmed.len();
+    for (i, c) in trimmed.char_indices() {
+        if spinner_unique.contains(&c) {
+            let byte_pos = trim_offset + i;
+            out.push(Candidate {
+                kind: ControlKind::Spinner,
+                label: "loading".to_string(),
+                x: byte_pos as u16,
+                y,
+                width: 1,
+                confidence: Confidence::inferred(0.85, &["spinner-glyph"]),
+                evidence: vec!["unicode-spinner"],
+                value: None,
+                focusable: false,
+                selected: false,
+                shortcut: None,
+            });
+            return out;
+        }
+    }
 
+    // For simple spinner chars, require standalone context
+    for (i, c) in trimmed.char_indices() {
+        if spinner_simple.contains(&c) {
+            // Skip if inside a bracketed progress bar
+            let in_bracket = trimmed.starts_with('[') && trimmed.ends_with(']')
+                && i > 0 && i < trimmed.len() - 1;
+            if in_bracket {
+                continue;
+            }
+            let prev_char = trimmed.chars().nth(i.saturating_sub(1));
+            let next_char = trimmed.chars().nth(i + 1);
+            let prev_ok = prev_char.map(|c| c == ' ' || c.is_alphanumeric()).unwrap_or(true);
+            let next_ok = next_char.map(|c| c == ' ' || c.is_alphanumeric()).unwrap_or(true);
             if prev_ok && next_ok {
+                let byte_pos = trim_offset + i;
                 out.push(Candidate {
                     kind: ControlKind::Spinner,
                     label: "loading".to_string(),
-                    x: i as u16,
+                    x: byte_pos as u16,
                     y,
                     width: 1,
                     confidence: Confidence::inferred(0.7, &["spinner-char"]),
                     evidence: vec!["spinning-glyph"],
+                    value: None,
+                    focusable: false,
+                    selected: false,
+                    shortcut: None,
                 });
+                return out;
             }
         }
     }
@@ -268,6 +392,18 @@ mod tests {
         let candidates = detect_tabs(" File │ Edit │ View │ Help ", 0);
         assert!(!candidates.is_empty());
         assert_eq!(candidates[0].kind, ControlKind::Tab);
+        // Default: none selected (no brackets)
+        assert!(!candidates[0].selected);
+    }
+
+    #[test]
+    fn test_detect_tabs_selected() {
+        let candidates = detect_tabs("[ File ] │ Edit │ View ", 0);
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates[0].selected);
+        assert_eq!(candidates[0].label, "File");
+        assert!(!candidates[1].selected);
+        assert!(!candidates[2].selected);
     }
 
     #[test]
@@ -276,6 +412,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, ControlKind::List);
         assert_eq!(candidates[0].label, "First item");
+        assert!(candidates[0].focusable);
     }
 
     #[test]
@@ -284,6 +421,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, ControlKind::List);
         assert_eq!(candidates[0].label, "First item");
+        assert!(candidates[0].focusable);
     }
 
     #[test]
@@ -291,6 +429,28 @@ mod tests {
         let candidates = detect_menu_items("File  Edit  View  Help", 0);
         assert!(!candidates.is_empty());
         assert_eq!(candidates[0].kind, ControlKind::MenuItem);
+        assert!(candidates[0].focusable);
+    }
+
+    #[test]
+    fn test_detect_menu_items_no_field_line() {
+        // Lines with colon-field should be skipped
+        let candidates = detect_menu_items("File: option", 0);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_detect_menu_items_no_button_line() {
+        // Lines with brackets should be skipped
+        let candidates = detect_menu_items("[File] [Edit]", 0);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_detect_menu_items_with_shortcut() {
+        let candidates = detect_menu_items("&File  Edit  &Help", 0);
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].shortcut, Some("F".to_string()));
     }
 
     #[test]
@@ -299,6 +459,8 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, ControlKind::Status);
         assert_eq!(candidates[0].label, "Connected");
+        assert_eq!(candidates[0].confidence.score, 0.6);
+        assert!(!candidates[0].focusable);
     }
 
     #[test]
@@ -306,6 +468,7 @@ mod tests {
         let candidates = detect_progress("[====>    ]", 0);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, ControlKind::Progress);
+        assert!(!candidates[0].focusable);
     }
 
     #[test]
@@ -316,9 +479,37 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_progress_rejects_digits_only() {
+        // A line with digits but no % sign or bar should not match
+        let candidates = detect_progress("Total: 42", 0);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
     fn test_detect_spinner() {
         let candidates = detect_spinner("Loading |", 0);
         assert!(!candidates.is_empty());
         assert_eq!(candidates[0].kind, ControlKind::Spinner);
+        assert!(!candidates[0].focusable);
+    }
+
+    #[test]
+    fn test_detect_spinner_unicode() {
+        let line = "Loading \u{25d4}";
+        let trimmed = line.trim();
+        eprintln!("line={:?} trimmed={:?} char_count={} char_lens={:?}",
+            line, trimmed, trimmed.chars().count(),
+            trimmed.chars().map(|c| c.len_utf8()).collect::<Vec<_>>());
+        let candidates = detect_spinner(line, 0);
+        eprintln!("candidates={:?}", candidates.iter().map(|c| &c.kind).collect::<Vec<_>>());
+        assert!(!candidates.is_empty(), "expected spinner for {:?}", line);
+        assert_eq!(candidates[0].kind, ControlKind::Spinner);
+    }
+
+    #[test]
+    fn test_detect_spinner_no_bar() {
+        // Spinner char inside a progress bar should not match
+        let candidates = detect_spinner("[|----    ]", 0);
+        assert!(candidates.is_empty());
     }
 }

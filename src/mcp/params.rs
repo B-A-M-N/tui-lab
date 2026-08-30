@@ -7,6 +7,45 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Typed mouse button (audit item 5/28): validated at the deserialization
+/// boundary so an invalid button is `invalid_request`, never silently coerced
+/// to `left` deep in the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseButtonParam {
+    Left,
+    Middle,
+    Right,
+}
+
+impl From<MouseButtonParam> for crate::backend::MouseButton {
+    fn from(b: MouseButtonParam) -> Self {
+        match b {
+            MouseButtonParam::Left => crate::backend::MouseButton::Left,
+            MouseButtonParam::Middle => crate::backend::MouseButton::Middle,
+            MouseButtonParam::Right => crate::backend::MouseButton::Right,
+        }
+    }
+}
+
+/// Typed scroll direction. Absent means `down` (documented default); an
+/// unknown string is rejected by serde rather than coerced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollDirectionParam {
+    Up,
+    Down,
+}
+
+impl From<ScrollDirectionParam> for crate::backend::ScrollDirection {
+    fn from(d: ScrollDirectionParam) -> Self {
+        match d {
+            ScrollDirectionParam::Up => crate::backend::ScrollDirection::Up,
+            ScrollDirectionParam::Down => crate::backend::ScrollDirection::Down,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiSessionParams {
     pub action: String,
@@ -71,6 +110,10 @@ pub enum TuiActRequest {
     /// Type text into the terminal.
     Type {
         text: String,
+        /// Audit item 28: mark this payload as sensitive so downstream
+        /// recording/logging hooks can redact it.
+        #[serde(default)]
+        sensitive: Option<bool>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -81,6 +124,8 @@ pub enum TuiActRequest {
     /// Paste text (with bracketed paste escape if negotiated).
     Paste {
         paste: String,
+        #[serde(default)]
+        sensitive: Option<bool>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -103,7 +148,7 @@ pub enum TuiActRequest {
         x: u16,
         y: u16,
         #[serde(default)]
-        button: Option<String>,
+        button: Option<MouseButtonParam>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -116,7 +161,7 @@ pub enum TuiActRequest {
         x: u16,
         y: u16,
         #[serde(default)]
-        button: Option<String>,
+        button: Option<MouseButtonParam>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -129,7 +174,7 @@ pub enum TuiActRequest {
         x: u16,
         y: u16,
         #[serde(default)]
-        button: Option<String>,
+        button: Option<MouseButtonParam>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -153,7 +198,7 @@ pub enum TuiActRequest {
         x: u16,
         y: u16,
         #[serde(default)]
-        button: Option<String>,
+        button: Option<MouseButtonParam>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -165,9 +210,8 @@ pub enum TuiActRequest {
     MouseScroll {
         x: u16,
         y: u16,
-        /// "up" or "down"
         #[serde(default)]
-        direction: Option<String>,
+        direction: Option<ScrollDirectionParam>,
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
@@ -265,6 +309,17 @@ impl TuiActRequest {
             TuiActRequest::Signal { .. } => "signal",
         }
     }
+
+    /// Whether this payload is marked sensitive (audit item 28). Only the
+    /// text-carrying actions can be sensitive; everything else is not.
+    pub fn sensitive(&self) -> bool {
+        match self {
+            TuiActRequest::Type { sensitive, .. } | TuiActRequest::Paste { sensitive, .. } => {
+                sensitive.unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -276,6 +331,9 @@ pub struct TuiWaitParams {
     pub title: Option<String>,
     #[serde(default)]
     pub budget_ms: Option<u64>,
+    /// Quiet interval for `screen_stable` / `idle` conditions (ms).
+    #[serde(default)]
+    pub quiet_ms: Option<u64>,
     #[serde(default)]
     pub id: Option<String>,
 }

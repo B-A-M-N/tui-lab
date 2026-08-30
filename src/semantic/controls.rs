@@ -13,6 +13,7 @@
 use crate::screen::ScreenState;
 use crate::semantic::confidence::Confidence;
 use crate::semantic::regions::Region;
+use crate::semantic::recognizers;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +90,14 @@ pub struct ControlBounds {
 fn default_true() -> bool { true }
 fn default_source() -> String { "inferred".to_string() }
 
+/// Check if point (px, py) is within bounds [x, x+width) x [y, y+height).
+fn region_contains_point(bounds: &crate::semantic::regions::Bounds, px: u16, py: u16) -> bool {
+    px >= bounds.x
+        && py >= bounds.y
+        && px < bounds.x + bounds.width
+        && py < bounds.y + bounds.height
+}
+
 /// Generate a stable control ID from kind, label, and geometry.
 fn stable_id(kind: &ControlKind, label: &str, x: u16, y: u16) -> String {
     let kind_str = format!("{:?}", kind).to_lowercase();
@@ -110,17 +119,25 @@ fn stable_id(kind: &ControlKind, label: &str, x: u16, y: u16) -> String {
 /// Detect button-like `[ Label ]` / `< Label >` tokens, field `Label:` marks,
 /// and checkbox/radio glyphs.
 ///
-/// Recognizers are ordered: toggle → button → field.  Once a span is consumed
-/// by an earlier recognizer it is not reconsidered by later ones.
+/// Detection order per line:
+///   toggle → button → field → tabs → menu → list → status → progress → spinner
+///
+/// Once a span is consumed by an earlier recognizer it is not reconsidered.
 pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control> {
     let mut out = Vec::new();
+    let any_line_has_button_or_field = screen
+        .viewport_text
+        .iter()
+        .any(|line| extract_bracketed(line).iter().any(|cap| !is_toggle_text(&cap.text))
+            || extract_field(line).is_some());
+
     for (y, line) in screen.viewport_text.iter().enumerate() {
         let y = y as u16;
-        let consumed = mark_consumed_spans(line, regions, y);
+        let mut consumed: Vec<(u16, u16)> = mark_consumed_spans(line, regions, y);
 
         // 1) checkbox/radio: ( ) or (*) or [ ] or [x]
         for cb in extract_toggle(line) {
-            if is_consumed(&consumed, cb.x, cb.x + 3) {
+            if overlaps_consumed(&consumed, cb.x, cb.x + 3) {
                 continue;
             }
             out.push(Control {
@@ -140,15 +157,16 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 evidence: vec!["toggle-glyph".to_string()],
                 source: "inferred".to_string(),
             });
+            consumed.push((cb.x, cb.x + 3));
         }
 
         // 2) buttons: [ text ] or < text >
         //    Skip `[x]`, `[ ]` which are toggles, not buttons.
         for cap in extract_bracketed(line) {
-            if is_consumed(&consumed, cap.x, cap.x + cap.text.len() as u16 + 2) {
+            let span_end = cap.x + cap.text.len() as u16 + 2;
+            if overlaps_consumed(&consumed, cap.x, span_end) {
                 continue;
             }
-            // Skip toggle-like content inside brackets
             if is_toggle_text(&cap.text) {
                 continue;
             }
@@ -169,11 +187,12 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 evidence: vec!["bracketed-label".to_string()],
                 source: "inferred".to_string(),
             });
+            consumed.push((cap.x, span_end));
         }
 
         // 3) field: "Label:" optionally followed by a value
         if let Some(f) = extract_field(line) {
-            if is_consumed(&consumed, f.x, f.x + f.label.len() as u16) {
+            if overlaps_consumed(&consumed, f.x, f.x + f.label.len() as u16) {
                 continue;
             }
             out.push(Control {
@@ -193,8 +212,90 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 evidence: vec!["label-colon".to_string()],
                 source: "inferred".to_string(),
             });
+            consumed.push((f.x, f.x + f.label.len() as u16));
+        }
+
+        // 4) tabs
+        for cand in recognizers::detect_tabs(line, y) {
+            if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
+                continue;
+            }
+            let mut ctrl = candidate_to_control(&cand, y, "inferred");
+            ctrl.checked = false;
+            out.push(ctrl);
+            consumed.push((cand.x, cand.x + cand.width));
+        }
+
+        // 5) menu items (skip if line already has a colon-field or button)
+        if !any_line_has_button_or_field {
+            for cand in recognizers::detect_menu_items(line, y) {
+                if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
+                    continue;
+                }
+                let mut ctrl = candidate_to_control(&cand, y, "inferred");
+                ctrl.checked = false;
+                out.push(ctrl);
+                consumed.push((cand.x, cand.x + cand.width));
+            }
+        }
+
+        // 6) list items
+        for cand in recognizers::detect_list_items(line, y) {
+            if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
+                continue;
+            }
+            let mut ctrl = candidate_to_control(&cand, y, "inferred");
+            ctrl.checked = false;
+            out.push(ctrl);
+            consumed.push((cand.x, cand.x + cand.width));
+        }
+
+        // 7) status (skip if line already produced a Button or Field)
+        if !any_line_has_button_or_field {
+            for cand in recognizers::detect_status(line, y) {
+                if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
+                    continue;
+                }
+                let mut ctrl = candidate_to_control(&cand, y, "inferred");
+                ctrl.checked = false;
+                out.push(ctrl);
+                consumed.push((cand.x, cand.x + cand.width));
+            }
+        }
+
+        // 8) progress
+        for cand in recognizers::detect_progress(line, y) {
+            if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
+                continue;
+            }
+            let mut ctrl = candidate_to_control(&cand, y, "inferred");
+            ctrl.checked = false;
+            out.push(ctrl);
+            consumed.push((cand.x, cand.x + cand.width));
+        }
+
+        // 9) spinner
+        for cand in recognizers::detect_spinner(line, y) {
+            if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
+                continue;
+            }
+            let mut ctrl = candidate_to_control(&cand, y, "inferred");
+            ctrl.checked = false;
+            out.push(ctrl);
+            consumed.push((cand.x, cand.x + cand.width));
         }
     }
+
+    // Region linking: assign region_id to each control
+    for ctrl in &mut out {
+        for region in regions {
+            if region_contains_point(&region.bounds, ctrl.bounds.x, ctrl.bounds.y) {
+                ctrl.region_id = Some(region.id.clone());
+                break;
+            }
+        }
+    }
+
     out
 }
 
@@ -235,8 +336,58 @@ fn mark_consumed_spans(line: &str, _regions: &[Region], _y: u16) -> Vec<(u16, u1
     consumed
 }
 
-fn is_consumed(consumed: &[(u16, u16)], start: u16, end: u16) -> bool {
-    consumed.iter().any(|&(cs, ce)| start >= cs && end <= ce)
+/// Check if [start, end) overlaps with any consumed span.
+/// Two spans overlap if they share any column.
+fn overlaps_consumed(consumed: &[(u16, u16)], start: u16, end: u16) -> bool {
+    consumed.iter().any(|&(cs, ce)| start < ce && end > cs)
+}
+
+/// Create a Control from a Candidate with fixed fields.
+fn candidate_to_control(
+    c: &recognizers::Candidate,
+    y: u16,
+    source: &str,
+) -> Control {
+    let kind_str = format!("{:?}", c.kind).to_lowercase();
+    let sanitized: String = c.label
+        .to_lowercase()
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '_')
+        .take(20)
+        .collect();
+    let sanitized = if sanitized.is_empty() {
+        "unnamed".to_string()
+    } else {
+        sanitized
+    };
+    let id = format!("{}:{}:{},{}", kind_str, sanitized, c.x, y);
+
+    let ev: Vec<String> = c.evidence.iter().map(|s| s.to_string()).collect();
+    let evidence_refs: Vec<&str> = c.evidence.to_vec();
+    let conf = Confidence::inferred(c.confidence.score, &evidence_refs);
+
+    Control {
+        id,
+        kind: c.kind.clone(),
+        label: c.label.clone(),
+        value: c.value.clone(),
+        bounds: ControlBounds {
+            x: c.x,
+            y,
+            width: c.width,
+            height: 1,
+        },
+        region_id: None,
+        focusable: c.focusable,
+        focused: false,
+        enabled: true,
+        selected: c.selected,
+        checked: false,
+        shortcut: c.shortcut.clone(),
+        confidence: conf,
+        evidence: ev,
+        source: source.to_string(),
+    }
 }
 
 struct Span {
@@ -515,5 +666,153 @@ mod tests {
     fn test_stable_id_sanitizes() {
         let id = stable_id(&ControlKind::Field, "Host Name!", 0, 0);
         assert_eq!(id, "field:hostname:0,0");
+    }
+
+    /// Helper: build a ScreenState from rows.
+    fn make_screen(rows: Vec<String>, cols: u16) -> ScreenState {
+        ScreenState {
+            cols,
+            rows: rows.len() as u16,
+            cursor: crate::screen::CursorState {
+                x: 0, y: 0, visible: true,
+            },
+            title: None,
+            cells: Vec::new(),
+            viewport_text: rows,
+            scrollback: Vec::new(),
+            raw_hash: String::new(),
+            visual_hash: String::new(),
+            structure_hash: String::new(),
+            process: crate::screen::ProcessState {
+                running: false,
+                exit_code: None,
+                exit_signal: None,
+                cwd: None,
+                pid: None,
+            },
+        }
+    }
+
+    /// Helper: build a Region with known bounds.
+    fn make_region(id: &str, x: u16, y: u16, w: u16, h: u16) -> Region {
+        use crate::semantic::regions::Bounds;
+        Region {
+            id: id.to_string(),
+            kind: crate::semantic::regions::RegionKind::Unknown,
+            title: None,
+            bounds: Bounds { x, y, width: w, height: h },
+            confidence: Confidence::inferred(0.9, &["test-region"]),
+            parent_id: None,
+            child_ids: Vec::new(),
+            clipping_state: crate::semantic::regions::ClippingState::None,
+        }
+    }
+
+    // ---- New control kind tests ----
+
+    #[test]
+    fn test_detect_spinner_line() {
+        let screen = make_screen(vec!["Loading |".to_string()], 40);
+        let controls = detect_controls(&screen, &[]);
+        let kinds: Vec<_> = controls.iter().map(|c| &c.kind).collect();
+        assert!(kinds.contains(&&ControlKind::Spinner));
+    }
+
+    #[test]
+    fn test_spinner_not_duplicated_as_status() {
+        // "Loading |" should emit a Spinner, not a Status
+        let screen = make_screen(vec!["Loading |".to_string()], 40);
+        let controls = detect_controls(&screen, &[]);
+        let kinds: Vec<_> = controls.iter().map(|c| &c.kind).collect();
+        assert!(!kinds.contains(&&ControlKind::Status));
+        assert!(kinds.contains(&&ControlKind::Spinner));
+    }
+
+    #[test]
+    fn test_tab_selected_flag() {
+        // Test tab detection directly (through the recognizer).
+        // Use a line where tabs won't be consumed by button/field extractors.
+        let screen = make_screen(vec!["File │ Edit │ View".to_string()], 40);
+        let controls = detect_controls(&screen, &[]);
+        let tabs: Vec<_> = controls
+            .iter()
+            .filter(|c| c.kind == ControlKind::Tab)
+            .collect();
+        // All should be unselected since no brackets.
+        for t in &tabs {
+            assert!(!t.selected, "tab {:?} should not be selected", t.label);
+        }
+    }
+
+    #[test]
+    fn test_tab_selected_flag_with_brackets() {
+        // Directly test the recognizer's bracket detection.
+        let cands = recognizers::detect_tabs("[File] │ Edit │ View", 0);
+        assert!(cands.len() >= 2);
+        assert!(cands.iter().any(|c| c.selected && c.label == "File"));
+        assert!(!cands.iter().any(|c| c.selected && c.label == "Edit"));
+    }
+
+    #[test]
+    fn test_focusable_by_kind() {
+        let screen = make_screen(
+            vec![
+                "[ Save ]".to_string(),    // Button -> focusable
+                "Host: localhost".to_string(), // Field -> focusable
+                "Status: OK".to_string(),       // Status -> not focusable
+                "[====>    ]".to_string(),  // Progress -> not focusable
+            ],
+            50,
+        );
+        let controls = detect_controls(&screen, &[]);
+        for ctrl in &controls {
+            match ctrl.kind {
+                ControlKind::Button | ControlKind::Field => {
+                    assert!(ctrl.focusable, "{:?} should be focusable", ctrl.kind);
+                }
+                ControlKind::Status | ControlKind::Progress | ControlKind::Spinner => {
+                    assert!(!ctrl.focusable, "{:?} should not be focusable", ctrl.kind);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_region_id_assignment() {
+        let region = make_region("reg-0", 0, 0, 80, 24);
+        let screen = make_screen(
+            vec![
+                "│ Host: localhost        │".to_string(), // inside region
+                "[ Save ]".to_string(),                     // inside region
+            ],
+            40,
+        );
+        let controls = detect_controls(&screen, &[region]);
+        // Controls should have region_id set
+        for ctrl in &controls {
+            assert_eq!(ctrl.region_id.as_deref(), Some("reg-0"));
+        }
+    }
+
+    #[test]
+    fn test_no_button_for_checkbox_line() {
+        // "[x] Option" should produce Checkbox, not also a Button
+        let screen = make_screen(vec!["[x] Option".to_string()], 40);
+        let controls = detect_controls(&screen, &[]);
+        let kinds: Vec<_> = controls.iter().map(|c| &c.kind).collect();
+        assert!(kinds.contains(&&ControlKind::Checkbox));
+        // There should be exactly 1 control (checkbox only, not button too)
+        assert_eq!(controls.len(), 1);
+    }
+
+    #[test]
+    fn test_overlaps_consumed() {
+        let consumed = vec![(0, 5), (10, 20)];
+        assert!(!overlaps_consumed(&consumed, 6, 9)); // gap between spans
+        assert!(overlaps_consumed(&consumed, 3, 7)); // overlaps first
+        assert!(overlaps_consumed(&consumed, 8, 11)); // overlaps second
+        assert!(overlaps_consumed(&consumed, 0, 1)); // inside first
+        assert!(overlaps_consumed(&consumed, 15, 16)); // inside second
     }
 }

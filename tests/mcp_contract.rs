@@ -14,10 +14,10 @@
 //! expected code, unknown assertions as `invalid_request`, real checkpoint
 //! delete, and non-cast recording as `unsupported`.
 
-use tui_lab::backend::{Input, KeyCode};
+use tui_lab::backend::{Input, KeyCode, KeyModifiers};
 use tui_lab::error::{Envelope, ErrorCategory};
 use tui_lab::mcp::helpers::{
-    build_input_from_request, build_wait, checkpoints, err, ok, run_assertion,
+    build_input_from_request, build_wait, checkpoints, control_label_exists, err, ok, run_assertion,
 };
 use tui_lab::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 use tui_lab::screen::{ProcessState, ScreenState};
@@ -153,6 +153,7 @@ fn contract_build_wait_screen_stable_has_quiet_interval() {
         text: None,
         title: None,
         budget_ms: None,
+        quiet_ms: None,
         id: None,
     };
     let cond = build_wait(&p).expect("build wait");
@@ -489,4 +490,362 @@ fn contract_structure_assertion_is_snapshot_alias() {
     let (passed, _, invalid) = run_assertion(&p, &screen);
     assert!(passed, "structure assertion should pass for matching hash");
     assert!(invalid.is_none());
+}
+
+// ─── Task 6: parse_key case fidelity ─────────────────────────────────
+
+#[test]
+fn contract_key_a_preserves_case() {
+    let p = TuiActRequest::Key {
+        key: "A".into(),
+        no_wait: None,
+        wait_ms: None,
+        id: None,
+    };
+    let input = build_input_from_request(&p).expect("build key A");
+    match input {
+        Input::Key(kev) => {
+            assert_eq!(kev.code, KeyCode::Char('A'));
+            assert!(!kev.modifiers.contains(KeyModifiers::SHIFT));
+        }
+        _ => panic!("expected Input::Key"),
+    }
+}
+
+#[test]
+fn contract_key_shift_a_yields_uppercase() {
+    let p = TuiActRequest::Key {
+        key: "shift+a".into(),
+        no_wait: None,
+        wait_ms: None,
+        id: None,
+    };
+    let input = build_input_from_request(&p).expect("build shift+a");
+    match input {
+        Input::Key(kev) => {
+            assert_eq!(kev.code, KeyCode::Char('A'));
+            assert!(kev.modifiers.contains(KeyModifiers::SHIFT));
+        }
+        _ => panic!("expected Input::Key"),
+    }
+}
+
+#[test]
+fn contract_key_ctrl_c() {
+    let p = TuiActRequest::Key {
+        key: "ctrl+c".into(),
+        no_wait: None,
+        wait_ms: None,
+        id: None,
+    };
+    let input = build_input_from_request(&p).expect("build ctrl+c");
+    match input {
+        Input::Key(kev) => {
+            assert_eq!(kev.code, KeyCode::Char('c'));
+            assert!(kev.modifiers.contains(KeyModifiers::CTRL));
+        }
+        _ => panic!("expected Input::Key"),
+    }
+}
+
+#[test]
+fn contract_key_bogus_modifier_errors() {
+    let p = TuiActRequest::Key {
+        key: "bogus+key".into(),
+        no_wait: None,
+        wait_ms: None,
+        id: None,
+    };
+    let result = build_input_from_request(&p);
+    assert!(result.is_err());
+}
+
+#[test]
+fn contract_key_f1_function() {
+    let p = TuiActRequest::Key {
+        key: "F1".into(),
+        no_wait: None,
+        wait_ms: None,
+        id: None,
+    };
+    let input = build_input_from_request(&p).expect("build F1");
+    match input {
+        Input::Key(kev) => {
+            assert_eq!(kev.code, KeyCode::Function(1));
+        }
+        _ => panic!("expected Input::Key"),
+    }
+}
+
+// ─── Task 7: build_wait idle and quiet_ms override ────────────────────
+
+#[test]
+fn contract_build_wait_idle_has_quiet_interval() {
+    let p = TuiWaitParams {
+        condition: "idle".into(),
+        text: None,
+        title: None,
+        budget_ms: None,
+        quiet_ms: None,
+        id: None,
+    };
+    let cond = build_wait(&p).expect("build wait idle");
+    match cond {
+        tui_lab::backend::WaitCond::Idle { quiet_for, .. } => {
+            assert_eq!(quiet_for, std::time::Duration::from_millis(250));
+        }
+        _ => panic!("idle must produce WaitCond::Idle"),
+    }
+}
+
+#[test]
+fn contract_build_wait_quiet_ms_overrides_both_conditions() {
+    let p_screen = TuiWaitParams {
+        condition: "screen_stable".into(),
+        text: None,
+        title: None,
+        budget_ms: None,
+        quiet_ms: Some(500),
+        id: None,
+    };
+    let cond = build_wait(&p_screen).expect("screen_stable with quiet_ms");
+    match cond {
+        tui_lab::backend::WaitCond::ScreenStable { quiet_for, .. } => {
+            assert_eq!(quiet_for, std::time::Duration::from_millis(500));
+        }
+        _ => panic!("screen_stable must produce ScreenStable"),
+    }
+
+    let p_idle = TuiWaitParams {
+        condition: "idle".into(),
+        text: None,
+        title: None,
+        budget_ms: None,
+        quiet_ms: Some(500),
+        id: None,
+    };
+    let cond = build_wait(&p_idle).expect("idle with quiet_ms");
+    match cond {
+        tui_lab::backend::WaitCond::Idle { quiet_for, .. } => {
+            assert_eq!(quiet_for, std::time::Duration::from_millis(500));
+        }
+        _ => panic!("idle must produce Idle"),
+    }
+}
+
+#[test]
+fn contract_build_wait_unknown_condition_returns_none() {
+    let p = TuiWaitParams {
+        condition: "nonexistent".into(),
+        text: None,
+        title: None,
+        budget_ms: None,
+        quiet_ms: None,
+        id: None,
+    };
+    assert!(build_wait(&p).is_none());
+}
+
+// ─── Task 9: run_assertion control_exists and focused_not ─────────────
+
+#[test]
+fn contract_control_exists_finds_matching_label() {
+    // Build a screen with a [ Save ] button region so control detection finds it.
+    let screen = ScreenState {
+        cols: 80,
+        rows: 24,
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["┌────────────────┐".to_string(), "│               [ Save ]  │".to_string(), "└────────────────┘".to_string()],
+        scrollback: Vec::new(),
+        raw_hash: String::new(),
+        visual_hash: String::new(),
+        structure_hash: String::new(),
+        process: ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    };
+    let p = TuiAssertParams {
+        assertion: "control_exists".into(),
+        text: None,
+        subject: Some("Save".into()),
+        reference: None,
+        x: None,
+        y: None,
+        cols: None,
+        rows: None,
+        expected_code: None,
+        id: None,
+    };
+    let (passed, _, invalid) = run_assertion(&p, &screen);
+    assert!(passed, "control_exists should find Save");
+    assert!(invalid.is_none());
+}
+
+#[test]
+fn contract_control_exists_missing_subject_is_invalid_request() {
+    let empty_screen = ScreenState {
+        cols: 80,
+        rows: 24,
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["".to_string(); 24],
+        scrollback: Vec::new(),
+        raw_hash: String::new(),
+        visual_hash: String::new(),
+        structure_hash: String::new(),
+        process: ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    };
+    let p = TuiAssertParams {
+        assertion: "control_exists".into(),
+        text: None,
+        subject: None,
+        reference: None,
+        x: None,
+        y: None,
+        cols: None,
+        rows: None,
+        expected_code: None,
+        id: None,
+    };
+    let (passed, _, invalid) = run_assertion(&p, &empty_screen);
+    assert!(!passed);
+    assert_eq!(invalid, Some(ErrorCategory::InvalidRequest));
+}
+
+#[test]
+fn contract_focused_not_with_no_focus_passes() {
+    let empty_screen = ScreenState {
+        cols: 80,
+        rows: 24,
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["".to_string(); 24],
+        scrollback: Vec::new(),
+        raw_hash: String::new(),
+        visual_hash: String::new(),
+        structure_hash: String::new(),
+        process: ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    };
+    let p = TuiAssertParams {
+        assertion: "focused_not".into(),
+        text: None,
+        subject: Some("Save".into()),
+        reference: None,
+        x: None,
+        y: None,
+        cols: None,
+        rows: None,
+        expected_code: None,
+        id: None,
+    };
+    let (passed, _, invalid) = run_assertion(&p, &empty_screen);
+    // No focus at all => passes (focus is NOT on "Save")
+    assert!(passed);
+    assert!(invalid.is_none());
+}
+
+#[test]
+fn contract_focused_not_missing_subject_is_invalid_request() {
+    let empty_screen = ScreenState {
+        cols: 80,
+        rows: 24,
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["".to_string(); 24],
+        scrollback: Vec::new(),
+        raw_hash: String::new(),
+        visual_hash: String::new(),
+        structure_hash: String::new(),
+        process: ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    };
+    let p = TuiAssertParams {
+        assertion: "focused_not".into(),
+        text: None,
+        subject: None,
+        reference: None,
+        x: None,
+        y: None,
+        cols: None,
+        rows: None,
+        expected_code: None,
+        id: None,
+    };
+    let (passed, _, invalid) = run_assertion(&p, &empty_screen);
+    assert!(!passed);
+    assert_eq!(invalid, Some(ErrorCategory::InvalidRequest));
+}
+
+// ─── control_label_exists pure helper ─────────────────────────────────
+
+#[test]
+fn contract_control_label_exists_helper() {
+    let screen = ScreenState {
+        cols: 80,
+        rows: 24,
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["┌────────────────┐".to_string(), "│               [ Save ]  │".to_string(), "└────────────────┘".to_string()],
+        scrollback: Vec::new(),
+        raw_hash: String::new(),
+        visual_hash: String::new(),
+        structure_hash: String::new(),
+        process: ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    };
+    assert!(control_label_exists(&screen, "Save"));
+    assert!(control_label_exists(&screen, "save")); // case-insensitive
+    assert!(!control_label_exists(&screen, "Missing"));
 }

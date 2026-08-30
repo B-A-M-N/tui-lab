@@ -3,6 +3,7 @@
 
 use crate::error::{Envelope, ErrorCategory};
 use crate::screen::ScreenState;
+use std::time::Duration;
 
 use crate::backend::{KeyEvent, KeyModifiers, MouseButton};
 
@@ -49,24 +50,29 @@ pub fn build_input_from_request(
         }
         crate::mcp::params::TuiActRequest::Type { text, .. } => Ok(Input::Text(text.clone())),
         crate::mcp::params::TuiActRequest::Paste { paste, .. } => Ok(Input::Paste(paste.clone())),
-        crate::mcp::params::TuiActRequest::Raw { raw, .. } => Ok(Input::Raw(raw.clone())),
+        crate::mcp::params::TuiActRequest::Raw { raw, .. } => {
+            if raw.is_empty() {
+                return Err("empty raw payload".into());
+            }
+            Ok(Input::Raw(raw.clone()))
+        }
         crate::mcp::params::TuiActRequest::MouseClick { x, y, button, .. } => {
-            Ok(Input::Mouse(MouseEvent::Press {
-                button: parse_button(button.as_deref()),
+            Ok(Input::MouseClick {
+                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
                 x: *x,
                 y: *y,
-            }))
+            })
         }
         crate::mcp::params::TuiActRequest::MousePress { x, y, button, .. } => {
             Ok(Input::Mouse(MouseEvent::Press {
-                button: parse_button(button.as_deref()),
+                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
                 x: *x,
                 y: *y,
             }))
         }
         crate::mcp::params::TuiActRequest::MouseRelease { x, y, button, .. } => {
             Ok(Input::Mouse(MouseEvent::Release {
-                button: parse_button(button.as_deref()),
+                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
                 x: *x,
                 y: *y,
             }))
@@ -76,7 +82,7 @@ pub fn build_input_from_request(
         }
         crate::mcp::params::TuiActRequest::MouseDrag { x, y, button, .. } => {
             Ok(Input::Mouse(MouseEvent::Drag {
-                button: parse_button(button.as_deref()),
+                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
                 x: *x,
                 y: *y,
             }))
@@ -84,10 +90,9 @@ pub fn build_input_from_request(
         crate::mcp::params::TuiActRequest::MouseScroll {
             x, y, direction, ..
         } => Ok(Input::Mouse(MouseEvent::Scroll {
-            direction: match direction.as_deref() {
-                Some("up") => ScrollDirection::Up,
-                _ => ScrollDirection::Down,
-            },
+            direction: direction
+                .map(crate::backend::ScrollDirection::from)
+                .unwrap_or(ScrollDirection::Down),
             x: *x,
             y: *y,
         })),
@@ -99,15 +104,12 @@ pub fn build_input_from_request(
     }
 }
 
-fn parse_button(b: Option<&str>) -> MouseButton {
-    match b {
-        Some("middle") => MouseButton::Middle,
-        Some("right") => MouseButton::Right,
-        _ => MouseButton::Left,
-    }
-}
-
 /// Parse an ergonomic key string into a typed [`KeyEvent`] (spec section 6).
+///
+/// Modifier names are matched case-insensitively, but a single-character final
+/// key *preserves its original case*.  When SHIFT is set on a letter, the
+/// character is uppercased (so `shift+a` yields `Char('A')`).  Multi-char
+/// unknown names still error.
 fn parse_key(s: &str) -> Result<KeyEvent, String> {
     use crate::backend::KeyCode;
     use KeyModifiers as M;
@@ -125,6 +127,9 @@ fn parse_key(s: &str) -> Result<KeyEvent, String> {
         }
     }
     let key = parts.last().copied().unwrap_or(s);
+    // The original (unlowercased) last part — used for single-char keys to
+    // preserve the caller's casing.
+    let orig_last = s.rsplit_once('+').map_or(s, |(_, rest)| rest);
     let code = match key {
         "enter" | "return" | "\n" | "\r" => KeyCode::Enter,
         "tab" => KeyCode::Tab,
@@ -155,7 +160,14 @@ fn parse_key(s: &str) -> Result<KeyEvent, String> {
         "f12" => KeyCode::Function(12),
         other => {
             if other.chars().count() == 1 {
-                KeyCode::Char(other.chars().next().unwrap())
+                // Single-char: preserve original case, then apply SHIFT.
+                let ch = orig_last.chars().next().unwrap();
+                let ch = if modifiers.contains(M::SHIFT) && ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
+                KeyCode::Char(ch)
             } else {
                 return Err(format!("unknown key '{}'", s));
             }
@@ -165,19 +177,34 @@ fn parse_key(s: &str) -> Result<KeyEvent, String> {
 }
 
 /// Build a wait condition.
+///
+/// Honours `quiet_ms` for `screen_stable` and `idle` conditions; defaults to
+/// 80 ms / 250 ms respectively when `quiet_ms` is `None`.
 pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backend::WaitCond> {
     use crate::backend::WaitCond;
+    let quiet = p
+        .quiet_ms
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(80));
+    let idle_quiet = p
+        .quiet_ms
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(250));
     match p.condition.as_str() {
         "text" => p.text.clone().map(WaitCond::Text),
         "text_absent" => p.text.clone().map(WaitCond::TextAbsent),
         "screen_change" => Some(WaitCond::ScreenChange),
         "screen_stable" => Some(WaitCond::ScreenStable {
-            quiet_for: std::time::Duration::from_millis(80),
+            quiet_for: quiet,
             after_screen_seq: None,
         }),
         "process_exit" => Some(WaitCond::ProcessExit),
         "title" => p.title.clone().map(WaitCond::Title),
         "bell" => Some(WaitCond::Bell),
+        "idle" => Some(WaitCond::Idle {
+            quiet_for: idle_quiet,
+            after_output_seq: None,
+        }),
         _ => None,
     }
 }
@@ -389,12 +416,80 @@ pub fn run_assertion(
                 ),
             }
         }
+        "control_exists" => {
+            // Assert that a control with the given label exists (case-insensitive).
+            match &p.subject {
+                Some(s) => {
+                    let sem = crate::semantic::analyze(screen);
+                    let found = sem.controls.iter().any(|c| c.label.eq_ignore_ascii_case(s));
+                    (
+                        found,
+                        if found {
+                            format!("control labeled '{}' found", s)
+                        } else {
+                            let kinds: Vec<String> = sem
+                                .controls
+                                .iter()
+                                .map(|c| format!("{:?}", c.kind))
+                                .collect();
+                            format!(
+                                "no control labeled '{}'; available: {}",
+                                s,
+                                kinds.join(", ")
+                            )
+                        },
+                        None,
+                    )
+                }
+                None => (
+                    false,
+                    "control_exists assertion requires 'subject' (control label)".into(),
+                    Some(ErrorCategory::InvalidRequest),
+                ),
+            }
+        }
+        "focused_not" => {
+            // Assert that focus is NOT on the named control (case-insensitive).
+            match &p.subject {
+                Some(s) => {
+                    let sem = crate::semantic::analyze(screen);
+                    let not_focused = sem
+                        .focus
+                        .control
+                        .as_deref()
+                        .map(|lbl| !lbl.eq_ignore_ascii_case(s))
+                        .unwrap_or(true); // no focus at all = also passes
+                    (
+                        not_focused,
+                        format!(
+                            "focused_not: focus is {:?}, expected not '{}'",
+                            sem.focus.control, s
+                        ),
+                        None,
+                    )
+                }
+                None => (
+                    false,
+                    "focused_not assertion requires 'subject' (control label)".into(),
+                    Some(ErrorCategory::InvalidRequest),
+                ),
+            }
+        }
         other => (
             false,
             format!("unknown assertion '{}'", other),
             Some(ErrorCategory::InvalidRequest),
         ),
     }
+}
+
+/// Check whether a control with the given label exists in the screen.
+/// Case-insensitive exact match.
+///
+/// Pure helper suitable for test exposure (helpers.rs is a lib module).
+pub fn control_label_exists(screen: &ScreenState, label: &str) -> bool {
+    let sem = crate::semantic::analyze(screen);
+    sem.controls.iter().any(|c| c.label.eq_ignore_ascii_case(label))
 }
 
 /// Write an asciinema v3 (NDJSON) event list from a screen snapshot.
@@ -421,6 +516,8 @@ pub fn write_cast(screen: &ScreenState) -> Vec<String> {
     events
 }
 
+/// LEGACY (pre-RunContext): scheduled for removal in the MCP rewiring wave.
+///
 /// Global checkpoint/store maps (OnceLock + Mutex). Defined here as thread-safe
 /// process-wide singletons; the server serializes calls (no parallel tool calls).
 use std::sync::OnceLock;
@@ -430,9 +527,11 @@ pub static SCENARIOS: OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>,
 > = OnceLock::new();
 
+/// LEGACY (pre-RunContext): scheduled for removal in the MCP rewiring wave.
 pub fn checkpoints() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     CHECKPOINTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
+/// LEGACY (pre-RunContext): scheduled for removal in the MCP rewiring wave.
 pub fn scenarios(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>> {
     SCENARIOS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
