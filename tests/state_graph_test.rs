@@ -1,6 +1,6 @@
 // Integration tests for the state graph (spec item 15).
 
-use tui_lab::exploration::{run, state_graph::*, ExplorationBudget, StateGraph, StateId};
+use tui_lab::exploration::{ExplorationBudget, StateGraph, StateId};
 use tui_lab::session::SessionManager;
 
 #[test]
@@ -169,6 +169,7 @@ fn test_exploration_run_with_graph() {
     let _ = sess.wait(
         tui_lab::backend::WaitCond::ScreenStable {
             quiet_for: std::time::Duration::from_millis(80),
+            after_screen_seq: None,
         },
         500,
     );

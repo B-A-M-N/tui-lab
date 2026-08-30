@@ -25,7 +25,7 @@ use vt100::Parser;
 
 use crate::backend::{
     trait_def::TerminalBackend, BackendError, BackendResult, Capabilities, Input, InputModes,
-    KeyCode, KeyEvent, MouseEncoding, MouseEvent, MouseMode, ObserveResult, ScrollDirection,
+    KeyCode, KeyEvent, MouseEncoding, MouseEvent, MouseMode, ScrollDirection,
     TerminalEventState, WaitCond, WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
@@ -35,21 +35,13 @@ use crate::screen::{ProcessState, ScreenState};
 /// Security boundary (spec section 75): these callbacks are *observations
 /// only*. We deliberately do NOT act on the host in response to terminal
 /// output — e.g. we never write the OSC 52 clipboard to the host clipboard.
+#[derive(Default)]
 struct BackendCallbacks {
     title: Option<String>,
     audible_bells: u64,
     title_seq: u64,
 }
 
-impl Default for BackendCallbacks {
-    fn default() -> Self {
-        BackendCallbacks {
-            title: None,
-            audible_bells: 0,
-            title_seq: 0,
-        }
-    }
-}
 
 impl vt100::Callbacks for BackendCallbacks {
     fn audible_bell(&mut self, _screen: &mut vt100::Screen) {
@@ -76,6 +68,7 @@ pub struct PortablePtyBackend {
     // Event sequencing state (spec section 1).
     output_seq: u64,
     screen_seq: u64,
+    content_seq: u64,
     bell_seq: u64,
     title_seq: u64,
     last_output_at_ms: u64,
@@ -102,6 +95,7 @@ impl PortablePtyBackend {
             chunk_rx: None,
             output_seq: 0,
             screen_seq: 0,
+            content_seq: 0,
             bell_seq: 0,
             title_seq: 0,
             last_output_at_ms: 0,
@@ -221,6 +215,7 @@ impl TerminalBackend for PortablePtyBackend {
         self.writer = Some(writer);
         self.output_seq = 0;
         self.screen_seq = 0;
+        self.content_seq = 0;
         self.bell_seq = 0;
         self.title_seq = 0;
         self.last_output_at_ms = 0;
@@ -324,6 +319,21 @@ impl TerminalBackend for PortablePtyBackend {
                 writer.write_all(&b).map_err(BackendError::Io)?;
                 writer.flush().map_err(BackendError::Io)?;
             }
+            Input::MouseClick { button, x, y } => {
+                // A click is press + release back-to-back (audit item 8).
+                let press = encode_mouse_event(
+                    &MouseEvent::Press { button, x, y },
+                    modes.mouse_encoding,
+                );
+                let release = encode_mouse_event(
+                    &MouseEvent::Release { button, x, y },
+                    modes.mouse_encoding,
+                );
+                writer.write_all(&press).map_err(BackendError::Io)?;
+                writer.flush().map_err(BackendError::Io)?;
+                writer.write_all(&release).map_err(BackendError::Io)?;
+                writer.flush().map_err(BackendError::Io)?;
+            }
             Input::Mouse(ev) => {
                 if modes.mouse_mode == MouseMode::None {
                     return Err(BackendError::Unsupported(
@@ -400,8 +410,8 @@ impl TerminalBackend for PortablePtyBackend {
         let baseline_last_screen_change = self.last_screen_change_instant;
 
         let quiet = match &cond {
-            WaitCond::ScreenStable { quiet_for } => *quiet_for,
-            WaitCond::Idle { quiet_for } => *quiet_for,
+            WaitCond::ScreenStable { quiet_for, .. } => *quiet_for,
+            WaitCond::Idle { quiet_for, .. } => *quiet_for,
             _ => Duration::from_millis(60),
         };
         // Track the instant of the last observed activity *during this wait*.
@@ -556,6 +566,9 @@ impl TerminalBackend for PortablePtyBackend {
         TerminalEventState {
             output_seq: self.output_seq,
             screen_seq: self.screen_seq,
+            content_seq: self.content_seq,
+            visual_seq: self.screen_seq,
+            interaction_seq: self.screen_seq + self.bell_seq + self.title_seq,
             bell_seq: self.bell_seq,
             title_seq: self.title_seq,
             last_output_at: self.last_output_at_ms,

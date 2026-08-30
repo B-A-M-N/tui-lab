@@ -3,18 +3,26 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 
 use super::model::{Checkpoint, CheckpointComparison, CheckpointMatches, FocusDiff, ScreenHashes};
 use crate::error::{Envelope, ErrorCategory};
 
 pub struct CheckpointStore {
+
     /// Session ID -> checkpoints by name.
     checkpoints: HashMap<String, HashMap<String, Checkpoint>>,
     /// Sequence counter for ordering.
     next_seq: u64,
-    /// Optional run directory for persistent storage.
+    /// Optional run directory for persistent storage. Read once persistence
+    /// lands (Wave 4); dead_code is deliberate for now.
+    #[allow(dead_code)]
     run_dir: Option<String>,
+}
+
+impl Default for CheckpointStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CheckpointStore {

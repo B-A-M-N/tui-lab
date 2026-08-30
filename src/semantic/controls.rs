@@ -125,8 +125,9 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
             }
             out.push(Control {
                 id: stable_id(&cb.kind, &cb.text, cb.x, y),
-                kind: cb.kind,
-                label: cb.text,
+                checked: cb.kind == ControlKind::Checkbox,
+                kind: cb.kind.clone(),
+                label: cb.text.clone(),
                 value: None,
                 bounds: ControlBounds { x: cb.x, y, width: cb.text.len() as u16, height: 1 },
                 region_id: None,
@@ -134,7 +135,6 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 focused: false,
                 enabled: true,
                 selected: false,
-                checked: cb.kind == ControlKind::Checkbox,
                 shortcut: None,
                 confidence: Confidence::inferred(0.9, &["toggle-glyph"]),
                 evidence: vec!["toggle-glyph".to_string()],
@@ -155,7 +155,7 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
             out.push(Control {
                 id: stable_id(&ControlKind::Button, &cap.text, cap.x, y),
                 kind: ControlKind::Button,
-                label: cap.text,
+                label: cap.text.clone(),
                 value: None,
                 bounds: ControlBounds { x: cap.x, y, width: cap.text.len() as u16, height: 1 },
                 region_id: None,
@@ -179,7 +179,7 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
             out.push(Control {
                 id: stable_id(&ControlKind::Field, &f.label, f.x, y),
                 kind: ControlKind::Field,
-                label: f.label,
+                label: f.label.clone(),
                 value: f.value,
                 bounds: ControlBounds { x: f.x, y, width: f.label.len() as u16, height: 1 },
                 region_id: None,

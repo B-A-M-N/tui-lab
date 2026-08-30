@@ -157,7 +157,7 @@ fn contract_build_wait_screen_stable_has_quiet_interval() {
     };
     let cond = build_wait(&p).expect("build wait");
     match cond {
-        tui_lab::backend::WaitCond::ScreenStable { quiet_for } => {
+        tui_lab::backend::WaitCond::ScreenStable { quiet_for, .. } => {
             assert_eq!(quiet_for, std::time::Duration::from_millis(80));
         }
         _ => panic!("screen_stable must carry a quiet_for interval"),

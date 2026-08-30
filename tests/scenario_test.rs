@@ -8,7 +8,7 @@ fn scenario_model_new() {
     assert_eq!(scenario.name, "test-scenario");
     assert_eq!(scenario.schema, "tui-lab/scenario/v1");
     assert!(scenario.steps.is_empty());
-    assert!(scenario.is_valid() == false);
+    assert!(!scenario.is_valid());
 }
 
 #[test]
