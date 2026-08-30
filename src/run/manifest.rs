@@ -14,6 +14,9 @@ pub struct RunManifest {
     pub started_at: u64,
     /// The launch spec of the primary session (None for tool-only runs).
     pub launch_spec: Option<LaunchSpec>,
+    /// True once `tui_run close` marked the run finished.
+    #[serde(default)]
+    pub closed: bool,
 }
 
 /// Load a manifest from a run directory.
@@ -33,6 +36,7 @@ mod tests {
             run_id: "run-abc".into(),
             started_at: 1_000,
             launch_spec: Some(LaunchSpec::new("python3", 80, 24)),
+            closed: false,
         };
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(
@@ -43,5 +47,6 @@ mod tests {
         let loaded = load(dir.path()).expect("load");
         assert_eq!(loaded.run_id, "run-abc");
         assert_eq!(loaded.launch_spec.as_ref().map(|s| s.command.as_str()), Some("python3"));
+        assert!(!loaded.closed);
     }
 }

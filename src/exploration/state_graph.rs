@@ -255,6 +255,23 @@ impl StateGraph {
             .collect()
     }
 
+    /// Serializable snapshot for run persistence (`state_graph.json`).
+    pub fn export(&self) -> serde_json::Value {
+        serde_json::json!({
+            "states": self.nodes.values().map(|n| serde_json::json!({
+                "structure_hash": n.structure_hash,
+                "visit_count": n.visit_count,
+                "first_seen_at": n.first_seen_at,
+                            })).collect::<Vec<_>>(),
+            "transitions": self.edges.iter().map(|e| serde_json::json!({
+                "from": e.from.as_str(),
+                "to": e.to.as_str(),
+                "action": e.action_name,
+                "count": e.count,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     /// Merge another graph into this one.
     pub fn merge(&mut self, other: &StateGraph) {
         for (id, node) in &other.nodes {

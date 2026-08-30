@@ -207,6 +207,8 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
+        self.run.lock().unwrap().bump_event();
+
         match p.mode.as_deref().unwrap_or("summary") {
             "summary" => {
                 // Compact summary for agent consumption (spec 36). Avoids
@@ -243,35 +245,27 @@ impl TuiLabServer {
                 ok(json!({ "semantic": sem }))
             }
             "diff" => {
-                // Real screen diff against the last observed frame (spec 35/21).
-                let before = sess.last().cloned();
-                let tr = match before {
-                    Some(ref b) => diff(b, &screen),
-                    None => diff(&screen, &screen),
-                };
-                let semantic_diff = match &before {
-                    Some(b) => {
-                        let sem_before = semantic::analyze(b);
-                        let sem_after = semantic::analyze(&screen);
-                        json!({
-                            "controls_added": sem_after.controls.len().saturating_sub(sem_before.controls.len()),
-                            "controls_removed": sem_before.controls.len().saturating_sub(sem_after.controls.len()),
-                            "regions_added": sem_after.regions.len().saturating_sub(sem_before.regions.len()),
-                            "regions_removed": sem_before.regions.len().saturating_sub(sem_after.regions.len()),
-                            "focus_before": sem_before.focus.control,
-                            "focus_after": sem_after.focus.control,
-                        })
+                // ONE diff path (re-review item 7): observe() above stashed
+                // the prior frame in `previous`, so this is a real
+                // previous→current comparison through the canonical
+                // `screen::diff`, returning the same `Transition` shape used
+                // by InteractionTransaction (semantic diff included — no
+                // second, MCP-local semantic-diff implementation).
+                match sess.previous() {
+                    Some(before) => {
+                        let tr = diff(before, &screen);
+                        ok(json!({
+                            "since": "previous_observation",
+                            "transition": tr,
+                        }))
                     }
-                    None => json!({ "note": "no prior frame available" }),
-                };
-                ok(json!({
-                    "since": "last_observation",
-                    "structure_hash": screen.structure_hash,
-                    "visual_hash": screen.visual_hash,
-                    "raw_hash": screen.raw_hash,
-                    "screen_diff": tr,
-                    "semantic_diff": semantic_diff,
-                }))
+                    None => ok(json!({
+                        "since": null,
+                        "note": "no prior frame available; observe twice, then diff",
+                        "structure_hash": screen.structure_hash,
+                        "visual_hash": screen.visual_hash,
+                    })),
+                }
             }
             "scrollback" => ok(json!({ "scrollback": screen.scrollback })),
             "history" => ok(json!({ "structure_hash": screen.structure_hash })),
@@ -315,13 +309,14 @@ impl TuiLabServer {
         };
         // Scenario recording in progress? Append this act (audit: scenarios
         // capture real tool traffic; sensitive payloads are not recorded).
-        if !p.sensitive() {
+        // Scoped to the resolved session generation (re-review item 5): a
+        // recording for session A never absorbs session B's traffic.
+        {
             let mut run = self.run.lock().unwrap();
-            for name in run.active_recordings() {
-                run.record_scenario_act(
-                    &name,
-                    serde_json::to_value(&p).unwrap_or_default(),
-                );
+            run.bump_transaction();
+            if !p.sensitive() {
+                let (sid, gen) = (sess.id.clone(), sess.generation);
+                run.record_scenario_act(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
             }
         }
         ok(json!({
@@ -354,14 +349,16 @@ impl TuiLabServer {
         };
         match sess.wait(cond, p.budget_ms.unwrap_or(5000)) {
             Ok(out) => {
+                // Scoped to the resolved session generation (item 5).
                 {
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
                     let mut run = self.run.lock().unwrap();
-                    for name in run.active_recordings() {
-                        run.record_scenario_wait(
-                            &name,
-                            serde_json::to_value(&p).unwrap_or_default(),
-                        );
-                    }
+                    run.bump_transaction();
+                    run.record_scenario_wait(
+                        &sid,
+                        gen,
+                        serde_json::to_value(&p).unwrap_or_default(),
+                    );
                 }
                 ok(json!({
                     "met": out.met,
@@ -402,10 +399,10 @@ impl TuiLabServer {
         };
         let (passed, detail, invalid) = run_assertion(&p, &screen);
         {
+            // Scoped to the resolved session generation (item 5).
+            let (sid, gen) = (sess.id.clone(), sess.generation);
             let mut run = self.run.lock().unwrap();
-            for name in run.active_recordings() {
-                run.record_scenario_assert(&name, serde_json::to_value(&p).unwrap_or_default());
-            }
+            run.record_scenario_assert(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
         }
         if passed {
             ok(json!({ "passed": true, "assertion": p.assertion }))
@@ -514,34 +511,57 @@ impl TuiLabServer {
                 let saved = run.list_saved_scenarios().unwrap_or_default();
                 ok(json!({ "recordings_in_progress": recorded, "scenarios": saved }))
             }
-            // begin a recording: subsequent tui_act / tui_wait / tui_assert
-            // calls with the same recording name append steps (audit item:
-            // scenarios must record real tool traffic, not be hand-authored).
+            // Begin a recording bound to the target session's generation.
+            // Subsequent tui_act / tui_wait / tui_assert calls resolving to
+            // that session generation append steps; other sessions never do
+            // (re-review item 5). The returned id — not the name — is the
+            // identity for record_stop.
             "record_start" => {
+                let mut mgr = self.manager.lock().unwrap();
+                let sess = match mgr.resolve_mut(p.id.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                };
                 let name = p.name.clone().unwrap_or_else(|| "scenario".into());
-                if run.begin_scenario_recording(&name) {
-                    ok(json!({ "recording": name, "started": true }))
-                } else {
-                    err(
-                        ErrorCategory::InvalidRequest,
-                        format!("already recording scenario '{}'", name),
-                    )
-                }
+                let (sid, gen) = (sess.id.clone(), sess.generation);
+                drop(mgr);
+                let rec_id = run.begin_scenario_recording(&name, &sid, gen);
+                ok(json!({
+                    "recording_id": rec_id.as_str(),
+                    "name": name,
+                    "session": sid,
+                    "generation": gen,
+                    "started": true,
+                }))
             }
-            // finish + persist; returns the serialized Scenario
+            // Finish + persist. Accepts `recording_id` (preferred identity)
+            // or falls back to the oldest active recording with `name`.
             "record_stop" => {
-                let name = match &p.name {
-                    Some(n) => n.clone(),
-                    None => {
-                        return err(ErrorCategory::InvalidRequest, "record_stop requires 'name'")
+                let rec_id = match (&p.recording_id, &p.name) {
+                    (Some(id), _) => id.clone(),
+                    (None, Some(name)) => match run.find_recording_by_name(name) {
+                        Some(id) => id,
+                        None => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                format!("no recording in progress named '{}'", name),
+                            )
+                        }
+                    },
+                    (None, None) => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            "record_stop requires 'recording_id' (or the recording 'name')",
+                        )
                     }
                 };
-                match run.finish_scenario_recording(&name) {
+                match run.finish_scenario_recording(&rec_id) {
                     Some(scenario) => {
                         let path: Option<String> = run
                             .save_scenario(scenario.clone())
                             .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
                         ok(json!({
+                            "recording_id": rec_id,
                             "name": scenario.name,
                             "steps": scenario.step_count(),
                             "saved_to": path,
@@ -550,7 +570,7 @@ impl TuiLabServer {
                     }
                     None => err(
                         ErrorCategory::InvalidRequest,
-                        format!("no recording in progress named '{}'", name),
+                        format!("no recording in progress with id '{}'", rec_id),
                     ),
                 }
             }
@@ -718,30 +738,34 @@ impl TuiLabServer {
             }
             "random" => {
                 let seed = p.seed.unwrap_or(4242);
-                let actions = p.actions.unwrap_or(20);
                 let recording_path = p.recording_path.as_deref().map(std::path::Path::new);
                 if recording_path.is_some() {
                     sess.enable_recording(false);
                 }
-                match crate::exploration::random::run(sess, seed, actions, recording_path) {
+                // The budget is the authority (re-review item 13): limits come
+                // from the run's ExplorationBudget, with an optional action
+                // override; the report names the real completion reason.
+                let budget = {
+                    let run = self.run.lock().unwrap();
+                    crate::exploration::random::Budget {
+                        max_actions: p.actions.unwrap_or(run.state_graph.budget().max_actions),
+                        ..crate::exploration::random::Budget::from_graph_budget(
+                            run.state_graph.budget(),
+                        )
+                    }
+                };
+                match crate::exploration::random::run(sess, seed, budget, recording_path) {
                     Ok(report) => {
-                        // Feed the observed structure hashes into the run's
-                        // state graph (consecutive hashes become transitions;
-                        // the pool does not name targets, so transitions carry
-                        // the action sequence index).
+                        // The state graph records WHAT ACTUALLY HAPPENED
+                        // (re-review item 12): transitions come from the
+                        // ordered ExplorationStep records (before → after via
+                        // the real action), not from post-hoc hash lists.
                         let graph_summary = {
                             let mut run = self.run.lock().unwrap();
-                            let mut prev: Option<&str> = None;
-                            for (i, h) in report.structure_hashes.iter().enumerate() {
-                                run.state_graph.record_state(h, None, i as u64);
-                                if let Some(p) = prev {
-                                    if p != h {
-                                        run.state_graph
-                                            .record_transition(p, h, &format!("step-{}", i));
-                                    }
-                                }
-                                prev = Some(h.as_str());
-                            }
+                            crate::exploration::random::record_steps(
+                                &mut run.state_graph,
+                                &report.steps,
+                            );
                             json!({
                                 "states": run.state_graph.state_count(),
                                 "transitions": run.state_graph.transition_count(),
@@ -884,6 +908,97 @@ impl TuiLabServer {
             other => err(
                 ErrorCategory::InvalidRequest,
                 format!("unknown action '{}'", other),
+            ),
+        }
+    }
+
+    /// Explicit run lifecycle (goal spec). Server startup stays side-effect
+    /// free: `TuiLabServer::new()` opens an ephemeral run — no filesystem
+    /// mutation. `persist` promotes the SAME run (identity + everything
+    /// accumulated so far) to durable storage; the root resolves from the
+    /// primary session's `LaunchSpec.cwd` unless an explicit root is given —
+    /// never from this process's cwd. `close` flushes and marks closed; it
+    /// does not kill sessions unless `kill_sessions` is set.
+    #[tool(
+        name = "tui_run",
+        description = "Run lifecycle: status, persist (ephemeral→durable, same run identity), close. Nothing is written to disk until you persist."
+    )]
+    async fn tui_run(&self, p: Parameters<TuiRunParams>) -> String {
+        let p = p.0;
+        match p.action.as_str() {
+            "status" => ok(self.run.lock().unwrap().status()),
+            "persist" => {
+                let mut run = self.run.lock().unwrap();
+                if run.run_dir().is_some() {
+                    return ok(json!({
+                        "run_id": run.id,
+                        "already_persistent": true,
+                        "artifact_root": run.run_dir().map(|d| d.to_string_lossy().to_string()),
+                    }));
+                }
+                // Root resolution: explicit `root` wins; else the primary
+                // session's LaunchSpec.cwd; else invalid_request — do NOT
+                // guess from the server process cwd.
+                let base: String = match p.root.clone() {
+                    Some(r) => r,
+                    None => match run.primary_session_cwd() {
+                        Some(cwd) => cwd.to_string(),
+                        None => {
+                            let run_id = run.id.clone();
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                format!(
+                                    "no artifact root resolvable for run {}: pass 'root' explicitly, or start a session whose LaunchSpec.cwd is set",
+                                    run_id
+                                ),
+                            );
+                        }
+                    },
+                };
+                match run.promote(std::path::Path::new(&base)) {
+                    Ok(root) => ok(json!({
+                        "run_id": run.id,
+                        "persistent": true,
+                        "artifact_root": root.to_string_lossy(),
+                        "promoted_from_ephemeral": true,
+                    })),
+                    Err(e) => err(ErrorCategory::InternalError, format!("persist failed: {e}")),
+                }
+            }
+            "close" => {
+                let mut run = self.run.lock().unwrap();
+                let already = run.is_closed();
+                let summary = run.status();
+                let kill = p.kill_sessions.unwrap_or(false);
+                let result = run.close();
+                drop(run);
+                if let Err(e) = result {
+                    return err(ErrorCategory::InternalError, format!("close flush failed: {e}"));
+                }
+                // Sessions survive close unless explicitly requested.
+                let stopped: Vec<String> = if kill {
+                    let mut mgr = self.manager.lock().unwrap();
+                    let ids: Vec<String> = mgr.list();
+                    let mut stopped = Vec::new();
+                    for id in ids {
+                        if mgr.stop(&id).is_ok() {
+                            stopped.push(id);
+                        }
+                    }
+                    stopped
+                } else {
+                    Vec::new()
+                };
+                ok(json!({
+                    "closed": true,
+                    "already_closed": already,
+                    "sessions_stopped": stopped,
+                    "final": summary,
+                }))
+            }
+            other => err(
+                ErrorCategory::InvalidRequest,
+                format!("unknown run action '{}' (status|persist|close)", other),
             ),
         }
     }
