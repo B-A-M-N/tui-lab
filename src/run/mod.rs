@@ -31,6 +31,73 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Upper bound on the in-memory transaction ledger (re-review Wave-2 item
+/// 15). Frames are heavy; the ledger holds evidence-level records. When the
+/// bound is hit the oldest half is evicted; the total counter is never
+/// reset, so `transactions: 47` stays honest while the ledger holds the
+/// most recent half-bound.
+const MAX_TRANSACTION_RECORDS: usize = 512;
+
+/// One settled interaction transaction, at evidence level.
+///
+/// This is the reconstructable record the run previously lacked (it could
+/// say `transactions: 47` but not replay any of them): ordered sequence,
+/// action, settle outcome, before/after hashes, and the cell delta. Full
+/// frames remain the caller's concern — attach them to artifacts, not to
+/// every run entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TransactionRecord {
+    /// Ordered execution index within the run (0-based).
+    pub seq: u64,
+    /// Unix-millis timestamp of the transaction.
+    pub at: u64,
+    /// Session the transaction ran against (informational; the run does not
+    /// own sessions).
+    pub session: String,
+    /// Action name ("key", "type", "mouse_click", "wait", ...).
+    pub action: String,
+    /// Whether the post-action settle condition was met.
+    pub settled: bool,
+    /// Why the settle resolved (or timed out), if reported.
+    pub settle_reason: Option<String>,
+    /// Structure hash before the action.
+    pub before_structure: String,
+    /// Structure hash after the action (the matching/settled frame).
+    pub after_structure: String,
+    /// Cells changed across the transition.
+    pub changed_cells: usize,
+    /// Settle latency in milliseconds.
+    pub elapsed_ms: u64,
+    /// The typed action (Wave-2 item 10) — present when the transaction came
+    /// through the canonical executor, so the ledger can *replay*, not just
+    /// count. Skipped for non-interaction ledger entries ("wait").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<crate::execution::CanonicalAction>,
+}
+
+impl TransactionRecord {
+    /// Build a record from a live [`crate::execution::InteractionTransaction`].
+    pub fn from_interaction(
+        seq: u64,
+        session: &str,
+        tx: &crate::execution::InteractionTransaction,
+    ) -> Self {
+        TransactionRecord {
+            seq,
+            at: now_ms(),
+            session: session.to_string(),
+            action: tx.action.clone(),
+            settled: tx.settled,
+            settle_reason: tx.settle_reason.clone(),
+            before_structure: tx.before.structure_hash.clone(),
+            after_structure: tx.after.structure_hash.clone(),
+            changed_cells: tx.transition.screen_diff.changed_cells,
+            elapsed_ms: tx.elapsed_ms,
+            canonical: tx.canonical.clone(),
+        }
+    }
+}
+
 /// Identity + artifact directory for one run.
 pub struct RunContext {
     /// Opaque run id (`run-<uuid simple>`).
@@ -46,10 +113,15 @@ pub struct RunContext {
     /// In-progress scenario recordings by opaque id (re-review item 5:
     /// session+generation scoped; names are not identities).
     recorders: HashMap<String, recording_scope::ScenarioRecording>,
-    /// Completed scenarios for this run. Memory is canonical during the live
-    /// run (so ephemeral runs still list/export); persistence to the run dir
-    /// is an artifact layer on top, not the source of truth.
+    /// Completed scenarios for this run, keyed by [`Scenario::id`] (re-review
+    /// Wave-1 item 9: names are display metadata and may collide; ids are the
+    /// storage key). Memory is canonical during the live run (so ephemeral
+    /// runs still list/export); persistence to the run dir is an artifact
+    /// layer on top, not the source of truth. The secondary name index only
+    /// maps *unambiguous* names — a name held by two scenarios resolves
+    /// through neither.
     saved_scenarios: HashMap<String, crate::scenario::model::Scenario>,
+    scenario_names: HashMap<String, String>,
     /// Completed PTY recordings retained in memory (run promotion must carry
     /// them into the durable root even when they were stopped while
     /// ephemeral). Keyed by suggested file name.
@@ -61,6 +133,12 @@ pub struct RunContext {
     pub state_graph: StateGraph,
     /// Findings emitted during this run (audit results).
     findings: Vec<crate::audit::Finding>,
+    /// Transaction ledger (re-review Wave-2 item 15): a serializable record
+    /// of every interaction transaction, so the run can *reconstruct* what
+    /// happened (`transactions: 47` without 47 reconstructable transactions
+    /// was the old shape). Bounded to MAX_TRANSACTION_RECORDS; full frames
+    /// stay in the callers' hands — this is the evidence-level record.
+    transactions: Vec<TransactionRecord>,
     /// Interaction transactions executed in this run (act/wait counters).
     transaction_count: u64,
     /// Events observed in this run (observe/wait calls).
@@ -80,10 +158,12 @@ impl RunContext {
             checkpoints: CheckpointStore::new(),
             recorders: HashMap::new(),
             saved_scenarios: HashMap::new(),
+            scenario_names: HashMap::new(),
             held_recordings: Vec::new(),
             focus_transitions: Vec::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
             findings: Vec::new(),
+            transactions: Vec::new(),
             transaction_count: 0,
             event_count: 0,
             closed: false,
@@ -102,9 +182,8 @@ impl RunContext {
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
         std::fs::create_dir_all(root.join("findings"))?;
-        run.checkpoints = CheckpointStore::with_run_dir(
-            root.join("checkpoints").to_string_lossy().to_string(),
-        );
+        run.checkpoints =
+            CheckpointStore::with_run_dir(root.join("checkpoints").to_string_lossy().to_string());
         run.run_dir = Some(root);
         run.write_manifest()?;
         Ok(run)
@@ -232,34 +311,64 @@ impl RunContext {
     }
 
     /// Save a scenario: memory first (canonical), then disk when the run is
-    /// persistent. Returns the artifact path when persistence happened, so
-    /// ephemeral runs report `saved_to: null` honestly but the scenario is
-    /// still listed and exportable.
-    pub fn save_scenario(
-        &mut self,
-        scenario: crate::scenario::model::Scenario,
-    ) -> Option<PathBuf> {
+    /// persistent. Storage key is the scenario's *id* (re-review Wave-1 item
+    /// 9); same-named scenarios from different sessions coexist. Returns the
+    /// artifact path when persistence happened, so ephemeral runs report
+    /// `saved_to: null` honestly but the scenario is still listed and
+    /// exportable.
+    pub fn save_scenario(&mut self, scenario: crate::scenario::model::Scenario) -> Option<PathBuf> {
+        // File names stay human-readable: `<name>-<id suffix>.json`. The id
+        // suffix keeps two same-named scenarios from overwriting each other
+        // on disk while the name keeps the artifact browsable. Legacy files
+        // saved as plain `<name>.json` before ids existed still load (see
+        // load_scenario's fallbacks).
+        let short_id = scenario.id.rsplit('-').next().unwrap_or("0").to_string();
+        let file_stem = format!("{}-{}", sanitize(&scenario.name), short_id);
+        self.scenario_names.remove(&scenario.name);
         self.saved_scenarios
-            .insert(scenario.name.clone(), scenario);
+            .insert(scenario.id.clone(), scenario.clone());
+        self.rebuild_scenario_name_index();
         let dir = self.run_dir.as_ref()?.join("scenarios");
         std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join(format!("{}.json", sanitize(&self.saved_scenarios
-            .values()
-            .last()
-            .expect("just inserted")
-            .name)));
+        let path = dir.join(format!("{}.json", file_stem));
         // Atomic write: temp file then rename (audit item 16).
-        let scenario = self.saved_scenarios.values().last().expect("just inserted");
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(scenario).ok()?).ok()?;
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&scenario).ok()?).ok()?;
         std::fs::rename(&tmp, &path).ok()?;
         Some(path)
     }
 
-    /// List saved scenarios in this run: the in-memory canonical set plus
-    /// anything persisted in the run dir (deduplicated).
+    /// Rebuild the unambiguous-name index over the in-memory scenario set.
+    /// A name that maps to exactly one scenario resolves; a name held by two
+    /// or more resolves through neither (callers must use the id).
+    fn rebuild_scenario_name_index(&mut self) {
+        self.scenario_names.clear();
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for sc in self.saved_scenarios.values() {
+            *counts.entry(sc.name.as_str()).or_insert(0) += 1;
+        }
+        for sc in self.saved_scenarios.values() {
+            if counts.get(sc.name.as_str()).copied().unwrap_or(0) == 1 {
+                self.scenario_names.insert(sc.name.clone(), sc.id.clone());
+            }
+        }
+    }
+
+    /// List saved scenarios in this run: the in-memory canonical set (ids)
+    /// plus anything persisted in the run dir. Disk entries whose file is
+    /// this run's own `<name>-<id-suffix>.json` artifact for an in-memory
+    /// scenario are not double-listed.
     pub fn list_saved_scenarios(&self) -> anyhow::Result<Vec<String>> {
         let mut out: Vec<String> = self.saved_scenarios.keys().cloned().collect();
+        // Stems this run already accounts for in memory.
+        let known_stems: Vec<String> = self
+            .saved_scenarios
+            .values()
+            .map(|sc| {
+                let short_id = sc.id.rsplit('-').next().unwrap_or("0");
+                format!("{}-{}", sanitize(&sc.name), short_id)
+            })
+            .collect();
         if let Some(root) = self.run_dir.as_ref() {
             let dir = root.join("scenarios");
             if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -267,7 +376,9 @@ impl RunContext {
                     let path = entry.path();
                     if path.extension().and_then(|e| e.to_str()) == Some("json") {
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            if !out.iter().any(|n| n == stem) {
+                            if !out.iter().any(|n| n == stem)
+                                && !known_stems.iter().any(|k| k == stem)
+                            {
                                 out.push(stem.to_string());
                             }
                         }
@@ -279,19 +390,78 @@ impl RunContext {
         Ok(out)
     }
 
-    /// Load a scenario by name: memory first, then the run dir.
-    pub fn load_scenario(
-        &self,
-        name: &str,
-    ) -> anyhow::Result<crate::scenario::model::Scenario> {
-        if let Some(s) = self.saved_scenarios.get(name) {
+    /// Load a scenario by id (preferred) or unambiguous name: memory first,
+    /// then the run dir. A name held by two or more in-memory scenarios is
+    /// ambiguous and deliberately refuses (use the scenario id). Legacy files
+    /// saved as plain `<name>.json` before ids existed are still found.
+    pub fn load_scenario(&self, key: &str) -> anyhow::Result<crate::scenario::model::Scenario> {
+        // 1. Direct id hit.
+        if let Some(s) = self.saved_scenarios.get(key) {
             return Ok(s.clone());
         }
+        // 2. Unambiguous-name fallback over the in-memory set.
+        if let Some(id) = self.scenario_names.get(key) {
+            if let Some(s) = self.saved_scenarios.get(id) {
+                return Ok(s.clone());
+            }
+        }
+        let name_held = self.saved_scenarios.values().any(|sc| sc.name == key);
+        if name_held {
+            // Multiple scenarios carry this name and the name index already
+            // refused it: never guess between them.
+            return Err(anyhow::anyhow!(
+                "scenario name '{}' is ambiguous in run '{}' — pass scenario_id instead",
+                key,
+                self.id
+            ));
+        }
+        // 3. Not held in memory: run-dir fallbacks for scenarios persisted by
+        // an earlier process — a file whose stem ends in this id suffix (when
+        // key looks like an id), the legacy plain `<name>.json`, or any file
+        // whose embedded name matches.
         let dir = self.scenario_dir()?;
-        let path = dir.join(format!("{}.json", sanitize(name)));
-        let bytes = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("scenario '{}' not found in run '{}': {}", name, self.id, e))?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let short_id = key.rsplit('-').next().unwrap_or("");
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if short_id.len() > key.len().saturating_sub(1) {
+            // key looks like a bare id: match any `<name>-<id-suffix>.json`.
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.ends_with(&format!("-{}.json", short_id)))
+                        .unwrap_or(false)
+                    {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+        candidates.push(dir.join(format!("{}.json", sanitize(key))));
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                candidates.push(entry.path());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for path in candidates {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(sc) = serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes) {
+                    if sc.name == key || sc.id == key {
+                        return Ok(sc);
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "scenario '{}' not found in run '{}' (use its scenario_id, or an unambiguous name)",
+            key,
+            self.id
+        ))
     }
 
     fn scenario_dir(&self) -> anyhow::Result<PathBuf> {
@@ -386,6 +556,56 @@ impl RunContext {
         self.transaction_count += 1;
     }
 
+    /// Record one settled interaction transaction into the run's ledger
+    /// (re-review Wave-2 item 15). Evidence-level: hashes, settle outcome,
+    /// timing, cell delta — not the full frames. The record's `seq` is
+    /// assigned here from the run's own counter. Bounded; when the ledger
+    /// is full, the oldest half is dropped (counters keep the true total).
+    pub fn record_interaction(
+        &mut self,
+        session: &str,
+        tx: &crate::execution::InteractionTransaction,
+    ) {
+        let seq = self.transaction_count;
+        self.transaction_count += 1;
+        let mut record = TransactionRecord::from_interaction(seq, session, tx);
+        record.seq = seq;
+        if self.transactions.len() >= MAX_TRANSACTION_RECORDS {
+            let drop = MAX_TRANSACTION_RECORDS / 2;
+            self.transactions.drain(..drop);
+        }
+        self.transactions.push(record);
+    }
+
+    /// Record a non-frame interaction (wait/observe) at evidence level.
+    pub fn record_event(&mut self, session: &str, action: &str) {
+        let seq = self.transaction_count;
+        self.transaction_count += 1;
+        self.transactions.push(TransactionRecord {
+            seq,
+            at: now_ms(),
+            session: session.to_string(),
+            action: action.to_string(),
+            settled: true,
+            settle_reason: None,
+            before_structure: String::new(),
+            after_structure: String::new(),
+            changed_cells: 0,
+            elapsed_ms: 0,
+            canonical: None,
+        });
+    }
+
+    /// The transaction ledger (bounded; see [`Self::record_transaction`]).
+    pub fn transactions(&self) -> &[TransactionRecord] {
+        &self.transactions
+    }
+
+    /// True transaction count, including ledger entries already evicted.
+    pub fn transaction_total(&self) -> u64 {
+        self.transaction_count
+    }
+
     /// The launch spec cwd of the primary session, if attached.
     pub fn primary_session_cwd(&self) -> Option<&str> {
         self.launch_spec.as_ref().and_then(|s| s.cwd.as_deref())
@@ -430,20 +650,21 @@ impl RunContext {
             return Ok(());
         };
         std::fs::create_dir_all(&dir)?;
-        // Scenarios held only in memory.
+        // Scenarios held only in memory. File names match save_scenario's
+        // `<name>-<id-suffix>.json` shape (Wave-1 item 9).
         let scen_dir = dir.join("scenarios");
         std::fs::create_dir_all(&scen_dir)?;
-        let mut pending: Vec<String> = self
-            .saved_scenarios
-            .keys()
-            .filter(|n| !scen_dir.join(format!("{}.json", sanitize(n))).exists())
-            .cloned()
-            .collect();
+        let mut pending: Vec<String> = self.saved_scenarios.keys().cloned().collect();
         pending.sort();
-        for name in pending {
-            if let Some(sc) = self.saved_scenarios.get(&name) {
-                let path = scen_dir.join(format!("{}.json", sanitize(&name)));
-                let tmp = scen_dir.join(format!("{}.json.tmp", sanitize(&name)));
+        for id in pending {
+            if let Some(sc) = self.saved_scenarios.get(&id) {
+                let short_id = sc.id.rsplit('-').next().unwrap_or("0");
+                let stem = format!("{}-{}", sanitize(&sc.name), short_id);
+                let path = scen_dir.join(format!("{}.json", stem));
+                if path.exists() {
+                    continue;
+                }
+                let tmp = scen_dir.join(format!("{}.json.tmp", stem));
                 std::fs::write(&tmp, serde_json::to_vec_pretty(sc)?)?;
                 std::fs::rename(&tmp, &path)?;
             }
@@ -457,6 +678,16 @@ impl RunContext {
         let ftmp = dir.join("focus_graph.json.tmp");
         std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.focus_transitions)?)?;
         std::fs::rename(&ftmp, dir.join("focus_graph.json"))?;
+        // Transaction ledger (Wave-2 item 15): NDJSON, one record per line,
+        // so partial reads and appends stay possible.
+        let ttmp = dir.join("transactions.jsonl.tmp");
+        let mut lines = String::new();
+        for tx in &self.transactions {
+            lines.push_str(&serde_json::to_string(tx)?);
+            lines.push('\n');
+        }
+        std::fs::write(&ttmp, lines)?;
+        std::fs::rename(&ttmp, dir.join("transactions.jsonl"))?;
         // Recordings held in memory (stopped while ephemeral).
         let rec_dir = dir.join("recordings");
         std::fs::create_dir_all(&rec_dir)?;
@@ -475,10 +706,7 @@ impl RunContext {
         let fdir = dir.join("findings");
         std::fs::create_dir_all(&fdir)?;
         let ftmp = dir.join("findings.json.tmp");
-        std::fs::write(
-            &ftmp,
-            serde_json::to_vec_pretty(&self.findings)?,
-        )?;
+        std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.findings)?)?;
         std::fs::rename(&ftmp, dir.join("findings.json"))?;
         Ok(())
     }
@@ -532,6 +760,7 @@ impl RunContext {
     pub fn counts(&self) -> serde_json::Value {
         json!({
             "transactions": self.transaction_count,
+            "transactions_in_ledger": self.transactions.len(),
             "events": self.event_count,
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.saved_scenarios.len(),
@@ -547,7 +776,13 @@ impl RunContext {
 fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "unnamed".into()
@@ -615,6 +850,62 @@ mod tests {
         assert!(run.active_recordings().is_empty());
     }
 
+    /// Wave-2 item 15: the run keeps a reconstructable transaction ledger,
+    /// not just a counter, and flushes it to transactions.jsonl.
+    #[test]
+    fn transaction_ledger_records_and_flushes() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(Some(tmp.path())).expect("run");
+
+        // Build a real interaction transaction through the canonical executor.
+        let mut s = crate::session::state::Session::new("ledger-sess".into(), "python3".into());
+        s.start_with_spec(crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "print('x'); import time; time.sleep(10)".into(),
+            ],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        })
+        .expect("spawn");
+        let tx = crate::execution::execute_act(
+            &mut s,
+            &crate::execution::CanonicalAction::Key {
+                key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('q')),
+            },
+            60,
+            1000,
+            false,
+        )
+        .expect("execute");
+
+        run.record_interaction("ledger-sess", &tx);
+        run.record_event("ledger-sess", "wait");
+
+        assert_eq!(run.transaction_total(), 2);
+        let ledger = run.transactions();
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger[0].seq, 0);
+        assert_eq!(ledger[0].action, "key");
+        assert_eq!(ledger[1].action, "wait");
+        assert_eq!(ledger[0].before_structure, tx.before.structure_hash);
+        assert_eq!(ledger[0].after_structure, tx.after.structure_hash);
+
+        run.flush().expect("flush");
+        let body =
+            std::fs::read_to_string(run.run_dir().expect("run dir").join("transactions.jsonl"))
+                .expect("ledger file");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "one NDJSON record per line: {body}");
+        let first: TransactionRecord = serde_json::from_str(lines[0]).expect("parse");
+        assert_eq!(first.action, "key");
+    }
+
     #[test]
     fn persistent_run_writes_manifest_and_scenario_roundtrip() {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -627,15 +918,47 @@ mod tests {
         let scenario = crate::scenario::model::Scenario::new("roundtrip")
             .act(serde_json::json!({"action": "key", "key": "enter"}))
             .wait(serde_json::json!({"condition": "text", "text": "SAVED"}));
+        let scenario_id = scenario.id.clone();
         let path = run.save_scenario(scenario).expect("save");
         assert!(path.exists());
 
-        let names = run.list_saved_scenarios().expect("list");
-        assert_eq!(names, vec!["roundtrip".to_string()]);
+        let ids = run.list_saved_scenarios().expect("list");
+        assert_eq!(ids, vec![scenario_id.clone()]);
 
-        let loaded = run.load_scenario("roundtrip").expect("load");
+        // Load by id…
+        let loaded = run.load_scenario(&scenario_id).expect("load by id");
         assert_eq!(loaded.step_count(), 2);
         assert_eq!(loaded.name, "roundtrip");
+        // …and by unambiguous name.
+        let loaded_by_name = run.load_scenario("roundtrip").expect("load by name");
+        assert_eq!(loaded_by_name.id, scenario_id);
+    }
+
+    #[test]
+    fn same_named_scenarios_do_not_collide() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(Some(tmp.path())).expect("run");
+
+        let a = crate::scenario::model::Scenario::new("login")
+            .act(serde_json::json!({"action": "key", "key": "enter"}));
+        let b = crate::scenario::model::Scenario::new("login")
+            .act(serde_json::json!({"action": "key", "key": "tab"}));
+        let id_a = a.id.clone();
+        let id_b = b.id.clone();
+        assert_ne!(id_a, id_b);
+        run.save_scenario(a).expect("save a");
+        run.save_scenario(b).expect("save b");
+
+        assert_eq!(run.saved_scenarios.len(), 2, "both scenarios kept");
+        // Ambiguous name resolves through neither…
+        assert!(run.load_scenario("login").is_err());
+        // …but each id resolves to its own steps.
+        let loaded_a = run.load_scenario(&id_a).expect("load a");
+        let loaded_b = run.load_scenario(&id_b).expect("load b");
+        assert_ne!(
+            loaded_a.steps, loaded_b.steps,
+            "id collision would overwrite one scenario with the other"
+        );
     }
 
     #[test]
@@ -655,10 +978,13 @@ mod tests {
             &crate::screen::ScreenState::new(80, 24),
             None,
         );
-        run.save_scenario(
-            crate::scenario::model::Scenario::new("promoted-flow")
-                .act(serde_json::json!({"action": "key", "key": "enter"})),
+        let promoted_scenario = crate::scenario::model::Scenario::new("promoted-flow")
+            .act(serde_json::json!({"action": "key", "key": "enter"}));
+        let expected_stem = format!(
+            "promoted-flow-{}",
+            promoted_scenario.id.rsplit('-').next().unwrap_or("0")
         );
+        run.save_scenario(promoted_scenario);
         let graph_root = base.path().join(".tui-lab").join("runs").join(&run_id);
 
         let root = run.promote(base.path()).expect("promote");
@@ -666,7 +992,10 @@ mod tests {
         assert_eq!(run.id, run_id, "promotion preserves run identity");
         assert!(graph_root.join("run.json").exists(), "manifest flushed");
         assert!(
-            graph_root.join("scenarios").join("promoted-flow.json").exists(),
+            graph_root
+                .join("scenarios")
+                .join(format!("{}.json", expected_stem))
+                .exists(),
             "ephemeral-era scenario flushed into durable root"
         );
 
@@ -728,8 +1057,7 @@ mod tests {
         // No-op transitions (unchanged focus) are not recorded.
         assert_eq!(run.focus_transitions().len(), 2);
         let root = run.promote(base.path()).expect("promote");
-        let body =
-            std::fs::read_to_string(root.join("focus_graph.json")).expect("focus graph");
+        let body = std::fs::read_to_string(root.join("focus_graph.json")).expect("focus graph");
         assert!(body.contains("\"menu\""), "ledger persisted: {body}");
         assert!(run.counts()["focus_transitions"].as_u64() >= Some(2));
     }

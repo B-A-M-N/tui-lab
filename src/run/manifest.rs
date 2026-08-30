@@ -46,7 +46,10 @@ mod tests {
         .expect("write");
         let loaded = load(dir.path()).expect("load");
         assert_eq!(loaded.run_id, "run-abc");
-        assert_eq!(loaded.launch_spec.as_ref().map(|s| s.command.as_str()), Some("python3"));
+        assert_eq!(
+            loaded.launch_spec.as_ref().map(|s| s.command.as_str()),
+            Some("python3")
+        );
         assert!(!loaded.closed);
     }
 }

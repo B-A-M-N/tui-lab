@@ -20,7 +20,13 @@ pub struct FrameworkDetection {
 
 /// Known TUI frameworks and their identifying package/crate names.
 /// (name, manifest markers, dependency markers, extra hints, secondary libs)
-type FrameworkSpec = (&'static str, &'static [&'static str], &'static [&'static str], &'static [&'static str], &'static [&'static str]);
+type FrameworkSpec = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+);
 
 const FRAMEWORKS: &[FrameworkSpec] = &[
     ("ratatui", &["ratatui"], &[], &[], &[]),

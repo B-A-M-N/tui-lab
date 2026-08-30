@@ -8,7 +8,6 @@ use super::model::{Checkpoint, CheckpointComparison, CheckpointMatches, FocusDif
 use crate::error::{Envelope, ErrorCategory};
 
 pub struct CheckpointStore {
-
     /// Session ID -> checkpoints by name.
     checkpoints: HashMap<String, HashMap<String, Checkpoint>>,
     /// Sequence counter for ordering.
@@ -110,7 +109,10 @@ impl CheckpointStore {
         };
         self.next_seq += 1;
         if let Err(e) = self.persist(session_id, &cp) {
-            eprintln!("tui-lab: checkpoint persistence failed for '{}': {}", name, e);
+            eprintln!(
+                "tui-lab: checkpoint persistence failed for '{}': {}",
+                name, e
+            );
         }
         self.checkpoints
             .entry(session_id.to_string())
@@ -253,7 +255,13 @@ impl CheckpointStore {
 fn sanitize_segment(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(80)
         .collect();
     if cleaned.is_empty() {
@@ -278,7 +286,11 @@ mod tests {
         crate::screen::ScreenState {
             cols: 10,
             rows: 3,
-            cursor: crate::screen::CursorState { x: 0, y: 0, visible: true },
+            cursor: crate::screen::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
             title: None,
             cells: Vec::new(),
             viewport_text: vec!["hi".to_string(), "".to_string(), "".to_string()],
@@ -298,10 +310,8 @@ mod tests {
 
     #[test]
     fn checkpoint_save_persists_and_loads_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "tui-lab-cp-test-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tui-lab-cp-test-{}", uuid::Uuid::new_v4().simple()));
         let session = "sess-1";
         let name = {
             let mut store = CheckpointStore::with_run_dir(dir.to_string_lossy().to_string());

@@ -3,6 +3,7 @@
 //! Each recognizer returns candidates with confidence/evidence.
 //! A merge/resolution pass in `controls.rs` eliminates overlaps.
 
+use crate::screen::display_width;
 use crate::semantic::confidence::Confidence;
 use crate::semantic::controls::ControlKind;
 
@@ -55,13 +56,15 @@ pub fn detect_tabs(line: &str, y: u16) -> Vec<Candidate> {
     if segments.len() >= 2 && segments.len() <= 8 {
         for (start, end, text) in &segments {
             let trimmed = text.trim();
-            if !trimmed.is_empty() && trimmed.len() <= 20 {
+            if !trimmed.is_empty() && trimmed.chars().count() <= 20 {
                 // Check if this segment is bracketed like "[Tab]" which
                 // conventionally marks the selected tab.
                 let selected = trimmed.starts_with('[') && trimmed.ends_with(']');
                 let label = if selected {
-                    // Strip brackets and re-trim inner content
-                    trimmed[1..trimmed.len() - 1].trim().to_string()
+                    // Strip ASCII brackets and re-trim inner content (char
+                    // boundary-safe: brackets are 1 byte, inner may not be).
+                    let inner = &trimmed['['.len_utf8()..trimmed.len() - ']'.len_utf8()];
+                    inner.trim().to_string()
                 } else {
                     trimmed.to_string()
                 };
@@ -70,7 +73,7 @@ pub fn detect_tabs(line: &str, y: u16) -> Vec<Candidate> {
                     label,
                     x: *start,
                     y,
-                    width: end - start,
+                    width: end - start, // segment bounds are column arithmetic
                     confidence: Confidence::inferred(0.7, &["tab-segment"]),
                     evidence: vec!["separator-delimited"],
                     value: None,
@@ -99,12 +102,15 @@ pub fn detect_list_items(line: &str, y: u16) -> Vec<Candidate> {
     if let Some(rest) = bullet_prefix {
         let label = rest.trim().to_string();
         if !label.is_empty() {
+            // Bullet glyph "•" is one column; "-"/"*" are ASCII — the width
+            // is indent + display width of the trimmed remainder.
+            let width = indent as u16 + display_width(trimmed);
             out.push(Candidate {
                 kind: ControlKind::List,
                 label,
                 x: indent as u16,
                 y,
-                width: trimmed.len() as u16,
+                width,
                 confidence: Confidence::inferred(0.8, &["bullet-list"]),
                 evidence: vec!["bullet-glyph"],
                 value: None,
@@ -123,12 +129,15 @@ pub fn detect_list_items(line: &str, y: u16) -> Vec<Candidate> {
                 if dot_pos <= 3 && trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
                     let label = trimmed[dot_pos + 2..].trim().to_string();
                     if !label.is_empty() {
+                        // Numbered prefix "N. " is ASCII; width follows the
+                        // display width of the full item text.
+                        let width = indent as u16 + display_width(trimmed);
                         out.push(Candidate {
                             kind: ControlKind::List,
                             label,
                             x: indent as u16,
                             y,
-                            width: trimmed.len() as u16,
+                            width,
                             confidence: Confidence::inferred(0.8, &["numbered-list"]),
                             evidence: vec!["number-prefix"],
                             value: None,
@@ -171,17 +180,29 @@ pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
         });
 
         if all_short && has_menu_words {
-            let mut pos = 0;
+            let mut pos = 0usize; // byte offset into trimmed
             for word in &words {
                 if let Some(idx) = trimmed[pos..].find(word) {
-                    let x = (pos + idx) as u16;
+                    // x is a screen column: measure the prefix's display
+                    // width instead of using the byte offset (item 22).
+                    let x = display_width(&trimmed[..pos + idx]);
                     // Extract shortcut: "&X" or "(X)text"
                     let shortcut = if word.starts_with('&') && word.len() > 1 {
                         // Shortcut char is after the ampersand
-                        Some(word[1..].chars().next().unwrap_or('\0').to_uppercase().to_string())
+                        Some(
+                            word[1..]
+                                .chars()
+                                .next()
+                                .unwrap_or('\0')
+                                .to_uppercase()
+                                .to_string(),
+                        )
                     } else if let Some(inner) = word.strip_prefix('(') {
                         // e.g. "(F)ile" — extract first parenthesized letter
-                        inner.chars().find(|c| *c != ')').map(|c| c.to_uppercase().to_string())
+                        inner
+                            .chars()
+                            .find(|c| *c != ')')
+                            .map(|c| c.to_uppercase().to_string())
                     } else {
                         None
                     };
@@ -190,7 +211,9 @@ pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
                         label: word.to_string(),
                         x,
                         y,
-                        width: word.len() as u16,
+                        // Display width, not UTF-8 bytes: a wide label must
+                        // claim its rendered columns (item 22).
+                        width: display_width(word),
                         confidence: Confidence::inferred(0.75, &["menu-bar"]),
                         evidence: vec!["menu-context"],
                         value: None,
@@ -198,7 +221,7 @@ pub fn detect_menu_items(line: &str, y: u16) -> Vec<Candidate> {
                         selected: false,
                         shortcut,
                     });
-                    pos = x as usize + word.len();
+                    pos = pos + idx + word.len(); // byte offset, not column
                 }
             }
         }
@@ -221,12 +244,15 @@ pub fn detect_status(line: &str, y: u16) -> Vec<Candidate> {
         if let Some(idx) = lower.find(keyword) {
             let after = &line[idx + keyword.len()..].trim();
             if !after.is_empty() {
+                // x in columns: the lowercase prefix has the same display
+                // width as the original text.
+                let x = display_width(&line[..idx + keyword.len()]);
                 out.push(Candidate {
                     kind: ControlKind::Status,
                     label: after.to_string(),
-                    x: (idx + keyword.len()) as u16,
+                    x,
                     y,
-                    width: after.len() as u16,
+                    width: display_width(after),
                     confidence: Confidence::inferred(0.6, &["status-label"]),
                     evidence: vec!["status-keyword"],
                     value: Some(after.to_string()),
@@ -252,19 +278,22 @@ pub fn detect_progress(line: &str, y: u16) -> Vec<Candidate> {
 
     // 1) Bracketed progress bar: [====>    ]
     if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 4 {
-        let inner = &trimmed[1..trimmed.len() - 1];
+        // Byte-safe inner slice: first/last chars are ASCII brackets, so
+        // char_indices on the remainder stays inside the ASCII envelope.
+        let inner = &trimmed[1..trimmed.len() - ']'.len_utf8()];
         let has_progress_chars = inner
             .chars()
             .any(|c| c == '=' || c == '#' || c == '█' || c == '▓');
         let has_incomplete = inner.chars().any(|c| c == ' ' || c == '.' || c == '░');
 
         if has_progress_chars && has_incomplete {
+            let x = display_width(line) - display_width(trimmed);
             out.push(Candidate {
                 kind: ControlKind::Progress,
                 label: "progress".to_string(),
-                x: (line.len() - trimmed.len()) as u16,
+                x,
                 y,
-                width: trimmed.len() as u16,
+                width: display_width(trimmed),
                 confidence: Confidence::inferred(0.9, &["progress-bar"]),
                 evidence: vec!["bar-glyphs"],
                 value: None,
@@ -290,13 +319,16 @@ pub fn detect_progress(line: &str, y: u16) -> Vec<Candidate> {
 
         if let Ok(pct) = num_str.parse::<u8>() {
             if pct <= 100 && !num_str.is_empty() {
-                let num_start = before_pct.len() - trimmed_end.len() + digit_start;
+                // Column arithmetic: digits + '%' are ASCII, so the number's
+                // width is its char count; its column is the display width
+                // of everything before it.
+                let num_start = display_width(trimmed_end) - num_str.chars().count() as u16;
                 out.push(Candidate {
                     kind: ControlKind::Progress,
                     label: format!("{}%", pct),
-                    x: (line.len() - trimmed.len() + num_start) as u16,
+                    x: display_width(line) - display_width(trimmed) + num_start,
                     y,
-                    width: (num_str.len() + 1) as u16,
+                    width: num_str.chars().count() as u16 + 1,
                     confidence: Confidence::inferred(0.85, &["percentage"]),
                     evidence: vec!["percent-sign"],
                     value: None,
@@ -326,14 +358,15 @@ pub fn detect_spinner(line: &str, y: u16) -> Vec<Candidate> {
     let spinner_simple: [char; 3] = ['|', '/', '\\'];
 
     // Check for Unicode spinner chars first
-    let trim_offset = line.len() - trimmed.len();
+    let trim_cols = display_width(line) - display_width(trimmed);
     for (i, c) in trimmed.char_indices() {
         if spinner_unique.contains(&c) {
-            let byte_pos = trim_offset + i;
+            // Column, not byte offset: measure the prefix width (item 22).
+            let x = trim_cols + display_width(&trimmed[..i]);
             out.push(Candidate {
                 kind: ControlKind::Spinner,
                 label: "loading".to_string(),
-                x: byte_pos as u16,
+                x,
                 y,
                 width: 1,
                 confidence: Confidence::inferred(0.85, &["spinner-glyph"]),
@@ -351,21 +384,27 @@ pub fn detect_spinner(line: &str, y: u16) -> Vec<Candidate> {
     for (i, c) in trimmed.char_indices() {
         if spinner_simple.contains(&c) {
             // Skip if inside a bracketed progress bar
-            let in_bracket = trimmed.starts_with('[') && trimmed.ends_with(']')
-                && i > 0 && i < trimmed.len() - 1;
+            let in_bracket = trimmed.starts_with('[')
+                && trimmed.ends_with(']')
+                && i > 0
+                && i < trimmed.len() - 1;
             if in_bracket {
                 continue;
             }
             let prev_char = trimmed.chars().nth(i.saturating_sub(1));
             let next_char = trimmed.chars().nth(i + 1);
-            let prev_ok = prev_char.map(|c| c == ' ' || c.is_alphanumeric()).unwrap_or(true);
-            let next_ok = next_char.map(|c| c == ' ' || c.is_alphanumeric()).unwrap_or(true);
+            let prev_ok = prev_char
+                .map(|c| c == ' ' || c.is_alphanumeric())
+                .unwrap_or(true);
+            let next_ok = next_char
+                .map(|c| c == ' ' || c.is_alphanumeric())
+                .unwrap_or(true);
             if prev_ok && next_ok {
-                let byte_pos = trim_offset + i;
+                let x = trim_cols + display_width(&trimmed[..i]);
                 out.push(Candidate {
                     kind: ControlKind::Spinner,
                     label: "loading".to_string(),
-                    x: byte_pos as u16,
+                    x,
                     y,
                     width: 1,
                     confidence: Confidence::inferred(0.7, &["spinner-char"]),
@@ -497,11 +536,18 @@ mod tests {
     fn test_detect_spinner_unicode() {
         let line = "Loading \u{25d4}";
         let trimmed = line.trim();
-        eprintln!("line={:?} trimmed={:?} char_count={} char_lens={:?}",
-            line, trimmed, trimmed.chars().count(),
-            trimmed.chars().map(|c| c.len_utf8()).collect::<Vec<_>>());
+        eprintln!(
+            "line={:?} trimmed={:?} char_count={} char_lens={:?}",
+            line,
+            trimmed,
+            trimmed.chars().count(),
+            trimmed.chars().map(|c| c.len_utf8()).collect::<Vec<_>>()
+        );
         let candidates = detect_spinner(line, 0);
-        eprintln!("candidates={:?}", candidates.iter().map(|c| &c.kind).collect::<Vec<_>>());
+        eprintln!(
+            "candidates={:?}",
+            candidates.iter().map(|c| &c.kind).collect::<Vec<_>>()
+        );
         assert!(!candidates.is_empty(), "expected spinner for {:?}", line);
         assert_eq!(candidates[0].kind, ControlKind::Spinner);
     }

@@ -45,13 +45,15 @@ impl ScenarioRunner {
                 StepKind::Act => match serde_json::from_value::<TuiActRequest>(step.params.clone())
                 {
                     Ok(req) => {
+                        // Typed action (Wave-2 item 10): the scenario step's
+                        // JSON is the same shape the live MCP call carried,
+                        // so replay executes exactly what was recorded.
                         let (step_passed, detail) =
-                            match crate::mcp::helpers::build_input_from_request(&req) {
-                                Ok(input) => {
+                            match crate::execution::CanonicalAction::from_request(&req) {
+                                Ok(action) => {
                                     match crate::execution::execute_act(
                                         session,
-                                        req.action_name(),
-                                        input,
+                                        &action,
                                         150,
                                         1150,
                                         req.no_wait(),

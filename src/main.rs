@@ -101,14 +101,23 @@ fn doctor() {
             }
     })
     .unwrap_or(false);
-    report(&mut out, "Terminal PTY", pty, "spawn python3 + parse screen");
+    report(
+        &mut out,
+        "Terminal PTY",
+        pty,
+        "spawn python3 + parse screen",
+    );
 
     // 2. Screen parsing / semantic model: analyze a synthetic frame.
     let semantic = std::panic::catch_unwind(|| {
         let screen = tui_lab::screen::ScreenState {
             cols: 40,
             rows: 5,
-            cursor: tui_lab::screen::CursorState { x: 1, y: 1, visible: true },
+            cursor: tui_lab::screen::CursorState {
+                x: 1,
+                y: 1,
+                visible: true,
+            },
             title: None,
             cells: Vec::new(),
             viewport_text: vec![
@@ -132,10 +141,18 @@ fn doctor() {
         };
         let sem = tui_lab::semantic::analyze(&screen);
         sem.controls.iter().any(|c| c.label == "Save")
-            && sem.controls.iter().any(|c| c.kind == tui_lab::semantic::ControlKind::Field)
+            && sem
+                .controls
+                .iter()
+                .any(|c| c.kind == tui_lab::semantic::ControlKind::Field)
     })
     .unwrap_or(false);
-    report(&mut out, "Semantic model", semantic, "control inference on synthetic frame");
+    report(
+        &mut out,
+        "Semantic model",
+        semantic,
+        "control inference on synthetic frame",
+    );
 
     // 3. Recording: construct a recorder and produce NDJSON.
     let recording = std::panic::catch_unwind(|| {
@@ -144,14 +161,18 @@ fn doctor() {
         r.event_count() > 0
     })
     .unwrap_or(false);
-    report(&mut out, "Recording (asciicast)", recording, "recorder produces events");
+    report(
+        &mut out,
+        "Recording (asciicast)",
+        recording,
+        "recorder produces events",
+    );
 
     // 4. Checkpoints: save + compare in a temp dir.
     let checkpoints = std::panic::catch_unwind(|| {
         let dir = std::env::temp_dir().join(format!("tui-lab-doctor-{}", std::process::id()));
-        let mut store = tui_lab::checkpoint::CheckpointStore::with_run_dir(
-            dir.to_string_lossy().to_string(),
-        );
+        let mut store =
+            tui_lab::checkpoint::CheckpointStore::with_run_dir(dir.to_string_lossy().to_string());
         let screen = probe_screen();
         let name = store.save("doctor", 0, None, &screen, None);
         let ok = store.contains("doctor", &name);
@@ -159,7 +180,12 @@ fn doctor() {
         ok
     })
     .unwrap_or(false);
-    report(&mut out, "Checkpoints", checkpoints, "save + persist round-trip");
+    report(
+        &mut out,
+        "Checkpoints",
+        checkpoints,
+        "save + persist round-trip",
+    );
 
     // 5. Scenario model: build + validate.
     let scenarios = std::panic::catch_unwind(|| {
@@ -181,11 +207,21 @@ fn doctor() {
         g.state_count() == 2 && g.transition_count() == 1
     })
     .unwrap_or(false);
-    report(&mut out, "Exploration (state graph)", exploration, "graph record + count");
+    report(
+        &mut out,
+        "Exploration (state graph)",
+        exploration,
+        "graph record + count",
+    );
 
     // 7. Coverage: honest probe for the optional tuicov executable.
     let coverage = tui_lab::coverage::tuicov::is_available();
-    report(&mut out, "Coverage (tuicov)", coverage, "optional executable on PATH");
+    report(
+        &mut out,
+        "Coverage (tuicov)",
+        coverage,
+        "optional executable on PATH",
+    );
 
     // 8. Framework probes: parse a synthetic ratatui manifest (this crate
     // itself legitimately has no TUI framework dependency — it IS the harness).
@@ -193,16 +229,18 @@ fn doctor() {
         let dir = std::env::temp_dir().join(format!("tui-lab-doctor-fw-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let manifest = dir.join("Cargo.toml");
-        let _ = std::fs::write(
-            &manifest,
-            "[dependencies]\nratatui = \"0.29\"\n",
-        );
+        let _ = std::fs::write(&manifest, "[dependencies]\nratatui = \"0.29\"\n");
         let det = tui_lab::framework::detect::detect(&dir.to_string_lossy());
         let _ = std::fs::remove_dir_all(&dir);
         det.framework.as_deref() == Some("ratatui")
     })
     .unwrap_or(false);
-    report(&mut out, "Framework detection", framework, "ratatui manifest parse");
+    report(
+        &mut out,
+        "Framework detection",
+        framework,
+        "ratatui manifest parse",
+    );
 
     // 9. python3 presence (fixtures + many audits depend on it).
     let python3 = std::process::Command::new("python3")
@@ -212,7 +250,12 @@ fn doctor() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    report(&mut out, "python3 (fixture runtime)", python3, "child on PATH");
+    report(
+        &mut out,
+        "python3 (fixture runtime)",
+        python3,
+        "child on PATH",
+    );
 
     let _ = writeln!(out);
     let core = pty && semantic && recording && checkpoints && scenarios && exploration;
@@ -239,7 +282,11 @@ fn probe_screen() -> tui_lab::screen::ScreenState {
     tui_lab::screen::ScreenState {
         cols: 10,
         rows: 3,
-        cursor: tui_lab::screen::CursorState { x: 0, y: 0, visible: true },
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
         title: None,
         cells: Vec::new(),
         viewport_text: vec!["a".to_string(), String::new(), String::new()],

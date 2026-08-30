@@ -12,8 +12,8 @@
 
 use crate::screen::ScreenState;
 use crate::semantic::confidence::Confidence;
-use crate::semantic::regions::Region;
 use crate::semantic::recognizers;
+use crate::semantic::regions::Region;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -87,8 +87,12 @@ pub struct ControlBounds {
     pub height: u16,
 }
 
-fn default_true() -> bool { true }
-fn default_source() -> String { "inferred".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_source() -> String {
+    "inferred".to_string()
+}
 
 /// Check if point (px, py) is within bounds [x, x+width) x [y, y+height).
 fn region_contains_point(bounds: &crate::semantic::regions::Bounds, px: u16, py: u16) -> bool {
@@ -98,22 +102,59 @@ fn region_contains_point(bounds: &crate::semantic::regions::Bounds, px: u16, py:
         && py < bounds.y + bounds.height
 }
 
-/// Generate a stable control ID from kind, label, and geometry.
-fn stable_id(kind: &ControlKind, label: &str, x: u16, y: u16) -> String {
-    let kind_str = format!("{:?}", kind).to_lowercase();
-    // Sanitize label: lowercase, alphanumeric + hyphens, max 20 chars
-    let sanitized: String = label
+/// Slugify a label into an ID path segment (lowercase alphanumeric + hyphen,
+/// capped at 20 chars).
+fn slugify_label(label: &str) -> String {
+    let cleaned: String = label
+        .trim()
         .to_lowercase()
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .take(20)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let sanitized = if sanitized.is_empty() {
+    let collapsed: String = cleaned
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let truncated: String = collapsed.chars().take(20).collect();
+    let truncated = truncated.trim_end_matches('-').to_string();
+    if truncated.is_empty() {
         "unnamed".to_string()
     } else {
-        sanitized
-    };
-    format!("{}:{}:{},{}", kind_str, sanitized, x, y)
+        truncated
+    }
+}
+
+/// Generate a stable, geometry-free control ID (re-review Wave-3 item 16 —
+/// `{kind}:{label}:{x},{y}` made every resize a new control, breaking focus
+/// tracking, scenario replay, and audit cross-references).
+///
+/// Format: `{kind}/{label-slug}` optionally prefixed with the containing
+/// region's stable path: `dialog/settings/button/save`. Duplicates (same
+/// region path + kind + label) get a 1-based `#{n}` disambiguator appended
+/// by the caller's second pass, since duplicates are only knowable after
+/// every control on the screen has been collected.
+fn stable_id(kind: &ControlKind, label: &str, region_path: Option<&str>) -> String {
+    let kind_str = slugify_label(&format!("{:?}", kind));
+    let label_slug = slugify_label(label);
+    match region_path {
+        Some(rp) if !rp.is_empty() => format!("{}/{}/{}", rp, kind_str, label_slug),
+        _ => format!("{}/{}", kind_str, label_slug),
+    }
+}
+
+/// Disambiguate duplicate control IDs with `#{n}` suffixes (second pass —
+/// duplicates are only knowable once the whole screen is collected).
+fn disambiguate_control_ids(controls: &mut [Control]) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for ctrl in controls.iter_mut() {
+        let n = seen.entry(ctrl.id.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            ctrl.id = format!("{}#{}", ctrl.id, n);
+        }
+    }
 }
 
 /// Detect button-like `[ Label ]` / `< Label >` tokens, field `Label:` marks,
@@ -125,15 +166,18 @@ fn stable_id(kind: &ControlKind, label: &str, x: u16, y: u16) -> String {
 /// Once a span is consumed by an earlier recognizer it is not reconsidered.
 pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control> {
     let mut out = Vec::new();
-    let any_line_has_button_or_field = screen
-        .viewport_text
-        .iter()
-        .any(|line| extract_bracketed(line).iter().any(|cap| !is_toggle_text(&cap.text))
-            || extract_field(line).is_some());
 
     for (y, line) in screen.viewport_text.iter().enumerate() {
         let y = y as u16;
         let mut consumed: Vec<(u16, u16)> = mark_consumed_spans(line, regions, y);
+        // Menu/status suppression is per-ROW (re-review Wave-3 item 20): a
+        // button or field on this line means the line is a control row, not
+        // a menu bar or status readout. The old screen-global `any(...)` let
+        // a single button anywhere suppress menu recognition everywhere.
+        let line_has_button_or_field = extract_bracketed(line)
+            .iter()
+            .any(|cap| !is_toggle_text(&cap.text))
+            || extract_field(line).is_some();
 
         // 1) checkbox/radio: ( ) or (*) or [ ] or [x]
         for cb in extract_toggle(line) {
@@ -141,17 +185,24 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 continue;
             }
             out.push(Control {
-                id: stable_id(&cb.kind, &cb.text, cb.x, y),
-                checked: cb.kind == ControlKind::Checkbox,
+                id: stable_id(&cb.kind, &cb.text, None),
+                checked: cb.checked,
                 kind: cb.kind.clone(),
                 label: cb.text.clone(),
                 value: None,
-                bounds: ControlBounds { x: cb.x, y, width: cb.text.len() as u16, height: 1 },
+                bounds: ControlBounds {
+                    x: cb.x,
+                    y,
+                    width: cb.text.chars().count() as u16,
+                    height: 1,
+                },
                 region_id: None,
                 focusable: true,
                 focused: false,
                 enabled: true,
-                selected: false,
+                // A `(*)` radio glyph means this option is the selected one
+                // of its group; checkboxes report state through `checked`.
+                selected: cb.kind == ControlKind::Radio && cb.checked,
                 shortcut: None,
                 confidence: Confidence::inferred(0.9, &["toggle-glyph"]),
                 evidence: vec!["toggle-glyph".to_string()],
@@ -163,7 +214,9 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
         // 2) buttons: [ text ] or < text >
         //    Skip `[x]`, `[ ]` which are toggles, not buttons.
         for cap in extract_bracketed(line) {
-            let span_end = cap.x + cap.text.len() as u16 + 2;
+            // `[ 确定 ]`: bracket + space + label + space — column arithmetic
+            // needs display width, not UTF-8 bytes (item 22).
+            let span_end = cap.x + cap.text.chars().count() as u16 + 2;
             if overlaps_consumed(&consumed, cap.x, span_end) {
                 continue;
             }
@@ -171,11 +224,16 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 continue;
             }
             out.push(Control {
-                id: stable_id(&ControlKind::Button, &cap.text, cap.x, y),
+                id: stable_id(&ControlKind::Button, &cap.text, None),
                 kind: ControlKind::Button,
                 label: cap.text.clone(),
                 value: None,
-                bounds: ControlBounds { x: cap.x, y, width: cap.text.len() as u16, height: 1 },
+                bounds: ControlBounds {
+                    x: cap.x,
+                    y,
+                    width: cap.text.chars().count() as u16,
+                    height: 1,
+                },
                 region_id: None,
                 focusable: true,
                 focused: false,
@@ -192,15 +250,21 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
 
         // 3) field: "Label:" optionally followed by a value
         if let Some(f) = extract_field(line) {
-            if overlaps_consumed(&consumed, f.x, f.x + f.label.len() as u16) {
+            let label_cols = f.label.chars().count() as u16;
+            if overlaps_consumed(&consumed, f.x, f.x + label_cols) {
                 continue;
             }
             out.push(Control {
-                id: stable_id(&ControlKind::Field, &f.label, f.x, y),
+                id: stable_id(&ControlKind::Field, &f.label, None),
                 kind: ControlKind::Field,
                 label: f.label.clone(),
                 value: f.value,
-                bounds: ControlBounds { x: f.x, y, width: f.label.len() as u16, height: 1 },
+                bounds: ControlBounds {
+                    x: f.x,
+                    y,
+                    width: label_cols,
+                    height: 1,
+                },
                 region_id: None,
                 focusable: true,
                 focused: false,
@@ -212,7 +276,7 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
                 evidence: vec!["label-colon".to_string()],
                 source: "inferred".to_string(),
             });
-            consumed.push((f.x, f.x + f.label.len() as u16));
+            consumed.push((f.x, f.x + label_cols));
         }
 
         // 4) tabs
@@ -227,7 +291,7 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
         }
 
         // 5) menu items (skip if line already has a colon-field or button)
-        if !any_line_has_button_or_field {
+        if !line_has_button_or_field {
             for cand in recognizers::detect_menu_items(line, y) {
                 if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
                     continue;
@@ -251,7 +315,7 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
         }
 
         // 7) status (skip if line already produced a Button or Field)
-        if !any_line_has_button_or_field {
+        if !line_has_button_or_field {
             for cand in recognizers::detect_status(line, y) {
                 if overlaps_consumed(&consumed, cand.x, cand.x + cand.width) {
                     continue;
@@ -286,15 +350,41 @@ pub fn detect_controls(screen: &ScreenState, regions: &[Region]) -> Vec<Control>
         }
     }
 
-    // Region linking: assign region_id to each control
+    // Region linking: assign each control to the *smallest* region that
+    // contains it (re-review Wave-3 item 21). Regions nest (dialog ⊂ screen
+    // panel ⊂ …); taking the first hit binds controls to the outermost
+    // container, which wrecks region-scoped queries like "buttons in this
+    // dialog".
     for ctrl in &mut out {
+        let mut best: Option<&Region> = None;
         for region in regions {
-            if region_contains_point(&region.bounds, ctrl.bounds.x, ctrl.bounds.y) {
-                ctrl.region_id = Some(region.id.clone());
-                break;
+            if !region_contains_point(&region.bounds, ctrl.bounds.x, ctrl.bounds.y) {
+                continue;
             }
+            best = match best {
+                Some(current) => {
+                    let cur_area = current.bounds.width as u32 * current.bounds.height as u32;
+                    let new_area = region.bounds.width as u32 * region.bounds.height as u32;
+                    if new_area < cur_area {
+                        Some(region)
+                    } else {
+                        best
+                    }
+                }
+                None => Some(region),
+            };
         }
+        ctrl.region_id = best.map(|r| r.id.clone());
     }
+
+    // Finalize stable IDs: rebuild each control's ID anchored to its
+    // (now-known) containing region's stable path, then disambiguate
+    // duplicates across the whole screen (re-review Wave-3 item 16).
+    for ctrl in out.iter_mut() {
+        let region_path = ctrl.region_id.as_deref().filter(|p| !p.is_empty());
+        ctrl.id = stable_id(&ctrl.kind, &ctrl.label, region_path);
+    }
+    disambiguate_control_ids(&mut out);
 
     out
 }
@@ -343,24 +433,10 @@ fn overlaps_consumed(consumed: &[(u16, u16)], start: u16, end: u16) -> bool {
 }
 
 /// Create a Control from a Candidate with fixed fields.
-fn candidate_to_control(
-    c: &recognizers::Candidate,
-    y: u16,
-    source: &str,
-) -> Control {
-    let kind_str = format!("{:?}", c.kind).to_lowercase();
-    let sanitized: String = c.label
-        .to_lowercase()
-        .chars()
-        .filter(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '_')
-        .take(20)
-        .collect();
-    let sanitized = if sanitized.is_empty() {
-        "unnamed".to_string()
-    } else {
-        sanitized
-    };
-    let id = format!("{}:{}:{},{}", kind_str, sanitized, c.x, y);
+fn candidate_to_control(c: &recognizers::Candidate, y: u16, source: &str) -> Control {
+    // Placeholder ID: the stable geometry-free ID is rebuilt by the
+    // post-region pass at the end of detect_controls (item 16).
+    let id = stable_id(&c.kind, &c.label, None);
 
     let ev: Vec<String> = c.evidence.iter().map(|s| s.to_string()).collect();
     let evidence_refs: Vec<&str> = c.evidence.to_vec();
@@ -439,6 +515,11 @@ struct Toggle {
     kind: ControlKind,
     text: String,
     x: u16,
+    /// Derived from the glyph itself, not the kind: `[ ]` is an *unchecked*
+    /// checkbox, `[x]` checked; `( )` unselected radio, `(*)` selected
+    /// (re-review Wave-3 item 18 — the old `kind == Checkbox` test marked
+    /// both `[ ] Foo` and `[x] Foo` as checked).
+    checked: bool,
 }
 
 fn extract_toggle(line: &str) -> Vec<Toggle> {
@@ -449,15 +530,34 @@ fn extract_toggle(line: &str) -> Vec<Toggle> {
             continue;
         }
         let triple: String = chars[i..i + 3].iter().collect();
-        let kind = match triple.as_str() {
-            "( )" => ControlKind::Radio,
-            "(*) " | "(*)" => ControlKind::Radio,
-            "[ ]" => ControlKind::Checkbox,
-            "[x]" | "[X]" => ControlKind::Checkbox,
+        let (kind, checked) = match triple.as_str() {
+            "( )" => (ControlKind::Radio, false),
+            "(*)" => (ControlKind::Radio, true),
+            "[ ]" => (ControlKind::Checkbox, false),
+            "[x]" | "[X]" => (ControlKind::Checkbox, true),
             _ => continue,
         };
-        // text after the toggle glyph
-        let text: String = chars[(i + 3).min(chars.len())..]
+        // Label runs from the glyph's end until the next toggle glyph or a
+        // border glyph (re-review Wave-3 item 19): two toggles on one line
+        // ("[ ] A   [x] B") must not swallow the following glyph and label
+        // into the first one's text.
+        let mut end = chars.len();
+        let mut j = i + 3;
+        while j < chars.len() {
+            if j + 3 <= chars.len() {
+                let next: String = chars[j..j + 3].iter().collect();
+                if matches!(next.as_str(), "( )" | "(*)" | "[ ]" | "[x]" | "[X]") {
+                    end = j;
+                    break;
+                }
+            }
+            if is_border_glyph(chars[j]) {
+                end = j;
+                break;
+            }
+            j += 1;
+        }
+        let text: String = chars[(i + 3).min(end)..end]
             .iter()
             .collect::<String>()
             .trim()
@@ -466,9 +566,33 @@ fn extract_toggle(line: &str) -> Vec<Toggle> {
             kind,
             text,
             x: i as u16,
+            checked,
         });
     }
     out
+}
+
+/// Box-drawing glyphs that terminate a label span.
+fn is_border_glyph(c: char) -> bool {
+    matches!(
+        c,
+        '─' | '│'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '╔'
+            | '╗'
+            | '╚'
+            | '╝'
+            | '║'
+            | '═'
+    )
 }
 
 struct Field {
@@ -622,12 +746,193 @@ mod tests {
         assert_eq!(toggles[0].text, "Option");
     }
 
+    /// Wave-3 item 19: a toggle's label terminates at the next toggle glyph
+    /// (or a border) — two toggles on one line must not swallow each other.
+    #[test]
+    fn test_toggle_label_ends_at_next_toggle() {
+        let toggles = extract_toggle("[ ] Alpha   [x] Beta");
+        assert_eq!(toggles.len(), 2, "both glyphs detected");
+        assert_eq!(
+            toggles[0].text, "Alpha",
+            "first label must not contain the second glyph"
+        );
+        assert_eq!(toggles[1].text, "Beta");
+        assert!(!toggles[0].checked);
+        assert!(toggles[1].checked);
+    }
+
+    /// Item 19: a border glyph also terminates the label.
+    #[test]
+    fn test_toggle_label_ends_at_border() {
+        let toggles = extract_toggle("[x] Done │ status");
+        assert_eq!(toggles.len(), 1);
+        assert_eq!(toggles[0].text, "Done");
+    }
+
+    /// Item 22: bounds are measured in display columns, not UTF-8 bytes.
+    /// `[ 确定 ]` renders as 8 columns (brackets+spaces+4), not 10.
+    #[test]
+    fn test_button_bounds_are_display_columns() {
+        let screen = make_screen(vec!["[ 确定 ]".to_string()], 20);
+        let controls = detect_controls(&screen, &[]);
+        let btn = controls
+            .iter()
+            .find(|c| c.kind == ControlKind::Button)
+            .expect("button");
+        assert_eq!(btn.label, "确定");
+        assert_eq!(btn.bounds.x, 0);
+        assert_eq!(
+            btn.bounds.width, 2,
+            "label width in columns, was bytes (=6)"
+        );
+    }
+
+    /// Item 22: a wide-glyph prefix must not shift the x of later content —
+    /// viewport_text rows are column-aligned by CellString (each 界 gets a
+    /// filler space at its continuation column), so char index stays equal
+    /// to screen column. The fixture row is built by the same builder
+    /// `from_vt` uses.
+    #[test]
+    fn test_column_alignment_survives_wide_prefix() {
+        use crate::screen::CellString;
+        // 界 at cols 0 and 2 (continuations at 1 and 3), button at col 5.
+        let row = CellString::from_cells(vec![(0, "界"), (2, "界"), (5, "[ OK ]")], 12)
+            .as_str()
+            .to_string();
+        let screen = make_screen(vec![row], 20);
+        let controls = detect_controls(&screen, &[]);
+        let btn = controls
+            .iter()
+            .find(|c| c.kind == ControlKind::Button)
+            .expect("button");
+        assert_eq!(btn.label, "OK");
+        assert_eq!(
+            btn.bounds.x, 5,
+            "x is the screen column after two double-width glyphs"
+        );
+    }
+
     #[test]
     fn test_extract_toggle_radio() {
         let toggles = extract_toggle("( ) Choice");
         assert_eq!(toggles.len(), 1);
         assert_eq!(toggles[0].kind, ControlKind::Radio);
         assert_eq!(toggles[0].text, "Choice");
+    }
+
+    /// Wave-3 item 18: checked state comes from the glyph, not the kind.
+    /// `[ ] Foo` and `[x] Foo` are both checkboxes; only the latter is on.
+    #[test]
+    fn test_toggle_state_from_glyph() {
+        let unchecked = extract_toggle("[ ] Foo");
+        let checked = extract_toggle("[x] Foo");
+        let checked_upper = extract_toggle("[X] Foo");
+        assert!(!unchecked[0].checked, "[ ] must be unchecked");
+        assert!(checked[0].checked, "[x] must be checked");
+        assert!(checked_upper[0].checked, "[X] must be checked");
+
+        let radio_off = extract_toggle("( ) Mode");
+        let radio_on = extract_toggle("(*) Mode");
+        assert!(!radio_off[0].checked);
+        assert!(radio_on[0].checked);
+    }
+
+    /// The full-control surface: detect_controls reports the derived state.
+    #[test]
+    fn test_detect_controls_reports_checked_state() {
+        let screen = make_screen(
+            vec![
+                "[ ] Offline".to_string(),
+                "[x] Online".to_string(),
+                "(*) Fast".to_string(),
+            ],
+            40,
+        );
+        let controls = detect_controls(&screen, &[]);
+        let offline = controls
+            .iter()
+            .find(|c| c.label == "Offline")
+            .expect("offline");
+        let online = controls
+            .iter()
+            .find(|c| c.label == "Online")
+            .expect("online");
+        let fast = controls.iter().find(|c| c.label == "Fast").expect("fast");
+        assert!(!offline.checked);
+        assert!(online.checked);
+        assert!(fast.selected, "(*) is the selected radio option");
+        // `checked` reflects the glyph state for any toggle — including the
+        // `(*)` radio glyph — so both flags read true for a selected radio.
+        assert!(fast.checked);
+    }
+
+    /// Wave-3 item 20: a button on one row must not suppress menu recognition
+    /// on other rows. Under the old screen-global flag, `File Edit View Help`
+    /// lost its menu items the moment any other row carried a `[ Button ]`.
+    #[test]
+    fn test_menu_row_survives_button_elsewhere() {
+        let screen = make_screen(
+            vec![
+                "File  Edit  View  Help".to_string(),
+                "Header: value".to_string(),
+                "[ Save ]".to_string(),
+            ],
+            40,
+        );
+        let controls = detect_controls(&screen, &[]);
+        let menus: Vec<_> = controls
+            .iter()
+            .filter(|c| c.kind == ControlKind::MenuItem)
+            .collect();
+        assert!(
+            menus.iter().any(|m| m.label.contains("File")),
+            "menu bar items must be recognized even though another row has a button/field; got {:?}",
+            controls.iter().map(|c| (&c.kind, &c.label)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Wave-3 item 21: a control inside nested regions binds to the
+    /// innermost (smallest) container, not the first/largest hit.
+    #[test]
+    fn test_control_binds_to_smallest_containing_region() {
+        let screen = make_screen(vec!["".to_string(), "  [ Save ]".to_string()], 40);
+        let outer = crate::semantic::Region {
+            id: "region-outer".into(),
+            kind: crate::semantic::RegionKind::Panel,
+            title: None,
+            bounds: crate::semantic::regions::Bounds {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 10,
+            },
+            parent_id: None,
+            child_ids: vec![],
+            clipping_state: crate::semantic::ClippingState::None,
+            confidence: crate::semantic::Confidence::inferred(0.9, &["test"]),
+        };
+        let inner = crate::semantic::Region {
+            id: "region-dialog".into(),
+            kind: crate::semantic::RegionKind::Dialog,
+            title: None,
+            bounds: crate::semantic::regions::Bounds {
+                x: 2,
+                y: 0,
+                width: 20,
+                height: 4,
+            },
+            parent_id: Some("region-outer".into()),
+            child_ids: vec![],
+            clipping_state: crate::semantic::ClippingState::None,
+            confidence: crate::semantic::Confidence::inferred(0.9, &["test"]),
+        };
+        let controls = detect_controls(&screen, &[outer, inner]);
+        let save = controls.iter().find(|c| c.label == "Save").expect("save");
+        assert_eq!(
+            save.region_id.as_deref(),
+            Some("region-dialog"),
+            "Save lives in the dialog, not the outer panel"
+        );
     }
 
     #[test]
@@ -647,25 +952,63 @@ mod tests {
         assert!(!consumed.is_empty());
     }
 
+    /// Wave-3 item 16: IDs are geometry-free — same kind+label+region yields
+    /// the same ID regardless of coordinates.
     #[test]
     fn test_stable_id_deterministic() {
-        let id1 = stable_id(&ControlKind::Button, "Save", 10, 5);
-        let id2 = stable_id(&ControlKind::Button, "Save", 10, 5);
+        let id1 = stable_id(&ControlKind::Button, "Save", Some("dialog/settings"));
+        let id2 = stable_id(&ControlKind::Button, "Save", Some("dialog/settings"));
         assert_eq!(id1, id2);
-        assert_eq!(id1, "button:save:10,5");
+        assert_eq!(id1, "dialog/settings/button/save");
     }
 
+    /// The old scheme made position part of the ID; the new scheme must NOT.
     #[test]
-    fn test_stable_id_different_positions() {
-        let id1 = stable_id(&ControlKind::Button, "Save", 10, 5);
-        let id2 = stable_id(&ControlKind::Button, "Save", 20, 5);
-        assert_ne!(id1, id2);
+    fn test_stable_id_ignores_position() {
+        // Position is no longer an input at all — two buttons with the same
+        // label collide at ID level and are separated by the `#{n}` second
+        // pass, not by geometry.
+        let id1 = stable_id(&ControlKind::Button, "Save", None);
+        let id2 = stable_id(&ControlKind::Button, "Save", None);
+        assert_eq!(id1, id2, "geometry must not leak into IDs");
+        assert_eq!(id1, "button/save");
     }
 
     #[test]
     fn test_stable_id_sanitizes() {
-        let id = stable_id(&ControlKind::Field, "Host Name!", 0, 0);
-        assert_eq!(id, "field:hostname:0,0");
+        let id = stable_id(&ControlKind::Field, "Host Name!", None);
+        assert_eq!(id, "field/host-name");
+    }
+
+    /// Duplicate labels on one screen get `#{n}` disambiguators, not
+    /// coordinate suffixes.
+    #[test]
+    fn test_duplicate_labels_disambiguated() {
+        let screen = make_screen(vec!["[ Save ]".to_string(), "[ Save ]".to_string()], 40);
+        let controls = detect_controls(&screen, &[]);
+        let ids: Vec<&str> = controls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "duplicates must be distinct");
+        assert!(ids[0].starts_with("button/save"), "ids: {ids:?}");
+        assert!(ids[1].starts_with("button/save#2"), "ids: {ids:?}");
+    }
+
+    /// The point of the whole change: moving a control (resize/reflow) keeps
+    /// its ID stable.
+    #[test]
+    fn test_control_id_survives_resize() {
+        // Same label, different coordinates — the scenario resize produces.
+        let at_a = make_screen(
+            vec!["".to_string(), "".to_string(), "      [ Save ]".to_string()],
+            60,
+        );
+        let at_b = make_screen(vec!["[ Save ]".to_string()], 40);
+        let a = detect_controls(&at_a, &[]);
+        let b = detect_controls(&at_b, &[]);
+        let id_a = a.iter().find(|c| c.label == "Save").map(|c| c.id.clone());
+        let id_b = b.iter().find(|c| c.label == "Save").map(|c| c.id.clone());
+        assert_eq!(id_a, id_b, "resize must not change the control's ID");
+        assert_eq!(id_a.as_deref(), Some("button/save"));
     }
 
     /// Helper: build a ScreenState from rows.
@@ -674,7 +1017,9 @@ mod tests {
             cols,
             rows: rows.len() as u16,
             cursor: crate::screen::CursorState {
-                x: 0, y: 0, visible: true,
+                x: 0,
+                y: 0,
+                visible: true,
             },
             title: None,
             cells: Vec::new(),
@@ -700,7 +1045,12 @@ mod tests {
             id: id.to_string(),
             kind: crate::semantic::regions::RegionKind::Unknown,
             title: None,
-            bounds: Bounds { x, y, width: w, height: h },
+            bounds: Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
             confidence: Confidence::inferred(0.9, &["test-region"]),
             parent_id: None,
             child_ids: Vec::new(),
@@ -757,10 +1107,10 @@ mod tests {
     fn test_focusable_by_kind() {
         let screen = make_screen(
             vec![
-                "[ Save ]".to_string(),    // Button -> focusable
+                "[ Save ]".to_string(),        // Button -> focusable
                 "Host: localhost".to_string(), // Field -> focusable
-                "Status: OK".to_string(),       // Status -> not focusable
-                "[====>    ]".to_string(),  // Progress -> not focusable
+                "Status: OK".to_string(),      // Status -> not focusable
+                "[====>    ]".to_string(),     // Progress -> not focusable
             ],
             50,
         );
@@ -784,7 +1134,7 @@ mod tests {
         let screen = make_screen(
             vec![
                 "│ Host: localhost        │".to_string(), // inside region
-                "[ Save ]".to_string(),                     // inside region
+                "[ Save ]".to_string(),                   // inside region
             ],
             40,
         );

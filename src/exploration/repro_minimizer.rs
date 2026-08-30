@@ -6,10 +6,23 @@
 use serde::{Deserialize, Serialize};
 
 /// A single action in a reproduction trace.
+///
+/// Carries the full [`CanonicalAction`] (re-review: `{index, name}` could
+/// count an action but never replay it — coordinates, typed text, and
+/// modifiers were all lost). `index` preserves the position in the original
+/// trace so minimized reports still point at real steps; `name` is derived
+/// from the action via [`CanonicalAction::name`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReproAction {
     pub index: u32,
-    pub name: String,
+    pub action: crate::execution::CanonicalAction,
+}
+
+impl ReproAction {
+    /// Display/evidence name, delegated to the canonical action.
+    pub fn name(&self) -> &'static str {
+        self.action.name()
+    }
 }
 
 /// Result of a reproduction attempt.
@@ -133,9 +146,13 @@ where
         let mut yaml = String::from("schema: tui-lab/repro/v1\n");
         yaml.push_str(&format!("actions: {}\n", actions.len()));
         yaml.push_str("steps:\n");
-        for action in actions {
-            yaml.push_str(&format!("  - action: {}\n", action.name));
-            yaml.push_str(&format!("    index: {}\n", action.index));
+        for ra in actions {
+            yaml.push_str(&format!("  - action: {}\n", ra.name()));
+            yaml.push_str(&format!("    index: {}\n", ra.index));
+            // The replayable payload: the canonical action's tagged JSON.
+            if let Ok(json) = serde_json::to_string(&ra.action) {
+                yaml.push_str(&format!("    params: {}\n", json));
+            }
         }
         yaml
     }
@@ -144,12 +161,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::CanonicalAction;
 
     fn make_actions(n: u32) -> Vec<ReproAction> {
         (0..n)
             .map(|i| ReproAction {
                 index: i,
-                name: format!("action_{}", i),
+                action: CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Tab),
+                },
             })
             .collect()
     }
@@ -241,18 +261,25 @@ mod tests {
         let actions = vec![
             ReproAction {
                 index: 0,
-                name: "tab".into(),
+                action: CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Tab),
+                },
             },
             ReproAction {
                 index: 5,
-                name: "enter".into(),
+                action: CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Enter),
+                },
             },
         ];
 
         let yaml = minimizer.to_yaml(&actions);
         assert!(yaml.contains("schema: tui-lab/repro/v1"));
         assert!(yaml.contains("actions: 2"));
-        assert!(yaml.contains("tab"));
-        assert!(yaml.contains("enter"));
+        // Names come from the canonical action; the replayable payload is
+        // embedded as tagged JSON (Wave-2 item 10).
+        assert!(yaml.contains("action: key"));
+        assert!(yaml.contains(r#""kind":"key""#));
+        assert!(yaml.contains("index: 5"));
     }
 }

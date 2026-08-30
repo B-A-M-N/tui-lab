@@ -87,7 +87,8 @@ impl McpProc {
         let text = resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("no text content in {name} response: {resp}"));
-        serde_json::from_str(text).unwrap_or_else(|e| panic!("envelope parse for {name}: {e}: {text}"))
+        serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("envelope parse for {name}: {e}: {text}"))
     }
 }
 
@@ -126,11 +127,23 @@ fn stdio_e2e_full_lifecycle() {
         .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
     for expected in [
-        "tui_session", "tui_observe", "tui_act", "tui_wait", "tui_assert",
-        "tui_checkpoint", "tui_scenario", "tui_record", "tui_explore",
-        "tui_audit", "tui_coverage", "tui_framework",
+        "tui_session",
+        "tui_observe",
+        "tui_act",
+        "tui_wait",
+        "tui_assert",
+        "tui_checkpoint",
+        "tui_scenario",
+        "tui_record",
+        "tui_explore",
+        "tui_audit",
+        "tui_coverage",
+        "tui_framework",
     ] {
-        assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected} in {names:?}"
+        );
     }
 
     // --- start a real session ---
@@ -144,8 +157,14 @@ fn stdio_e2e_full_lifecycle() {
         }),
     );
     assert_eq!(start["category"], "success", "start failed: {start}");
-    let session = start["data"]["session"].as_str().expect("session id").to_string();
-    assert!(start["data"]["capabilities"].is_object(), "capabilities missing");
+    let session = start["data"]["session"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert!(
+        start["data"]["capabilities"].is_object(),
+        "capabilities missing"
+    );
 
     // --- observe: READY is on screen ---
     let obs = mcp.tool(
@@ -156,7 +175,25 @@ fn stdio_e2e_full_lifecycle() {
         .as_array()
         .map(|rows| rows.iter().filter_map(|r| r.as_str()).collect::<String>())
         .unwrap_or_default();
-    assert!(text.contains("READY"), "READY missing from observation: {obs}");
+    assert!(
+        text.contains("READY"),
+        "READY missing from observation: {obs}"
+    );
+    // --- observe mode=tree: hierarchical rendering (Wave-4) ---
+    let obs_tree = mcp.tool(
+        "tui_observe",
+        serde_json::json!({ "mode": "tree", "id": session }),
+    );
+    assert_eq!(obs_tree["category"], "success", "tree mode: {obs_tree}");
+    let rendered = obs_tree["data"]["rendered"].as_str().unwrap_or_default();
+    assert!(
+        rendered.contains("screen"),
+        "tree render must include the root node: {obs_tree}"
+    );
+    assert!(
+        obs_tree["data"]["tree"]["root"]["bounds"].is_object(),
+        "tree carries bounds: {obs_tree}"
+    );
 
     // --- act: type text + enter ---
     let act = mcp.tool(
@@ -194,7 +231,10 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(obs1["category"], "success", "diff 1: {obs1}");
     // Earlier observes already established a prior frame, and nothing changed
     // since: a real previous→current diff with no movement.
-    assert_eq!(obs1["data"]["since"], "previous_observation", "diff 1: {obs1}");
+    assert_eq!(
+        obs1["data"]["since"], "previous_observation",
+        "diff 1: {obs1}"
+    );
     assert_eq!(
         obs1["data"]["transition"]["before_structure_hash"],
         obs1["data"]["transition"]["after_structure_hash"],
@@ -210,7 +250,10 @@ fn stdio_e2e_full_lifecycle() {
             "args": ["-c", "print('FIRST'); import time; time.sleep(3); print('DELTA-7'); time.sleep(60)"] }),
     );
     assert_eq!(start_c["category"], "success", "session C start: {start_c}");
-    let sess_c = start_c["data"]["session"].as_str().expect("session c").to_string();
+    let sess_c = start_c["data"]["session"]
+        .as_str()
+        .expect("session c")
+        .to_string();
     // Baseline observation (FIRST on screen).
     let obs_c0 = mcp.tool(
         "tui_observe",
@@ -237,7 +280,10 @@ fn stdio_e2e_full_lifecycle() {
     assert!(tr.is_object(), "canonical Transition missing: {obs2}");
     // The canonical Transition shape (same as InteractionTransaction).
     assert!(tr["screen_diff"].is_object(), "screen_diff missing: {obs2}");
-    assert!(tr["semantic_diff"].is_object(), "semantic_diff missing: {obs2}");
+    assert!(
+        tr["semantic_diff"].is_object(),
+        "semantic_diff missing: {obs2}"
+    );
     assert_ne!(
         tr["before_structure_hash"], tr["after_structure_hash"],
         "async DELTA-7 changed the screen; hashes must differ: {tr}"
@@ -248,7 +294,10 @@ fn stdio_e2e_full_lifecycle() {
         all.contains("DELTA-7"),
         "screen_diff must surface the async DELTA-7 change: {tr}"
     );
-    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_c }));
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": sess_c }),
+    );
 
     // --- checkpoint save + compare ---
     let cp = mcp.tool(
@@ -261,7 +310,10 @@ fn stdio_e2e_full_lifecycle() {
         "tui_checkpoint",
         serde_json::json!({ "action": "compare", "name": "e2e-cp", "id": session }),
     );
-    assert_eq!(cp_compare["category"], "success", "compare failed: {cp_compare}");
+    assert_eq!(
+        cp_compare["category"], "success",
+        "compare failed: {cp_compare}"
+    );
 
     // --- scenario record lifecycle over real traffic ---
     // Recording identity is the returned id (names are display labels).
@@ -270,7 +322,10 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "record_start", "name": "e2e-flow", "id": session }),
     );
     assert_eq!(rec["category"], "success", "record_start failed: {rec}");
-    let rec_id = rec["data"]["recording_id"].as_str().expect("recording_id").to_string();
+    let rec_id = rec["data"]["recording_id"]
+        .as_str()
+        .expect("recording_id")
+        .to_string();
     assert!(
         rec_id.starts_with("rec-"),
         "recording id must be rec-<uuid>: {rec}"
@@ -288,14 +343,24 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(stop["category"], "success", "record_stop failed: {stop}");
     assert_eq!(stop["data"]["steps"], 1, "recorded steps: {stop}");
     assert_eq!(stop["data"]["recording_id"], rec_id.as_str());
+    // Saved scenarios have true ids (Wave-1 item 9): record_stop returns one
+    // and the list is keyed by id, not name.
+    let scen_id = stop["data"]["scenario_id"]
+        .as_str()
+        .expect("scenario_id")
+        .to_string();
+    assert!(scen_id.starts_with("scn-"), "scenario id shape: {stop}");
     // Ephemeral run: saved_to is honestly null, but the scenario must be
     // retained in the run context — listable and exportable.
     let list = mcp.tool("tui_scenario", serde_json::json!({ "action": "list" }));
     let listed = list["data"]["scenarios"]
         .as_array()
-        .map(|a| a.iter().any(|n| n.as_str() == Some("e2e-flow")))
+        .map(|a| a.iter().any(|n| n.as_str() == Some(scen_id.as_str())))
         .unwrap_or(false);
-    assert!(listed, "scenario must be listed after record_stop: {list}");
+    assert!(
+        listed,
+        "scenario must be listed by id after record_stop: {list}"
+    );
     let export = mcp.tool(
         "tui_scenario",
         serde_json::json!({ "action": "export", "name": "e2e-flow" }),
@@ -314,8 +379,14 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "start", "command": "python3",
             "args": ["-c", "import time; time.sleep(60)"] }),
     );
-    assert_eq!(start_b["category"], "success", "session B start failed: {start_b}");
-    let sess_b = start_b["data"]["session"].as_str().expect("session b").to_string();
+    assert_eq!(
+        start_b["category"], "success",
+        "session B start failed: {start_b}"
+    );
+    let sess_b = start_b["data"]["session"]
+        .as_str()
+        .expect("session b")
+        .to_string();
 
     let rec_a = mcp.tool(
         "tui_scenario",
@@ -340,7 +411,10 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "mode": "diff", "id": sess_b }),
     );
     assert_eq!(obs_b1["category"], "success", "diff B1: {obs_b1}");
-    assert_eq!(obs_b1["data"]["since"], "previous_observation", "diff B1: {obs_b1}");
+    assert_eq!(
+        obs_b1["data"]["since"], "previous_observation",
+        "diff B1: {obs_b1}"
+    );
     let trb = &obs_b1["data"]["transition"];
     assert_eq!(
         trb["before_structure_hash"], trb["after_structure_hash"],
@@ -369,22 +443,37 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "record_stop", "recording_id": id_a }),
     );
     assert_eq!(stop_a["category"], "success", "stop A: {stop_a}");
-    assert_eq!(stop_a["data"]["steps"], 1, "A must hold ONLY its own act: {stop_a}");
-        let a_step = stop_a["data"]["scenario"]["steps"][0].to_string();
+    assert_eq!(
+        stop_a["data"]["steps"], 1,
+        "A must hold ONLY its own act: {stop_a}"
+    );
+    let a_step = stop_a["data"]["scenario"]["steps"][0].to_string();
     assert!(a_step.contains("\"tab\""), "A steps: {a_step}");
-    assert!(!a_step.contains("escape"), "A absorbed B's traffic: {a_step}");
+    assert!(
+        !a_step.contains("escape"),
+        "A absorbed B's traffic: {a_step}"
+    );
 
     let stop_b = mcp.tool(
         "tui_scenario",
         serde_json::json!({ "action": "record_stop", "recording_id": id_b }),
     );
     assert_eq!(stop_b["category"], "success", "stop B: {stop_b}");
-    assert_eq!(stop_b["data"]["steps"], 1, "B must hold ONLY its own act: {stop_b}");
+    assert_eq!(
+        stop_b["data"]["steps"], 1,
+        "B must hold ONLY its own act: {stop_b}"
+    );
     let b_step = stop_b["data"]["scenario"]["steps"][0].to_string();
     assert!(b_step.contains("escape"), "B steps: {b_step}");
-    assert!(!b_step.contains("\"tab\""), "B absorbed A's traffic: {b_step}");
+    assert!(
+        !b_step.contains("\"tab\""),
+        "B absorbed A's traffic: {b_step}"
+    );
 
-    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_b }));
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": sess_b }),
+    );
 
     // --- scenario replay through MCP (regression path: record → run) ---
     // Record a real scenario: the child echoes typed text, so the assert
@@ -394,7 +483,10 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "start", "command": "python3",
             "args": ["-c", "import time; time.sleep(60)"] }),
     );
-    assert_eq!(start_r["category"], "success", "replay target start: {start_r}");
+    assert_eq!(
+        start_r["category"], "success",
+        "replay target start: {start_r}"
+    );
     let sess_r = start_r["data"]["session"].as_str().unwrap().to_string();
 
     let rec_r = mcp.tool(
@@ -411,7 +503,10 @@ fn stdio_e2e_full_lifecycle() {
         "tui_assert",
         serde_json::json!({ "assertion": "text", "text": "regression-marker", "id": sess_r }),
     );
-    assert_eq!(asrt_r["category"], "success", "recorded assert must pass: {asrt_r}");
+    assert_eq!(
+        asrt_r["category"], "success",
+        "recorded assert must pass: {asrt_r}"
+    );
     let stop_r = mcp.tool(
         "tui_scenario",
         serde_json::json!({ "action": "record_stop", "recording_id": id_r }),
@@ -436,13 +531,19 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "start", "command": "python3",
             "args": ["-c", "import time; time.sleep(60)"] }),
     );
-    assert_eq!(start_r2["category"], "success", "replay target 2: {start_r2}");
+    assert_eq!(
+        start_r2["category"], "success",
+        "replay target 2: {start_r2}"
+    );
     let sess_r2 = start_r2["data"]["session"].as_str().unwrap().to_string();
     let run_ok2 = mcp.tool(
         "tui_scenario",
         serde_json::json!({ "action": "run", "name": "echo-flow", "id": sess_r2 }),
     );
-    assert_eq!(run_ok2["category"], "success", "run cross-session: {run_ok2}");
+    assert_eq!(
+        run_ok2["category"], "success",
+        "run cross-session: {run_ok2}"
+    );
     assert_eq!(
         run_ok2["data"]["passed"], true,
         "same-app fresh session must pass: {run_ok2}"
@@ -457,13 +558,22 @@ fn stdio_e2e_full_lifecycle() {
                 { "kind": "assert", "assertion": "text", "text": "never-appears-xyz" }
             ] }),
     );
-    assert_eq!(save_fail["category"], "success", "save failing scenario: {save_fail}");
+    assert_eq!(
+        save_fail["category"], "success",
+        "save failing scenario: {save_fail}"
+    );
     let run_bad = mcp.tool(
         "tui_scenario",
         serde_json::json!({ "action": "run", "name": "failing-flow", "id": sess_r2 }),
     );
-    assert_eq!(run_bad["category"], "success", "transport stays success: {run_bad}");
-    assert_eq!(run_bad["data"]["passed"], false, "regression must be detected: {run_bad}");
+    assert_eq!(
+        run_bad["category"], "success",
+        "transport stays success: {run_bad}"
+    );
+    assert_eq!(
+        run_bad["data"]["passed"], false,
+        "regression must be detected: {run_bad}"
+    );
     assert_eq!(run_bad["data"]["steps_total"], 1);
     assert_eq!(run_bad["data"]["steps_failed"], 1, "{run_bad}");
     // The failure detail must name the expectation, not say "executed".
@@ -473,17 +583,32 @@ fn stdio_e2e_full_lifecycle() {
         "assert detail must state the expectation: {detail}"
     );
 
-    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_r }));
-    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_r2 }));
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": sess_r }),
+    );
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": sess_r2 }),
+    );
 
     // --- recording lifecycle (PTY boundary) ---
-    let rstart = mcp.tool("tui_record", serde_json::json!({ "format": "start", "id": session }));
-    assert_eq!(rstart["category"], "success", "record start failed: {rstart}");
+    let rstart = mcp.tool(
+        "tui_record",
+        serde_json::json!({ "format": "start", "id": session }),
+    );
+    assert_eq!(
+        rstart["category"], "success",
+        "record start failed: {rstart}"
+    );
     let _ = mcp.tool(
         "tui_act",
         serde_json::json!({ "action": "key", "key": "x", "id": session }),
     );
-    let rstop = mcp.tool("tui_record", serde_json::json!({ "format": "stop", "id": session }));
+    let rstop = mcp.tool(
+        "tui_record",
+        serde_json::json!({ "format": "stop", "id": session }),
+    );
     assert_eq!(rstop["category"], "success", "record stop failed: {rstop}");
     assert!(
         rstop["data"]["events"].as_u64().unwrap_or(0) > 0,
@@ -517,18 +642,32 @@ fn stdio_e2e_full_lifecycle() {
         let rep = &ex["data"]["report"];
         // Ordered step record present (item 12).
         let steps = rep["steps"].as_array().expect("steps array");
-        assert_eq!(steps.len() as u64, rep["actions_run"].as_u64().unwrap_or(99));
+        assert_eq!(
+            steps.len() as u64,
+            rep["actions_run"].as_u64().unwrap_or(99)
+        );
         for (i, s) in steps.iter().enumerate() {
             assert_eq!(s["seq"], i as u64, "steps must be ordered: {s}");
             assert!(s["action"].is_string(), "step action: {s}");
-            assert!(s["before"].is_string() && s["after"].is_string(), "step identity: {s}");
+            assert!(
+                s["before"].is_string() && s["after"].is_string(),
+                "step identity: {s}"
+            );
         }
         // Real completion reason, never a generic "completed" (item 13).
         let reason = rep["completion_reason"].as_str().expect("reason");
         assert!(
-            ["action_budget", "time_budget", "relaunch_budget", "depth_budget",
-             "unique_state_budget", "clean_exit", "failure", "cancelled"]
-                .contains(&reason),
+            [
+                "action_budget",
+                "time_budget",
+                "relaunch_budget",
+                "depth_budget",
+                "unique_state_budget",
+                "clean_exit",
+                "failure",
+                "cancelled"
+            ]
+            .contains(&reason),
             "unknown completion reason: {reason}"
         );
         // 5 actions requested, budget default max_actions=50 → action_budget.
@@ -542,25 +681,41 @@ fn stdio_e2e_full_lifecycle() {
             !edges.is_empty(),
             "explorer must record transitions into the run graph: {graph}"
         );
-        let actions_seen: Vec<&str> = edges
-            .iter()
-            .filter_map(|e| e[2].as_str())
-            .collect();
+        let actions_seen: Vec<&str> = edges.iter().filter_map(|e| e[2].as_str()).collect();
         assert!(
             actions_seen.iter().all(|a| !a.starts_with("step-")),
             "no synthetic step-N edges allowed: {actions_seen:?}"
         );
         assert!(
-            actions_seen.iter().any(|a| ["tab", "down", "up", "enter", "escape",
-                "left", "right", "pageup", "pagedown", "home", "end", "space",
-                "shift+tab"].contains(a)),
+            actions_seen.iter().any(|a| [
+                "tab",
+                "down",
+                "up",
+                "enter",
+                "escape",
+                "left",
+                "right",
+                "pageup",
+                "pagedown",
+                "home",
+                "end",
+                "space",
+                "shift+tab"
+            ]
+            .contains(a)),
             "edges must carry real action names: {actions_seen:?}"
         );
-        let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sess_e }));
+        let _ = mcp.tool(
+            "tui_session",
+            serde_json::json!({ "action": "stop", "id": sess_e }),
+        );
     }
 
     // --- audit: static profile through stdio ---
-    let audit = mcp.tool("tui_audit", serde_json::json!({ "profile": "focus", "id": session }));
+    let audit = mcp.tool(
+        "tui_audit",
+        serde_json::json!({ "profile": "focus", "id": session }),
+    );
     assert_eq!(audit["category"], "success", "audit failed: {audit}");
     assert!(audit["data"]["findings"].is_array());
 
@@ -568,7 +723,10 @@ fn stdio_e2e_full_lifecycle() {
     // → same identity, durable artifacts → close ---
     let st0 = mcp.tool("tui_run", serde_json::json!({ "action": "status" }));
     assert_eq!(st0["category"], "success", "run status: {st0}");
-    assert_eq!(st0["data"]["mode"], "ephemeral", "startup must be ephemeral: {st0}");
+    assert_eq!(
+        st0["data"]["mode"], "ephemeral",
+        "startup must be ephemeral: {st0}"
+    );
     assert!(
         st0["data"]["artifact_root"].is_null(),
         "ephemeral run has no artifact root: {st0}"
@@ -577,7 +735,10 @@ fn stdio_e2e_full_lifecycle() {
     assert!(run_id.starts_with("run-"), "run id shape: {run_id}");
     // sessions array present (live session list from the manager).
     assert!(
-        st0["data"]["sessions"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        st0["data"]["sessions"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "status must list live sessions: {st0}"
     );
     // Real work happened before persist (checkpoints, scenario, transactions).
@@ -626,13 +787,18 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(persist["category"], "success", "persist: {persist}");
     assert_eq!(persist["data"]["persistent"], true);
     assert_eq!(
-        persist["data"]["run_id"], run_id.as_str(),
+        persist["data"]["run_id"],
+        run_id.as_str(),
         "promotion must preserve run identity"
     );
-    let artifact_root = persist["data"]["artifact_root"].as_str().expect("root").to_string();
+    let artifact_root = persist["data"]["artifact_root"]
+        .as_str()
+        .expect("root")
+        .to_string();
     let expected_root = explicit_runs.join(&run_id);
     assert_eq!(
-        std::path::Path::new(&artifact_root), expected_root,
+        std::path::Path::new(&artifact_root),
+        expected_root,
         "explicit runs-dir root must hold the run directly: {persist}"
     );
     // Durable artifacts actually on disk.
@@ -665,12 +831,18 @@ fn stdio_e2e_full_lifecycle() {
     assert!(
         cast_count > 0,
         "held recording must be flushed at promotion: {:?}",
-        std::fs::read_dir(&recordings_dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
+        std::fs::read_dir(&recordings_dir).map(|d| d
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>())
     );
 
     // Status now reports persistent.
     let st1 = mcp.tool("tui_run", serde_json::json!({ "action": "status" }));
-    assert_eq!(st1["data"]["mode"], "persistent", "status after persist: {st1}");
+    assert_eq!(
+        st1["data"]["mode"], "persistent",
+        "status after persist: {st1}"
+    );
     assert_eq!(st1["data"]["artifact_root"], artifact_root.as_str());
 
     // Close: flushes + marks closed; sessions survive (kill_sessions unset).
@@ -681,7 +853,10 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(close["category"], "success", "close: {close}");
     assert_eq!(close["data"]["closed"], true);
     assert!(
-        close["data"]["sessions_stopped"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        close["data"]["sessions_stopped"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "explicit kill_sessions must stop sessions: {close}"
     );
     // Manifest on disk records closure.
@@ -693,6 +868,9 @@ fn stdio_e2e_full_lifecycle() {
     let _ = std::fs::remove_dir_all(&persist_root);
 
     // --- stop session ---
-    let stop = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": session }));
+    let stop = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": session }),
+    );
     assert_eq!(stop["category"], "success", "stop failed: {stop}");
 }

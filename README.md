@@ -62,12 +62,23 @@ the stored launch spec.
 ### tui_observe
 Observe terminal state.
 
-**Modes:** `summary`, `screen`, `cells`, `semantic`, `diff`, `scrollback`
+**Modes:** `summary`, `screen`, `cells`, `semantic`, `tree`, `diff`, `scrollback`
 
 `diff` compares the previous observation to the current one through the one
 canonical `screen::diff`, returning the same `Transition` shape as
 `tui_act` (screen + semantic diff). A session with no prior frame reports
 `since: null` honestly instead of diffing a frame with itself.
+
+`tree` returns the hierarchical terminal-state tree: regions nested per
+containment, controls inside their regions with state flags, focus, and
+screen-level components (tables, trees, scrollbars) attached — the
+machine-readable shape to compare against an intended design. `rendered`
+is an indented text view for logs.
+
+The `semantic` payload includes the Wave-4 semantic surfaces: `affordances`
+(actionable capabilities with their visible cues), `components` (detected
+tables/trees/scrollbars), and `relationships` (normalized spatial relations
+keyed by stable IDs with re-derivable geometry reasons).
 
 ### tui_act
 Drive keyboard/mouse input. Returns a screen transition.
@@ -176,8 +187,8 @@ integrated until the real MCP path can exercise it.
 |-----------|-------|
 | Terminal PTY | working |
 | Screen parsing | working |
-| Keyboard | working |
-| Mouse | working (encoding conformance-tested) |
+| Keyboard | working (legacy + xterm modified-navigation `CSI 1;<m>`; kitty protocol not implemented — SUPER rejected) |
+| Mouse | working (SGR/X10/UTF-8 byte-conformance-tested: press/release/move/drag/wheel) |
 | Resize | working (single-record, backend-owned) |
 | State waits | working (causality-anchored) |
 | Semantic model | v2 (border graph) |

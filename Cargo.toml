@@ -19,7 +19,7 @@ serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }  # KeyModifiers serializes with CanonicalAction
 
 # Terminal engine substrate (Rust-native, spec section 36/37 fallback).
 # tui-test-rs (beta, in rewrite) is kept behind a feature flag and is NOT
@@ -30,6 +30,7 @@ anyhow = "1.0.104"
 regex = "1"
 rand = "0.8"
 blake3 = "1"      # durable, cross-version content hashes (spec section 18)
+unicode-width = "0.2"  # display-width arithmetic for column-accurate rows (item 22)
 uuid = "1"        # collision-resistant session ids (spec section 12)
 libc = "0.2"      # Unix process-group signal delivery (spec section 7)
 toml = "0.8"      # parse Cargo.toml manifests properly (spec section 64)

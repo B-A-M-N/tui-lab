@@ -44,11 +44,7 @@ pub struct ScenarioRecording {
 }
 
 impl ScenarioRecording {
-    pub fn new(
-        name: impl Into<String>,
-        session_id: impl Into<String>,
-        generation: u32,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, session_id: impl Into<String>, generation: u32) -> Self {
         let name = name.into();
         ScenarioRecording {
             id: ScenarioRecordingId::generate(),

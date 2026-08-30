@@ -160,7 +160,7 @@ impl From<vt100::MouseProtocolEncoding> for MouseEncoding {
 /// A typed key event with modifiers (spec section 6). Replaces the fragile
 /// `String` key parsing that could not even encode `ctrl+c` (`"ctrl+c"` is
 /// six characters, so `s.len() == 3` never matched).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
     pub code: KeyCode,
     pub modifiers: KeyModifiers,
@@ -178,7 +178,7 @@ impl KeyEvent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyCode {
     Char(char),
     Enter,
@@ -200,7 +200,7 @@ pub enum KeyCode {
 
 bitflags::bitflags! {
     /// Keyboard modifier flags (spec section 6).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct KeyModifiers: u8 {
         const NONE = 0;
         const CTRL = 1;
@@ -224,7 +224,7 @@ impl KeyModifiers {
 
 /// Typed mouse button (spec section 5). The MCP boundary must normalize the
 /// numeric button into this enum rather than forwarding an arbitrary `u8`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -245,7 +245,7 @@ impl MouseButton {
 
 /// A typed mouse event (spec section 5). The backend encoder translates this
 /// into the negotiated protocol bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEvent {
     Press {
         button: MouseButton,
@@ -273,7 +273,7 @@ pub enum MouseEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollDirection {
     Up,
     Down,
@@ -318,7 +318,7 @@ pub enum Input {
 ///     name the concept they mean.
 ///   * `interaction_seq` — +1 whenever any user-observable event fires
 ///     (screen_seq, bell, or title).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct TerminalEventState {
     pub output_seq: u64,
     pub screen_seq: u64,
@@ -414,7 +414,8 @@ pub trait RecordingHook: Send + Sync + 'static {
 /// Shared slot through which a [`RecordingHook`] is attached to a backend.
 /// The PTY reader thread keeps a clone of the slot and locks it per chunk, so
 /// a hook can be attached/detached while a session is running.
-pub type RecordingHookSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn RecordingHook>>>>;
+pub type RecordingHookSlot =
+    std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn RecordingHook>>>>;
 
 /// Create an empty recording hook slot.
 pub fn new_recording_hook_slot() -> RecordingHookSlot {
@@ -423,6 +424,10 @@ pub fn new_recording_hook_slot() -> RecordingHookSlot {
 
 /// The reason a wait resolved (spec section 1). Hermes should know *what*
 /// condition resolved and what state existed when it did.
+///
+/// Re-review P0: kept for backwards compatibility, but new code should
+/// prefer [`CaptureReason`] which has the full reason taxonomy and
+/// supports action/scenario/audit/replay paths uniformly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {
     Text,
@@ -436,6 +441,73 @@ pub enum WaitReason {
     Timeout,
 }
 
+/// The reason a capture or wait resolved. Unified taxonomy shared by waits,
+/// actions, scenarios, audits, and replay (re-review P0).
+///
+/// Existing `WaitReason` is a strict subset; new code paths should emit a
+/// `CaptureReason` directly. `From` conversions preserve compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureReason {
+    /// A screen settled to stable for the required quiet interval.
+    Settled,
+    /// A screen-change was detected.
+    ScreenChanged,
+    /// The watched text appeared on screen.
+    TextMatched,
+    /// The watched text disappeared from screen.
+    TextAbsent,
+    /// The child process exited.
+    ProcessExit,
+    /// The terminal bell rang.
+    Bell,
+    /// The terminal title changed.
+    Title,
+    /// No output for the configured idle interval.
+    Idle,
+    /// The output channel closed (pipe EOF, terminal disconnected).
+    OutputClosed,
+    /// The wait deadline elapsed without any other reason triggering.
+    Deadline,
+    /// The wait was cancelled by the caller.
+    Cancelled,
+}
+
+impl From<WaitReason> for CaptureReason {
+    fn from(w: WaitReason) -> Self {
+        match w {
+            WaitReason::Text => CaptureReason::TextMatched,
+            WaitReason::TextAbsent => CaptureReason::TextAbsent,
+            WaitReason::ScreenChange => CaptureReason::ScreenChanged,
+            WaitReason::ScreenStable => CaptureReason::Settled,
+            WaitReason::ProcessExit => CaptureReason::ProcessExit,
+            WaitReason::Title => CaptureReason::Title,
+            WaitReason::Bell => CaptureReason::Bell,
+            WaitReason::Idle => CaptureReason::Idle,
+            WaitReason::Timeout => CaptureReason::Deadline,
+        }
+    }
+}
+
+impl From<CaptureReason> for WaitReason {
+    fn from(c: CaptureReason) -> Self {
+        match c {
+            CaptureReason::TextMatched => WaitReason::Text,
+            CaptureReason::TextAbsent => WaitReason::TextAbsent,
+            CaptureReason::ScreenChanged => WaitReason::ScreenChange,
+            CaptureReason::Settled => WaitReason::ScreenStable,
+            CaptureReason::ProcessExit => WaitReason::ProcessExit,
+            CaptureReason::Bell => WaitReason::Bell,
+            CaptureReason::Title => WaitReason::Title,
+            CaptureReason::Idle => WaitReason::Idle,
+            CaptureReason::Deadline => WaitReason::Timeout,
+            // OutputClosed/Cancelled are not representable in the older
+            // WaitReason enum — map them to Idle as the closest fallback.
+            CaptureReason::OutputClosed => WaitReason::Idle,
+            CaptureReason::Cancelled => WaitReason::Idle,
+        }
+    }
+}
+
 /// Richer wait result replacing the bare `bool` (spec section 1).
 #[derive(Debug, Clone)]
 pub struct WaitOutcome {
@@ -445,4 +517,160 @@ pub struct WaitOutcome {
     pub screen_seq: u64,
     pub output_seq: u64,
     pub state: ScreenState,
+}
+
+/// The unified capture result, shared by waits, actions, scenarios, audits,
+/// and replay (re-review P0). The frame field is the **authoritative**
+/// matching frame — the screen state captured at the moment the reason
+/// condition resolved, NOT a separate `observe()` call afterwards.
+#[derive(Debug, Clone)]
+pub struct CaptureOutcome {
+    /// The condition that triggered capture.
+    pub reason: CaptureReason,
+    /// Whether the desired condition was met (`true`) or the wait timed out
+    /// / was cancelled (`false`).
+    pub met: bool,
+    /// Sequence number of the screen at capture time.
+    pub screen_seq: u64,
+    /// Sequence number of the output stream at capture time.
+    pub output_seq: u64,
+    /// The frame that satisfied the capture (or the last seen frame on a
+    /// timeout). For `met: true`, this is the authoritative matching frame.
+    pub frame: ScreenState,
+    /// Elapsed time in milliseconds from anchor to capture.
+    pub elapsed_ms: u64,
+}
+
+impl CaptureOutcome {
+    /// Lift a `WaitOutcome` into the new `CaptureOutcome` shape.
+    pub fn from_wait(o: WaitOutcome) -> Self {
+        CaptureOutcome {
+            reason: o.reason.into(),
+            met: o.met,
+            screen_seq: o.screen_seq,
+            output_seq: o.output_seq,
+            frame: o.state,
+            elapsed_ms: o.elapsed_ms,
+        }
+    }
+}
+
+/// The canonical frame exchanged by transactions, replay, and audit
+/// evidence (re-review P0). Wraps [`ScreenState`] with a stable identity
+/// so frames can be referenced across runs and tools without recomputing
+/// hashes. The underlying [`ScreenState::structure_hash`] remains the
+/// de-duplication key.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalFrame {
+    /// The screen at the moment the frame was captured.
+    pub state: ScreenState,
+    /// Screen sequence number at capture time.
+    pub screen_seq: u64,
+    /// Output sequence number at capture time.
+    pub output_seq: u64,
+    /// Optional monotonic id for cross-run referencing.
+    pub frame_id: Option<u64>,
+}
+
+impl CanonicalFrame {
+    /// Wrap a `ScreenState` plus its sequence numbers into a canonical frame.
+    pub fn new(state: ScreenState, screen_seq: u64, output_seq: u64) -> Self {
+        CanonicalFrame {
+            state,
+            screen_seq,
+            output_seq,
+            frame_id: None,
+        }
+    }
+
+    /// Convenience: the structure hash used as the canonical key.
+    pub fn key(&self) -> &str {
+        &self.state.structure_hash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::{CursorState, ProcessState};
+
+    fn empty_state(hash: &str) -> ScreenState {
+        ScreenState {
+            cols: 80,
+            rows: 24,
+            cursor: CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
+            title: None,
+            cells: vec![],
+            viewport_text: vec![],
+            scrollback: vec![],
+            raw_hash: "r".into(),
+            visual_hash: "v".into(),
+            structure_hash: hash.into(),
+            process: ProcessState {
+                running: true,
+                exit_code: None,
+                exit_signal: None,
+                cwd: None,
+                pid: None,
+            },
+        }
+    }
+
+    #[test]
+    fn capture_reason_round_trips_through_wait_reason() {
+        for r in [
+            CaptureReason::Settled,
+            CaptureReason::ScreenChanged,
+            CaptureReason::TextMatched,
+            CaptureReason::TextAbsent,
+            CaptureReason::ProcessExit,
+            CaptureReason::Bell,
+            CaptureReason::Title,
+            CaptureReason::Idle,
+            CaptureReason::OutputClosed,
+            CaptureReason::Deadline,
+            CaptureReason::Cancelled,
+        ] {
+            let w: WaitReason = r.into();
+            let back: CaptureReason = w.into();
+            // OutputClosed/Cancelled map to Idle on the WaitReason side;
+            // everything else is a stable round-trip.
+            if matches!(r, CaptureReason::OutputClosed | CaptureReason::Cancelled) {
+                assert!(matches!(back, CaptureReason::Idle));
+            } else {
+                assert_eq!(back, r, "round-trip for {:?}", r);
+            }
+        }
+    }
+
+    #[test]
+    fn capture_outcome_from_wait_carries_frame() {
+        let mut frame = empty_state("abc");
+        frame.viewport_text = vec!["hello".into()];
+        let wait = WaitOutcome {
+            met: true,
+            elapsed_ms: 42,
+            reason: WaitReason::ScreenStable,
+            screen_seq: 11,
+            output_seq: 7,
+            state: frame,
+        };
+        let cap = CaptureOutcome::from_wait(wait);
+        assert!(cap.met);
+        assert_eq!(cap.elapsed_ms, 42);
+        assert_eq!(cap.frame.structure_hash, "abc");
+        assert_eq!(cap.screen_seq, 11);
+        assert_eq!(cap.output_seq, 7);
+        assert!(matches!(cap.reason, CaptureReason::Settled));
+    }
+
+    #[test]
+    fn canonical_frame_key_uses_structure_hash() {
+        let frame = CanonicalFrame::new(empty_state("hash42"), 0, 0);
+        assert_eq!(frame.key(), "hash42");
+    }
 }
