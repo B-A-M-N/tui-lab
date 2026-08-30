@@ -11,27 +11,34 @@ use rmcp::tool_router;
 use rmcp::ServerHandler;
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{
-    build_input_from_request, build_wait, checkpoints, err, err_continued, ok, run_assertion,
-    scenarios, write_cast,
-};
+use crate::mcp::helpers::{build_input_from_request, build_wait, err, err_continued, ok, run_assertion};
 use crate::mcp::params::*;
 use crate::screen::diff;
 use crate::semantic;
 use crate::session::SessionManager;
 use rmcp::handler::server::wrapper::Parameters;
 
-/// Shared MCP state: the session manager. Serialized by Hermes (no parallel calls).
-#[derive(Clone, Default)]
+/// Shared MCP state: the session manager plus the run context (composition
+/// root for checkpoints, scenarios, recordings, findings, exploration graph —
+/// audit item: "Run/Artifact Model"). Serialized by Hermes (no parallel calls).
+#[derive(Clone)]
 pub struct TuiLabServer {
     manager: Arc<std::sync::Mutex<SessionManager>>,
+    run: Arc<std::sync::Mutex<crate::run::RunContext>>,
 }
 
 impl TuiLabServer {
     pub fn new() -> Self {
         TuiLabServer {
             manager: Arc::new(std::sync::Mutex::new(SessionManager::new())),
+            run: Arc::new(std::sync::Mutex::new(crate::run::RunContext::ephemeral())),
         }
+    }
+}
+
+impl Default for TuiLabServer {
+    fn default() -> Self {
+        TuiLabServer::new()
     }
 }
 
@@ -309,6 +316,17 @@ impl TuiLabServer {
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
         let tr = diff(&before, &after);
+        // Scenario recording in progress? Append this act (audit: scenarios
+        // capture real tool traffic; sensitive payloads are not recorded).
+        if !p.sensitive() {
+            let mut run = self.run.lock().unwrap();
+            for name in run.active_recordings() {
+                run.record_scenario_act(
+                    &name,
+                    serde_json::to_value(&p).unwrap_or_default(),
+                );
+            }
+        }
         ok(json!({
             "action": p.action_name(),
             "transition": tr,
@@ -332,22 +350,33 @@ impl TuiLabServer {
             None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),
         };
         match sess.wait(cond, p.budget_ms.unwrap_or(5000)) {
-            Ok(out) => ok(json!({
-                "met": out.met,
-                "timeout": !out.met,
-                "reason": format!("{:?}", out.reason),
-                "elapsed_ms": out.elapsed_ms,
-                "screen_seq": out.screen_seq,
-                "output_seq": out.output_seq,
-                "state": {
-                    "structure_hash": out.state.structure_hash,
-                    "visual_hash": out.state.visual_hash,
-                    "process": {
-                        "running": out.state.process.running,
-                        "exit_code": out.state.process.exit_code,
+            Ok(out) => {
+                {
+                    let mut run = self.run.lock().unwrap();
+                    for name in run.active_recordings() {
+                        run.record_scenario_wait(
+                            &name,
+                            serde_json::to_value(&p).unwrap_or_default(),
+                        );
+                    }
+                }
+                ok(json!({
+                    "met": out.met,
+                    "timeout": !out.met,
+                    "reason": format!("{:?}", out.reason),
+                    "elapsed_ms": out.elapsed_ms,
+                    "screen_seq": out.screen_seq,
+                    "output_seq": out.output_seq,
+                    "state": {
+                        "structure_hash": out.state.structure_hash,
+                        "visual_hash": out.state.visual_hash,
+                        "process": {
+                            "running": out.state.process.running,
+                            "exit_code": out.state.process.exit_code,
+                        },
                     },
-                },
-            })),
+                }))
+            }
             Err(e) => err(ErrorCategory::BackendError, e.to_string()),
         }
     }
@@ -369,6 +398,12 @@ impl TuiLabServer {
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
         let (passed, detail, invalid) = run_assertion(&p, &screen);
+        {
+            let mut run = self.run.lock().unwrap();
+            for name in run.active_recordings() {
+                run.record_scenario_assert(&name, serde_json::to_value(&p).unwrap_or_default());
+            }
+        }
         if passed {
             ok(json!({ "passed": true, "assertion": p.assertion }))
         } else if let Some(ErrorCategory::InvalidRequest) = invalid {
@@ -387,33 +422,50 @@ impl TuiLabServer {
     )]
     async fn tui_checkpoint(&self, p: Parameters<TuiCheckpointParams>) -> String {
         let p = p.0;
+        // Resolve session first (all actions except a bare list still need a
+        // live session; list is per-session scoped, defaulting to active).
+        let mut mgr = self.manager.lock().unwrap();
+        let session_id = match mgr.resolve(p.id.as_deref()) {
+            Ok(s) => s.id.clone(),
+            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+        };
+        let mut run = self.run.lock().unwrap();
         match p.action.as_str() {
-            "list" => ok(
-                json!({ "checkpoints": checkpoints().lock().unwrap().keys().collect::<Vec<_>>() }),
-            ),
+            "list" => ok(json!({ "checkpoints": run.checkpoints.list(&session_id) })),
             "save" => {
-                let mut mgr = self.manager.lock().unwrap();
-                let sess = match mgr.resolve_mut(p.id.as_deref()) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                let (generation, screen, sem) = {
+                    let sess = match mgr.get_mut(&session_id) {
+                        Ok(s) => s,
+                        Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                    };
+                    let screen = match sess.observe(40) {
+                        Ok(s) => s,
+                        Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                    };
+                    let sem = semantic::analyze(&screen);
+                    (sess.generation, screen, sem)
                 };
-                let screen = match sess.observe(40) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-                };
-                let name = p
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| screen.structure_hash.clone());
-                checkpoints()
-                    .lock()
-                    .unwrap()
-                    .insert(name.clone(), screen.structure_hash.clone());
-                ok(json!({ "name": name, "structure_hash": screen.structure_hash }))
+                let name = run.checkpoints.save(
+                    &session_id,
+                    generation,
+                    p.name.clone(),
+                    &screen,
+                    Some(&sem),
+                );
+                ok(json!({
+                    "name": name,
+                    "structure_hash": screen.structure_hash,
+                    "visual_hash": screen.visual_hash,
+                    "focus": sem.focus.control,
+                    "controls": sem.controls.len(),
+                }))
             }
             "compare" => {
-                let mut mgr = self.manager.lock().unwrap();
-                let sess = match mgr.resolve_mut(p.id.as_deref()) {
+                let name = match &p.name {
+                    Some(n) => n.clone(),
+                    None => return err(ErrorCategory::InvalidRequest, "compare requires 'name'"),
+                };
+                let sess = match mgr.get_mut(&session_id) {
                     Ok(s) => s,
                     Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
                 };
@@ -421,15 +473,13 @@ impl TuiLabServer {
                     Ok(s) => s,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
-                match p
-                    .name
-                    .as_ref()
-                    .and_then(|n| checkpoints().lock().unwrap().get(n).cloned())
-                {
-                    Some(prev) => {
-                        ok(json!({ "name": p.name, "match": prev == screen.structure_hash }))
+                let sem = semantic::analyze(&screen);
+                match run.checkpoints.compare(&session_id, &name, &screen, Some(&sem)) {
+                    Ok(json_out) => json_out,
+                    Err(ErrorCategory::InvalidRequest) => {
+                        err(ErrorCategory::InvalidRequest, "no such checkpoint")
                     }
-                    None => err(ErrorCategory::InvalidRequest, "no such checkpoint"),
+                    Err(c) => err(c, "checkpoint comparison failed"),
                 }
             }
             "delete" => {
@@ -437,7 +487,7 @@ impl TuiLabServer {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "delete requires 'name'"),
                 };
-                let removed = checkpoints().lock().unwrap().remove(&name).is_some();
+                let removed = run.checkpoints.delete(&session_id, &name);
                 ok(json!({ "name": name, "deleted": removed }))
             }
             other => err(
@@ -454,26 +504,97 @@ impl TuiLabServer {
     )]
     async fn tui_scenario(&self, p: Parameters<TuiScenarioParams>) -> String {
         let p = p.0;
+        let mut run = self.run.lock().unwrap();
         match p.action.as_str() {
             "list" => {
-                ok(json!({ "scenarios": scenarios().lock().unwrap().keys().collect::<Vec<_>>() }))
+                let recorded = run.active_recordings();
+                let saved = run.list_saved_scenarios().unwrap_or_default();
+                ok(json!({ "recordings_in_progress": recorded, "scenarios": saved }))
             }
+            // begin a recording: subsequent tui_act / tui_wait / tui_assert
+            // calls with the same recording name append steps (audit item:
+            // scenarios must record real tool traffic, not be hand-authored).
+            "record_start" => {
+                let name = p.name.clone().unwrap_or_else(|| "scenario".into());
+                if run.begin_scenario_recording(&name) {
+                    ok(json!({ "recording": name, "started": true }))
+                } else {
+                    err(
+                        ErrorCategory::InvalidRequest,
+                        format!("already recording scenario '{}'", name),
+                    )
+                }
+            }
+            // finish + persist; returns the serialized Scenario
+            "record_stop" => {
+                let name = match &p.name {
+                    Some(n) => n.clone(),
+                    None => {
+                        return err(ErrorCategory::InvalidRequest, "record_stop requires 'name'")
+                    }
+                };
+                match run.finish_scenario_recording(&name) {
+                    Some(scenario) => {
+                        let path: Option<String> = run
+                            .save_scenario(&scenario)
+                            .ok()
+                            .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
+                        ok(json!({
+                            "name": scenario.name,
+                            "steps": scenario.step_count(),
+                            "saved_to": path,
+                            "scenario": serde_json::to_value(&scenario).unwrap_or_default(),
+                        }))
+                    }
+                    None => err(
+                        ErrorCategory::InvalidRequest,
+                        format!("no recording in progress named '{}'", name),
+                    ),
+                }
+            }
+            // explicit save of hand-authored steps (validated through the
+            // Scenario model rather than stored as opaque JSON)
             "save" => {
                 let name = p.name.clone().unwrap_or_else(|| "scenario".into());
                 let steps = p.steps.clone().unwrap_or_default();
-                scenarios().lock().unwrap().insert(name.clone(), steps);
-                ok(
-                    json!({ "name": name, "steps": scenarios().lock().unwrap().get(&name).unwrap().len() }),
-                )
+                let mut recorder = crate::scenario::recorder::ScenarioRecorder::new(name.clone());
+                for s in &steps {
+                    let kind = s
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("act")
+                        .to_string();
+                    let params = s.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                    match kind.as_str() {
+                        "act" => recorder.record_act(params),
+                        "wait" => recorder.record_wait(params),
+                        "assert" => recorder.record_assert(params),
+                        other => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                format!("unknown step kind '{}' (act|wait|assert)", other),
+                            )
+                        }
+                    }
+                }
+                let scenario = recorder.build();
+                let count = scenario.step_count();
+                let path: Option<String> = run
+                    .save_scenario(&scenario)
+                    .ok()
+                    .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
+                ok(json!({ "name": name, "steps": count, "saved_to": path }))
             }
             "export" => {
                 let name = match &p.name {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "export requires name"),
                 };
-                match scenarios().lock().unwrap().get(&name) {
-                    Some(s) => ok(json!({ "name": name, "scenario": s })),
-                    None => err(ErrorCategory::InvalidRequest, "no such scenario"),
+                match run.load_scenario(&name) {
+                    Ok(scenario) => ok(
+                        json!({ "name": name, "scenario": serde_json::to_value(&scenario).unwrap_or_default() }),
+                    ),
+                    Err(e) => err(ErrorCategory::InvalidRequest, format!("no such scenario: {}", e)),
                 }
             }
             other => err(
@@ -496,21 +617,74 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        match p.format.as_deref().unwrap_or("cast") {
-            "cast" => {
-                let screen = match sess.observe(40) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-                };
-                let out = write_cast(&screen);
-                ok(
-                    json!({ "format": "cast", "event_count": out.len(), "note": "asciinema v3 NDJSON events buffered" }),
-                )
+        match p.format.as_deref().unwrap_or("start") {
+            // Attach the raw PTY hook (audit item 24): every byte the reader
+            // thread sees from now on is captured with timing.
+            "start" => {
+                sess.enable_recording(false);
+                ok(json!({
+                    "recording": "started",
+                    "boundary": "pty-bytes",
+                    "note": "output is captured at the raw PTY byte boundary; call format=stop to flush to a .cast file"
+                }))
             }
+            // Detach + write the .cast into the run's recordings dir.
+            "stop" => {
+                sess.disable_recording();
+                let rec = match sess.recorder() {
+                    Some(r) => r.clone(),
+                    None => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            "no recording in progress (call format=start first)",
+                        )
+                    }
+                };
+                let (events, ndjson) = {
+                    let r = rec.lock().expect("recorder");
+                    (r.event_count(), r.to_ndjson())
+                };
+                let run = self.run.lock().unwrap();
+                let path = match run.run_dir() {
+                    Some(dir) => {
+                        let rec_dir = dir.join("recordings");
+                        let _ = std::fs::create_dir_all(&rec_dir);
+                        let file = rec_dir.join(format!(
+                            "{}-{}.cast",
+                            sess.id,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0)
+                        ));
+                        match std::fs::write(&file, ndjson.join("\n") + "\n") {
+                            Ok(()) => Some(file.to_string_lossy().to_string()),
+                            Err(e) => {
+                                return err(
+                                    ErrorCategory::BackendError,
+                                    format!("recording flush failed: {}", e),
+                                )
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                ok(json!({
+                    "recording": "stopped",
+                    "events": events,
+                    "saved_to": path,
+                    "note": path.is_none().then(|| "ephemeral run: content returned inline, not persisted".to_string()),
+                    "inline_events": path.is_none().then_some(ndjson),
+                }))
+            }
+            "cast" => err(
+                ErrorCategory::InvalidRequest,
+                "format='cast' is not a lifecycle action; use format=start then format=stop (produces asciinema v3 .cast)",
+            ),
             other => err(
                 ErrorCategory::Unsupported,
                 format!(
-                    "recording format '{}' is not implemented by the current backend; only 'cast' (asciinema v3) is available",
+                    "recording format '{}' is not implemented by the current backend; only the pty-boundary .cast lifecycle (start/stop) is available",
                     other
                 ),
             ),
@@ -548,9 +722,72 @@ impl TuiLabServer {
                     sess.enable_recording(false);
                 }
                 match crate::exploration::random::run(sess, seed, actions, recording_path) {
-                    Ok(report) => ok(json!({ "seed": seed, "report": report })),
+                    Ok(report) => {
+                        // Feed the observed structure hashes into the run's
+                        // state graph (consecutive hashes become transitions;
+                        // the pool does not name targets, so transitions carry
+                        // the action sequence index).
+                        let graph_summary = {
+                            let mut run = self.run.lock().unwrap();
+                            let mut prev: Option<&str> = None;
+                            for (i, h) in report.structure_hashes.iter().enumerate() {
+                                run.state_graph.record_state(h, None, i as u64);
+                                if let Some(p) = prev {
+                                    if p != h {
+                                        run.state_graph
+                                            .record_transition(p, h, &format!("step-{}", i));
+                                    }
+                                }
+                                prev = Some(h.as_str());
+                            }
+                            json!({
+                                "states": run.state_graph.state_count(),
+                                "transitions": run.state_graph.transition_count(),
+                                "dead_ends": run.state_graph.find_dead_ends().len(),
+                            })
+                        };
+                        // Persist the graph when the run is persistent.
+                        let graph_path = {
+                            let run = self.run.lock().unwrap();
+                            match run.run_dir() {
+                                Some(dir) => {
+                                    let path = dir.join("state_graph.json");
+                                    let payload = json!({
+                                        "edges": run.state_graph.edge_list(),
+                                        "visit_counts": run.state_graph.visit_counts(),
+                                        "known_states": run.state_graph.known_states(),
+                                    });
+                                    std::fs::write(&path, payload.to_string())
+                                        .ok()
+                                        .map(|_| path.to_string_lossy().to_string())
+                                }
+                                None => None,
+                            }
+                        };
+                        ok(json!({
+                            "seed": seed,
+                            "report": report,
+                            "state_graph": graph_summary,
+                            "state_graph_path": graph_path,
+                        }))
+                    }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
+            }
+            "state_graph" => {
+                let run = self.run.lock().unwrap();
+                ok(json!({
+                    "states": run.state_graph.state_count(),
+                    "transitions": run.state_graph.transition_count(),
+                    "dead_ends": run.state_graph
+                        .find_dead_ends()
+                        .into_iter()
+                        .map(|n| n.structure_hash.clone())
+                        .collect::<Vec<String>>(),
+                    "edges": run.state_graph.edge_list(),
+                    "visit_counts": run.state_graph.visit_counts(),
+                    "budget_exhausted": run.state_graph.budget_exhausted(),
+                }))
             }
             other => err(
                 ErrorCategory::InvalidRequest,
@@ -571,13 +808,47 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        let screen = match sess.observe(40) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+        let profile = p.profile.as_deref().unwrap_or("full").to_string();
+
+        // Active profiles drive the app through the session and observe real
+        // transitions (audit items 52-55). Static profiles read one frame.
+        let active = matches!(
+            profile.as_str(),
+            "keyboard" | "focus" | "resize" | "clipping" | "layout"
+        );
+        let (findings, mode) = if active {
+            let fs = match profile.as_str() {
+                "keyboard" => crate::audit::driver::keyboard_audit(sess, 20),
+                "focus" => crate::audit::driver::focus_audit(sess),
+                "resize" | "layout" => crate::audit::driver::resize_audit(sess),
+                "clipping" => crate::audit::driver::clipping_audit(sess),
+                _ => unreachable!("guarded by `active`"),
+            };
+            (fs, "active")
+        } else {
+            let screen = match sess.observe(40) {
+                Ok(s) => s,
+                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+            };
+            let sem = semantic::analyze(&screen);
+            (
+                crate::audit::run(&profile, &screen, &sem),
+                "static",
+            )
         };
-        let sem = semantic::analyze(&screen);
-        let findings = crate::audit::run(p.profile.as_deref().unwrap_or("full"), &screen, &sem);
-        ok(json!({ "profile": p.profile, "findings": findings }))
+
+        // Findings accumulate in the run context (composition root) so a
+        // later audit/coverage query can see prior evidence.
+        {
+            let mut run = self.run.lock().unwrap();
+            run.extend_findings(findings.clone());
+        }
+        ok(json!({
+            "profile": profile,
+            "mode": mode,
+            "finding_count": findings.len(),
+            "findings": findings,
+        }))
     }
 
     /// Coverage (spec section 5). Backed by `tuicov` when present; reports
