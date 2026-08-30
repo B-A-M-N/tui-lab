@@ -50,6 +50,13 @@ pub struct RunContext {
     /// run (so ephemeral runs still list/export); persistence to the run dir
     /// is an artifact layer on top, not the source of truth.
     saved_scenarios: HashMap<String, crate::scenario::model::Scenario>,
+    /// Completed PTY recordings retained in memory (run promotion must carry
+    /// them into the durable root even when they were stopped while
+    /// ephemeral). Keyed by suggested file name.
+    held_recordings: Vec<(String, String)>,
+    /// Focus-transition ledger: (unix_ms, session, from, to) recorded from
+    /// semantic analysis of every observation. The run's focus graph.
+    focus_transitions: Vec<(u64, String, Option<String>, Option<String>)>,
     /// Exploration state graph (owned here so audits/exploration share it).
     pub state_graph: StateGraph,
     /// Findings emitted during this run (audit results).
@@ -73,6 +80,8 @@ impl RunContext {
             checkpoints: CheckpointStore::new(),
             recorders: HashMap::new(),
             saved_scenarios: HashMap::new(),
+            held_recordings: Vec::new(),
+            focus_transitions: Vec::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
             findings: Vec::new(),
             transaction_count: 0,
@@ -323,6 +332,45 @@ impl RunContext {
         Ok(())
     }
 
+    /// Retain a completed PTY recording in run memory. When the run is (or
+    /// becomes) persistent, `flush` writes it under `recordings/`.
+    pub fn hold_recording(&mut self, file_name: String, ndjson: String) {
+        self.held_recordings.push((file_name, ndjson));
+    }
+
+    /// Recordings held in memory (name + event count preview).
+    pub fn held_recordings(&self) -> Vec<serde_json::Value> {
+        self.held_recordings
+            .iter()
+            .map(|(name, body)| {
+                json!({
+                    "file": name,
+                    "events": body.lines().count().saturating_sub(1),
+                })
+            })
+            .collect()
+    }
+
+    /// Record one focus transition observed during any session's traffic
+    /// (the run's focus graph, one entry per semantic focus change).
+    pub fn record_focus_transition(
+        &mut self,
+        session_id: &str,
+        from: Option<String>,
+        to: Option<String>,
+    ) {
+        if from == to {
+            return;
+        }
+        self.focus_transitions
+            .push((now_ms(), session_id.to_string(), from, to));
+    }
+
+    /// The focus-transition ledger.
+    pub fn focus_transitions(&self) -> &[(u64, String, Option<String>, Option<String>)] {
+        &self.focus_transitions
+    }
+
     /// Whether the run is marked closed (`tui_run close`).
     pub fn is_closed(&self) -> bool {
         self.closed
@@ -405,6 +453,24 @@ impl RunContext {
         let tmp = dir.join("state_graph.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&graph)?)?;
         std::fs::rename(&tmp, dir.join("state_graph.json"))?;
+        // Focus graph.
+        let ftmp = dir.join("focus_graph.json.tmp");
+        std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.focus_transitions)?)?;
+        std::fs::rename(&ftmp, dir.join("focus_graph.json"))?;
+        // Recordings held in memory (stopped while ephemeral).
+        let rec_dir = dir.join("recordings");
+        std::fs::create_dir_all(&rec_dir)?;
+        let mut still_held = Vec::new();
+        for (name, body) in std::mem::take(&mut self.held_recordings) {
+            // Names come from the recorder (session id + millis): already
+            // path-safe, so preserve them verbatim rather than re-sanitizing
+            // (which would rewrite '.' to '_').
+            match std::fs::write(rec_dir.join(&name), &body) {
+                Ok(()) => {}
+                Err(_) => still_held.push((name, body)),
+            }
+        }
+        self.held_recordings = still_held;
         // Findings.
         let fdir = dir.join("findings");
         std::fs::create_dir_all(&fdir)?;
@@ -470,6 +536,8 @@ impl RunContext {
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.saved_scenarios.len(),
             "findings": self.findings.len(),
+            "held_recordings": self.held_recordings.len(),
+            "focus_transitions": self.focus_transitions.len(),
             "state_graph_states": self.state_graph.state_count(),
             "state_graph_transitions": self.state_graph.transition_count(),
         })
@@ -633,6 +701,37 @@ mod tests {
         let mut eph = RunContext::ephemeral();
         eph.close().expect("ephemeral close");
         assert!(eph.is_closed() && eph.run_dir().is_none());
+    }
+
+    #[test]
+    fn ephemeral_recording_survives_promotion() {
+        let base = tempfile::tempdir().expect("base");
+        let mut run = RunContext::ephemeral();
+        // Recording stopped while ephemeral: held in memory, not on disk.
+        run.hold_recording("sess-A-123.cast".to_string(), "x\ny\n".to_string());
+        assert_eq!(run.held_recordings().len(), 1);
+        let root = run.promote(base.path()).expect("promote");
+        let written = root.join("recordings").join("sess-A-123.cast");
+        assert!(written.exists(), "held recording flushed at promotion");
+        let body = std::fs::read_to_string(written).expect("body");
+        assert_eq!(body, "x\ny\n");
+        assert!(run.held_recordings().is_empty(), "flush drains the hold");
+    }
+
+    #[test]
+    fn focus_transitions_record_and_flush() {
+        let base = tempfile::tempdir().expect("base");
+        let mut run = RunContext::ephemeral();
+        run.record_focus_transition("s", None, Some("file".into()));
+        run.record_focus_transition("s", Some("file".into()), Some("file".into()));
+        run.record_focus_transition("s", Some("file".into()), Some("menu".into()));
+        // No-op transitions (unchanged focus) are not recorded.
+        assert_eq!(run.focus_transitions().len(), 2);
+        let root = run.promote(base.path()).expect("promote");
+        let body =
+            std::fs::read_to_string(root.join("focus_graph.json")).expect("focus graph");
+        assert!(body.contains("\"menu\""), "ledger persisted: {body}");
+        assert!(run.counts()["focus_transitions"].as_u64() >= Some(2));
     }
 
     #[test]
