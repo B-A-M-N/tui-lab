@@ -68,46 +68,96 @@ fn scenario_recorder_builds_scenario() {
 
 #[test]
 fn scenario_runner_executes_steps() {
+    // The runner must actually EXECUTE steps through the canonical executor:
+    // the act's keystroke must reach the child and the assert must run
+    // against the real screen — not the old fabricated "(true, act step
+    // executed)" placeholders.
     let scenario = Scenario::new("runner-test")
-        .act(serde_json::json!({"action": "key", "key": "enter"}))
+        .act(serde_json::json!({"action": "type", "text": "echo hi"}))
+        .wait(serde_json::json!({"condition": "screen_stable", "budget_ms": 2000}))
         .assert(serde_json::json!({"assertion": "text", "text": "test"}));
 
     let mut mgr = tui_lab::session::SessionManager::new();
-    let args: Vec<String> = vec!["-c".into(), "print('test')".into()];
+    let args: Vec<String> = vec!["-c".into(), "print('test'); import time; time.sleep(10)".into()];
     let id = mgr
         .start("python3", &args, None, &[], 80, 24, "auto", "local")
         .expect("start");
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
     let report = ScenarioRunner::run(&scenario, sess, |_params, _screen| {
-        (true, "mock assertion passed".into())
+        unreachable!("assertion_fn is legacy; runner evaluates via run_assertion")
     });
 
     assert_eq!(report.scenario_name, "runner-test");
-    assert_eq!(report.steps_total, 2);
-    assert_eq!(report.steps_passed, 2);
-    assert_eq!(report.steps_failed, 0);
+    assert_eq!(report.steps_total, 3);
+    assert_eq!(
+        report.steps_failed,
+        0,
+        "all steps must pass against the real session: {:?}",
+        report.step_results
+    );
+    // The act step detail must show real execution, not the old placeholder.
+    assert!(
+        report.step_results[0].detail.contains("act executed, settled="),
+        "act detail: {}",
+        report.step_results[0].detail
+    );
 }
 
 #[test]
 fn scenario_runner_detects_failures() {
+    // A failing assertion must produce a real failure with real detail.
     let scenario = Scenario::new("fail-test")
-        .act(serde_json::json!({"action": "key", "key": "enter"}))
+        .act(serde_json::json!({"action": "type", "text": "hello"}))
         .assert(serde_json::json!({"assertion": "text", "text": "never_matches"}));
 
     let mut mgr = tui_lab::session::SessionManager::new();
-    let args: Vec<String> = vec!["-c".into(), "print('test')".into()];
+    let args: Vec<String> = vec!["-c".into(), "print('test'); import time; time.sleep(10)".into()];
     let id = mgr
         .start("python3", &args, None, &[], 80, 24, "auto", "local")
         .expect("start");
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
     let report = ScenarioRunner::run(&scenario, sess, |_params, _screen| {
-        (false, "mock assertion failed".into())
+        unreachable!("assertion_fn is legacy; runner evaluates via run_assertion")
     });
 
     assert_eq!(report.steps_total, 2);
-    assert_eq!(report.steps_passed, 1);
-    assert_eq!(report.steps_failed, 1);
-    assert_eq!(report.step_results[1].detail, "mock assertion failed");
+    assert_eq!(report.steps_passed, 1, "act passes: {:?}", report.step_results);
+    assert_eq!(report.steps_failed, 1, "assert must fail for real: {:?}", report.step_results);
+    assert!(
+        report.step_results[1].detail.contains("never_matches"),
+        "assert detail must state the expectation: {}",
+        report.step_results[1].detail
+    );
+}
+
+#[test]
+fn scenario_runner_actually_sends_input() {
+    // The strongest form of the re-review item-4 requirement: a scenario
+    // that types text must make that text appear in the child's terminal.
+    let scenario = Scenario::new("type-test")
+        .act(serde_json::json!({"action": "type", "text": "marker-xyz"}));
+
+    let mut mgr = tui_lab::session::SessionManager::new();
+    let args: Vec<String> = vec!["-c".into(), "import time; time.sleep(10)".into()];
+    let id = mgr
+        .start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .expect("start");
+
+    let sess = mgr.resolve_mut(Some(&id)).unwrap();
+    let report = ScenarioRunner::run(&scenario, sess, |_params, _screen| {
+        unreachable!("assertion_fn is legacy")
+    });
+    assert_eq!(report.steps_failed, 0, "{:?}", report.step_results);
+
+    let screen = mgr.resolve_mut(Some(&id)).unwrap().observe(40).unwrap();
+    assert!(
+        screen
+            .viewport_text
+            .iter()
+            .any(|r| r.contains("marker-xyz")),
+        "typed text must reach the PTY (terminal echo): {:?}",
+        screen.viewport_text
+    );
 }

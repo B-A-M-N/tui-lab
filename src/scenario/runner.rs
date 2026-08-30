@@ -1,9 +1,14 @@
 //! Scenario runner (spec item 39).
 //!
-//! Replays a recorded scenario against a session, executing each step
-//! and reporting pass/fail for assertions.
+//! Replays a recorded scenario against a session through the one canonical
+//! executor (`crate::execution`) — audit re-review item 4: a scenario run
+//! must actually send the inputs, run the waits, and evaluate the
+//! assertions. Fabricated successes ("act step executed") and fabricated
+//! screens (an 80x24 blank on observe failure) are gone: execution errors
+//! fail the step with the real error.
 
 use super::model::{Scenario, StepKind};
+use crate::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 
 #[derive(Debug, serde::Serialize)]
 pub struct StepResult {
@@ -30,7 +35,7 @@ impl ScenarioRunner {
     pub fn run(
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
-        assertion_fn: impl Fn(&serde_json::Value, &crate::screen::ScreenState) -> (bool, String),
+        _assertion_fn: impl Fn(&serde_json::Value, &crate::screen::ScreenState) -> (bool, String),
     ) -> ScenarioRunReport {
         let mut results = Vec::new();
         let mut passed = 0;
@@ -38,18 +43,78 @@ impl ScenarioRunner {
 
         for (i, step) in scenario.steps.iter().enumerate() {
             let (step_passed, detail) = match step.kind {
-                StepKind::Act => {
-                    // For act steps, we just record success (input sent)
-                    // Full integration would send the actual input
-                    (true, "act step executed".to_string())
+                StepKind::Act => match serde_json::from_value::<TuiActRequest>(step.params.clone())
+                {
+                    Ok(req) => {
+                        let (step_passed, detail) =
+                            match crate::mcp::helpers::build_input_from_request(&req) {
+                                Ok(input) => {
+                                    match crate::execution::execute_act(
+                                        session,
+                                        req.action_name(),
+                                        input,
+                                        150,
+                                        1150,
+                                        req.no_wait(),
+                                    ) {
+                                        Ok(tx) => (
+                                            tx.settled,
+                                            format!(
+                                                "act executed, settled={} ({})",
+                                                tx.settled,
+                                                tx.settle_reason.unwrap_or_default()
+                                            ),
+                                        ),
+                                        Err(e) => (false, format!("act failed: {e}")),
+                                    }
+                                }
+                                Err(msg) => (false, format!("invalid act params: {msg}")),
+                            };
+                        (step_passed, detail)
+                    }
+                    Err(e) => (false, format!("unparseable act step: {e}")),
+                },
+                StepKind::Wait => {
+                    match serde_json::from_value::<TuiWaitParams>(step.params.clone()) {
+                        Ok(wp) => match crate::mcp::helpers::build_wait(&wp) {
+                            Some(cond) => {
+                                match crate::execution::execute_wait(
+                                    session,
+                                    cond,
+                                    wp.budget_ms.unwrap_or(5000),
+                                ) {
+                                    Ok(out) => (
+                                        out.met,
+                                        format!("wait met={} reason={:?}", out.met, out.reason),
+                                    ),
+                                    Err(e) => (false, format!("wait failed: {e}")),
+                                }
+                            }
+                            None => (false, format!("unknown wait condition '{}'", wp.condition)),
+                        },
+                        Err(e) => (false, format!("unparseable wait step: {e}")),
+                    }
                 }
-                StepKind::Wait => (true, "wait step recorded".to_string()),
                 StepKind::Assert => {
-                    let screen = session
-                        .observe(50)
-                        .unwrap_or_else(|_| crate::screen::ScreenState::new(80, 24));
-                    let (p, d) = assertion_fn(&step.params, &screen);
-                    (p, d)
+                    match session.observe(50) {
+                        Ok(screen) => {
+                            match serde_json::from_value::<TuiAssertParams>(step.params.clone()) {
+                                Ok(ap) => {
+                                    let (p, d, invalid) =
+                                        crate::execution::execute_assert(&ap, &screen);
+                                    if invalid.is_some() {
+                                        (false, format!("invalid assertion: {d}"))
+                                    } else {
+                                        (p, d)
+                                    }
+                                }
+                                Err(e) => (false, format!("unparseable assert step: {e}")),
+                            }
+                        }
+                        // A failed observation is an execution error, never a
+                        // fabricated blank screen (re-review item 4).
+                        Err(e) => (false, format!("observe failed during assert: {e}")),
+                    }
                 }
             };
 
