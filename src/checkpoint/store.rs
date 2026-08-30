@@ -72,6 +72,9 @@ impl CheckpointStore {
             created_at: now_millis(),
         };
         self.next_seq += 1;
+        if let Err(e) = self.persist(session_id, &cp) {
+            eprintln!("tui-lab: checkpoint persistence failed for '{}': {}", name, e);
+        }
         self.checkpoints
             .entry(session_id.to_string())
             .or_default()
@@ -151,6 +154,76 @@ impl CheckpointStore {
             .map(|m| m.contains_key(name))
             .unwrap_or(false)
     }
+
+    /// Persist one checkpoint to `<run_dir>/<session_id>/<name>.json`.
+    ///
+    /// Called by `save()` when a run dir is configured; failures are
+    /// non-fatal (the in-memory copy remains authoritative) but are
+    /// returned so the caller can report degraded persistence honestly.
+    fn persist(&self, session_id: &str, cp: &Checkpoint) -> std::io::Result<()> {
+        let Some(dir) = &self.run_dir else {
+            return Ok(()); // ephemeral run: nothing to do
+        };
+        let dir = std::path::Path::new(dir).join(sanitize_segment(session_id));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.json", sanitize_segment(&cp.name)));
+        let tmp = dir.join(format!(
+            "{}.json.tmp-{}",
+            sanitize_segment(&cp.name),
+            std::process::id()
+        ));
+        let json = serde_json::to_vec_pretty(cp)?;
+        fs::write(&tmp, &json)?;
+        fs::rename(&tmp, &path) // atomic
+    }
+
+    /// Load all persisted checkpoints for a session from the run dir into
+    /// memory. Idempotent; unknown/corrupt files are skipped.
+    pub fn load_session(&mut self, session_id: &str) -> usize {
+        let Some(dir) = &self.run_dir else {
+            return 0;
+        };
+        let dir = std::path::Path::new(dir).join(sanitize_segment(session_id));
+        let mut loaded = 0;
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(cp) = serde_json::from_slice::<Checkpoint>(&bytes) else {
+                continue;
+            };
+            // Keep the sequence counter ahead of anything loaded.
+            self.next_seq = self.next_seq.max(cp.sequence + 1);
+            self.checkpoints
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(cp.name.clone(), cp);
+            loaded += 1;
+        }
+        loaded
+    }
+}
+
+/// Filesystem-safe segment: alphanumerics, `-`, `_`, `.`; everything else
+/// becomes `_`. Bounded to 80 chars.
+fn sanitize_segment(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .take(80)
+        .collect();
+    if cleaned.is_empty() {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn now_millis() -> u64 {
@@ -158,4 +231,77 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen() -> crate::screen::ScreenState {
+        crate::screen::ScreenState {
+            cols: 10,
+            rows: 3,
+            cursor: crate::screen::CursorState { x: 0, y: 0, visible: true },
+            title: None,
+            cells: Vec::new(),
+            viewport_text: vec!["hi".to_string(), "".to_string(), "".to_string()],
+            scrollback: Vec::new(),
+            raw_hash: "r1".into(),
+            visual_hash: "v1".into(),
+            structure_hash: "s1".into(),
+            process: crate::screen::ProcessState {
+                running: true,
+                exit_code: None,
+                exit_signal: None,
+                cwd: None,
+                pid: None,
+            },
+        }
+    }
+
+    #[test]
+    fn checkpoint_save_persists_and_loads_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "tui-lab-cp-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let session = "sess-1";
+        let name = {
+            let mut store = CheckpointStore::with_run_dir(dir.to_string_lossy().to_string());
+            store.save(session, 0, Some("before".into()), &screen(), None)
+        };
+        // Fresh store over the same dir must see the persisted checkpoint.
+        let mut store2 = CheckpointStore::with_run_dir(dir.to_string_lossy().to_string());
+        assert_eq!(store2.load_session(session), 1, "one checkpoint loaded");
+        assert!(store2.contains(session, &name));
+        let list = store2.list(session);
+        assert_eq!(list, vec!["before".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_ephemeral_store_skips_persistence() {
+        let mut store = CheckpointStore::new();
+        let n = store.save("s", 0, None, &screen(), None);
+        assert!(store.contains("s", &n));
+        assert_eq!(store.load_session("s"), 0, "nothing on disk to load");
+    }
+
+    #[test]
+    fn checkpoint_delete_is_real() {
+        let mut store = CheckpointStore::new();
+        let n = store.save("s", 0, Some("x".into()), &screen(), None);
+        assert!(store.delete("s", &n));
+        assert!(!store.delete("s", &n), "second delete is false");
+        assert!(!store.contains("s", &n));
+    }
+
+    #[test]
+    fn sanitize_segment_removes_path_chars() {
+        // `.` and `/`: dots are kept (harmless inside a single segment,
+        // no separators), slashes become underscores.
+        assert_eq!(sanitize_segment("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_segment(""), "unnamed");
+        assert_eq!(sanitize_segment("ok-name_1.json"), "ok-name_1.json");
+    }
 }

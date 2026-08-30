@@ -17,7 +17,7 @@
 use tui_lab::backend::{Input, KeyCode, KeyModifiers};
 use tui_lab::error::{Envelope, ErrorCategory};
 use tui_lab::mcp::helpers::{
-    build_input_from_request, build_wait, checkpoints, control_label_exists, err, ok, run_assertion,
+    build_input_from_request, build_wait, control_label_exists, err, ok, run_assertion,
 };
 use tui_lab::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 use tui_lab::screen::{ProcessState, ScreenState};
@@ -179,18 +179,50 @@ fn contract_envelope_shapes() {
 }
 
 #[test]
-fn contract_checkpoint_save_then_delete() {
-    let name = format!("cp-{}", uuid::Uuid::new_v4().simple());
-    checkpoints()
-        .lock()
-        .unwrap()
-        .insert(name.clone(), "hash1".into());
-    assert!(checkpoints().lock().unwrap().contains_key(&name));
-    let removed = checkpoints().lock().unwrap().remove(&name).is_some();
-    assert!(removed);
-    // second delete is a no-op but still "success" at the tool layer
-    let removed_again = checkpoints().lock().unwrap().remove(&name).is_some();
-    assert!(!removed_again);
+fn contract_checkpoint_store_save_compare_delete() {
+    use tui_lab::checkpoint::store::CheckpointStore;
+    use tui_lab::screen::{CursorState, ProcessState, ScreenState};
+
+    let screen = ScreenState {
+        cols: 10,
+        rows: 3,
+        cursor: CursorState { x: 0, y: 0, visible: true },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["a".to_string(), "".to_string(), "".to_string()],
+        scrollback: Vec::new(),
+        raw_hash: "r".into(),
+        visual_hash: "v".into(),
+        structure_hash: "s".into(),
+        process: ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    };
+
+    let mut store = CheckpointStore::new();
+    let name = store.save("sess", 0, Some("before".into()), &screen, None);
+    assert!(store.contains("sess", &name));
+
+    // compare: same screen matches; result is a JSON envelope with matches
+    let out = store.compare("sess", &name, &screen, None).expect("compare");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("envelope json");
+    assert_eq!(
+        parsed["data"]["comparison"]["matches"]["structure"],
+        serde_json::json!(true),
+        "out: {}",
+        out
+    );
+
+    // unknown checkpoint is invalid_request, not a silent pass
+    let miss = store.compare("sess", "nope", &screen, None);
+    assert_eq!(miss, Err(ErrorCategory::InvalidRequest));
+
+    assert!(store.delete("sess", &name));
+    assert!(!store.delete("sess", &name), "second delete is false");
 }
 
 #[test]

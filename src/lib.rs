@@ -12,6 +12,7 @@ pub mod exploration;
 pub mod framework;
 pub mod mcp;
 pub mod recording;
+pub mod run;
 pub mod scenario;
 pub mod screen;
 pub mod semantic;
