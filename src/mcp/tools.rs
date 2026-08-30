@@ -926,7 +926,12 @@ impl TuiLabServer {
     async fn tui_run(&self, p: Parameters<TuiRunParams>) -> String {
         let p = p.0;
         match p.action.as_str() {
-            "status" => ok(self.run.lock().unwrap().status()),
+            "status" => {
+                let sessions = self.manager.lock().unwrap().list();
+                ok(self.run.lock().unwrap().status(
+                    sessions.into_iter().map(serde_json::Value::String).collect(),
+                ))
+            }
             "persist" => {
                 let mut run = self.run.lock().unwrap();
                 if run.run_dir().is_some() {
@@ -968,7 +973,9 @@ impl TuiLabServer {
             "close" => {
                 let mut run = self.run.lock().unwrap();
                 let already = run.is_closed();
-                let summary = run.status();
+                let sessions = self.manager.lock().unwrap().list();
+                let summary =
+                    run.status(sessions.into_iter().map(serde_json::Value::String).collect());
                 let kill = p.kill_sessions.unwrap_or(false);
                 let result = run.close();
                 drop(run);

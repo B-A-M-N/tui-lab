@@ -476,6 +476,11 @@ fn stdio_e2e_full_lifecycle() {
     );
     let run_id = st0["data"]["run_id"].as_str().expect("run id").to_string();
     assert!(run_id.starts_with("run-"), "run id shape: {run_id}");
+    // sessions array present (live session list from the manager).
+    assert!(
+        st0["data"]["sessions"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "status must list live sessions: {st0}"
+    );
     // Real work happened before persist (checkpoints, scenario, transactions).
     assert!(
         st0["data"]["counts"]["transactions"].as_u64().unwrap_or(0) > 0,
@@ -507,7 +512,18 @@ fn stdio_e2e_full_lifecycle() {
     );
     assert_eq!(cp_d["category"], "success", "cp D: {cp_d}");
 
-    let persist = mcp.tool("tui_run", serde_json::json!({ "action": "persist" }));
+    // Explicit root (the runs dir itself, per the spec example) wins over
+    // session-cwd resolution: <root>/<same-run-id>/ directly.
+    let explicit_runs = std::env::temp_dir()
+        .join(format!("tui-lab-e2e-{}", std::process::id()))
+        .join(".tui-lab")
+        .join("runs");
+    let _ = std::fs::remove_dir_all(&explicit_runs);
+    std::fs::create_dir_all(&explicit_runs).expect("explicit runs dir");
+    let persist = mcp.tool(
+        "tui_run",
+        serde_json::json!({ "action": "persist", "root": explicit_runs.to_string_lossy() }),
+    );
     assert_eq!(persist["category"], "success", "persist: {persist}");
     assert_eq!(persist["data"]["persistent"], true);
     assert_eq!(
@@ -515,10 +531,10 @@ fn stdio_e2e_full_lifecycle() {
         "promotion must preserve run identity"
     );
     let artifact_root = persist["data"]["artifact_root"].as_str().expect("root").to_string();
-    let expected_root = persist_root.join(".tui-lab").join("runs").join(&run_id);
+    let expected_root = explicit_runs.join(&run_id);
     assert_eq!(
         std::path::Path::new(&artifact_root), expected_root,
-        "root must resolve from session cwd, not server cwd"
+        "explicit runs-dir root must hold the run directly: {persist}"
     );
     // Durable artifacts actually on disk.
     assert!(expected_root.join("run.json").exists(), "manifest written");
