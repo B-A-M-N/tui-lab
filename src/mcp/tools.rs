@@ -536,8 +536,7 @@ impl TuiLabServer {
                 match run.finish_scenario_recording(&name) {
                     Some(scenario) => {
                         let path: Option<String> = run
-                            .save_scenario(&scenario)
-                            .ok()
+                            .save_scenario(scenario.clone())
                             .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
                         ok(json!({
                             "name": scenario.name,
@@ -580,8 +579,7 @@ impl TuiLabServer {
                 let scenario = recorder.build();
                 let count = scenario.step_count();
                 let path: Option<String> = run
-                    .save_scenario(&scenario)
-                    .ok()
+                    .save_scenario(scenario.clone())
                     .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
                 ok(json!({ "name": name, "steps": count, "saved_to": path }))
             }
@@ -630,9 +628,10 @@ impl TuiLabServer {
             }
             // Detach + write the .cast into the run's recordings dir.
             "stop" => {
-                sess.disable_recording();
-                let rec = match sess.recorder() {
-                    Some(r) => r.clone(),
+                // stop_recording() detaches the hook and hands back the sink
+                // (disable_recording() would drop it before retrieval).
+                let rec = match sess.stop_recording() {
+                    Some(r) => r,
                     None => {
                         return err(
                             ErrorCategory::InvalidRequest,
