@@ -48,22 +48,31 @@ impl ScenarioRunner {
                         // Typed action (Wave-2 item 10): the scenario step's
                         // JSON is the same shape the live MCP call carried,
                         // so replay executes exactly what was recorded.
+                        // Sensitive steps route through the redacting executor
+                        // so a replayed secret never lands in a cast either
+                        // (leak fix).
+                        let vis = if req.sensitive() {
+                            crate::execution::InputVisibility::Sensitive
+                        } else {
+                            crate::execution::InputVisibility::Normal
+                        };
                         let (step_passed, detail) =
                             match crate::execution::CanonicalAction::from_request(&req) {
                                 Ok(action) => {
-                                    match crate::execution::execute_act(
+                                    match crate::execution::execute_act_with_visibility(
                                         session,
                                         &action,
                                         150,
                                         1150,
                                         req.no_wait(),
+                                        vis,
                                     ) {
                                         Ok(tx) => (
-                                            tx.settled,
+                                            tx.settled(),
                                             format!(
-                                                "act executed, settled={} ({})",
-                                                tx.settled,
-                                                tx.settle_reason.unwrap_or_default()
+                                                "act executed, settled={:?} ({})",
+                                                tx.settle,
+                                                tx.settle_reason()
                                             ),
                                         ),
                                         Err(e) => (false, format!("act failed: {e}")),

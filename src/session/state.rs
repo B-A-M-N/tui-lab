@@ -44,6 +44,23 @@ impl LaunchSpec {
     }
 }
 
+/// Rows whose cell text differs between two frames (Wave B item 12:
+/// `ScreenChanged.dirty_rows` derived at the only place with both frames).
+/// Compares viewport text per row — cheap, and matches what an incremental
+/// reader would fetch.
+fn dirty_rows(prev: &ScreenState, next: &ScreenState) -> Vec<u16> {
+    let mut out = Vec::new();
+    let rows = prev.viewport_text.len().max(next.viewport_text.len());
+    for y in 0..rows {
+        let a = prev.viewport_text.get(y);
+        let b = next.viewport_text.get(y);
+        if a != b {
+            out.push(y as u16);
+        }
+    }
+    out
+}
+
 pub struct Session {
     pub id: String,
     pub command: String,
@@ -66,6 +83,21 @@ pub struct Session {
     record_input: bool,
     /// Raw PTY byte-stream hook slot; attached to the backend at start.
     recording_slot: RecordingHookSlot,
+    /// Monotonic anchor sequence (re-review P1: `ObservationAnchor.index`
+    /// must be a real per-session counter, not a hardcoded 0). Allocated by
+    /// [`Session::next_anchor`]; shared by every executor path.
+    next_anchor_seq: u64,
+    /// Per-session terminal event queue (Wave B item 12): every observe,
+    /// send, resize, and process-state change appends here. Waits, audits,
+    /// incremental observation, and run persistence all read this one
+    /// stream.
+    events: crate::events::TerminalEventQueue,
+    /// Per-consumer observation cursors (Wave B item 13): named consumers
+    /// (`hermes`, `audit`, `explorer`, `recording`, ...) each remember their
+    /// own position in the event stream. Cursors live in the session so a
+    /// reconnecting consumer resumes where it left off, but reading is
+    /// stateless — `events_since` never mutates a cursor implicitly.
+    cursors: std::collections::HashMap<String, u64>,
 }
 
 /// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`].
@@ -107,6 +139,64 @@ impl Session {
             recorder: None,
             record_input: false,
             recording_slot: crate::backend::new_recording_hook_slot(),
+            next_anchor_seq: 0,
+            events: crate::events::TerminalEventQueue::new(),
+            cursors: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Allocate the next monotonic anchor index for this session
+    /// (re-review P1 fix 9). Every [`crate::execution::ObservationAnchor`]
+    /// created against this session gets a distinct, increasing index.
+    pub fn next_anchor(&mut self) -> u64 {
+        let n = self.next_anchor_seq;
+        self.next_anchor_seq += 1;
+        n
+    }
+
+    /// Suppress input recording for the duration of `f` (re-review P0 leak
+    /// fix, recording half). Sensitive payloads must not reach the cast file
+    /// through [`RecordingHook::on_input`]; the hook forwards bytes
+    /// synchronously on the calling thread inside `send_input`, so a guard
+    /// flag set/cleared around the send is race-free.
+    pub fn send_unrecorded(&mut self, input: crate::backend::Input) -> anyhow::Result<()> {
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut r) = rec.lock() {
+                r.suppress_input();
+            }
+        }
+        let result = self.backend.send_input(input);
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut r) = rec.lock() {
+                r.resume_input();
+            }
+        }
+        result.map_err(anyhow::Error::from)
+    }
+
+    /// Raise BOTH recording suppression gates (input + output) for the
+    /// duration of a sensitive transaction (leak fix, echo half): the tty
+    /// line discipline echoes typed bytes back as output, so the input gate
+    /// alone would still leave the payload in the cast. The caller MUST
+    /// call [`Self::resume_recording`] when the transaction window closes.
+    /// Panics are not expected mid-window (no user code runs here), but a
+    /// resumed-late recorder only ever over-suppresses, never leaks.
+    pub fn suppress_recording(&mut self) {
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut r) = rec.lock() {
+                r.suppress_input();
+                r.suppress_output();
+            }
+        }
+    }
+
+    /// Release both recording suppression gates (sensitive window closed).
+    pub fn resume_recording(&mut self) {
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut r) = rec.lock() {
+                r.resume_input();
+                r.resume_output();
+            }
         }
     }
 
@@ -309,14 +399,93 @@ impl Session {
     }
 
     /// Observe: refresh the screen via the backend's event-aware settle, keep
-    /// the previous frame for diffing, and return the new frame.
+    /// the previous frame for diffing, return the new frame, and emit the
+    /// derived events (Wave B item 12): ScreenChanged / VisualChanged /
+    /// CursorMoved / TitleChanged / ProcessExited / SemanticChanged-class
+    /// transitions are derived by diffing against the previous frame.
     pub fn observe(&mut self, idle_ms: u64) -> anyhow::Result<ScreenState> {
         let s = self
             .backend
             .observe(std::time::Duration::from_millis(idle_ms))?;
         self.previous = self.last.take();
+        let prev = self.last.take();
+        if let Some(p) = &prev {
+            self.emit_frame_events(p, &s.screen);
+        } else {
+            // First observation of a generation: process started.
+            self.push_event(crate::events::TerminalEventKind::ProcessStarted);
+        }
         self.last = Some(s.screen.clone());
         Ok(s.screen)
+    }
+
+    /// Diff two frames and push the events the transition implies. Kept
+    /// side-effect-free on `self.events` apart from the pushes themselves.
+    fn emit_frame_events(&mut self, prev: &ScreenState, next: &ScreenState) {
+        let structure_changed = prev.structure_hash != next.structure_hash;
+        let visual_changed = prev.visual_hash != next.visual_hash;
+        if structure_changed {
+            self.push_event(crate::events::TerminalEventKind::ScreenChanged {
+                dirty_rows: dirty_rows(prev, next),
+            });
+        } else if visual_changed {
+            self.push_event(crate::events::TerminalEventKind::VisualChanged);
+        }
+        if prev.cursor != next.cursor {
+            self.push_event(crate::events::TerminalEventKind::CursorMoved {
+                x: next.cursor.x,
+                y: next.cursor.y,
+            });
+        }
+        if prev.title != next.title {
+            if let Some(t) = &next.title {
+                self.push_event(crate::events::TerminalEventKind::TitleChanged {
+                    title: t.clone(),
+                });
+            }
+        }
+        if prev.process.running && !next.process.running {
+            self.push_event(crate::events::TerminalEventKind::ProcessExited {
+                exit_code: next.process.exit_code,
+                exit_signal: next.process.exit_signal.clone(),
+            });
+        }
+    }
+
+    /// Append to the session's event queue.
+    fn push_event(&mut self, kind: crate::events::TerminalEventKind) {
+        self.events
+            .push(&self.id, self.generation, kind);
+    }
+
+    /// Read events after `cursor` WITHOUT moving it (per-consumer cursors,
+    /// Wave B item 13: the caller owns the position).
+    pub fn events_since(&self, cursor: u64) -> crate::events::EventBatch {
+        self.events.since(cursor)
+    }
+
+    /// Read events after the named consumer's stored cursor, then advance
+    /// that cursor to the served position. Unknown consumers start at 0.
+    pub fn events_for_consumer(&mut self, consumer: &str) -> crate::events::EventBatch {
+        let cursor = self.cursors.get(consumer).copied().unwrap_or(0);
+        let batch = self.events.since(cursor);
+        self.cursors.insert(consumer.to_string(), batch.cursor);
+        batch
+    }
+
+    /// The session's whole retained event stream, plus declared-gap stats.
+    pub fn event_queue_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "total": self.events.total(),
+            "retained": self.events.retained(),
+            "evicted": self.events.evicted(),
+            "last_seq": self.events.last_seq(),
+        })
+    }
+
+    /// Drain retained events for run persistence (keeps seq continuity).
+    pub fn drain_events(&mut self) -> Vec<crate::events::TerminalEvent> {
+        self.events.drain()
     }
 
     /// The most recent observation.
@@ -352,6 +521,7 @@ impl Session {
             spec.cols = cols;
             spec.rows = rows;
         }
+        self.push_event(crate::events::TerminalEventKind::Resize { cols, rows });
         Ok(())
     }
 

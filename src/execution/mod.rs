@@ -11,7 +11,9 @@
 //! baseline (`wait_after`), and the outcome reports honestly whether the
 //! screen actually settled (re-review items 8/9).
 
-use crate::backend::{CaptureOutcome, Input, TerminalEventState, WaitCond, WaitOutcome};
+use crate::backend::{
+    CaptureOutcome, CanonicalFrame, Input, TerminalEventState, WaitCond, WaitOutcome,
+};
 use crate::screen::diff::Transition;
 use crate::screen::ScreenState;
 use crate::session::state::Session;
@@ -159,6 +161,17 @@ impl CanonicalAction {
         }
     }
 
+    /// Byte length of the payload this action carries (leak-fix support for
+    /// redacted persistence: the length is replay-relevant metadata and is
+    /// safe to keep; the bytes are not).
+    pub fn payload_len(&self) -> usize {
+        match self {
+            CanonicalAction::Type { text } | CanonicalAction::Paste { text } => text.len(),
+            CanonicalAction::Raw { bytes } => bytes.len(),
+            _ => 0,
+        }
+    }
+
     /// From the MCP request shape. Transport fields (`no_wait`, `wait_ms`,
     /// `id`) are deliberately dropped — they describe *how to observe* the
     /// action, not the action itself.
@@ -228,6 +241,88 @@ impl CanonicalAction {
     }
 }
 
+/// Settlement outcome for one interaction (re-review P1: `no_wait` must not
+/// report `settled` — "I did not test settlement" is not "it settled").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettleStatus {
+    /// The anchored settle condition was met within budget.
+    Met,
+    /// The settle condition timed out.
+    TimedOut,
+    /// Settlement was not tested (`no_wait=true`).
+    Skipped,
+}
+
+impl SettleStatus {
+    /// Bridge from the legacy `(settled, reason)` pair while callers migrate.
+    /// The executor's no-wait path reports reason `"no_wait"`.
+    pub fn from_legacy(settled: bool, reason: &str) -> Self {
+        if reason == "no_wait" {
+            SettleStatus::Skipped
+        } else if settled {
+            SettleStatus::Met
+        } else {
+            SettleStatus::TimedOut
+        }
+    }
+}
+
+/// How an input payload may be persisted (re-review P0 leak fix). This is a
+/// property of the action envelope, not of the MCP request: every recorder
+/// (transaction ledger, scenarios, traces, recordings, error/debug output)
+/// consults it, so a sensitive payload can never survive through a path that
+/// forgot to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputVisibility {
+    /// Payload may be persisted verbatim.
+    Normal,
+    /// Payload must never appear verbatim in any artifact; a redacted
+    /// stand-in (kind + byte length) is persisted instead.
+    Sensitive,
+    /// Same guarantee as [`InputVisibility::Sensitive`]; reserved for an
+    /// explicit never-persist request so the two intents stay distinguishable
+    /// in evidence.
+    NeverPersist,
+}
+
+/// The persistence-boundary view of a [`CanonicalAction`]: either the full
+/// action, or a redacted stand-in that keeps replay-relevant metadata (kind,
+/// payload byte length) without the payload. The live executor always
+/// receives the real action — redaction happens only at persistence.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "persistence", rename_all = "snake_case")]
+pub enum PersistedAction {
+    Full(CanonicalAction),
+    Redacted {
+        /// Action kind name (`type`, `paste`, ...).
+        kind: String,
+        /// Byte length of the redacted payload.
+        byte_len: usize,
+    },
+}
+
+impl PersistedAction {
+    /// Project an action through a visibility policy. Only text-carrying
+    /// actions (`type`, `paste`) redact — key events, coordinates, and raw
+    /// control sequences carry no user-secret payload.
+    pub fn project(action: &CanonicalAction, visibility: InputVisibility) -> Self {
+        match visibility {
+            InputVisibility::Normal => PersistedAction::Full(action.clone()),
+            InputVisibility::Sensitive | InputVisibility::NeverPersist => match action {
+                CanonicalAction::Type { text } | CanonicalAction::Paste { text } => {
+                    PersistedAction::Redacted {
+                        kind: action.name().to_string(),
+                        byte_len: text.len(),
+                    }
+                }
+                other => PersistedAction::Full(other.clone()),
+            },
+        }
+    }
+}
+
 /// A named anchor captured *before* an input is sent, used to express
 /// "wait for screen change *following this anchor*" rather than "wait for
 /// any change". Re-review P0 first-class anchor type.
@@ -245,51 +340,121 @@ pub struct ObservationAnchor {
     pub index: u64,
 }
 
-/// One settled interaction: what was sent, whether the screen settled, and
-/// the before/after transition. MCP, scenarios, audits, and exploration all
-/// consume this shape rather than improvising their own.
+/// One settled interaction (Wave B item 10): canonical children hold the
+/// truth, accessors derive the rest. The old shape carried the same facts
+/// four ways (`action` string + `canonical`, `settled` bool + `settle_reason`,
+/// `after` frame + `capture`) which could silently disagree; now:
 ///
-/// `after` is the authoritative settled frame (re-review P0 "matching frame"):
-/// the screen state captured when `wait_after` satisfied its condition, NOT a
-/// separate `observe()` call afterwards. Separate post-capture is available
-/// via `InteractionTransaction::after_post`.
+/// - the action lives in [`Self::action`] (`ActionEnvelope`-level:
+///   `CanonicalAction` + visibility);
+/// - settlement lives in [`Self::settle`] only — `settled()` and the reason
+///   derive from it;
+/// - frames live in [`Self::before_frame`] / [`Self::after_frame`] as
+///   [`CanonicalFrame`]s (citable `frame:N` identity), the raw
+///   [`ScreenState`] reachable through `.state`;
+/// - the capture outcome is the single record of *why* the after-frame is
+///   authoritative (matching-frame capture), never optional for a settled
+///   act.
 #[derive(Debug, Clone)]
 pub struct InteractionTransaction {
-    /// The action name (e.g. "key", "type", "mouse_click").
-    pub action: String,
-    /// The typed action itself (re-review Wave-2 item 10): serializable, so
-    /// the ledger/scenarios can reconstruct exactly what was sent.
-    pub canonical: Option<CanonicalAction>,
-    /// Whether the post-action settle wait actually met its condition.
-    pub settled: bool,
-    /// Why the settle resolved (or timed out).
-    pub settle_reason: Option<String>,
-    pub before: ScreenState,
-    /// The frame that satisfied the wait — the authoritative after.
-    pub after: ScreenState,
-    /// Optional post-settle capture, for callers that want a stable view
-    /// after the matching frame (e.g. for diff UI). `None` when not captured.
-    pub after_post: Option<ScreenState>,
+    /// The action envelope: canonical action + visibility policy.
+    pub action: ActionEnvelope,
+    /// The anchor that scoped the settle wait (captured before send).
+    pub anchor: ObservationAnchor,
+    /// The frame immediately before the input.
+    pub before_frame: CanonicalFrame,
+    /// The frame that satisfied the settle wait — the authoritative after
+    /// (re-review P0 "matching frame"). For `SettleStatus::Skipped` this is
+    /// a fresh post-action capture, clearly not a settled one.
+    pub after_frame: CanonicalFrame,
+    /// How the settle wait resolved.
+    pub settle: SettleStatus,
+    /// The before→after transition (screen + semantic diff).
     pub transition: Transition,
-    pub elapsed_ms: u64,
-    /// Screen sequence number of the matching after-frame, if known.
-    pub after_screen_seq: Option<u64>,
-    /// The anchor that scoped the settle wait (re-review P0). Captured
-    /// before the input was sent.
-    pub anchor: Option<ObservationAnchor>,
-    /// Optional capture outcome (re-review P0). When present, this is the
-    /// unified result shape for waits/actions/scenarios/audits/replay.
+    /// The unified capture outcome for the after-frame (re-review P0).
+    /// `None` only on the `no_wait` path, where no matching-frame capture
+    /// happened.
     pub capture: Option<CaptureOutcome>,
+    /// Total act latency (send + settle) in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// Action + persistence policy as one unit (leak fix): the executor always
+/// receives the real action; every recorder consults `visibility`.
+#[derive(Debug, Clone)]
+pub struct ActionEnvelope {
+    pub action: CanonicalAction,
+    pub visibility: InputVisibility,
+}
+
+impl ActionEnvelope {
+    pub fn new(action: CanonicalAction, visibility: InputVisibility) -> Self {
+        ActionEnvelope { action, visibility }
+    }
+
+    /// The action's stable name.
+    pub fn name(&self) -> &'static str {
+        self.action.name()
+    }
+}
+
+impl InteractionTransaction {
+    /// The action name (derived — the old duplicated `action: String` field).
+    pub fn name(&self) -> &'static str {
+        self.action.name()
+    }
+
+    /// The typed canonical action, for replay/ledger.
+    pub fn canonical(&self) -> &CanonicalAction {
+        &self.action.action
+    }
+
+    /// Legacy read of settlement as a bool. `Skipped` counts as *not*
+    /// settled — "we did not test" must not pass a settled assertion.
+    pub fn settled(&self) -> bool {
+        self.settle == SettleStatus::Met
+    }
+
+    /// Why the settle resolved (derived): `Some` reason string for every
+    /// status, mirroring the old `settle_reason` field.
+    pub fn settle_reason(&self) -> String {
+        match self.settle {
+            SettleStatus::Met => self
+                .capture
+                .as_ref()
+                .map(|c| format!("{:?}", c.reason))
+                .unwrap_or_else(|| "met".to_string()),
+            SettleStatus::TimedOut => "settle_budget_exhausted".to_string(),
+            SettleStatus::Skipped => "no_wait".to_string(),
+        }
+    }
+
+    /// The screen state before the action.
+    pub fn before(&self) -> &ScreenState {
+        &self.before_frame.state
+    }
+
+    /// The screen state after the action (the matching frame when settled).
+    pub fn after(&self) -> &ScreenState {
+        &self.after_frame.state
+    }
+
+    /// Screen sequence of the after-frame, if the capture recorded one.
+    pub fn after_screen_seq(&self) -> Option<u64> {
+        self.capture.as_ref().map(|c| c.screen_seq)
+    }
 }
 
 /// Execute one act against a session with proper causality:
 ///
 /// 1. capture the event baseline *before* sending;
-/// 2. send the input;
+/// 2. send the input (routed through `send_unrecorded` when the visibility
+///    policy is `Sensitive`/`NeverPersist`, so the cast never sees the
+///    payload bytes — leak fix);
 /// 3. wait for a screen stable *anchored after the baseline* (closes the
 ///    entry-pump race — re-review item 8);
-/// 4. report `settled: false` with the real reason when stabilization timed
-///    out instead of silently continuing (re-review item 9).
+/// 4. report the true [`SettleStatus`] — `Skipped` under `no_wait`, never a
+///    fake "settled" (re-review item 9 / P1 fix 8).
 ///
 /// `quiet_ms` is the quiet interval that defines "settled" (default 150ms).
 /// `settle_budget_ms` bounds the wait (default quiet + 1000ms).
@@ -300,6 +465,27 @@ pub fn execute_act(
     settle_budget_ms: u64,
     no_wait: bool,
 ) -> Result<InteractionTransaction, anyhow::Error> {
+    execute_act_with_visibility(
+        session,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        InputVisibility::Normal,
+    )
+}
+
+/// [`execute_act`] with an explicit [`InputVisibility`] policy. Sensitive
+/// visibility routes the send through [`Session::send_unrecorded`] and marks
+/// the transaction so every downstream recorder redacts.
+pub fn execute_act_with_visibility(
+    session: &mut Session,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+    visibility: InputVisibility,
+) -> Result<InteractionTransaction, anyhow::Error> {
     let before = match session.last().cloned() {
         Some(s) => s,
         None => session.observe(0)?,
@@ -308,16 +494,41 @@ pub fn execute_act(
     let anchor = ObservationAnchor {
         state: baseline,
         label: None,
-        index: 0, // caller may overwrite via the public field if needed
+        // Real monotonic per-session anchor index (re-review P1 fix 9).
+        index: session.next_anchor(),
     };
+    let mut before_frame = CanonicalFrame::new(before, 0, baseline.output_seq);
+    before_frame.session_id = Some(session.id.clone());
+    before_frame.generation = Some(session.generation);
 
-    session.send(action.to_input())?;
+    // Sensitive payloads bypass the recording hook for the WHOLE transaction
+    // window (leak fix): the send is gated on input, and the settle wait's
+    // captures are gated on output because the tty line discipline echoes
+    // typed bytes back — the echo IS the payload. The PTY still receives
+    // everything; only the cast is blind during the window.
+    let sensitive_window = matches!(
+        visibility,
+        InputVisibility::Sensitive | InputVisibility::NeverPersist
+    );
+    if sensitive_window {
+        session.suppress_recording();
+    }
+    let send_result = session.send(action.to_input());
+    let send_failed = send_result.is_err();
+    if send_failed {
+        // Never leave the gates raised on an error path.
+        if sensitive_window {
+            session.resume_recording();
+        }
+        send_result?;
+    }
 
-    let (settled, settle_reason, elapsed_ms, after, after_screen_seq, capture) = if no_wait {
+    let (settle, elapsed_ms, after_state, after_screen_seq, capture) = if no_wait {
         // Even with no_wait, capture a fresh frame so callers always get
-        // both before and after. No settle semantics.
+        // both before and after — but settlement was NOT tested. Reporting
+        // `SettleStatus::Skipped` is the honest answer (re-review P1 fix 8).
         let s = session.observe(quiet_ms)?;
-        (true, Some("no_wait".to_string()), 0, s, None, None)
+        (SettleStatus::Skipped, 0, s, None, None)
     } else {
         let budget = settle_budget_ms.max(quiet_ms.saturating_add(1000));
         // Use the matching frame from wait_after (re-review P0). No second
@@ -331,32 +542,39 @@ pub fn execute_act(
             budget,
         )?;
         let capture = CaptureOutcome::from_wait(outcome.clone());
-        let reason = format!("{:?}", outcome.reason);
-        (
-            outcome.met,
-            Some(reason),
-            outcome.elapsed_ms,
-            outcome.state,
-            Some(outcome.screen_seq),
-            Some(capture),
-        )
+        let settle = if outcome.met {
+            SettleStatus::Met
+        } else {
+            SettleStatus::TimedOut
+        };
+        let seq = outcome.screen_seq;
+        (settle, outcome.elapsed_ms, outcome.state, Some(seq), Some(capture))
     };
 
-    let transition = crate::screen::diff(&before, &after);
+    let transition = crate::screen::diff(&before_frame.state, &after_state);
+    let mut after_frame = CanonicalFrame::new(
+        after_state,
+        after_screen_seq.unwrap_or(0),
+        capture.as_ref().map(|c| c.output_seq).unwrap_or(0),
+    );
+    after_frame.session_id = Some(session.id.clone());
+    after_frame.generation = Some(session.generation);
+
+    // Sensitive window closed: the settled frame has been captured, so the
+    // application's own (masked) rendering is recorded again from here on.
+    if sensitive_window {
+        session.resume_recording();
+    }
 
     Ok(InteractionTransaction {
-        action: action.name().to_string(),
-        canonical: Some(action.clone()),
-        settled,
-        settle_reason,
-        before,
-        after,
-        after_post: None,
+        action: ActionEnvelope::new(action.clone(), visibility),
+        anchor,
+        before_frame,
+        after_frame,
+        settle,
         transition,
-        elapsed_ms,
-        after_screen_seq,
-        anchor: Some(anchor),
         capture,
+        elapsed_ms,
     })
 }
 
@@ -418,15 +636,12 @@ mod tests {
             false,
         )
         .expect("execute act");
-        assert!(
-            tx.settled,
-            "simple echo app must settle: {:?}",
-            tx.settle_reason
-        );
-        assert_eq!(tx.action, "key");
+        assert_eq!(tx.settle, SettleStatus::Met, "{}", tx.settle_reason());
+        assert!(tx.settled(), "legacy bool must agree with the status");
+        assert_eq!(tx.name(), "key");
         // echoed char must appear in the after frame
         assert!(
-            tx.after.viewport_text.iter().any(|r| r.contains('x')),
+            tx.after().viewport_text.iter().any(|r| r.contains('x')),
             "typed char must be echoed"
         );
     }
@@ -444,9 +659,107 @@ mod tests {
             true,
         )
         .expect("execute act");
-        assert!(tx.settled);
-        assert_eq!(tx.settle_reason.as_deref(), Some("no_wait"));
+        // no_wait must be Skipped, not settled (re-review P1 fix 8).
+        assert_eq!(tx.settle, SettleStatus::Skipped);
+        assert!(
+            !tx.settled(),
+            "Skipped must not read as settled through the legacy bool"
+        );
+        assert_eq!(tx.settle_reason().as_str(), "no_wait");
         assert_eq!(tx.elapsed_ms, 0);
+    }
+
+    /// Anchor indices are real per-session monotonic counters (P1 fix 9),
+    /// not hardcoded zeros.
+    #[test]
+    fn anchor_indices_are_monotonic() {
+        let mut s = session();
+        let a = execute_act(
+            &mut s,
+            &CanonicalAction::Key {
+                key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('a')),
+            },
+            60,
+            1000,
+            true,
+        )
+        .expect("act 1");
+        let b = execute_act(
+            &mut s,
+            &CanonicalAction::Key {
+                key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('b')),
+            },
+            60,
+            1000,
+            true,
+        )
+        .expect("act 2");
+        let ia = a.anchor.index;
+        let ib = b.anchor.index;
+        assert!(ib > ia, "anchor index must increase: {} then {}", ia, ib);
+    }
+
+    /// A sensitive action's bytes must never reach the session's cast
+    /// recording (leak fix, live half), while the PTY still receives them —
+    /// the echo in the after-frame proves delivery.
+    #[test]
+    fn sensitive_send_bypasses_recording_but_reaches_pty() {
+        let mut s = session();
+        s.enable_recording(true);
+        let secret = "hunter2-secret-payload";
+        let tx = execute_act_with_visibility(
+            &mut s,
+            &CanonicalAction::Type {
+                text: secret.to_string(),
+            },
+            80,
+            1500,
+            false,
+            InputVisibility::Sensitive,
+        )
+        .expect("sensitive act");
+        // PTY got the bytes: python echoes them back to the screen.
+        assert!(
+            tx.after()
+                .viewport_text
+                .iter()
+                .any(|r: &String| r.contains(secret)),
+            "payload must reach the PTY and be echoed"
+        );
+        // ...but not the recording.
+        let cast = s
+            .recorder()
+            .expect("recorder")
+            .lock()
+            .expect("recorder lock")
+            .to_ndjson()
+            .join("\n");
+        assert!(
+            !cast.contains(secret),
+            "sensitive payload must not leak into the recording"
+        );
+        // Unprotected sends still record (control).
+        let _ = execute_act(
+            &mut s,
+            &CanonicalAction::Type {
+                text: "visible-text".to_string(),
+            },
+            80,
+            1500,
+            false,
+        )
+        .expect("normal act");
+        let cast2 = s
+            .recorder()
+            .expect("recorder")
+            .lock()
+            .expect("recorder lock")
+            .to_ndjson()
+            .join("\n");
+        assert!(
+            cast2.contains("visible-text"),
+            "non-sensitive input must still be recorded"
+        );
     }
 
     // ── CanonicalAction (Wave-2 item 10) ──────────────────────────────

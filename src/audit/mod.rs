@@ -8,6 +8,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 pub mod driver;
+pub mod orchestrator;
 pub use driver::*;
 
 /// What kind of artifact an [`EvidenceRef`] points at.

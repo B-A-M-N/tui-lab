@@ -49,7 +49,7 @@ impl TuiLabServer {
         name = "tui_session",
         description = "Manage TUI sessions: start, restart, stop, list, status."
     )]
-    async fn tui_session(&self, p: Parameters<TuiSessionParams>) -> String {
+    pub async fn tui_session(&self, p: Parameters<TuiSessionParams>) -> String {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         match p.action.as_str() {
@@ -110,11 +110,13 @@ impl TuiLabServer {
                         let version = sess.backend_version();
                         let kind = sess.backend_kind.clone();
                         let generation = sess.generation;
-                        // Attach the launch spec to the run (audit re-review
-                        // item 1: the run owns session/launch correlation, so
-                        // relaunches and artifacts share one identity).
+                        // Attach the launch spec to the run, per session
+                        // (audit re-review item 1 + P0 fix 6: the run owns
+                        // session/launch correlation for *all* sessions, so
+                        // relaunches, restarts, and multi-session replay
+                        // share one identity).
                         if let Some(spec) = launch.clone() {
-                            self.run.lock().unwrap().set_launch_spec(spec);
+                            self.run.lock().unwrap().set_launch_spec(&id, spec);
                         }
                         let run_id = self.run.lock().unwrap().id.clone();
                         ok(json!({
@@ -291,6 +293,25 @@ impl TuiLabServer {
                     })),
                 }
             }
+            // Incremental read (Wave B item 13): return only what changed
+            // since the named consumer's cursor, with dirty rows — far more
+            // token-efficient than full-screen rereads for monitoring.
+            "changes" => {
+                let consumer = p.consumer.clone().unwrap_or_else(|| "hermes".to_string());
+                let batch = sess.events_for_consumer(&consumer);
+                ok(json!({
+                    "consumer": consumer,
+                    "cursor": batch.cursor,
+                    "gap": batch.gap,
+                    "first_available": batch.first_available,
+                    "events": batch.events,
+                    "note": if batch.events.is_empty() {
+                        Some("no changes since cursor".to_string())
+                    } else {
+                        None
+                    },
+                }))
+            }
             // Honest unsupported (re-review Part VIII): an empty scrollback
             // array is ambiguous with "supported but empty"; until real
             // scrollback exists, say so explicitly. `history` likewise — a
@@ -316,7 +337,7 @@ impl TuiLabServer {
         name = "tui_act",
         description = "Drive input. Returns a screen transition after the action. Actions: key, keys, type, paste, raw, mouse_click, mouse_press, mouse_release, mouse_move, mouse_drag, mouse_scroll, resize, signal."
     )]
-    async fn tui_act(&self, p: Parameters<TuiActRequest>) -> String {
+    pub async fn tui_act(&self, p: Parameters<TuiActRequest>) -> String {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id()) {
@@ -329,39 +350,86 @@ impl TuiLabServer {
             Ok(a) => a,
             Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
         };
+        // Visibility policy (leak fix): sensitive payloads execute normally
+        // but are redacted in EVERY recorder — the cast (via send_unrecorded),
+        // the run ledger (via PersistedAction), and scenario recordings
+        // (payload stripped below).
+        let sensitive = p.sensitive();
+        let visibility = if sensitive {
+            crate::execution::InputVisibility::Sensitive
+        } else {
+            crate::execution::InputVisibility::Normal
+        };
         // The one canonical executor (re-review item 4): anchored settle wait
         // (item 8) + honest settle reporting (item 9).
         let quiet = p.wait_ms().unwrap_or(150);
-        let tx = match crate::execution::execute_act(
+        let tx = match crate::execution::execute_act_with_visibility(
             sess,
             &action,
             quiet,
             quiet.saturating_add(1000),
             p.no_wait(),
+            visibility,
         ) {
             Ok(t) => t,
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
         // Scenario recording in progress? Append this act (audit: scenarios
-        // capture real tool traffic; sensitive payloads are not recorded).
+        // capture real tool traffic; sensitive payloads are not recorded —
+        // and for a sensitive step the *params* are stripped to a redacted
+        // placeholder so replay still works shape-wise without the secret).
         // Scoped to the resolved session generation (re-review item 5): a
         // recording for session A never absorbs session B's traffic.
-        {
+        let frame_refs = {
             let (sid, gen) = (sess.id.clone(), sess.generation);
             let mut run = self.run.lock().unwrap();
+            // Citable frame identities (Wave B item 11): both frames get
+            // per-run ids and full provenance.
+            let b = run.register_frame(&mut {
+                let mut f = tx.before_frame.clone();
+                f.session_id = Some(sid.clone());
+                f.generation = Some(gen);
+                f
+            });
+            let a = run.register_frame(&mut {
+                let mut f = tx.after_frame.clone();
+                f.session_id = Some(sid.clone());
+                f.generation = Some(gen);
+                f
+            });
             // Run ledger (Wave-2 item 15): the reconstructable transaction
-            // record, not just a counter.
+            // record, not just a counter. The ledger projects the action
+            // through the visibility policy — sensitive payloads are stored
+            // as Redacted(kind, byte_len), never verbatim.
             run.record_interaction(&sid, &tx);
-            if !p.sensitive() {
+            // Scenario capture (see block comment above): sensitive steps
+            // are recorded as redacted placeholders, never with the payload.
+            if sensitive {
+                run.record_scenario_act(
+                    &sid,
+                    gen,
+                    json!({
+                        "kind": tx.name(),
+                        "sensitive": true,
+                        "redacted": true,
+                        "payload_bytes": tx.canonical().payload_len(),
+                    }),
+                );
+            } else {
                 run.record_scenario_act(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
             }
-        }
+            serde_json::json!({ "before": format!("frame:{b}"), "after": format!("frame:{a}") })
+        };
         ok(json!({
-            "action": tx.action,
-            "settled": tx.settled,
-            "settle_reason": tx.settle_reason,
+            "action": tx.name(),
+            "settled": tx.settled(),
+            "settle_status": tx.settle,
+            "settle_reason": tx.settle_reason(),
             "elapsed_ms": tx.elapsed_ms,
-            "warnings": if tx.settled { Vec::<String>::new() } else {
+            "frames": frame_refs,
+            "warnings": if tx.settled() { Vec::<String>::new() } else if tx.settle == crate::execution::SettleStatus::Skipped {
+                vec!["settlement was not tested (no_wait=true); reported honestly as skipped".to_string()]
+            } else {
                 vec!["screen did not reach the requested stability within the settle budget".to_string()]
             },
             "transition": tx.transition,
@@ -544,7 +612,7 @@ impl TuiLabServer {
         name = "tui_scenario",
         description = "Record, save, list, and export workflows as regression scenarios."
     )]
-    async fn tui_scenario(&self, p: Parameters<TuiScenarioParams>) -> String {
+    pub async fn tui_scenario(&self, p: Parameters<TuiScenarioParams>) -> String {
         let p = p.0;
         let mut run = self.run.lock().unwrap();
         match p.action.as_str() {
@@ -764,7 +832,7 @@ impl TuiLabServer {
         name = "tui_record",
         description = "Produce terminal recordings (asciinema .cast). Other formats are delegated to the backend."
     )]
-    async fn tui_record(&self, p: Parameters<TuiRecordParams>) -> String {
+    pub async fn tui_record(&self, p: Parameters<TuiRecordParams>) -> String {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
@@ -813,7 +881,8 @@ impl TuiLabServer {
                 // persist` carries the recording into the durable root
                 // (goal spec: promotion preserves "recordings already held
                 // in memory") — the content is also returned inline.
-                let path = {
+                let size = body.len() as u64;
+                let (path, artifact) = {
                     let mut run = self.run.lock().unwrap();
                     match run.run_dir().cloned() {
                         Some(dir) => {
@@ -821,7 +890,19 @@ impl TuiLabServer {
                             let _ = std::fs::create_dir_all(&rec_dir);
                             let file = rec_dir.join(&file_name);
                             match std::fs::write(&file, &body) {
-                                Ok(()) => Some(file.to_string_lossy().to_string()),
+                                Ok(()) => {
+                                    // Typed ref for the persisted artifact (Wave B item 15).
+                                    let rel = std::path::PathBuf::from("recordings")
+                                        .join(&file_name);
+                                    let r = run.register_artifact(
+                                        crate::run::ArtifactKind::Recording,
+                                        Some(rel),
+                                        Some(size),
+                                        Some(sess.id.clone()),
+                                        format!("pty recording, {} events", events),
+                                    );
+                                    (Some(file.to_string_lossy().to_string()), Some(r))
+                                }
                                 Err(e) => {
                                     return err(
                                         ErrorCategory::BackendError,
@@ -832,7 +913,16 @@ impl TuiLabServer {
                         }
                         None => {
                             run.hold_recording(file_name, body.clone());
-                            None
+                            // Ephemeral: registered without a path; the ref
+                            // resolves once the run is promoted.
+                            let r = run.register_artifact(
+                                crate::run::ArtifactKind::Recording,
+                                None,
+                                Some(size),
+                                Some(sess.id.clone()),
+                                format!("pty recording, {} events (held, ephemeral run)", events),
+                            );
+                            (None, Some(r))
                         }
                     }
                 };
@@ -840,6 +930,13 @@ impl TuiLabServer {
                     "recording": "stopped",
                     "events": events,
                     "saved_to": path,
+                    "artifact": artifact.as_ref().map(|a| serde_json::json!({
+                        "id": a.id,
+                        "kind": a.kind,
+                        "path": a.path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        "size": a.size,
+                        "summary": a.summary,
+                    })),
                     "held_in_run": path.is_none(),
                     "note": path.is_none().then(|| "ephemeral run: held in run memory; tui_run persist will write it to the durable root".to_string()),
                     "inline_events": path.is_none().then_some(ndjson),
@@ -982,41 +1079,27 @@ impl TuiLabServer {
         };
         let profile = p.profile.as_deref().unwrap_or("full").to_string();
 
-        // Active profiles drive the app through the session and observe real
-        // transitions (audit items 52-55). Static profiles read one frame.
-        let active = matches!(
-            profile.as_str(),
-            "keyboard" | "focus" | "resize" | "clipping" | "layout"
-        );
-        let (findings, mode) = if active {
-            let fs = match profile.as_str() {
-                "keyboard" => crate::audit::driver::keyboard_audit(sess, 20),
-                "focus" => crate::audit::driver::focus_audit(sess),
-                "resize" | "layout" => crate::audit::driver::resize_audit(sess),
-                "clipping" => crate::audit::driver::clipping_audit(sess),
-                _ => unreachable!("guarded by `active`"),
+        // The audit ENGINE owns the static-vs-active decision (re-review
+        // P0 fix 2): `full` is the composite (static + every active driver),
+        // and no profile is weaker than its members. The MCP layer only
+        // surfaces the resulting mode.
+        let report =
+            match crate::audit::orchestrator::run_profile(sess, &profile) {
+                Ok(r) => r,
+                Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
             };
-            (fs, "active")
-        } else {
-            let screen = match sess.observe(40) {
-                Ok(s) => s,
-                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-            };
-            let sem = semantic::analyze(&screen);
-            (crate::audit::run(&profile, &screen, &sem), "static")
-        };
 
         // Findings accumulate in the run context (composition root) so a
         // later audit/coverage query can see prior evidence.
         {
             let mut run = self.run.lock().unwrap();
-            run.extend_findings(findings.clone());
+            run.extend_findings(report.findings.clone());
         }
         ok(json!({
             "profile": profile,
-            "mode": mode,
-            "finding_count": findings.len(),
-            "findings": findings,
+            "mode": report.mode,
+            "finding_count": report.findings.len(),
+            "findings": report.findings,
         }))
     }
 
@@ -1066,7 +1149,7 @@ impl TuiLabServer {
         name = "tui_run",
         description = "Run lifecycle: status, persist (ephemeral→durable, same run identity), close. Nothing is written to disk until you persist."
     )]
-    async fn tui_run(&self, p: Parameters<TuiRunParams>) -> String {
+    pub async fn tui_run(&self, p: Parameters<TuiRunParams>) -> String {
         let p = p.0;
         match p.action.as_str() {
             "status" => {
@@ -1118,6 +1201,18 @@ impl TuiLabServer {
             }
             "close" => {
                 let mut run = self.run.lock().unwrap();
+                // Drain terminal-event queues into the run (Wave B item 14)
+                // before the flush so the event logs land in the artifacts.
+                // The id list is bound FIRST: a `for sid in lock().list()`
+                // would keep the manager guard alive for the whole loop and
+                // re-locking it below self-deadlocks (std Mutex is not
+                // reentrant) — the exact hang this replaces.
+                let session_ids = self.manager.lock().unwrap().list();
+                for sid in session_ids {
+                    if let Ok(sess) = self.manager.lock().unwrap().resolve_mut(Some(&sid)) {
+                        run.hold_events(&sid, sess.drain_events());
+                    }
+                }
                 let already = run.is_closed();
                 let sessions = self.manager.lock().unwrap().list();
                 let summary = run.status(

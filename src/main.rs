@@ -196,14 +196,17 @@ fn doctor() {
     .unwrap_or(false);
     report(&mut out, "Scenarios", scenarios, "model build + validate");
 
-    // 6. Exploration: state graph bookkeeping.
+    // 6. Exploration: state graph bookkeeping (identity-keyed, P0 fix 3).
     let exploration = std::panic::catch_unwind(|| {
+        use tui_lab::exploration::state_graph::StateIdentity;
         let mut g = tui_lab::exploration::StateGraph::new(
             tui_lab::exploration::ExplorationBudget::default(),
         );
-        g.record_state("h1", None, 0);
-        g.record_state("h2", None, 1);
-        g.record_transition("h1", "h2", "k");
+        let a = StateIdentity::from_parts("h1");
+        let b = StateIdentity::from_parts("h2");
+        g.record_state_identity(&a, 0);
+        g.record_state_identity(&b, 1);
+        g.record_transition_identity(&a, &b, "k");
         g.state_count() == 2 && g.transition_count() == 1
     })
     .unwrap_or(false);
@@ -211,7 +214,7 @@ fn doctor() {
         &mut out,
         "Exploration (state graph)",
         exploration,
-        "graph record + count",
+        "identity graph record + count",
     );
 
     // 7. Coverage: honest probe for the optional tuicov executable.

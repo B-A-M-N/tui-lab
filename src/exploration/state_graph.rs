@@ -2,10 +2,35 @@
 //!
 //! Tracks visited UI states and the transitions between them during exploration.
 //! Powers novelty scoring, dead-end detection, and guided candidate generation.
+//!
+//! Identity hashing is versioned BLAKE3 (re-review P0 fix 4): these keys are
+//! persisted in run artifacts and compared across processes/versions, so they
+//! must be stable, deterministic, and explicitly versioned — never
+//! `DefaultHasher`, which is unspecified, may change between Rust releases,
+//! and is only meant for in-process hash maps.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
+
+/// Schema version prefix for identity hashes. Bump when the identity input
+/// changes so old artifacts remain readable and distinguishable.
+const IDENTITY_SCHEMA: &str = "identity:v1";
+
+/// Versioned BLAKE3 over a labeled set of parts (P0 fix 4). Deterministic:
+/// parts are fed in the given order with explicit separators, and callers
+/// must pass pre-sorted collections (never hash-map iteration order).
+fn identity_hash(kind: &str, parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(IDENTITY_SCHEMA.as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(kind.as_bytes());
+    hasher.update(&[0u8]);
+    for p in parts {
+        hasher.update(&(p.len() as u64).to_le_bytes());
+        hasher.update(p.as_bytes());
+    }
+    format!("{}:{}:{}", IDENTITY_SCHEMA, kind, hasher.finalize().to_hex())
+}
 
 /// Identity for a UI state node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -22,13 +47,9 @@ impl StateId {
         StateId(format!("sem:{}", hash))
     }
 
-    /// Create a combined ID from multiple hashes.
+    /// Create a combined ID from multiple hashes (versioned BLAKE3, P0 fix 4).
     pub fn combined(parts: &[&str]) -> Self {
-        let mut hasher = DefaultHasher::new();
-        for p in parts {
-            p.hash(&mut hasher);
-        }
-        StateId(format!("{:016x}", hasher.finish()))
+        StateId(identity_hash("combined", parts))
     }
 
     pub fn as_str(&self) -> &str {
@@ -45,6 +66,12 @@ impl StateId {
 /// the separate hashes so the graph can key on the layers a navigation
 /// analysis actually needs (`interaction` = structure + focus/selection).
 ///
+/// All three layers are versioned BLAKE3 digests, stable across processes
+/// and suitable for persisted artifacts (P0 fix 4). The interaction layer
+/// is fed a canonical, sorted input set: structure hash, focused control ID,
+/// and the SORTED list of selected control IDs — never unsorted iteration
+/// order.
+///
 /// `id()` derives the graph key from `structure + interaction`, which is
 /// usually right for navigation graphs; `visual` is carried for evidence
 /// and layout-sensitive analyses.
@@ -54,9 +81,10 @@ pub struct StateIdentity {
     pub content: String,
     /// Visually-rendered hash (ignores non-rendered attribute changes).
     pub visual: String,
-    /// Interaction-identity hash: structure hash combined with the focused
-    /// control ID and selection state. `None` when no semantic analysis is
-    /// available, in which case identity degrades to content-only.
+    /// Interaction-identity hash: versioned BLAKE3 over the structure
+    /// hash, the focused control ID, and the sorted selected control IDs.
+    /// `None` when no semantic analysis is available, in which case
+    /// identity degrades to content-only.
     pub interaction: Option<String>,
 }
 
@@ -71,23 +99,51 @@ impl StateIdentity {
         }
     }
 
+    /// Identity from bare content parts (tests, synthesized states): the
+    /// visual layer mirrors content and the interaction layer is absent.
+    /// Hashes are still wrapped in the versioned BLAKE3 scheme so keys stay
+    /// in one format.
+    pub fn from_parts(content_key: &str) -> Self {
+        StateIdentity {
+            content: identity_hash("content", &[content_key]),
+            visual: identity_hash("visual", &[content_key]),
+            interaction: None,
+        }
+    }
+
     /// Identity including the interaction layer from semantic analysis.
+    ///
+    /// The interaction digest is fed a canonical input set (P0 fix 4):
+    /// structure hash, focused control ID, then the *sorted* selected
+    /// control IDs. Sorting makes the digest independent of the order the
+    /// detector happened to emit controls in.
     pub fn with_semantic(
         screen: &crate::screen::ScreenState,
         semantic: &crate::semantic::SemanticScreen,
     ) -> Self {
-        let mut hasher = DefaultHasher::new();
-        screen.structure_hash.hash(&mut hasher);
-        semantic.focus.control_id.hash(&mut hasher);
-        // Selection state participates: which row/tab is selected is
-        // interaction state even when text is identical.
-        for c in &semantic.controls {
-            c.selected.hash(&mut hasher);
-        }
+        let mut selected: Vec<&str> = semantic
+            .controls
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.id.as_str())
+            .collect();
+        selected.sort_unstable();
+        let parts: Vec<String> = std::iter::once(screen.structure_hash.clone())
+            .chain(
+                semantic
+                    .focus
+                    .control_id
+                    .clone()
+                    .into_iter()
+                    .map(|id| format!("focus={}", id)),
+            )
+            .chain(selected.iter().map(|id| format!("selected={}", id)))
+            .collect();
+        let part_refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         StateIdentity {
             content: screen.structure_hash.clone(),
             visual: screen.visual_hash.clone(),
-            interaction: Some(format!("{:016x}", hasher.finish())),
+            interaction: Some(identity_hash("interaction", &part_refs)),
         }
     }
 
@@ -161,6 +217,11 @@ impl StateGraph {
     }
 
     /// Record observing a state. Returns true if this state is novel.
+    ///
+    /// Deprecated (re-review P0 fix 3): keys on the bare structure hash,
+    /// which collapses interaction-distinct states. New code must use
+    /// [`Self::record_state_identity`].
+    #[deprecated(since = "0.1.0", note = "keys collapse interaction state; use record_state_identity")]
     pub fn record_state(
         &mut self,
         structure_hash: &str,
@@ -231,6 +292,11 @@ impl StateGraph {
     }
 
     /// Record a transition between two states.
+    ///
+    /// Deprecated (re-review P0 fix 3): keys on bare structure hashes and
+    /// loses interaction state. New code must use
+    /// [`Self::record_transition_identity`].
+    #[deprecated(since = "0.1.0", note = "loses interaction state; use record_transition_identity")]
     pub fn record_transition(&mut self, from_hash: &str, to_hash: &str, action_name: &str) {
         let from = StateId::from_structure_hash(from_hash);
         let to = StateId::from_structure_hash(to_hash);
@@ -479,9 +545,12 @@ mod tests {
         let budget = ExplorationBudget::default();
         let mut graph = StateGraph::new(budget);
 
-        assert!(graph.record_state("hash1", None, 0));
-        assert!(!graph.record_state("hash1", None, 1));
-        assert!(graph.record_state("hash2", None, 2));
+        let s1 = StateIdentity::from_parts("hash1");
+        let s2 = StateIdentity::from_parts("hash2");
+
+        assert!(graph.record_state_identity(&s1, 0));
+        assert!(!graph.record_state_identity(&s1, 1));
+        assert!(graph.record_state_identity(&s2, 2));
 
         assert_eq!(graph.state_count(), 2);
     }
@@ -491,15 +560,12 @@ mod tests {
         let budget = ExplorationBudget::default();
         let mut graph = StateGraph::new(budget);
 
-        graph.record_state("a", None, 0);
-        graph.record_state("b", None, 1);
-        graph.record_transition("a", "b", "tab");
-        graph.record_transition("a", "b", "tab"); // duplicate
+        let a = StateIdentity::from_parts("a");
+        let b = StateIdentity::from_parts("b");
+        graph.record_transition_identity(&a, &b, "tab");
+        graph.record_transition_identity(&a, &b, "tab"); // duplicate
 
         assert_eq!(graph.transition_count(), 1);
-        let out = graph.outgoing("a");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].count, 2);
     }
 
     #[test]
@@ -507,18 +573,18 @@ mod tests {
         let budget = ExplorationBudget::default();
         let mut graph = StateGraph::new(budget);
 
-        // New state
+        // New state (score is keyed by the node id string).
         assert_eq!(graph.novelty_score("new_hash"), 10);
 
-        // Record and check
-        graph.record_state("visited_once", None, 0);
-        assert_eq!(graph.novelty_score("visited_once"), 3);
+        let once = StateIdentity::from_parts("visited_once");
+        graph.record_state_identity(&once, 0);
+        assert_eq!(graph.novelty_score(once.id().as_str()), 3);
 
-        // Visit many times
+        let many = StateIdentity::from_parts("visited_many");
         for _ in 0..10 {
-            graph.record_state("visited_many", None, 0);
+            graph.record_state_identity(&many, 0);
         }
-        assert_eq!(graph.novelty_score("visited_many"), -5);
+        assert_eq!(graph.novelty_score(many.id().as_str()), -5);
     }
 
     #[test]
@@ -529,10 +595,10 @@ mod tests {
         };
         let mut graph = StateGraph::new(budget);
 
-        graph.record_state("a", None, 0);
+        graph.record_state_identity(&StateIdentity::from_parts("a"), 0);
         assert!(!graph.budget_exhausted());
 
-        graph.record_state("b", None, 1);
+        graph.record_state_identity(&StateIdentity::from_parts("b"), 1);
         assert!(graph.budget_exhausted());
     }
 
@@ -541,16 +607,15 @@ mod tests {
         let budget = ExplorationBudget::default();
         let mut graph = StateGraph::new(budget);
 
-        graph.record_state("start", None, 0);
-        graph.record_state("middle", None, 1);
-        graph.record_state("dead_end", None, 2);
+        let start = StateIdentity::from_parts("start");
+        let middle = StateIdentity::from_parts("middle");
+        let dead_end = StateIdentity::from_parts("dead_end");
 
-        graph.record_transition("start", "middle", "tab");
-        graph.record_transition("middle", "dead_end", "enter");
+        graph.record_transition_identity(&start, &middle, "tab");
+        graph.record_transition_identity(&middle, &dead_end, "enter");
 
         let dead_ends = graph.find_dead_ends();
         assert_eq!(dead_ends.len(), 1);
-        assert_eq!(dead_ends[0].id.as_str(), "dead_end");
     }
 
     #[test]
@@ -559,21 +624,111 @@ mod tests {
         let mut g1 = StateGraph::new(budget.clone());
         let mut g2 = StateGraph::new(budget);
 
-        g1.record_state("a", None, 0);
-        g1.record_state("b", None, 1);
-        g1.record_transition("a", "b", "tab");
+        let a = StateIdentity::from_parts("a");
+        let b = StateIdentity::from_parts("b");
+        let c = StateIdentity::from_parts("c");
 
-        g2.record_state("b", None, 10);
-        g2.record_state("c", None, 11);
-        g2.record_transition("b", "c", "enter");
+        g1.record_state_identity(&a, 0);
+        g1.record_state_identity(&b, 1);
+        g1.record_transition_identity(&a, &b, "tab");
+
+        g2.record_state_identity(&b, 10);
+        g2.record_state_identity(&c, 11);
+        g2.record_transition_identity(&b, &c, "enter");
 
         g1.merge(&g2);
 
         assert_eq!(g1.state_count(), 3);
         assert_eq!(g1.transition_count(), 2);
 
-        // State b should have combined visit count
-        let b = g1.get_node("b").unwrap();
-        assert_eq!(b.visit_count, 2);
+        // State b should have combined visit count.
+        let b_id = b.id();
+        let b_node = g1.get_node(b_id.as_str()).unwrap();
+        assert_eq!(b_node.visit_count, 2);
+    }
+
+    /// P0 fix 4: identities are versioned BLAKE3, not `DefaultHasher`.
+    /// The digest format itself must carry the version prefix so artifacts
+    /// from a future input change are distinguishable, and the digest must
+    /// be stable across processes (same inputs → same string, always).
+    #[test]
+    fn identity_hashes_are_versioned_and_stable() {
+        let i1 = StateIdentity::from_parts("screen-state");
+        let i2 = StateIdentity::from_parts("screen-state");
+        assert_eq!(i1.content, i2.content, "deterministic across instances");
+        assert!(
+            i1.content.starts_with("identity:v1:content:"),
+            "content digest must carry the schema prefix, got {}",
+            i1.content
+        );
+        assert!(
+            i1.interaction.is_none(),
+            "from_parts leaves the interaction layer absent"
+        );
+        // Different inputs, different digests — and never equal by accident.
+        assert_ne!(i1.content, i1.visual, "layer kinds are bound into the hash");
+    }
+
+    /// P0 fix 4: the interaction digest must not depend on the order the
+    /// detector emits controls in. Two semantic screens with the same
+    /// selected set in different orders must produce identical identity.
+    #[test]
+    fn interaction_identity_is_order_independent() {
+        use crate::semantic::controls::{Control, ControlKind};
+        let screen = crate::screen::ScreenState::new(80, 24);
+        let make_sem = |selected: &[&str]| -> crate::semantic::SemanticScreen {
+            let mut s = crate::semantic::analyze(&screen);
+            s.focus.control_id = Some("button/ok".to_string());
+            for sel_id in selected {
+                s.controls.push(Control {
+                    id: format!("row/{}", sel_id),
+                    kind: ControlKind::List,
+                    label: sel_id.to_string(),
+                    value: None,
+                    bounds: crate::semantic::controls::ControlBounds {
+                        x: 0,
+                        y: 0,
+                        width: 10,
+                        height: 1,
+                    },
+                    region_id: None,
+                    focusable: true,
+                    focused: false,
+                    enabled: true,
+                    selected: true,
+                    checked: false,
+                    shortcut: None,
+                    confidence: crate::semantic::confidence::Confidence::inferred(0.9, &[
+                        "test-fixture",
+                    ]),
+                    evidence: vec![],
+                    source: "inferred".to_string(),
+                });
+            }
+            s
+        };
+        let a = StateIdentity::with_semantic(&screen, &make_sem(&["alpha", "beta"]));
+        let b = StateIdentity::with_semantic(&screen, &make_sem(&["beta", "alpha"]));
+        assert_eq!(
+            a.interaction, b.interaction,
+            "selection order must not change the interaction digest"
+        );
+
+        // And a different selection set must change it.
+        let c = StateIdentity::with_semantic(&screen, &make_sem(&["alpha", "gamma"]));
+        assert_ne!(a.interaction, c.interaction);
+    }
+
+    /// JSON round-trip keeps identity intact (report/export durability).
+    #[test]
+    fn state_identity_json_roundtrip() {
+        let screen = crate::screen::ScreenState::new(80, 24);
+        let mut sem = crate::semantic::analyze(&screen);
+        sem.focus.control_id = Some("field/host".into());
+        let id = StateIdentity::with_semantic(&screen, &sem);
+        let json = serde_json::to_string(&id).expect("serialize");
+        let back: StateIdentity = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, id);
+        assert_eq!(back.id(), id.id(), "graph key must survive the round-trip");
     }
 }

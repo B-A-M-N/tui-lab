@@ -9,12 +9,20 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Shared stdout reader: the request loop reads lines from it while a
+/// watchdog thread observes progress. A hard hang in the server (e.g. a
+/// deadlocked tool handler) would otherwise block `read_line` forever —
+/// the deadline was previously only checked between lines, so a stuck
+/// server meant a stuck test binary, not a timeout failure.
+struct SharedStdout(BufReader<std::process::ChildStdout>);
 
 struct McpProc {
     child: Child,
     stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdout: Arc<Mutex<SharedStdout>>,
     next_id: u64,
 }
 
@@ -29,7 +37,9 @@ impl McpProc {
             .spawn()
             .expect("spawn hermes-tui-lab mcp");
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let stdout = Arc::new(Mutex::new(SharedStdout(
+            BufReader::new(child.stdout.take().expect("stdout")),
+        )));
         McpProc {
             child,
             stdin,
@@ -53,12 +63,21 @@ impl McpProc {
         self.stdin.flush().expect("flush");
 
         let deadline = Instant::now() + Duration::from_secs(30);
+        // Watchdog: if no line arrives for 30s the server is hung, not slow.
+        // Kill the child so the blocked read_line below hits EOF and the
+        // test fails with a message instead of blocking the harness forever.
+        let mut watchdog = Watchdog::start(Some(self.child.id()), deadline);
         loop {
-            assert!(Instant::now() < deadline, "timeout waiting for {method}");
+            assert!(
+                Instant::now() < deadline,
+                "timeout waiting for {method}"
+            );
             let mut line = String::new();
-            // set a coarse read timeout by relying on the deadline assert;
-            // blocking reads are bounded by the child's lifetime.
-            let n = self.stdout.read_line(&mut line).expect("read line");
+            let n = {
+                let mut out = self.stdout.lock().expect("stdout lock");
+                out.0.read_line(&mut line).expect("read line")
+            };
+            watchdog.progress();
             assert!(n > 0, "server closed stdout while waiting for {method}");
             let v: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
@@ -89,6 +108,45 @@ impl McpProc {
             .unwrap_or_else(|| panic!("no text content in {name} response: {resp}"));
         serde_json::from_str(text)
             .unwrap_or_else(|e| panic!("envelope parse for {name}: {e}: {text}"))
+    }
+}
+
+/// Kills the server child when the deadline passes without progress. The
+/// server's death unblocks the reader (EOF), turning a server deadlock into
+/// a normal test failure instead of an eternally-running test binary.
+struct Watchdog {
+    stop: Arc<Mutex<bool>>,
+}
+
+impl Watchdog {
+    fn start(child_pid: Option<u32>, deadline: Instant) -> Self {
+        let stop = Arc::new(Mutex::new(false));
+        let flag = stop.clone();
+        std::thread::spawn(move || {
+            while Instant::now() < deadline {
+                if *flag.lock().unwrap() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if !*flag.lock().unwrap() {
+                eprintln!("[e2e watchdog] no response before deadline; killing server {child_pid:?}");
+                if let Some(pid) = child_pid {
+                    // SIGKILL the process group: the child PTY apps die too,
+                    // so no stray python3 survives the failed test.
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+            }
+        });
+        Watchdog { stop }
+    }
+
+    /// Called after every successful line read: disarms the kill.
+    fn progress(&mut self) {
+        *self.stop.lock().unwrap() = true;
     }
 }
 
@@ -649,9 +707,18 @@ fn stdio_e2e_full_lifecycle() {
         for (i, s) in steps.iter().enumerate() {
             assert_eq!(s["seq"], i as u64, "steps must be ordered: {s}");
             assert!(s["action"].is_string(), "step action: {s}");
+            // Layered identity (re-review P0 fix 3): before/after carry
+            // content/visual/interaction, not a bare structure hash.
             assert!(
-                s["before"].is_string() && s["after"].is_string(),
+                s["before"]["content"].is_string()
+                    && s["before"]["interaction"].is_string()
+                    && s["after"]["content"].is_string()
+                    && s["after"]["visual"].is_string(),
                 "step identity: {s}"
+            );
+            assert!(
+                s["settle"].is_string(),
+                "step settle status (met/timed_out/skipped): {s}"
             );
         }
         // Real completion reason, never a generic "completed" (item 13).
@@ -873,4 +940,43 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "stop", "id": session }),
     );
     assert_eq!(stop["category"], "success", "stop failed: {stop}");
+}
+
+
+/// Watchdog proof (harness hardening): a server that never responds must
+/// produce a request() timeout failure, not an eternal hang. Uses a silent
+/// child (`sleep`) standing in for a deadlocked server.
+#[test]
+fn watchdog_converts_silent_server_into_timeout() {
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let mut silent = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let stdout = Arc::new(Mutex::new(SharedStdout(BufReader::new(
+        silent.stdout.take().expect("stdout"),
+    ))));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut wd = Watchdog::start(Some(silent.id()), deadline);
+    let start = Instant::now();
+    let mut line = String::new();
+    let n = {
+        let mut out = stdout.lock().unwrap();
+        out.0.read_line(&mut line).expect("read")
+    };
+    // sleep never writes: the read must unblock via watchdog SIGKILL -> EOF.
+    assert_eq!(n, 0, "expected EOF after watchdog kill, got {n} bytes");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "watchdog must kill quickly"
+    );
+    wd.progress();
+    let _ = silent.kill();
+    let _ = silent.wait();
 }

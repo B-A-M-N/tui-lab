@@ -556,10 +556,11 @@ impl CaptureOutcome {
 }
 
 /// The canonical frame exchanged by transactions, replay, and audit
-/// evidence (re-review P0). Wraps [`ScreenState`] with a stable identity
-/// so frames can be referenced across runs and tools without recomputing
-/// hashes. The underlying [`ScreenState::structure_hash`] remains the
-/// de-duplication key.
+/// evidence (re-review P0, made real in Wave B item 11). Wraps
+/// [`ScreenState`] with provenance (run/session/generation), capture
+/// sequence numbers, and a stable per-run `frame_id` so evidence can cite
+/// `frame:1047` instead of an opaque hash. The underlying
+/// [`ScreenState::structure_hash`] remains the de-duplication key.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CanonicalFrame {
     /// The screen at the moment the frame was captured.
@@ -568,8 +569,21 @@ pub struct CanonicalFrame {
     pub screen_seq: u64,
     /// Output sequence number at capture time.
     pub output_seq: u64,
-    /// Optional monotonic id for cross-run referencing.
+    /// Per-run monotonic frame id (the citable identity: `frame:1047`).
+    /// `None` until a run assigns it.
     pub frame_id: Option<u64>,
+    /// The run this frame belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The session this frame was captured from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Session generation at capture time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+    /// Unix-millis capture time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<u64>,
 }
 
 impl CanonicalFrame {
@@ -580,6 +594,45 @@ impl CanonicalFrame {
             screen_seq,
             output_seq,
             frame_id: None,
+            run_id: None,
+            session_id: None,
+            generation: None,
+            captured_at: None,
+        }
+    }
+
+    /// Fill in run/session provenance (chainable).
+    pub fn with_provenance(
+        mut self,
+        run_id: &str,
+        session_id: &str,
+        generation: u32,
+    ) -> Self {
+        self.run_id = Some(run_id.to_string());
+        self.session_id = Some(session_id.to_string());
+        self.generation = Some(generation);
+        self.captured_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
+        self
+    }
+
+    /// Assign the next per-run frame id (caller allocates from the run
+    /// counter); returns the id for citing.
+    pub fn assign_frame_id(&mut self, id: u64) -> u64 {
+        self.frame_id = Some(id);
+        id
+    }
+
+    /// Citable identity string (`frame:1047`) — falls back to the sequence
+    /// numbers when no run id was assigned.
+    pub fn cite(&self) -> String {
+        match self.frame_id {
+            Some(id) => format!("frame:{id}"),
+            None => format!("frame:seq-{}-{}", self.screen_seq, self.output_seq),
         }
     }
 

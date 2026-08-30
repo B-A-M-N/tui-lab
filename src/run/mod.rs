@@ -19,9 +19,11 @@
 //! server holds a `RunContext` and every subsystem hangs off it. This is what
 //! turns "implemented modules" into "product paths".
 
+pub mod artifacts;
 pub mod manifest;
 pub mod recording_scope;
 
+pub use artifacts::{ArtifactKind, ArtifactRef};
 pub use manifest::RunManifest;
 
 use crate::checkpoint::store::CheckpointStore;
@@ -33,9 +35,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Upper bound on the in-memory transaction ledger (re-review Wave-2 item
 /// 15). Frames are heavy; the ledger holds evidence-level records. When the
-/// bound is hit the oldest half is evicted; the total counter is never
-/// reset, so `transactions: 47` stays honest while the ledger holds the
-/// most recent half-bound.
+/// bound is hit the oldest half is evicted; the eviction is *declared* —
+/// `dropped_records`/`first_available_seq` travel with the run (manifest +
+/// status) so a promoted run never pretends to be replay-complete
+/// (re-review P0 fix 5).
 const MAX_TRANSACTION_RECORDS: usize = 512;
 
 /// One settled interaction transaction, at evidence level.
@@ -56,9 +59,10 @@ pub struct TransactionRecord {
     pub session: String,
     /// Action name ("key", "type", "mouse_click", "wait", ...).
     pub action: String,
-    /// Whether the post-action settle condition was met.
-    pub settled: bool,
-    /// Why the settle resolved (or timed out), if reported.
+    /// How the settle wait resolved ("met" / "timed_out" / "skipped").
+    /// Serialized as a string; `settled()` derives the legacy bool.
+    pub settle: String,
+    /// Why the settle resolved (or timed out / was skipped), if reported.
     pub settle_reason: Option<String>,
     /// Structure hash before the action.
     pub before_structure: String,
@@ -68,32 +72,47 @@ pub struct TransactionRecord {
     pub changed_cells: usize,
     /// Settle latency in milliseconds.
     pub elapsed_ms: u64,
-    /// The typed action (Wave-2 item 10) — present when the transaction came
-    /// through the canonical executor, so the ledger can *replay*, not just
-    /// count. Skipped for non-interaction ledger entries ("wait").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub canonical: Option<crate::execution::CanonicalAction>,
+    /// The typed action (Wave-2 item 10) as it may be persisted (leak fix):
+    /// `Full` when the visibility policy allows it, `Redacted { kind,
+    /// byte_len }` for sensitive payloads — the payload itself never lands
+    /// in the ledger. Skipped for non-interaction ledger entries ("wait").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persisted_action: Option<crate::execution::PersistedAction>,
 }
 
 impl TransactionRecord {
+    /// Legacy view of settlement as a bool.
+    pub fn settled(&self) -> bool {
+        self.settle == "met"
+    }
+
     /// Build a record from a live [`crate::execution::InteractionTransaction`].
     pub fn from_interaction(
         seq: u64,
         session: &str,
         tx: &crate::execution::InteractionTransaction,
     ) -> Self {
+        let settle = match tx.settle {
+            crate::execution::SettleStatus::Met => "met",
+            crate::execution::SettleStatus::TimedOut => "timed_out",
+            crate::execution::SettleStatus::Skipped => "skipped",
+        };
+        let persisted_action = Some(crate::execution::PersistedAction::project(
+            tx.canonical(),
+            tx.action.visibility,
+        ));
         TransactionRecord {
             seq,
             at: now_ms(),
             session: session.to_string(),
-            action: tx.action.clone(),
-            settled: tx.settled,
-            settle_reason: tx.settle_reason.clone(),
-            before_structure: tx.before.structure_hash.clone(),
-            after_structure: tx.after.structure_hash.clone(),
+            action: tx.name().to_string(),
+            settle: settle.to_string(),
+            settle_reason: Some(tx.settle_reason()),
+            before_structure: tx.before().structure_hash.clone(),
+            after_structure: tx.after().structure_hash.clone(),
             changed_cells: tx.transition.screen_diff.changed_cells,
             elapsed_ms: tx.elapsed_ms,
-            canonical: tx.canonical.clone(),
+            persisted_action,
         }
     }
 }
@@ -106,8 +125,18 @@ pub struct RunContext {
     pub started_at: u64,
     /// Artifact root: `.tui-lab/runs/<id>` when persistence is enabled.
     run_dir: Option<PathBuf>,
-    /// The launch spec of the primary session this run was opened for, if any.
-    launch_spec: Option<crate::session::state::LaunchSpec>,
+    /// Launch spec per session (re-review P0 fix 6): a run can involve
+    /// multiple sessions and each restart creates a new generation, so the
+    /// run records one entry per session id it has seen.
+    session_specs: HashMap<String, crate::session::state::LaunchSpec>,
+    /// First session recorded — the run's primary for cwd/root resolution.
+    primary_session: Option<String>,
+    /// How many ledger records were evicted before flush (P0 fix 5): when
+    /// nonzero, the durable run is *not* replay-complete and says so.
+    dropped_records: u64,
+    /// Sequence number of the oldest record still in the ledger; `None`
+    /// when nothing was evicted (equivalent to 0).
+    first_available_seq: Option<u64>,
     /// Checkpoints recorded during this run.
     pub checkpoints: CheckpointStore,
     /// In-progress scenario recordings by opaque id (re-review item 5:
@@ -143,6 +172,20 @@ pub struct RunContext {
     transaction_count: u64,
     /// Events observed in this run (observe/wait calls).
     event_count: u64,
+    /// Per-run frame id allocator (Wave B item 11): every CanonicalFrame
+    /// registered with the run gets a citable `frame:N` identity.
+    next_frame_id: u64,
+    /// Artifact registry (Wave B item 15): typed references to every large
+    /// artifact the run produced (recordings, event logs). Tools return an
+    /// [`ArtifactRef`] instead of inlining multi-kilobyte payloads.
+    artifacts: Vec<ArtifactRef>,
+    /// True once the ledger has been appended to transactions.jsonl for a
+    /// persistent run (drives incremental appends, Wave B item 14).
+    ledger_flushed_upto: u64,
+    /// Terminal-event batches drained from sessions (Wave B item 12/14):
+    /// (session id, events). Filled by the MCP layer before flush; written
+    /// to `events/<session>.jsonl` when the run persists.
+    held_events: Vec<(String, Vec<crate::events::TerminalEvent>)>,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
 }
@@ -154,7 +197,10 @@ impl RunContext {
             id: format!("run-{}", uuid::Uuid::new_v4().simple()),
             started_at: now_ms(),
             run_dir: None,
-            launch_spec: None,
+            session_specs: HashMap::new(),
+            primary_session: None,
+            dropped_records: 0,
+            first_available_seq: None,
             checkpoints: CheckpointStore::new(),
             recorders: HashMap::new(),
             saved_scenarios: HashMap::new(),
@@ -166,18 +212,23 @@ impl RunContext {
             transactions: Vec::new(),
             transaction_count: 0,
             event_count: 0,
+            next_frame_id: 0,
+            artifacts: Vec::new(),
+            ledger_flushed_upto: 0,
+            held_events: Vec::new(),
             closed: false,
         }
     }
 
-    /// Create a persistent run rooted at `.tui-lab/runs/<run-id>` under
-    /// `base` (defaults to the process cwd when `base` is `None`).
-    pub fn persistent(base: Option<&std::path::Path>) -> anyhow::Result<Self> {
+    /// Create a persistent run rooted at `.tui-lab/runs/<run-id>` under the
+    /// caller-supplied `base` (re-review P0 fix 7). There is no `None`
+    /// default: guessing the process cwd as an artifact destination was the
+    /// exact behavior the MCP-layer policy rejects, so the lower API no
+    /// longer offers it. Callers resolve the base from session cwd or an
+    /// explicit request root.
+    pub fn persistent(base: &std::path::Path) -> anyhow::Result<Self> {
         let mut run = RunContext::ephemeral();
-        let root = match base {
-            Some(b) => Self::runs_dir_for(b, &run.id),
-            None => PathBuf::from(".tui-lab").join("runs").join(&run.id),
-        };
+        let root = Self::runs_dir_for(base, &run.id);
         std::fs::create_dir_all(root.join("checkpoints"))?;
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
@@ -194,14 +245,46 @@ impl RunContext {
         self.run_dir.as_ref()
     }
 
-    /// Record the launch spec of the session this run is attached to.
-    pub fn set_launch_spec(&mut self, spec: crate::session::state::LaunchSpec) {
-        self.launch_spec = Some(spec);
+    /// Record the launch spec of the session this run is attached to
+    /// (per-session map, P0 fix 6). The first session recorded becomes the
+    /// run's primary (cwd/root resolution).
+    pub fn set_launch_spec(&mut self, session_id: &str, spec: crate::session::state::LaunchSpec) {
+        if self.primary_session.is_none() {
+            self.primary_session = Some(session_id.to_string());
+        }
+        self.session_specs.insert(session_id.to_string(), spec);
         self.write_manifest().ok();
     }
 
-    pub fn launch_spec(&self) -> Option<&crate::session::state::LaunchSpec> {
-        self.launch_spec.as_ref()
+    /// The launch spec recorded for one session.
+    pub fn launch_spec(
+        &self,
+        session_id: &str,
+    ) -> Option<&crate::session::state::LaunchSpec> {
+        self.session_specs.get(session_id)
+    }
+
+    /// The primary session's launch spec, if any session was recorded.
+    pub fn primary_launch_spec(&self) -> Option<&crate::session::state::LaunchSpec> {
+        self.primary_session
+            .as_ref()
+            .and_then(|id| self.session_specs.get(id))
+    }
+
+    /// Replay-history completeness (P0 fix 5): when the in-memory ledger
+    /// evicted records before a flush, the durable run is not
+    /// replay-complete — the manifest and status report the gap instead of
+    /// pretending.
+    pub fn history_complete(&self) -> bool {
+        self.dropped_records == 0
+    }
+
+    pub fn dropped_records(&self) -> u64 {
+        self.dropped_records
+    }
+
+    pub fn first_available_seq(&self) -> Option<u64> {
+        self.first_available_seq
     }
 
     /// Start recording a scenario bound to one session generation. Returns
@@ -493,7 +576,12 @@ impl RunContext {
             schema: "tui-lab.run.v1".into(),
             run_id: self.id.clone(),
             started_at: self.started_at,
-            launch_spec: self.launch_spec.clone(),
+            launch_spec: self.primary_launch_spec().cloned(),
+            sessions: self.session_specs.clone(),
+            primary_session: self.primary_session.clone(),
+            history_complete: self.history_complete(),
+            first_available_seq: self.first_available_seq,
+            dropped_records: self.dropped_records,
             closed: self.closed,
         };
         let tmp = dir.join("run.json.tmp");
@@ -559,8 +647,12 @@ impl RunContext {
     /// Record one settled interaction transaction into the run's ledger
     /// (re-review Wave-2 item 15). Evidence-level: hashes, settle outcome,
     /// timing, cell delta — not the full frames. The record's `seq` is
-    /// assigned here from the run's own counter. Bounded; when the ledger
-    /// is full, the oldest half is dropped (counters keep the true total).
+    /// assigned here from the run's own counter.
+    ///
+    /// Bounded (P0 fix 5): when the ledger is full the oldest half is
+    /// evicted, and the eviction is *declared* — `dropped_records` grows
+    /// and `first_available_seq` moves, so a later flush/promotion can
+    /// never present the run as replay-complete.
     pub fn record_interaction(
         &mut self,
         session: &str,
@@ -570,30 +662,57 @@ impl RunContext {
         self.transaction_count += 1;
         let mut record = TransactionRecord::from_interaction(seq, session, tx);
         record.seq = seq;
-        if self.transactions.len() >= MAX_TRANSACTION_RECORDS {
-            let drop = MAX_TRANSACTION_RECORDS / 2;
-            self.transactions.drain(..drop);
-        }
-        self.transactions.push(record);
+        self.push_ledger(record);
     }
 
     /// Record a non-frame interaction (wait/observe) at evidence level.
+    ///
+    /// Settlement is honestly `skipped`: no settle wait ran for this entry,
+    /// and the old hardcoded `settled: true` (with empty hashes) was a lie.
+    /// Same bounding + declared eviction as [`Self::record_interaction`]
+    /// (P0 fix 5) — one bounded path, not one bounded and one unbounded.
     pub fn record_event(&mut self, session: &str, action: &str) {
         let seq = self.transaction_count;
         self.transaction_count += 1;
-        self.transactions.push(TransactionRecord {
+        self.push_ledger(TransactionRecord {
             seq,
             at: now_ms(),
             session: session.to_string(),
             action: action.to_string(),
-            settled: true,
-            settle_reason: None,
+            settle: "skipped".to_string(),
+            settle_reason: Some("non-interaction event".to_string()),
             before_structure: String::new(),
             after_structure: String::new(),
             changed_cells: 0,
             elapsed_ms: 0,
-            canonical: None,
+            persisted_action: None,
         });
+    }
+
+    /// Shared bounded push with declared eviction (P0 fix 5).
+    fn push_ledger(&mut self, record: TransactionRecord) {
+        // Persistent runs append immediately (Wave B item 14): the file is
+        // the authoritative history, memory is only a bounded window. The
+        // watermark rolls back on append failure so flush retries the tail.
+        if let Some(dir) = self.run_dir.clone() {
+            let flushed = self.ledger_flushed_upto;
+            self.transactions.push(record);
+            if self.append_ledger_incremental(&dir).is_err() {
+                self.ledger_flushed_upto = flushed;
+            }
+        } else {
+            self.transactions.push(record);
+        }
+        // Declared eviction (P0 fix 5) — for persistent runs this trims the
+        // memory window only (disk already holds the records); for
+        // ephemeral runs it is a real loss, which the manifest declares.
+        if self.transactions.len() >= MAX_TRANSACTION_RECORDS + 512 {
+            let drop = MAX_TRANSACTION_RECORDS / 2;
+            let new_first = self.transactions[drop].seq;
+            self.transactions.drain(..drop);
+            self.dropped_records += drop as u64;
+            self.first_available_seq = Some(new_first);
+        }
     }
 
     /// The transaction ledger (bounded; see [`Self::record_transaction`]).
@@ -608,7 +727,8 @@ impl RunContext {
 
     /// The launch spec cwd of the primary session, if attached.
     pub fn primary_session_cwd(&self) -> Option<&str> {
-        self.launch_spec.as_ref().and_then(|s| s.cwd.as_deref())
+        self.primary_launch_spec()
+            .and_then(|s| s.cwd.as_deref())
     }
 
     /// Status snapshot for `tui_run status` (goal spec shape).
@@ -627,6 +747,13 @@ impl RunContext {
             "closed": self.closed,
             "primary_session_cwd": self.primary_session_cwd().map(str::to_string),
             "counts": self.counts(),
+            "artifacts": self.artifacts.iter().map(|a| serde_json::json!({
+                "id": a.id,
+                "kind": a.kind,
+                "path": a.path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                "size": a.size,
+                "summary": a.summary,
+            })).collect::<Vec<_>>(),
         })
     }
 
@@ -678,16 +805,35 @@ impl RunContext {
         let ftmp = dir.join("focus_graph.json.tmp");
         std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.focus_transitions)?)?;
         std::fs::rename(&ftmp, dir.join("focus_graph.json"))?;
-        // Transaction ledger (Wave-2 item 15): NDJSON, one record per line,
-        // so partial reads and appends stay possible.
-        let ttmp = dir.join("transactions.jsonl.tmp");
-        let mut lines = String::new();
-        for tx in &self.transactions {
-            lines.push_str(&serde_json::to_string(tx)?);
-            lines.push('\n');
+        // Transaction ledger (Wave-2 item 15 + Wave B item 14): NDJSON,
+        // APPENDED incrementally — every record whose seq exceeds
+        // `ledger_flushed_upto` is appended now, so a crash loses at most
+        // the last in-flight record instead of the whole unflushed tail.
+        // The eviction window still bounds memory; the file is the
+        // authoritative history for persistent runs.
+        self.append_ledger_incremental(&dir)?;
+        // Terminal-event logs (Wave B item 12/14).
+        let ev_dir = dir.join("events");
+        std::fs::create_dir_all(&ev_dir)?;
+        for (session, events) in std::mem::take(&mut self.held_events) {
+            let safe = sanitize(&session);
+            let mut body = String::new();
+            for ev in &events {
+                body.push_str(&serde_json::to_string(ev)?);
+                body.push('\n');
+            }
+            let path = ev_dir.join(format!("{}.jsonl", safe));
+            let tmp = ev_dir.join(format!("{}.jsonl.tmp", safe));
+            std::fs::write(&tmp, &body)?;
+            std::fs::rename(&tmp, &path)?;
+            self.register_artifact(
+                crate::run::ArtifactKind::EventLog,
+                Some(std::path::PathBuf::from("events").join(format!("{}.jsonl", safe))),
+                Some(body.len() as u64),
+                Some(session),
+                format!("terminal event log, {} events", events.len()),
+            );
         }
-        std::fs::write(&ttmp, lines)?;
-        std::fs::rename(&ttmp, dir.join("transactions.jsonl"))?;
         // Recordings held in memory (stopped while ephemeral).
         let rec_dir = dir.join("recordings");
         std::fs::create_dir_all(&rec_dir)?;
@@ -756,11 +902,91 @@ impl RunContext {
         Ok(root)
     }
 
+    /// Append every ledger record not yet on disk to
+    /// `<run>/transactions.jsonl` (Wave B item 14). Called by `flush` (and
+    /// by `record_interaction` for persistent runs) so the file grows
+    /// incrementally with the run. Evicted records are never rewritten —
+    /// they are already in the file if the run was persistent when they
+    /// landed, and the manifest's declared gap covers them if not.
+    fn append_ledger_incremental(&mut self, dir: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let path = dir.join("transactions.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        for tx in &self.transactions {
+            if tx.seq >= self.ledger_flushed_upto {
+                let line = serde_json::to_string(tx)?;
+                file.write_all(line.as_bytes())?;
+                file.write_all(b"\n")?;
+                self.ledger_flushed_upto = tx.seq + 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Assign the next citable frame id (Wave B item 11) and stamp the
+    /// frame with run provenance. Returns the id (`frame:N`).
+    pub fn register_frame(
+        &mut self,
+        frame: &mut crate::backend::CanonicalFrame,
+    ) -> u64 {
+        self.next_frame_id += 1;
+        let id = self.next_frame_id;
+        frame.assign_frame_id(id);
+        frame.run_id = Some(self.id.clone());
+        id
+    }
+
+    /// Hold one session's drained terminal events for persistence (Wave B
+    /// item 14). Sessions own the live queue; the run keeps the export.
+    pub fn hold_events(
+        &mut self,
+        session: &str,
+        events: Vec<crate::events::TerminalEvent>,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        self.held_events.push((session.to_string(), events));
+    }
+
+    /// Register a produced artifact and get its typed ref (Wave B item 15).
+    pub fn register_artifact(
+        &mut self,
+        kind: ArtifactKind,
+        path: Option<PathBuf>,
+        size: Option<u64>,
+        session: Option<String>,
+        summary: impl Into<String>,
+    ) -> ArtifactRef {
+        let n = self.artifacts.len() + 1;
+        let r = ArtifactRef {
+            id: format!("art-{}", n),
+            kind,
+            path,
+            size,
+            session,
+            summary: summary.into(),
+        };
+        self.artifacts.push(r.clone());
+        r
+    }
+
+    /// All artifacts registered in this run.
+    pub fn artifacts(&self) -> &[ArtifactRef] {
+        &self.artifacts
+    }
+
     /// Counts for `tui_run status`.
     pub fn counts(&self) -> serde_json::Value {
         json!({
             "transactions": self.transaction_count,
             "transactions_in_ledger": self.transactions.len(),
+            "history_complete": self.history_complete(),
+            "dropped_records": self.dropped_records,
+            "first_available_seq": self.first_available_seq,
             "events": self.event_count,
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.saved_scenarios.len(),
@@ -769,6 +995,8 @@ impl RunContext {
             "focus_transitions": self.focus_transitions.len(),
             "state_graph_states": self.state_graph.state_count(),
             "state_graph_transitions": self.state_graph.transition_count(),
+            "frames": self.next_frame_id,
+            "artifacts": self.artifacts.len(),
         })
     }
 }
@@ -855,7 +1083,7 @@ mod tests {
     #[test]
     fn transaction_ledger_records_and_flushes() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let mut run = RunContext::persistent(Some(tmp.path())).expect("run");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
 
         // Build a real interaction transaction through the canonical executor.
         let mut s = crate::session::state::Session::new("ledger-sess".into(), "python3".into());
@@ -893,8 +1121,8 @@ mod tests {
         assert_eq!(ledger[0].seq, 0);
         assert_eq!(ledger[0].action, "key");
         assert_eq!(ledger[1].action, "wait");
-        assert_eq!(ledger[0].before_structure, tx.before.structure_hash);
-        assert_eq!(ledger[0].after_structure, tx.after.structure_hash);
+        assert_eq!(ledger[0].before_structure, tx.before().structure_hash);
+        assert_eq!(ledger[0].after_structure, tx.after().structure_hash);
 
         run.flush().expect("flush");
         let body =
@@ -906,14 +1134,136 @@ mod tests {
         assert_eq!(first.action, "key");
     }
 
+    /// Wave B item 14: a PERSISTENT run appends each ledger record to
+    /// transactions.jsonl immediately — the file grows with the run, so a
+    /// crash cannot lose the unflushed tail.
+    #[test]
+    fn persistent_ledger_appends_incrementally() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+
+        // Record BEFORE any flush: the file must already hold the record.
+        run.record_event("s1", "wait");
+        let path = run.run_dir().expect("dir").join("transactions.jsonl");
+        let body = std::fs::read_to_string(&path).expect("ledger exists pre-flush");
+        assert_eq!(body.lines().count(), 1, "appended immediately: {body}");
+
+        run.record_event("s1", "wait");
+        let body = std::fs::read_to_string(&path).expect("reread");
+        assert_eq!(body.lines().count(), 2, "second append: {body}");
+
+        // And flush is idempotent on the file (no duplicate lines).
+        run.flush().expect("flush");
+        let body = std::fs::read_to_string(&path).expect("reread");
+        assert_eq!(body.lines().count(), 2, "flush must not duplicate");
+    }
+
+    /// Wave B item 11: frames get citable per-run ids and provenance.
+    #[test]
+    fn frames_get_citable_ids() {
+        let mut run = RunContext::ephemeral();
+        let mut f = crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 3, 9);
+        let id = run.register_frame(&mut f);
+        assert_eq!(id, 1);
+        assert_eq!(f.frame_id, Some(1));
+        assert_eq!(f.cite(), "frame:1");
+        assert_eq!(f.run_id.as_deref(), Some(run.id.as_str()));
+
+        let mut g =
+            crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 4, 10);
+        let id2 = run.register_frame(&mut g);
+        assert_eq!(id2, 2, "monotonic per run");
+        assert_eq!(run.counts()["frames"], 2);
+    }
+
+    /// Wave B item 15: artifacts register as typed refs, both persisted and
+    /// held (ephemeral), and travel into run status.
+    #[test]
+    fn artifact_refs_register_and_cite() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+        let rel = std::path::PathBuf::from("recordings").join("s1-1.cast");
+        let a = run.register_artifact(
+            ArtifactKind::Recording,
+            Some(rel.clone()),
+            Some(123),
+            Some("s1".into()),
+            "test recording",
+        );
+        assert_eq!(a.id, "art-1");
+        assert_eq!(a.cite(), "art-1:recording");
+        assert_eq!(run.artifacts().len(), 1);
+
+        // Ephemeral registration (no path) still gets a ref.
+        let b = run.register_artifact(
+            ArtifactKind::EventLog,
+            None,
+            Some(456),
+            Some("s2".into()),
+            "held events",
+        );
+        assert_eq!(b.id, "art-2");
+        assert!(b.path.is_none());
+
+        let status = run.status(vec![]);
+        let arts = status["artifacts"].as_array().expect("artifacts in status");
+        assert_eq!(arts.len(), 2);
+    }
+
+    /// Wave B item 12/14: session event queues drain into per-session
+    /// events/<session>.jsonl on flush, registered as typed artifacts.
+    #[test]
+    fn event_logs_flush_to_artifacts() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+
+        let mut s = crate::session::state::Session::new("ev-sess".into(), "python3".into());
+        s.start_with_spec(crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec!["-c".into(), "print('ev'); import time; time.sleep(10)".into()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        })
+        .expect("spawn");
+        // Two observations: ProcessStarted (+ possibly ScreenChanged).
+        let _ = s.observe(50).expect("observe 1");
+        let _ = s.observe(50).expect("observe 2");
+        let drained = s.drain_events();
+        assert!(!drained.is_empty(), "observe must emit events");
+        assert!(
+            drained
+                .iter()
+                .any(|e| e.kind.name() == "process_started"),
+            "first observation emits ProcessStarted"
+        );
+
+        run.hold_events("ev-sess", drained);
+        run.flush().expect("flush");
+        let log = std::fs::read_to_string(
+            run.run_dir().expect("dir").join("events").join("ev-sess.jsonl"),
+        )
+        .expect("event log");
+        assert!(log.contains("\"type\":\"process_started\""), "{log}");
+        assert!(
+            run.artifacts()
+                .iter()
+                .any(|a| a.kind == ArtifactKind::EventLog),
+            "event log registered as artifact"
+        );
+    }
+
     #[test]
     fn persistent_run_writes_manifest_and_scenario_roundtrip() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let mut run = RunContext::persistent(Some(tmp.path())).expect("run");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
         assert!(run.run_dir().is_some());
         assert!(run.run_dir().unwrap().join("run.json").exists());
 
-        run.set_launch_spec(crate::session::state::LaunchSpec::new("python3", 80, 24));
+        run.set_launch_spec("primary-sess", crate::session::state::LaunchSpec::new("python3", 80, 24));
 
         let scenario = crate::scenario::model::Scenario::new("roundtrip")
             .act(serde_json::json!({"action": "key", "key": "enter"}))
@@ -937,7 +1287,7 @@ mod tests {
     #[test]
     fn same_named_scenarios_do_not_collide() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let mut run = RunContext::persistent(Some(tmp.path())).expect("run");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
 
         let a = crate::scenario::model::Scenario::new("login")
             .act(serde_json::json!({"action": "key", "key": "enter"}));
@@ -1071,7 +1421,7 @@ mod tests {
         assert!(st["artifact_root"].is_null());
 
         let base = tempfile::tempdir().expect("base");
-        let per = RunContext::persistent(Some(base.path())).expect("persistent");
+        let per = RunContext::persistent(base.path()).expect("persistent");
         let st2 = per.status(vec![serde_json::Value::String("sess-x".into())]);
         assert_eq!(st2["mode"], "persistent");
         assert_eq!(st2["persistent"], true);

@@ -77,6 +77,11 @@ pub struct TuiObserveParams {
     pub idle_ms: Option<u64>,
     #[serde(default)]
     pub id: Option<String>,
+    /// mode=changes: which consumer cursor to read/advance (Wave B item 13).
+    /// Distinct consumers ("hermes", "audit", "explorer", ...) each keep
+    /// their own position in the event stream.
+    #[serde(default)]
+    pub consumer: Option<String>,
 }
 
 /// Schema wrapper for [`TuiActRequest`]: re-roots the enum's natural `oneOf`
