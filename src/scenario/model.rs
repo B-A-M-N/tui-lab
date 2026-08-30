@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 pub struct Scenario {
     /// Schema version for forward compatibility.
     pub schema: String,
+    /// Stable identity (re-review Wave-1 item 9). The name is display/search
+    /// metadata; the id is the storage key, so two recordings that happen to
+    /// share a name (e.g. "login" recorded in two sessions) never collide.
+    /// Defaults on deserialize so scenario files saved before ids existed
+    /// still load.
+    #[serde(default = "Scenario::generate_id")]
+    pub id: String,
     /// Human-readable name.
     pub name: String,
     /// Optional metadata.
@@ -58,7 +65,7 @@ fn default_rows() -> u16 {
 }
 
 /// A single step in a scenario.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioStep {
     /// The kind of step: "act", "wait", or "assert".
     pub kind: StepKind,
@@ -76,10 +83,16 @@ pub enum StepKind {
 }
 
 impl Scenario {
-    /// Create a new scenario with the given name.
+    /// Generate a fresh scenario id (`scn-<uuid>`).
+    pub fn generate_id() -> String {
+        format!("scn-{}", uuid::Uuid::new_v4().simple())
+    }
+
+    /// Create a new scenario with the given name (a fresh id is assigned).
     pub fn new(name: impl Into<String>) -> Self {
         Scenario {
             schema: "tui-lab/scenario/v1".to_string(),
+            id: Self::generate_id(),
             name: name.into(),
             metadata: None,
             inherit_session: true,

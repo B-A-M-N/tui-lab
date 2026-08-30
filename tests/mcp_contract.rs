@@ -16,9 +16,8 @@
 
 use tui_lab::backend::{Input, KeyCode, KeyModifiers};
 use tui_lab::error::{Envelope, ErrorCategory};
-use tui_lab::mcp::helpers::{
-    build_input_from_request, build_wait, control_label_exists, err, ok, run_assertion,
-};
+use tui_lab::execution::CanonicalAction;
+use tui_lab::mcp::helpers::{build_wait, control_label_exists, err, ok, run_assertion};
 use tui_lab::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 use tui_lab::screen::{ProcessState, ScreenState};
 use tui_lab::session::manager::SessionManager;
@@ -139,7 +138,9 @@ fn contract_keys_action_sends_full_sequence() {
         wait_ms: None,
         id: None,
     };
-    let input = build_input_from_request(&p).expect("build keys input");
+    let input = CanonicalAction::from_request(&p)
+        .expect("build keys input")
+        .to_input();
     match input {
         Input::Keys(keys) => assert_eq!(keys.len(), 3, "keys must preserve the whole sequence"),
         _ => panic!("expected Input::Keys"),
@@ -186,7 +187,11 @@ fn contract_checkpoint_store_save_compare_delete() {
     let screen = ScreenState {
         cols: 10,
         rows: 3,
-        cursor: CursorState { x: 0, y: 0, visible: true },
+        cursor: CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
         title: None,
         cells: Vec::new(),
         viewport_text: vec!["a".to_string(), "".to_string(), "".to_string()],
@@ -208,7 +213,9 @@ fn contract_checkpoint_store_save_compare_delete() {
     assert!(store.contains("sess", &name));
 
     // compare: same screen matches; result is a JSON envelope with matches
-    let out = store.compare("sess", &name, &screen, None).expect("compare");
+    let out = store
+        .compare("sess", &name, &screen, None)
+        .expect("compare");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("envelope json");
     assert_eq!(
         parsed["data"]["comparison"]["matches"]["structure"],
@@ -282,7 +289,9 @@ fn contract_ctrl_key_encodes_typed_representation() {
         wait_ms: None,
         id: None,
     };
-    let input = build_input_from_request(&p).expect("build key input");
+    let input = CanonicalAction::from_request(&p)
+        .expect("build key input")
+        .to_input();
     match input {
         Input::Key(kev) => {
             assert_eq!(kev.code, KeyCode::Char('c'));
@@ -534,7 +543,9 @@ fn contract_key_a_preserves_case() {
         wait_ms: None,
         id: None,
     };
-    let input = build_input_from_request(&p).expect("build key A");
+    let input = CanonicalAction::from_request(&p)
+        .expect("build key A")
+        .to_input();
     match input {
         Input::Key(kev) => {
             assert_eq!(kev.code, KeyCode::Char('A'));
@@ -552,7 +563,9 @@ fn contract_key_shift_a_yields_uppercase() {
         wait_ms: None,
         id: None,
     };
-    let input = build_input_from_request(&p).expect("build shift+a");
+    let input = CanonicalAction::from_request(&p)
+        .expect("build shift+a")
+        .to_input();
     match input {
         Input::Key(kev) => {
             assert_eq!(kev.code, KeyCode::Char('A'));
@@ -570,7 +583,9 @@ fn contract_key_ctrl_c() {
         wait_ms: None,
         id: None,
     };
-    let input = build_input_from_request(&p).expect("build ctrl+c");
+    let input = CanonicalAction::from_request(&p)
+        .expect("build ctrl+c")
+        .to_input();
     match input {
         Input::Key(kev) => {
             assert_eq!(kev.code, KeyCode::Char('c'));
@@ -588,7 +603,7 @@ fn contract_key_bogus_modifier_errors() {
         wait_ms: None,
         id: None,
     };
-    let result = build_input_from_request(&p);
+    let result = CanonicalAction::from_request(&p);
     assert!(result.is_err());
 }
 
@@ -600,7 +615,9 @@ fn contract_key_f1_function() {
         wait_ms: None,
         id: None,
     };
-    let input = build_input_from_request(&p).expect("build F1");
+    let input = CanonicalAction::from_request(&p)
+        .expect("build F1")
+        .to_input();
     match input {
         Input::Key(kev) => {
             assert_eq!(kev.code, KeyCode::Function(1));
@@ -693,7 +710,11 @@ fn contract_control_exists_finds_matching_label() {
         },
         title: None,
         cells: Vec::new(),
-        viewport_text: vec!["┌────────────────┐".to_string(), "│               [ Save ]  │".to_string(), "└────────────────┘".to_string()],
+        viewport_text: vec![
+            "┌────────────────┐".to_string(),
+            "│               [ Save ]  │".to_string(),
+            "└────────────────┘".to_string(),
+        ],
         scrollback: Vec::new(),
         raw_hash: String::new(),
         visual_hash: String::new(),
@@ -864,7 +885,11 @@ fn contract_control_label_exists_helper() {
         },
         title: None,
         cells: Vec::new(),
-        viewport_text: vec!["┌────────────────┐".to_string(), "│               [ Save ]  │".to_string(), "└────────────────┘".to_string()],
+        viewport_text: vec![
+            "┌────────────────┐".to_string(),
+            "│               [ Save ]  │".to_string(),
+            "└────────────────┘".to_string(),
+        ],
         scrollback: Vec::new(),
         raw_hash: String::new(),
         visual_hash: String::new(),

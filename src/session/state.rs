@@ -122,13 +122,14 @@ impl Session {
         let cols = self.cols();
         let rows = self.rows();
         let sink = std::sync::Arc::new(std::sync::Mutex::new(AsciicastRecorder::new(
-            cols, rows, record_input,
+            cols,
+            rows,
+            record_input,
         )));
         self.recorder = Some(sink.clone());
         // Attach the hook to the backend so raw bytes flow to the recorder.
-        let hook: std::sync::Arc<dyn RecordingHook> = std::sync::Arc::new(RecorderHook {
-            sink: sink.clone(),
-        });
+        let hook: std::sync::Arc<dyn RecordingHook> =
+            std::sync::Arc::new(RecorderHook { sink: sink.clone() });
         *self.recording_slot.lock().expect("recording slot") = Some(hook);
         self.backend.set_recording_hook(self.recording_slot.clone());
     }
@@ -158,9 +159,7 @@ impl Session {
     }
 
     /// Access the recorder (shared, interior-mutable).
-    pub fn recorder(
-        &self,
-    ) -> Option<&std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>> {
+    pub fn recorder(&self) -> Option<&std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>> {
         self.recorder.as_ref()
     }
 
@@ -208,9 +207,9 @@ impl Session {
     pub fn write_recording<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
         match self.recorder.as_ref() {
             Some(rec) => {
-                let r = rec.lock().map_err(|_| {
-                    std::io::Error::other("recorder mutex poisoned")
-                })?;
+                let r = rec
+                    .lock()
+                    .map_err(|_| std::io::Error::other("recorder mutex poisoned"))?;
                 r.write_to_file(path)
             }
             None => Ok(()),
@@ -264,8 +263,7 @@ impl Session {
     pub fn start_with_spec(&mut self, spec: LaunchSpec) -> anyhow::Result<()> {
         // Re-attach any active recording hook (the backend was just replaced
         // internally on restart).
-        self.backend
-            .set_recording_hook(self.recording_slot.clone());
+        self.backend.set_recording_hook(self.recording_slot.clone());
         self.backend.start(
             &spec.command,
             &spec.args,
@@ -374,11 +372,9 @@ impl Session {
         cond: WaitCond,
         budget_ms: u64,
     ) -> anyhow::Result<WaitOutcome> {
-        let out = self.backend.wait_after(
-            baseline,
-            cond,
-            std::time::Duration::from_millis(budget_ms),
-        )?;
+        let out =
+            self.backend
+                .wait_after(baseline, cond, std::time::Duration::from_millis(budget_ms))?;
         Ok(out)
     }
 

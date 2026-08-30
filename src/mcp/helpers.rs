@@ -5,7 +5,7 @@ use crate::error::{Envelope, ErrorCategory};
 use crate::screen::ScreenState;
 use std::time::Duration;
 
-use crate::backend::{KeyEvent, KeyModifiers, MouseButton};
+use crate::backend::{KeyEvent, KeyModifiers};
 
 /// Render a success envelope.
 pub fn ok(data: serde_json::Value) -> String {
@@ -31,85 +31,20 @@ pub fn err_continued(cat: ErrorCategory, detail: String) -> String {
     env.to_json()
 }
 
-/// Build a [`crate::backend::Input`] from a tagged [`crate::mcp::params::TuiActRequest`].
-pub fn build_input_from_request(
-    p: &crate::mcp::params::TuiActRequest,
-) -> Result<crate::backend::Input, String> {
-    use crate::backend::{Input, MouseEvent, ScrollDirection};
-    match p {
-        crate::mcp::params::TuiActRequest::Key { key, .. } => Ok(Input::Key(parse_key(key)?)),
-        crate::mcp::params::TuiActRequest::Keys { keys, .. } => {
-            if keys.is_empty() {
-                return Err("empty keys".into());
-            }
-            let mut out = Vec::with_capacity(keys.len());
-            for k in keys {
-                out.push(parse_key(k)?);
-            }
-            Ok(Input::Keys(out))
-        }
-        crate::mcp::params::TuiActRequest::Type { text, .. } => Ok(Input::Text(text.clone())),
-        crate::mcp::params::TuiActRequest::Paste { paste, .. } => Ok(Input::Paste(paste.clone())),
-        crate::mcp::params::TuiActRequest::Raw { raw, .. } => {
-            if raw.is_empty() {
-                return Err("empty raw payload".into());
-            }
-            Ok(Input::Raw(raw.clone()))
-        }
-        crate::mcp::params::TuiActRequest::MouseClick { x, y, button, .. } => {
-            Ok(Input::MouseClick {
-                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
-                x: *x,
-                y: *y,
-            })
-        }
-        crate::mcp::params::TuiActRequest::MousePress { x, y, button, .. } => {
-            Ok(Input::Mouse(MouseEvent::Press {
-                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
-                x: *x,
-                y: *y,
-            }))
-        }
-        crate::mcp::params::TuiActRequest::MouseRelease { x, y, button, .. } => {
-            Ok(Input::Mouse(MouseEvent::Release {
-                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
-                x: *x,
-                y: *y,
-            }))
-        }
-        crate::mcp::params::TuiActRequest::MouseMove { x, y, .. } => {
-            Ok(Input::Mouse(MouseEvent::Move { x: *x, y: *y }))
-        }
-        crate::mcp::params::TuiActRequest::MouseDrag { x, y, button, .. } => {
-            Ok(Input::Mouse(MouseEvent::Drag {
-                button: button.map(crate::backend::MouseButton::from).unwrap_or(MouseButton::Left),
-                x: *x,
-                y: *y,
-            }))
-        }
-        crate::mcp::params::TuiActRequest::MouseScroll {
-            x, y, direction, ..
-        } => Ok(Input::Mouse(MouseEvent::Scroll {
-            direction: direction
-                .map(crate::backend::ScrollDirection::from)
-                .unwrap_or(ScrollDirection::Down),
-            x: *x,
-            y: *y,
-        })),
-        crate::mcp::params::TuiActRequest::Resize { cols, rows, .. } => Ok(Input::Resize {
-            cols: *cols,
-            rows: *rows,
-        }),
-        crate::mcp::params::TuiActRequest::Signal { signal, .. } => Ok(Input::Signal(*signal)),
-    }
-}
-
 /// Parse an ergonomic key string into a typed [`KeyEvent`] (spec section 6).
 ///
 /// Modifier names are matched case-insensitively, but a single-character final
 /// key *preserves its original case*.  When SHIFT is set on a letter, the
 /// character is uppercased (so `shift+a` yields `Char('A')`).  Multi-char
 /// unknown names still error.
+/// Parse an ergonomic key string ("ctrl+c", "shift+tab") into a typed
+/// [`KeyEvent`]. Public wrapper so [`crate::execution::CanonicalAction`]
+/// shares the one parser — MCP `tui_act` and any persisted/replayed action
+/// must agree on key names.
+pub fn parse_key_public(s: &str) -> Result<KeyEvent, String> {
+    parse_key(s)
+}
+
 fn parse_key(s: &str) -> Result<KeyEvent, String> {
     use crate::backend::KeyCode;
     use KeyModifiers as M;
@@ -489,6 +424,7 @@ pub fn run_assertion(
 /// Pure helper suitable for test exposure (helpers.rs is a lib module).
 pub fn control_label_exists(screen: &ScreenState, label: &str) -> bool {
     let sem = crate::semantic::analyze(screen);
-    sem.controls.iter().any(|c| c.label.eq_ignore_ascii_case(label))
+    sem.controls
+        .iter()
+        .any(|c| c.label.eq_ignore_ascii_case(label))
 }
-

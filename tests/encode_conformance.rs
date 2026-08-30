@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use tui_lab::backend::portable_pty::PortablePtyBackend;
 use tui_lab::backend::TerminalBackend;
-use tui_lab::backend::{
-    Input, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, WaitCond,
-};
+use tui_lab::backend::{Input, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, WaitCond};
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -67,15 +65,8 @@ fn spawn_hex_reader_with_init(init_bytes: &[u8], read_n: usize) -> PortablePtyBa
     escaped.push_str(&format!("data=sys.stdin.buffer.read({read_n})\n"));
     escaped.push_str("print('HEX:'+data.hex(),flush=True)");
 
-    b.start(
-        "python3",
-        &["-c".to_string(), escaped],
-        None,
-        &[],
-        80,
-        24,
-    )
-    .expect("start python");
+    b.start("python3", &["-c".to_string(), escaped], None, &[], 80, 24)
+        .expect("start python");
     b
 }
 
@@ -98,7 +89,11 @@ fn encode_ctrl_c_emits_control_byte() {
     let out = b
         .wait(WaitCond::Text("HEX:03".into()), Duration::from_secs(5))
         .expect("wait");
-    assert!(out.met, "ctrl+c should emit byte 0x03, got={}", out.state.viewport_text.join(" "));
+    assert!(
+        out.met,
+        "ctrl+c should emit byte 0x03, got={}",
+        out.state.viewport_text.join(" ")
+    );
     b.stop().expect("stop");
 }
 
@@ -120,7 +115,11 @@ fn encode_ctrl_d_emits_0x04() {
     let out = b
         .wait(WaitCond::Text("HEX:04".into()), Duration::from_secs(5))
         .expect("wait");
-    assert!(out.met, "ctrl+d should emit byte 0x04, got={}", out.state.viewport_text.join(" "));
+    assert!(
+        out.met,
+        "ctrl+d should emit byte 0x04, got={}",
+        out.state.viewport_text.join(" ")
+    );
     b.stop().expect("stop");
 }
 
@@ -142,7 +141,11 @@ fn encode_ctrl_z_emits_0x1a() {
     let out = b
         .wait(WaitCond::Text("HEX:1a".into()), Duration::from_secs(5))
         .expect("wait");
-    assert!(out.met, "ctrl+z should emit byte 0x1a, got={}", out.state.viewport_text.join(" "));
+    assert!(
+        out.met,
+        "ctrl+z should emit byte 0x1a, got={}",
+        out.state.viewport_text.join(" ")
+    );
     b.stop().expect("stop");
 }
 
@@ -233,8 +236,11 @@ fn arrows_use_csi_without_application_cursor() {
 /// Audit item 68: real mouse protocol encodings - SGR press and release.
 #[test]
 fn mouse_sgr_click_press_and_release() {
-    // Enable mouse press + SGR encoding via DECSET.
-    let mut b = spawn_hex_reader_with_init(b"\x1b[?1000;1006h", 22);
+    // Enable mouse reporting + SGR encoding. Use ?1002h (ButtonMotion) so
+    // MouseClick can emit a release; ?1000h is Press-only.
+    // SGR press = "ESC[<0;X;YM" = 11 bytes; release uses lowercase 'm'.
+    // Read 11 bytes for press + 11 for release = 22 total.
+    let mut b = spawn_hex_reader_with_init(b"\x1b[?1002;1006h", 22);
     std::thread::sleep(Duration::from_millis(500));
     b.send_input(Input::MouseClick {
         button: MouseButton::Left,
@@ -246,10 +252,7 @@ fn mouse_sgr_click_press_and_release() {
         .wait(WaitCond::Text("HEX".into()), Duration::from_secs(5))
         .expect("wait");
     let hex_str = out.state.viewport_text.join("");
-    let clean: String = hex_str
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let clean: String = hex_str.chars().filter(|c| !c.is_whitespace()).collect();
     // Press:  ESC[<0;11;21M = 1b5b3c303b31313b32314d
     assert!(
         clean.contains("1b5b3c303b31313b32314d"),
@@ -270,12 +273,17 @@ fn mouse_sgr_click_press_and_release() {
 // ---------------------------------------------------------------------------
 
 /// MouseClick with X10 encoding (mouse mode 1000, default encoding) emits
-/// 3 raw bytes: Cb (32+button), X (32+col), Y (32+row).
-/// For Left at (10,20): 0x20 0x2a 0x36 -> 202a36.
-/// Audit item 68: real mouse protocol encodings - X10 press.
+/// 3 raw bytes per event: Cb (32+button, +3 for release), X (32+(x+1)),
+/// Y (32+(y+1)). 1-based wire coords; MouseEvent uses 0-based input.
+/// For Left press at (10,20): 0x20 0x2b 0x35 -> 202b35.
+/// For Left release at (10,20): 0x23 0x2b 0x35 -> 232b35 (button + 3).
+/// Audit item 68: real mouse protocol encodings - X10 press + release.
 #[test]
 fn mouse_x10_click_three_raw_bytes() {
-    let mut b = spawn_hex_reader_with_init(b"\x1b[?1000h", 6);
+    // Read 6 bytes for press (ESC[M + Cb X Y) and 6 bytes for release = 12 total.
+    // Use ?1002h (ButtonMotion mode) so releases are allowed — ?1000h
+    // is Press-only and MouseClick would reject the release.
+    let mut b = spawn_hex_reader_with_init(b"\x1b[?1002h", 12);
     std::thread::sleep(Duration::from_millis(500));
     b.send_input(Input::MouseClick {
         button: MouseButton::Left,
@@ -284,12 +292,21 @@ fn mouse_x10_click_three_raw_bytes() {
     })
     .expect("send mouse click");
     let out = b
-        .wait(WaitCond::Text("HEX:1b5b4d202a34".into()), Duration::from_secs(5))
+        .wait(WaitCond::Text("HEX".into()), Duration::from_secs(5))
         .expect("wait");
+    let hex_str = out.state.viewport_text.join("");
+    let clean: String = hex_str.chars().filter(|c| !c.is_whitespace()).collect();
+    // Press: ESC[M + 20 2b 35 = 1b5b4d202b35
     assert!(
-        out.met,
-        "X10 click at (10,20) Left should emit 1b5b4d202a34 (ESC[M + 202a34), got={}",
-        out.state.viewport_text.join(" ")
+        clean.contains("1b5b4d202b35"),
+        "X10 press at (10,20) Left should emit 1b5b4d202b35, got={}",
+        hex_str
+    );
+    // Release: ESC[M + 23 2b 35 = 1b5b4d232b35
+    assert!(
+        clean.contains("1b5b4d232b35"),
+        "X10 release at (10,20) Left should emit 1b5b4d232b35, got={}",
+        hex_str
     );
     b.stop().expect("stop");
 }
@@ -348,16 +365,12 @@ fn bracketed_paste_wraps_when_negotiated() {
     // Enable bracketed paste via DECSET 2004.
     let mut b = spawn_hex_reader_with_init(b"\x1b[?2004h", 14);
     std::thread::sleep(Duration::from_millis(500));
-    b.send_input(Input::Paste("hi".into()))
-        .expect("send paste");
+    b.send_input(Input::Paste("hi".into())).expect("send paste");
     let out = b
         .wait(WaitCond::Text("HEX".into()), Duration::from_secs(5))
         .expect("wait");
     let hex_str = out.state.viewport_text.join("");
-    let clean: String = hex_str
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let clean: String = hex_str.chars().filter(|c| !c.is_whitespace()).collect();
     // Open:  ESC[200~ = 0x1b 0x5b 0x32 0x30 0x30 0x7e -> 1b5b3230307e
     assert!(
         clean.contains("1b5b3230307e"),
@@ -383,8 +396,7 @@ fn bracketed_paste_wraps_when_negotiated() {
 fn paste_raw_when_not_negotiated() {
     let mut b = spawn_hex_reader(2);
     std::thread::sleep(Duration::from_millis(400));
-    b.send_input(Input::Paste("hi".into()))
-        .expect("send paste");
+    b.send_input(Input::Paste("hi".into())).expect("send paste");
     let out = b
         .wait(WaitCond::Text("HEX:6869".into()), Duration::from_secs(5))
         .expect("wait");
@@ -448,8 +460,7 @@ fn screen_stable_resolves_on_one_frame_reaction() {
     assert!(
         out.met,
         "ScreenStable should resolve after one-frame reaction; met={}, elapsed={}ms",
-        out.met,
-        out.elapsed_ms
+        out.met, out.elapsed_ms
     );
 
     // Also assert that a plain (no-anchor) ScreenStable resolves -
@@ -466,8 +477,7 @@ fn screen_stable_resolves_on_one_frame_reaction() {
     assert!(
         out2.met,
         "Generic ScreenStable should resolve with no anchor; met={}, elapsed={}ms",
-        out2.met,
-        out2.elapsed_ms
+        out2.met, out2.elapsed_ms
     );
 
     b.stop().expect("stop");
@@ -487,7 +497,10 @@ fn style_only_change_bumps_screen_seq() {
         "python3",
         &[
             "-c".to_string(),
-            "import sys,time; sys.stdout.write('TITLE'); sys.stdout.flush(); time.sleep(1)\n"
+            // Stay alive well past the assertion window: the reverse-video
+            // echo only renders while the child is running, and under load
+            // the Text wait can eat most of a 1s lifetime (race seen in CI).
+            "import sys,time; sys.stdout.write('TITLE'); sys.stdout.flush(); time.sleep(6)\n"
                 .to_string(),
         ],
         None,
@@ -535,16 +548,20 @@ fn style_only_change_bumps_screen_seq() {
 // ---------------------------------------------------------------------------
 
 /// With UTF-8 mouse encoding (1005), click bytes use codepoints:
-/// Cb = 32+button, X = 32+col, Y = 32+row (same as X10 but as UTF-8 chars).
-/// For press at (10,20) Left: Cb=32(0x20), X=42(0x2a), Y=52(0x34).
-/// Press: ESC[M + 20 2a 34 = 1b5b4d202a34 (4 bytes)
-/// For release at (10,20) Left: Cb=32+128=160(0xa0), X=42(0x2a), Y=52(0x34).
-/// Release: ESC[M + a0 2a 34 = 1b5b4da02a34 (4 bytes)
+/// Cb = 32+button (+3 for release), X = 32+(x+1), Y = 32+(y+1)
+/// (1-based wire coords; our MouseEvent uses 0-based input).
+/// For press at (10,20) Left: Cb=32(0x20), X=43(0x2b), Y=53(0x35).
+/// Press: ESC[M + 20 2b 35 = 1b5b4d202b35 (4 bytes)
+/// For release at (10,20) Left: Cb=32+3=35(0x23), X=43(0x2b), Y=53(0x35).
+/// Release: ESC[M + 23 2b 35 = 1b5b4d232b35 (4 bytes)
 /// Total: 8 bytes. Read 8.
 /// Audit item 68: real mouse protocol encodings - UTF-8 encoding (1005).
 #[test]
 fn mouse_utf8_encoding_emits_utf8_coords() {
-    let mut b = spawn_hex_reader_with_init(b"\x1b[?1000;1005h", 12);
+    // Enable mouse reporting + UTF-8 encoding. Use ?1002h (ButtonMotion) so
+    // MouseClick can emit a release; ?1000h is Press-only.
+    // Press + release are each 6 bytes (ESC[M + Cb X Y) = 12 total.
+    let mut b = spawn_hex_reader_with_init(b"\x1b[?1002;1005h", 12);
     std::thread::sleep(Duration::from_millis(500));
     b.send_input(Input::MouseClick {
         button: MouseButton::Left,
@@ -556,21 +573,18 @@ fn mouse_utf8_encoding_emits_utf8_coords() {
         .wait(WaitCond::Text("HEX".into()), Duration::from_secs(5))
         .expect("wait");
     let hex_str = out.state.viewport_text.join("");
-    let clean: String = hex_str
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    // Press: ESC[M + UTF8 coords -> 1b5b4d202a34
+    let clean: String = hex_str.chars().filter(|c| !c.is_whitespace()).collect();
+    // Press: ESC[M + UTF8 coords -> 1b5b4d202b35
     assert!(
-        clean.contains("1b5b4d202a34"),
-        "UTF-8 mouse press missing (expected 1b5b4d202a34), got: {}",
+        clean.contains("1b5b4d202b35"),
+        "UTF-8 mouse press missing (expected 1b5b4d202b35), got: {}",
         hex_str
     );
-    // Release: ESC[M + 0x23 0x2a 0x34 -> 1b5b4d232a34
+    // Release: ESC[M + 0x23 0x2b 0x35 -> 1b5b4d232b35
     // (xterm 1005 release encoding: button byte = 32 + button + 3 = 35 = '#').
     assert!(
-        clean.contains("1b5b4d232a34"),
-        "UTF-8 mouse release missing (expected 1b5b4d232a34), got: {}",
+        clean.contains("1b5b4d232b35"),
+        "UTF-8 mouse release missing (expected 1b5b4d232b35), got: {}",
         hex_str
     );
     b.stop().expect("stop");

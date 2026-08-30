@@ -408,7 +408,11 @@ mod tests {
         ScreenState {
             cols,
             rows,
-            cursor: CursorState { x: 0, y: 0, visible: true },
+            cursor: CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
             title: None,
             cells,
             viewport_text,

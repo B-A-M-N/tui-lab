@@ -45,11 +45,7 @@ fn conformance_screen_change_resolves_on_real_change() {
     ))
     .expect("trigger");
     let out = b
-        .wait_after(
-            baseline,
-            WaitCond::ScreenChange,
-            Duration::from_secs(5),
-        )
+        .wait_after(baseline, WaitCond::ScreenChange, Duration::from_secs(5))
         .expect("wait");
     assert!(
         out.met,

@@ -40,7 +40,10 @@ pub fn from_vt(screen: &VtScreen, process: ProcessState, title: Option<String>) 
     let mut structure = blake3::Hasher::new();
 
     for y in 0..rows {
-        let mut line = String::new();
+        // Cell texts for this row in column order; empty continuation cells
+        // (wide glyphs) and blank cells contribute "" and are padded by the
+        // CellString builder (item 22 — char index == screen column).
+        let row_start = cells.len();
         for x in 0..cols {
             let ch = screen.cell(y, x);
             let (text, fg, bg, bold, dim, italic, underline, reverse, strike) = match ch {
@@ -96,14 +99,12 @@ pub fn from_vt(screen: &VtScreen, process: ProcessState, title: Option<String>) 
             );
             visual.update(text.as_bytes());
             visual.update(vis_s.as_bytes());
-
-            if text.is_empty() {
-                line.push(' ');
-            } else {
-                line.push_str(&text);
-            }
         }
-        viewport_text.push(line);
+        let line = crate::screen::cell_string::CellString::from_cells(
+            cells[row_start..].iter().map(|c| (c.x, c.text.as_str())),
+            cols,
+        );
+        viewport_text.push(line.as_str().to_string());
     }
 
     // Structure hash: normalize per-row (item 19). We build the structure
@@ -145,4 +146,49 @@ fn hex(h: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process_state() -> ProcessState {
+        ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        }
+    }
+
+    /// Item 22, end to end: real vt100 grid bytes → from_vt → rows in which
+    /// char index == screen column even with wide glyphs present.
+    #[test]
+    fn from_vt_rows_stay_column_aligned_with_wide_glyphs() {
+        let mut p = vt100::Parser::new(4, 10, 0);
+        // 界 (width 2) at col 0, A lands at col 2; continuation cell empty.
+        p.process("界A".as_bytes());
+        let state = from_vt(p.screen(), process_state(), None);
+        let row = &state.viewport_text[0];
+        assert_eq!(row.chars().next(), Some('界'));
+        assert_eq!(row.chars().nth(1), Some(' '), "continuation column padded");
+        assert_eq!(row.chars().nth(2), Some('A'));
+
+        // Same row via the CellString view: char_at agrees with the grid.
+        let cs = crate::screen::CellString::aligned(row.clone());
+        assert_eq!(cs.char_at(2), Some('A'));
+        assert!(cs.display_width() >= 3);
+    }
+
+    /// Item 22: pure-ASCII rows are byte-identical to the old assembly
+    /// (including its full-width space padding of blank cells).
+    #[test]
+    fn from_vt_ascii_rows_unchanged() {
+        let mut p = vt100::Parser::new(4, 20, 0);
+        p.process(b"[ OK ] Host: db");
+        let state = from_vt(p.screen(), process_state(), None);
+        assert!(state.viewport_text[0].starts_with("[ OK ] Host: db"));
+        assert_eq!(state.viewport_text[0].len(), 20, "padded to grid width");
+    }
 }

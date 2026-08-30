@@ -5,8 +5,8 @@
 //! screen actually stayed quiet.
 
 use super::{
-    BackendResult, Capabilities, Input, InputModes, ObserveResult, TerminalEventState,
-    WaitCond, WaitOutcome,
+    BackendResult, Capabilities, Input, InputModes, ObserveResult, TerminalEventState, WaitCond,
+    WaitOutcome,
 };
 use crate::screen::{ProcessState, ScreenState};
 use std::time::Duration;

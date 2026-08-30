@@ -297,19 +297,14 @@ pub fn detect_regions(screen: &ScreenState) -> Vec<Region> {
 
     // Precompute sibling parent-id information for role inference
     // (avoids simultaneous mutable/immutable borrow on `regions`).
-    let sibling_parent_ids: Vec<Option<String>> = regions
-        .iter()
-        .map(|r| r.parent_id.clone())
-        .collect();
+    let sibling_parent_ids: Vec<Option<String>> =
+        regions.iter().map(|r| r.parent_id.clone()).collect();
 
     for region in regions.iter_mut() {
-        region.kind = infer_role_with_parent(
-            region,
-            cols as u16,
-            rows as u16,
-            &sibling_parent_ids,
-        );
+        region.kind = infer_role_with_parent(region, cols as u16, rows as u16, &sibling_parent_ids);
     }
+
+    assign_stable_ids(&mut regions);
 
     regions
 }
@@ -406,13 +401,11 @@ fn trace_rectangle(
         }
     }
 
-    let valid_bottom = (start_x..=top_right).all(|x| {
-        matches!(conn[bottom_y][x], Some(c) if c.left || c.right)
-    });
+    let valid_bottom =
+        (start_x..=top_right).all(|x| matches!(conn[bottom_y][x], Some(c) if c.left || c.right));
 
-    let valid_left = (start_y..=bottom_y).all(|y| {
-        matches!(conn[y][start_x], Some(c) if c.up || c.down)
-    });
+    let valid_left =
+        (start_y..=bottom_y).all(|y| matches!(conn[y][start_x], Some(c) if c.up || c.down));
 
     if !valid_bottom || !valid_left {
         return None;
@@ -461,17 +454,14 @@ fn trace_rectangle(
 
     let title = top_title.or(interior_title);
 
-    let clipping_state = check_clipping(
-        conn,
-        start_x,
-        start_y,
-        top_right,
-        bottom_y,
-        cols,
-        rows,
-    );
+    let clipping_state = check_clipping(conn, start_x, start_y, top_right, bottom_y, cols, rows);
 
     Some(Region {
+        // Unique-but-geometric placeholder. The stable semantic ID (kind/
+        // title-based, geometry-free) is finalized by `assign_stable_ids`
+        // once kind and hierarchy are known (re-review Wave-3 item 17);
+        // hierarchy links formed against this placeholder are rewritten
+        // through its old→new mapping.
         id: format!("region-{}-{}", start_x, start_y),
         kind: RegionKind::Unknown,
         title,
@@ -486,6 +476,80 @@ fn trace_rectangle(
         child_ids: Vec::new(),
         clipping_state,
     })
+}
+
+/// Slugify free text into an ID path segment: lowercase, alphanumeric +
+/// hyphen, capped at 24 chars. Empty input yields `None` so callers can
+/// omit the segment instead of emitting `--`.
+fn slugify(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let collapsed: String = cleaned
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let truncated: String = collapsed.chars().take(24).collect();
+    let truncated = truncated.trim_end_matches('-').to_string();
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
+/// Finalize stable, geometry-free region IDs (re-review Wave-3 item 17).
+///
+/// Format: `{kind-slug}/{title-slug}` (e.g. `dialog/settings`), falling back
+/// to `{kind-slug}` alone for untitled regions. Duplicates get a 1-based
+/// `#{n}` disambiguator in first-seen (area-descending) order, so two
+/// untitled panels stay distinct: `panel#1`, `panel#2`.
+///
+/// Kind comes from role inference and parent/child links reference IDs, so
+/// this must run after both; it rewrites `parent_id`/`child_ids` to match
+/// the new IDs.
+fn assign_stable_ids(regions: &mut [Region]) {
+    use std::collections::HashMap;
+
+    // Old → new mapping so hierarchy links can be rewritten in place.
+    let old_ids: Vec<String> = regions.iter().map(|r| r.id.clone()).collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for region in regions.iter_mut() {
+        let kind_slug = slugify(&format!("{:?}", region.kind)).unwrap_or_else(|| "region".into());
+        let base = match slugify(region.title.as_deref().unwrap_or("")) {
+            Some(title_slug) => format!("{}/{}", kind_slug, title_slug),
+            None => kind_slug,
+        };
+        let n = seen.entry(base.clone()).or_insert(0);
+        *n += 1;
+        region.id = if *n == 1 {
+            base
+        } else {
+            format!("{}#{}", base, n)
+        };
+    }
+
+    // Rewrite hierarchy links to the new id space.
+    let mapping: HashMap<String, String> = old_ids
+        .iter()
+        .cloned()
+        .zip(regions.iter().map(|r| r.id.clone()))
+        .collect();
+    for region in regions.iter_mut() {
+        if let Some(p) = region.parent_id.take() {
+            region.parent_id = Some(mapping.get(&p).cloned().unwrap_or(p));
+        }
+        region.child_ids = region
+            .child_ids
+            .drain(..)
+            .map(|c| mapping.get(&c).cloned().unwrap_or(c))
+            .collect();
+    }
 }
 
 /// Try to extract a title embedded in the top border edge.
@@ -524,7 +588,11 @@ fn extract_title_from_top_edge(
             i += 1;
         }
         let run_end = i; // exclusive
-        let trimmed: String = chars[run_start..run_end].iter().collect::<String>().trim().to_string();
+        let trimmed: String = chars[run_start..run_end]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
         if !trimmed.is_empty() {
             let len = trimmed.len();
             best = match best {
@@ -604,18 +672,14 @@ fn check_clipping(
         && br.is_some_and(is_corner_conn);
 
     // Check that all four edges connect without gaps.
-    let top_edge_ok = (start_x..=end_x).all(|x| {
-        matches!(conn[start_y][x], Some(c) if c.left || c.right || is_corner_conn(c))
-    });
-    let bottom_edge_ok = (start_x..=end_x).all(|x| {
-        matches!(conn[end_y][x], Some(c) if c.left || c.right || is_corner_conn(c))
-    });
-    let left_edge_ok = (start_y..=end_y).all(|y| {
-        matches!(conn[y][start_x], Some(c) if c.up || c.down || is_corner_conn(c))
-    });
-    let right_edge_ok = (start_y..=end_y).all(|y| {
-        matches!(conn[y][end_x], Some(c) if c.up || c.down || is_corner_conn(c))
-    });
+    let top_edge_ok = (start_x..=end_x)
+        .all(|x| matches!(conn[start_y][x], Some(c) if c.left || c.right || is_corner_conn(c)));
+    let bottom_edge_ok = (start_x..=end_x)
+        .all(|x| matches!(conn[end_y][x], Some(c) if c.left || c.right || is_corner_conn(c)));
+    let left_edge_ok = (start_y..=end_y)
+        .all(|y| matches!(conn[y][start_x], Some(c) if c.up || c.down || is_corner_conn(c)));
+    let right_edge_ok = (start_y..=end_y)
+        .all(|y| matches!(conn[y][end_x], Some(c) if c.up || c.down || is_corner_conn(c)));
 
     let perimeter_complete =
         all_corners_ok && top_edge_ok && bottom_edge_ok && left_edge_ok && right_edge_ok;
@@ -751,37 +815,29 @@ fn infer_role_with_parent(
             .iter()
             .filter(|&pid| pid.as_ref() == my_parent)
             .enumerate()
-            .all(|(idx, _)| idx == 0 || {
-                // Without access to other regions' bounds we can't compare y.
-                // Fallback: if our y is <= the first sibling's y.
-                false
+            .all(|(idx, _)| {
+                idx == 0 || {
+                    // Without access to other regions' bounds we can't compare y.
+                    // Fallback: if our y is <= the first sibling's y.
+                    false
+                }
             })
     {
         return RegionKind::Toolbar;
     }
 
     // Footer: region at the bottom of the viewport, height <= 4, wider than tall.
-    if !has_parent
-        && b.y + b.height >= rows - 2
-        && b.height <= 4
-        && b.width > b.height
-    {
+    if !has_parent && b.y + b.height >= rows - 2 && b.height <= 4 && b.width > b.height {
         return RegionKind::Footer;
     }
 
     // Dialog: has a title, is smaller than the viewport, and is nested.
-    if has_title
-        && area < screen_area * 0.5
-        && has_parent
-    {
+    if has_title && area < screen_area * 0.5 && has_parent {
         return RegionKind::Dialog;
     }
 
     // List: tall and narrow (height >= 6, width <= 40, height > width).
-    if b.height >= 6
-        && b.width <= 40
-        && b.height > b.width
-    {
+    if b.height >= 6 && b.width <= 40 && b.height > b.width {
         return RegionKind::List;
     }
 
@@ -912,16 +968,16 @@ mod tests {
         }
 
         let rows: Vec<String> = vec![
-            make_row_outer_top(),           // row 0
-            make_row_outer_side(),          // row 1
-            make_row_outer_side_with_inner_top(),  // row 2
-            make_row_outer_side_with_inner_side(), // row 3
-            make_row_outer_side_with_inner_side(), // row 4
-            make_row_outer_side_with_inner_side(), // row 5
+            make_row_outer_top(),                    // row 0
+            make_row_outer_side(),                   // row 1
+            make_row_outer_side_with_inner_top(),    // row 2
+            make_row_outer_side_with_inner_side(),   // row 3
+            make_row_outer_side_with_inner_side(),   // row 4
+            make_row_outer_side_with_inner_side(),   // row 5
             make_row_outer_side_with_inner_bottom(), // row 6
-            make_row_outer_side(),          // row 7
-            make_row_outer_side(),          // row 8
-            make_row_outer_bottom(),        // row 9
+            make_row_outer_side(),                   // row 7
+            make_row_outer_side(),                   // row 8
+            make_row_outer_bottom(),                 // row 9
         ];
 
         let screen = make_screen(rows, 41);
@@ -936,8 +992,14 @@ mod tests {
         );
 
         // Identify inner and outer by bounds
-        let outer = detected.iter().find(|r| r.bounds.x == 0 && r.bounds.y == 0).expect("outer region");
-        let inner = detected.iter().find(|r| r.bounds.x == 4 && r.bounds.y == 2).expect("inner region");
+        let outer = detected
+            .iter()
+            .find(|r| r.bounds.x == 0 && r.bounds.y == 0)
+            .expect("outer region");
+        let inner = detected
+            .iter()
+            .find(|r| r.bounds.x == 4 && r.bounds.y == 2)
+            .expect("inner region");
 
         // Inner should be nested inside outer
         assert_eq!(
@@ -1031,7 +1093,12 @@ mod tests {
 
         // Row 0: ┌── Settings ───────────────────────────┐  = 41 chars
         let row0: String = "┌── Settings ───────────────────────────┐".to_string();
-        assert_eq!(row0.chars().count(), 41, "row0 should have 41 chars, got {}", row0.chars().count());
+        assert_eq!(
+            row0.chars().count(),
+            41,
+            "row0 should have 41 chars, got {}",
+            row0.chars().count()
+        );
         rows.push(row0);
 
         // Rows 1..8: side walls
@@ -1049,15 +1116,27 @@ mod tests {
         let screen = make_screen(rows, 41);
 
         // Debug: print the top row
-        eprintln!("Top row: {:?} (len={} chars)", screen.viewport_text[0], screen.viewport_text[0].chars().count());
+        eprintln!(
+            "Top row: {:?} (len={} chars)",
+            screen.viewport_text[0],
+            screen.viewport_text[0].chars().count()
+        );
         for (i, c) in screen.viewport_text[0].char_indices() {
-            eprintln!("  col {}: '{:2?}' is_border={}", i, c, super::is_border_char(c));
+            eprintln!(
+                "  col {}: '{:2?}' is_border={}",
+                i,
+                c,
+                super::is_border_char(c)
+            );
         }
 
         let detected = detect_regions(&screen);
         eprintln!("Detected {} region(s)", detected.len());
         for r in &detected {
-            eprintln!("  region id={} bounds={:?} title={:?} clipping={:?}", r.id, r.bounds, r.title, r.clipping_state);
+            eprintln!(
+                "  region id={} bounds={:?} title={:?} clipping={:?}",
+                r.id, r.bounds, r.title, r.clipping_state
+            );
         }
 
         assert_eq!(detected.len(), 1, "expected 1 region");

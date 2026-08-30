@@ -11,7 +11,7 @@ use rmcp::tool_router;
 use rmcp::ServerHandler;
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{build_input_from_request, build_wait, err, err_continued, ok, run_assertion};
+use crate::mcp::helpers::{build_wait, err, err_continued, ok};
 use crate::mcp::params::*;
 use crate::screen::diff;
 use crate::semantic;
@@ -92,11 +92,7 @@ impl TuiLabServer {
                         )
                     }
                 }
-                let env: Vec<(String, String)> = p
-                    .env
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
+                let env: Vec<(String, String)> = p.env.unwrap_or_default().into_iter().collect();
                 match mgr.start(
                     &command,
                     &p.args.unwrap_or_default(),
@@ -256,6 +252,22 @@ impl TuiLabServer {
                 let sem = semantic::analyze(&screen);
                 ok(json!({ "semantic": sem }))
             }
+            // The hierarchical rendering (re-review Wave-4): regions nested
+            // per containment, controls inside their regions, focus and
+            // screen-level components attached. This is the shape to compare
+            // against an intended design without re-deriving containment.
+            "tree" => {
+                let sem = semantic::analyze(&screen);
+                let tree = semantic::build_state_tree(
+                    screen.cols,
+                    screen.rows,
+                    &sem.regions,
+                    &sem.controls,
+                    &sem.focus,
+                    &sem.components,
+                );
+                ok(json!({ "tree": tree, "rendered": tree.render() }))
+            }
             "diff" => {
                 // ONE diff path (re-review item 7): observe() above stashed
                 // the prior frame in `previous`, so this is a real
@@ -279,8 +291,18 @@ impl TuiLabServer {
                     })),
                 }
             }
-            "scrollback" => ok(json!({ "scrollback": screen.scrollback })),
-            "history" => ok(json!({ "structure_hash": screen.structure_hash })),
+            // Honest unsupported (re-review Part VIII): an empty scrollback
+            // array is ambiguous with "supported but empty"; until real
+            // scrollback exists, say so explicitly. `history` likewise — a
+            // structure hash is not history.
+            "scrollback" => err(
+                ErrorCategory::Unsupported,
+                "scrollback is not implemented in this backend (capability reports scrollback=false); use mode=screen for the live viewport",
+            ),
+            "history" => err(
+                ErrorCategory::Unsupported,
+                "run/session event history is not implemented; the current frame identity is available via mode=summary (structure_hash)",
+            ),
             other => err(
                 ErrorCategory::InvalidRequest,
                 format!("unknown mode '{}'", other),
@@ -301,8 +323,10 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        let input = match build_input_from_request(&p) {
-            Ok(i) => i,
+        // The typed action (Wave-2 item 10): built once from the request,
+        // executed, and stored on the transaction for lossless replay.
+        let action = match crate::execution::CanonicalAction::from_request(&p) {
+            Ok(a) => a,
             Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
         };
         // The one canonical executor (re-review item 4): anchored settle wait
@@ -310,8 +334,7 @@ impl TuiLabServer {
         let quiet = p.wait_ms().unwrap_or(150);
         let tx = match crate::execution::execute_act(
             sess,
-            p.action_name(),
-            input,
+            &action,
             quiet,
             quiet.saturating_add(1000),
             p.no_wait(),
@@ -324,10 +347,12 @@ impl TuiLabServer {
         // Scoped to the resolved session generation (re-review item 5): a
         // recording for session A never absorbs session B's traffic.
         {
+            let (sid, gen) = (sess.id.clone(), sess.generation);
             let mut run = self.run.lock().unwrap();
-            run.bump_transaction();
+            // Run ledger (Wave-2 item 15): the reconstructable transaction
+            // record, not just a counter.
+            run.record_interaction(&sid, &tx);
             if !p.sensitive() {
-                let (sid, gen) = (sess.id.clone(), sess.generation);
                 run.record_scenario_act(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
             }
         }
@@ -359,13 +384,14 @@ impl TuiLabServer {
             Some(c) => c,
             None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),
         };
-        match sess.wait(cond, p.budget_ms.unwrap_or(5000)) {
+        // Go through the canonical wait executor (re-review P0).
+        match crate::execution::execute_wait(sess, cond, p.budget_ms.unwrap_or(5000)) {
             Ok(out) => {
                 // Scoped to the resolved session generation (item 5).
                 {
                     let (sid, gen) = (sess.id.clone(), sess.generation);
                     let mut run = self.run.lock().unwrap();
-                    run.bump_transaction();
+                    run.record_event(&sid, "wait");
                     run.record_scenario_wait(
                         &sid,
                         gen,
@@ -409,7 +435,8 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
-        let (passed, detail, invalid) = run_assertion(&p, &screen);
+        // Go through the canonical assert executor (re-review P0).
+        let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
         {
             // Scoped to the resolved session generation (item 5).
             let (sid, gen) = (sess.id.clone(), sess.generation);
@@ -486,7 +513,10 @@ impl TuiLabServer {
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
                 let sem = semantic::analyze(&screen);
-                match run.checkpoints.compare(&session_id, &name, &screen, Some(&sem)) {
+                match run
+                    .checkpoints
+                    .compare(&session_id, &name, &screen, Some(&sem))
+                {
                     Ok(json_out) => json_out,
                     Err(ErrorCategory::InvalidRequest) => {
                         err(ErrorCategory::InvalidRequest, "no such checkpoint")
@@ -574,6 +604,7 @@ impl TuiLabServer {
                             .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
                         ok(json!({
                             "recording_id": rec_id,
+                            "scenario_id": scenario.id,
                             "name": scenario.name,
                             "steps": scenario.step_count(),
                             "saved_to": path,
@@ -641,10 +672,13 @@ impl TuiLabServer {
                 }
                 let scenario = recorder.build();
                 let count = scenario.step_count();
+                let scenario_id = scenario.id.clone();
                 let path: Option<String> = run
                     .save_scenario(scenario.clone())
                     .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
-                ok(json!({ "name": name, "steps": count, "saved_to": path }))
+                ok(
+                    json!({ "scenario_id": scenario_id, "name": name, "steps": count, "saved_to": path }),
+                )
             }
             "export" => {
                 let name = match &p.name {
@@ -655,7 +689,10 @@ impl TuiLabServer {
                     Ok(scenario) => ok(
                         json!({ "name": name, "scenario": serde_json::to_value(&scenario).unwrap_or_default() }),
                     ),
-                    Err(e) => err(ErrorCategory::InvalidRequest, format!("no such scenario: {}", e)),
+                    Err(e) => err(
+                        ErrorCategory::InvalidRequest,
+                        format!("no such scenario: {}", e),
+                    ),
                 }
             }
             // Replay a saved scenario against a session through the one
@@ -664,14 +701,15 @@ impl TuiLabServer {
             "run" => {
                 let name = match &p.name {
                     Some(n) => n.clone(),
-                    None => {
-                        return err(ErrorCategory::InvalidRequest, "run requires 'name'")
-                    }
+                    None => return err(ErrorCategory::InvalidRequest, "run requires 'name'"),
                 };
                 let scenario = match run.load_scenario(&name) {
                     Ok(sc) => sc,
                     Err(e) => {
-                        return err(ErrorCategory::InvalidRequest, format!("no such scenario: {}", e))
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!("no such scenario: {}", e),
+                        )
                     }
                 };
                 drop(run);
@@ -683,7 +721,10 @@ impl TuiLabServer {
                 let report = crate::scenario::runner::ScenarioRunner::run(&scenario, sess);
                 let (sid, gen) = (sess.id.clone(), sess.generation);
                 drop(mgr);
-                self.run.lock().unwrap().bump_transaction();
+                self.run
+                    .lock()
+                    .unwrap()
+                    .record_event(&sid, &format!("scenario_run:{}", scenario.name));
                 if report.steps_failed == 0 {
                     ok(json!({
                         "name": report.scenario_name,
@@ -962,10 +1003,7 @@ impl TuiLabServer {
                 Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
             };
             let sem = semantic::analyze(&screen);
-            (
-                crate::audit::run(&profile, &screen, &sem),
-                "static",
-            )
+            (crate::audit::run(&profile, &screen, &sem), "static")
         };
 
         // Findings accumulate in the run context (composition root) so a
@@ -1034,7 +1072,10 @@ impl TuiLabServer {
             "status" => {
                 let sessions = self.manager.lock().unwrap().list();
                 ok(self.run.lock().unwrap().status(
-                    sessions.into_iter().map(serde_json::Value::String).collect(),
+                    sessions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ))
             }
             "persist" => {
@@ -1079,13 +1120,20 @@ impl TuiLabServer {
                 let mut run = self.run.lock().unwrap();
                 let already = run.is_closed();
                 let sessions = self.manager.lock().unwrap().list();
-                let summary =
-                    run.status(sessions.into_iter().map(serde_json::Value::String).collect());
+                let summary = run.status(
+                    sessions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                );
                 let kill = p.kill_sessions.unwrap_or(false);
                 let result = run.close();
                 drop(run);
                 if let Err(e) = result {
-                    return err(ErrorCategory::InternalError, format!("close flush failed: {e}"));
+                    return err(
+                        ErrorCategory::InternalError,
+                        format!("close flush failed: {e}"),
+                    );
                 }
                 // Sessions survive close unless explicitly requested.
                 let stopped: Vec<String> = if kill {

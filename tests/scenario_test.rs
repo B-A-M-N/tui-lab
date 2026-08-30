@@ -78,7 +78,10 @@ fn scenario_runner_executes_steps() {
         .assert(serde_json::json!({"assertion": "text", "text": "test"}));
 
     let mut mgr = tui_lab::session::SessionManager::new();
-    let args: Vec<String> = vec!["-c".into(), "print('test'); import time; time.sleep(10)".into()];
+    let args: Vec<String> = vec![
+        "-c".into(),
+        "print('test'); import time; time.sleep(10)".into(),
+    ];
     let id = mgr
         .start("python3", &args, None, &[], 80, 24, "auto", "local")
         .expect("start");
@@ -89,14 +92,15 @@ fn scenario_runner_executes_steps() {
     assert_eq!(report.scenario_name, "runner-test");
     assert_eq!(report.steps_total, 3);
     assert_eq!(
-        report.steps_failed,
-        0,
+        report.steps_failed, 0,
         "all steps must pass against the real session: {:?}",
         report.step_results
     );
     // The act step detail must show real execution, not the old placeholder.
     assert!(
-        report.step_results[0].detail.contains("act executed, settled="),
+        report.step_results[0]
+            .detail
+            .contains("act executed, settled="),
         "act detail: {}",
         report.step_results[0].detail
     );
@@ -110,7 +114,10 @@ fn scenario_runner_detects_failures() {
         .assert(serde_json::json!({"assertion": "text", "text": "never_matches"}));
 
     let mut mgr = tui_lab::session::SessionManager::new();
-    let args: Vec<String> = vec!["-c".into(), "print('test'); import time; time.sleep(10)".into()];
+    let args: Vec<String> = vec![
+        "-c".into(),
+        "print('test'); import time; time.sleep(10)".into(),
+    ];
     let id = mgr
         .start("python3", &args, None, &[], 80, 24, "auto", "local")
         .expect("start");
@@ -119,8 +126,16 @@ fn scenario_runner_detects_failures() {
     let report = ScenarioRunner::run(&scenario, sess);
 
     assert_eq!(report.steps_total, 2);
-    assert_eq!(report.steps_passed, 1, "act passes: {:?}", report.step_results);
-    assert_eq!(report.steps_failed, 1, "assert must fail for real: {:?}", report.step_results);
+    assert_eq!(
+        report.steps_passed, 1,
+        "act passes: {:?}",
+        report.step_results
+    );
+    assert_eq!(
+        report.steps_failed, 1,
+        "assert must fail for real: {:?}",
+        report.step_results
+    );
     assert!(
         report.step_results[1].detail.contains("never_matches"),
         "assert detail must state the expectation: {}",
@@ -132,8 +147,8 @@ fn scenario_runner_detects_failures() {
 fn scenario_runner_actually_sends_input() {
     // The strongest form of the re-review item-4 requirement: a scenario
     // that types text must make that text appear in the child's terminal.
-    let scenario = Scenario::new("type-test")
-        .act(serde_json::json!({"action": "type", "text": "marker-xyz"}));
+    let scenario =
+        Scenario::new("type-test").act(serde_json::json!({"action": "type", "text": "marker-xyz"}));
 
     let mut mgr = tui_lab::session::SessionManager::new();
     let args: Vec<String> = vec!["-c".into(), "import time; time.sleep(10)".into()];

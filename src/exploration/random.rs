@@ -18,7 +18,8 @@ use rand::SeedableRng;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::backend::{Input, KeyEvent, KeyModifiers};
+use crate::backend::{KeyEvent, KeyModifiers};
+use crate::execution::{execute_act, CanonicalAction};
 use crate::session::state::Session;
 
 /// Why an exploration actually stopped (re-review item 13).
@@ -108,20 +109,22 @@ fn classify_exit(code: Option<i32>, signal: Option<&str>) -> ExitClassification 
     }
 }
 
-fn key(code: crate::backend::KeyCode) -> Input {
-    Input::Key(KeyEvent::new(code))
+fn key(code: crate::backend::KeyCode) -> CanonicalAction {
+    CanonicalAction::Key {
+        key: KeyEvent::new(code),
+    }
 }
 
-/// An action factory: name + zero-arg input constructor.
-type ActionFactory = (&'static str, fn() -> Input);
+/// An action factory: name + zero-arg canonical action constructor. Actions
+/// are typed ([`CanonicalAction`], Wave-2 item 10) so an exploration trace
+/// can be replayed losslessly — the old `(name, fn() -> Input)` pool lost
+/// modifiers/coords at recording time.
+type ActionFactory = (&'static str, fn() -> CanonicalAction);
 
 const ACTION_POOL: &[ActionFactory] = &[
     ("tab", || key(crate::backend::KeyCode::Tab)),
-    ("shift+tab", || {
-        Input::Key(KeyEvent::with_modifiers(
-            crate::backend::KeyCode::Tab,
-            KeyModifiers::SHIFT,
-        ))
+    ("shift+tab", || CanonicalAction::Key {
+        key: KeyEvent::with_modifiers(crate::backend::KeyCode::Tab, KeyModifiers::SHIFT),
     }),
     ("down", || key(crate::backend::KeyCode::Down)),
     ("up", || key(crate::backend::KeyCode::Up)),
@@ -203,35 +206,30 @@ pub fn run(
         }
 
         let (name, mk) = ACTION_POOL.choose(&mut rng).unwrap();
-        let before = session.observe(30)?;
-        if let Err(_e) = session.send(mk()) {
-            exits.push(ProcessExit {
-                action_index: i,
-                action_name: name.to_string(),
-                classification: ExitClassification::Unknown,
-                exit_code: None,
-                exit_signal: None,
-            });
-            terminated_early = true;
-            reason = ExplorationCompletionReason::Failure;
-            break;
-        }
+        // Go through the canonical executor so baseline-before-send and
+        // anchored settle-wait ordering match MCP `tui_act` exactly
+        // (re-review P0 "one canonical executor").
+        let action = mk();
+        let tx = match execute_act(session, &action, 120, 1500, false) {
+            Ok(tx) => tx,
+            Err(_e) => {
+                exits.push(ProcessExit {
+                    action_index: i,
+                    action_name: name.to_string(),
+                    classification: ExitClassification::Unknown,
+                    exit_code: None,
+                    exit_signal: None,
+                });
+                terminated_early = true;
+                reason = ExplorationCompletionReason::Failure;
+                break;
+            }
+        };
 
-        // Anchored settle wait: baseline captured before the send.
-        let baseline = session.event_state();
-        let wait_out = session
-            .wait_after(
-                baseline,
-                crate::backend::WaitCond::ScreenStable {
-                    quiet_for: std::time::Duration::from_millis(120),
-                    after_screen_seq: None,
-                },
-                400,
-            )
-            .ok();
-        let settled = wait_out.as_ref().map(|o| o.met).unwrap_or(false);
-        let after = session.observe(50)?;
-        let elapsed_ms = wait_out.as_ref().map(|o| o.elapsed_ms).unwrap_or(0);
+        let settled = tx.settled;
+        let after = tx.after.clone();
+        let elapsed_ms = tx.elapsed_ms;
+        let before_hash = tx.before.structure_hash.clone();
 
         let novel_state = !hashes.contains(&after.structure_hash);
         if novel_state {
@@ -246,9 +244,9 @@ pub fn run(
         steps.push(ExplorationStep {
             seq: i as u64,
             action: name.to_string(),
-            before: before.structure_hash.clone(),
+            before: before_hash.clone(),
             after: after.structure_hash.clone(),
-            changed: before.structure_hash != after.structure_hash,
+            changed: before_hash != after.structure_hash,
             settled,
             elapsed_ms,
             novel_state,
@@ -330,7 +328,10 @@ pub fn run(
 
 /// Feed executed steps into the run's state graph — from the ordered record
 /// of what actually happened, not from reconstructed hashes (item 12).
-pub fn record_steps(graph: &mut crate::exploration::state_graph::StateGraph, steps: &[ExplorationStep]) {
+pub fn record_steps(
+    graph: &mut crate::exploration::state_graph::StateGraph,
+    steps: &[ExplorationStep],
+) {
     for s in steps {
         graph.record_transition(&s.before, &s.after, &s.action);
     }

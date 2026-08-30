@@ -36,6 +36,71 @@ impl StateId {
     }
 }
 
+/// Layered state identity (re-review Wave-2 item 14).
+///
+/// The graph's old key was the structure hash alone, which collapses
+/// states that differ only in *interaction* state — a screen where focus is
+/// on "Save" and one where focus is on "Cancel" have identical normalized
+/// text, so Tab traversals vanished from the graph. `StateIdentity` carries
+/// the separate hashes so the graph can key on the layers a navigation
+/// analysis actually needs (`interaction` = structure + focus/selection).
+///
+/// `id()` derives the graph key from `structure + interaction`, which is
+/// usually right for navigation graphs; `visual` is carried for evidence
+/// and layout-sensitive analyses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct StateIdentity {
+    /// Normalized-text structure hash (volatile patterns removed).
+    pub content: String,
+    /// Visually-rendered hash (ignores non-rendered attribute changes).
+    pub visual: String,
+    /// Interaction-identity hash: structure hash combined with the focused
+    /// control ID and selection state. `None` when no semantic analysis is
+    /// available, in which case identity degrades to content-only.
+    pub interaction: Option<String>,
+}
+
+impl StateIdentity {
+    /// Identity from a frame's hashes without semantic analysis: the
+    /// interaction layer is absent and `id()` falls back to content.
+    pub fn from_frame(screen: &crate::screen::ScreenState) -> Self {
+        StateIdentity {
+            content: screen.structure_hash.clone(),
+            visual: screen.visual_hash.clone(),
+            interaction: None,
+        }
+    }
+
+    /// Identity including the interaction layer from semantic analysis.
+    pub fn with_semantic(
+        screen: &crate::screen::ScreenState,
+        semantic: &crate::semantic::SemanticScreen,
+    ) -> Self {
+        let mut hasher = DefaultHasher::new();
+        screen.structure_hash.hash(&mut hasher);
+        semantic.focus.control_id.hash(&mut hasher);
+        // Selection state participates: which row/tab is selected is
+        // interaction state even when text is identical.
+        for c in &semantic.controls {
+            c.selected.hash(&mut hasher);
+        }
+        StateIdentity {
+            content: screen.structure_hash.clone(),
+            visual: screen.visual_hash.clone(),
+            interaction: Some(format!("{:016x}", hasher.finish())),
+        }
+    }
+
+    /// The graph key: interaction-inclusive when available, content
+    /// otherwise.
+    pub fn id(&self) -> StateId {
+        match &self.interaction {
+            Some(i) => StateId::combined(&[&self.content, i]),
+            None => StateId::from_structure_hash(&self.content),
+        }
+    }
+}
+
 /// A node in the state graph: a unique UI state.
 #[derive(Debug, Clone)]
 pub struct StateNode {
@@ -118,6 +183,53 @@ impl StateGraph {
         novel
     }
 
+    /// Record observing a state by layered [`StateIdentity`] (Wave-2 item
+    /// 14). Interaction-distinct states (same text, different focus) get
+    /// separate nodes. Returns true if this state is novel.
+    pub fn record_state_identity(&mut self, identity: &StateIdentity, timestamp: u64) -> bool {
+        let id = identity.id();
+        let novel = !self.nodes.contains_key(&id);
+        let node = self.nodes.entry(id.clone()).or_insert_with(|| StateNode {
+            id,
+            first_seen_at: timestamp,
+            visit_count: 0,
+            structure_hash: identity.content.clone(),
+            semantic_hash: identity.interaction.clone(),
+        });
+        node.visit_count += 1;
+        novel
+    }
+
+    /// Record a transition between two identity-keyed states.
+    pub fn record_transition_identity(
+        &mut self,
+        from: &StateIdentity,
+        to: &StateIdentity,
+        action_name: &str,
+    ) {
+        let from_id = from.id();
+        let to_id = to.id();
+        self.nodes
+            .entry(from_id.clone())
+            .or_insert_with(|| StateNode {
+                id: from_id.clone(),
+                first_seen_at: 0,
+                visit_count: 0,
+                structure_hash: from.content.clone(),
+                semantic_hash: from.interaction.clone(),
+            });
+        self.nodes
+            .entry(to_id.clone())
+            .or_insert_with(|| StateNode {
+                id: to_id.clone(),
+                first_seen_at: 0,
+                visit_count: 0,
+                structure_hash: to.content.clone(),
+                semantic_hash: to.interaction.clone(),
+            });
+        self.push_edge(from_id, to_id, action_name);
+    }
+
     /// Record a transition between two states.
     pub fn record_transition(&mut self, from_hash: &str, to_hash: &str, action_name: &str) {
         let from = StateId::from_structure_hash(from_hash);
@@ -139,7 +251,11 @@ impl StateGraph {
             semantic_hash: None,
         });
 
-        // Find existing edge or create new
+        self.push_edge(from, to, action_name);
+    }
+
+    /// Insert or increment the edge between two state ids.
+    fn push_edge(&mut self, from: StateId, to: StateId, action_name: &str) {
         if let Some(edge) = self
             .edges
             .iter_mut()
@@ -302,6 +418,60 @@ mod tests {
 
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
+    }
+
+    /// Wave-2 item 14: focus-only changes must not collapse. Two frames with
+    /// identical structure hashes but different focused controls get
+    /// separate graph nodes when identity carries the interaction layer.
+    #[test]
+    fn test_identity_distinguishes_focus_only_states() {
+        let screen = crate::screen::ScreenState::new(80, 24);
+        let make_sem = |focus: &str| -> crate::semantic::SemanticScreen {
+            let mut s = crate::semantic::analyze(&screen);
+            s.focus.control_id = Some(focus.to_string());
+            s
+        };
+        let a = StateIdentity::with_semantic(&screen, &make_sem("button/save"));
+        let b = StateIdentity::with_semantic(&screen, &make_sem("button/cancel"));
+        assert_ne!(a.id(), b.id(), "focus-only change must be a distinct state");
+
+        // And the graph keeps both nodes.
+        let mut g = StateGraph::new(ExplorationBudget::default());
+        assert!(g.record_state_identity(&a, 0));
+        assert!(
+            g.record_state_identity(&b, 1),
+            "second focus state is novel"
+        );
+        assert_eq!(g.state_count(), 2);
+
+        // Identity without semantic analysis degrades to content-keying.
+        let plain = StateIdentity::from_frame(&screen);
+        assert!(plain.interaction.is_none());
+        assert_eq!(
+            plain.id(),
+            StateId::from_structure_hash(&screen.structure_hash)
+        );
+    }
+
+    #[test]
+    fn test_identity_transition_records_edge() {
+        let screen = crate::screen::ScreenState::new(80, 24);
+        let mut sem = crate::semantic::analyze(&screen);
+        sem.focus.control_id = Some("a".into());
+        let ida = StateIdentity::with_semantic(&screen, &sem);
+        sem.focus.control_id = Some("b".into());
+        let idb = StateIdentity::with_semantic(&screen, &sem);
+
+        let mut g = StateGraph::new(ExplorationBudget::default());
+        g.record_transition_identity(&ida, &idb, "tab");
+        g.record_transition_identity(&ida, &idb, "tab");
+        assert_eq!(g.transition_count(), 1);
+        let out = g.outgoing(&ida.content); // lookup by content hash — legacy path
+        assert_eq!(
+            out.len(),
+            0,
+            "identity-keyed edge is not visible via hash keying"
+        );
     }
 
     #[test]
