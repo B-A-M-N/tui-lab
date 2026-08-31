@@ -737,3 +737,672 @@ fn has_incomplete_border(row: &str) -> bool {
     // Incomplete if only one side has border
     first_is_border != last_is_border
 }
+
+/// Run the mouse audit (Wave G item 66): real clicks through the canonical
+/// executor on each visible, enabled, clickable control. Evidence-first:
+/// the driver reports what actually changed after each click (focus, screen
+/// structure), and flags controls that declare clickability but absorb
+/// clicks without any observable effect. Buttons/links whose semantics we
+/// cannot verify statically are never assumed broken — the finding cites
+/// the observed transition, not a guess.
+pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
+    use crate::backend::MouseButton;
+
+    let mut findings = Vec::new();
+    let screen = match session.observe(50) {
+        Ok(s) => s,
+        Err(e) => {
+            findings.push(Finding {
+                id: "MOUSE-ERR".into(),
+                severity: "error".into(),
+                category: "mouse".into(),
+                summary: format!("Cannot observe: {}", e),
+                evidence: vec![ev_other_empty(
+                    "mouse_observe_failed",
+                    "session.observe failed at mouse audit start",
+                )],
+                confidence: 1.0,
+                reproduction: None,
+            });
+            return findings;
+        }
+    };
+    let caps = session.capabilities();
+    if !caps.mouse {
+        findings.push(Finding {
+            id: "MOUSE-NO-CAPS".into(),
+            severity: "info".into(),
+            category: "mouse".into(),
+            summary: "Backend reports no mouse-encoding capability; clicks are sent but the app may never receive them.".into(),
+            evidence: vec![ev_other(
+                "mouse_capability_absent",
+                "capabilities.mouse = false",
+                json!({ "backend": session.backend_kind }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+        });
+        // Continue anyway: an app with mouse support behind a
+        // capability-blind backend is still worth probing honestly.
+    }
+
+    let sem = semantic::analyze(&screen);
+    // Risk filter (Wave D risk classes): only click SAFE-looking targets —
+    // buttons and links whose click might mutate or destroy state are
+    // listed, not clicked, unless the screen marks them unambiguous. Here
+    // we click only controls whose label does not match destructive verbs.
+    let destructive = ["delete", "remove", "quit", "kill", "reset", "format", "erase"];
+    let clickable: Vec<&semantic::Control> = sem
+        .controls
+        .iter()
+        .filter(|c| {
+            if !c.enabled || c.bounds.width == 0 || c.bounds.height == 0 {
+                return false;
+            }
+            matches!(c.kind, semantic::ControlKind::Button | semantic::ControlKind::Tab | semantic::ControlKind::MenuItem)
+                || c.focusable
+        })
+        .filter(|c| {
+            let label = c.label.to_lowercase();
+            !destructive.iter().any(|d| label.contains(d))
+        })
+        .take(max_clicks as usize)
+        .collect();
+
+    if clickable.is_empty() {
+        findings.push(Finding {
+            id: "MOUSE-NO-TARGETS".into(),
+            severity: "info".into(),
+            category: "mouse".into(),
+            summary: "No safe clickable controls detected; nothing clicked (destructive-looking labels are never clicked by the audit).".into(),
+            evidence: vec![ev_other(
+                "no_click_targets",
+                "no enabled button/link controls passed the risk filter",
+                json!({
+                    "controls_seen": sem.controls.len(),
+                    "risk_filter": "non-destructive, enabled, non-empty bounds",
+                }),
+            )],
+            confidence: 0.9,
+            reproduction: None,
+        });
+        return findings;
+    }
+
+    let mut clicked = 0u32;
+    let mut unresponsive: Vec<String> = Vec::new();
+    let mut responded: Vec<String> = Vec::new();
+
+    for ctrl in &clickable {
+        let cx = ctrl.bounds.x.saturating_add(ctrl.bounds.width / 2);
+        let cy = ctrl.bounds.y.saturating_add(ctrl.bounds.height / 2);
+        let before = match session.observe(30) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let tx = match execute_act(
+            session,
+            &CanonicalAction::MouseClick {
+                button: MouseButton::Left,
+                x: cx,
+                y: cy,
+            },
+            80,
+            500,
+            false,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                findings.push(Finding {
+                    id: "MOUSE-SEND-ERR".into(),
+                    severity: "warn".into(),
+                    category: "mouse".into(),
+                    summary: format!("Click send failed at ({}, {}): {}", cx, cy, e),
+                    evidence: vec![ev_other(
+                        "click_send_failed",
+                        "execute_act returned Err for MouseClick",
+                        json!({ "x": cx, "y": cy, "control": ctrl.id }),
+                    )],
+                    confidence: 0.9,
+                    reproduction: None,
+                });
+                break;
+            }
+        };
+        clicked += 1;
+        let before_sem = semantic::analyze(&before);
+        let after_sem = semantic::analyze(tx.after());
+        let focus_moved = before_sem.focus.control != after_sem.focus.control;
+        let structure_changed = before.structure_hash != tx.after().structure_hash;
+        if focus_moved || structure_changed {
+            responded.push(ctrl.label.clone());
+            // Record the click edge into evidence via one finding per
+            // responsive control is too noisy; they are summarized below.
+        } else {
+            unresponsive.push(format!(
+                "{} at ({},{})",
+                ctrl.label, ctrl.bounds.x, ctrl.bounds.y
+            ));
+        }
+    }
+
+    if clicked > 0 {
+        findings.push(Finding {
+            id: if unresponsive.is_empty() {
+                "MOUSE-OK".into()
+            } else {
+                "MOUSE-UNRESPONSIVE".into()
+            },
+            severity: if unresponsive.is_empty() {
+                "info".into()
+            } else {
+                "warn".into()
+            },
+            category: "mouse".into(),
+            summary: format!(
+                "Clicked {} control(s): {} responded (focus or screen changed), {} did not",
+                clicked,
+                responded.len(),
+                unresponsive.len()
+            ),
+            evidence: vec![ev_other(
+                "mouse_click_results",
+                "per-control click outcomes (center-of-bounds, canonical executor)",
+                json!({
+                    "clicked": clicked,
+                    "responded": responded,
+                    "unresponsive": unresponsive,
+                    "note": "unresponsive = neither focus nor structure hash changed within the settle budget; the control may still act non-visibly",
+                }),
+            )],
+            confidence: 0.8,
+            reproduction: None,
+        });
+    }
+
+    findings
+}
+
+/// Run the performance audit (Wave G item 66): observe and settle latency
+/// percentiles over a bounded number of samples. Evidence = measured
+/// milliseconds, not assertions about the app's speed; slow paths are
+/// flagged against the tool's own budgets so the numbers stay interpretable.
+pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let samples = samples.clamp(3, 20);
+    let mut observe_ms: Vec<u64> = Vec::new();
+    let mut settle_ms: Vec<u64> = Vec::new();
+
+    for _ in 0..samples {
+        let t0 = std::time::Instant::now();
+        let r = session.observe(40);
+        observe_ms.push(t0.elapsed().as_millis() as u64);
+        match r {
+            Ok(_) => {}
+            Err(e) => {
+                findings.push(Finding {
+                    id: "PERF-ERR".into(),
+                    severity: "error".into(),
+                    category: "performance".into(),
+                    summary: format!("Observe failed during sampling: {}", e),
+                    evidence: vec![ev_other_empty(
+                        "perf_observe_failed",
+                        "session.observe failed during performance sampling",
+                    )],
+                    confidence: 1.0,
+                    reproduction: None,
+                });
+                return findings;
+            }
+        }
+        // A settle wait measures how long the app takes to go quiet after
+        // its latest output — the same quantity a user experiences as lag.
+        let t1 = std::time::Instant::now();
+        let _ = session.wait(
+            WaitCond::ScreenStable {
+                quiet_for: std::time::Duration::from_millis(60),
+                after_screen_seq: None,
+            },
+            1000,
+        );
+        settle_ms.push(t1.elapsed().as_millis() as u64);
+    }
+
+    let pct = |v: &mut Vec<u64>, p: usize| -> u64 {
+        v.sort_unstable();
+        v.get(v.len().saturating_sub(1).min(p * v.len() / 100))
+            .copied()
+            .unwrap_or(0)
+    };
+    let obs_p50 = pct(&mut observe_ms, 50);
+    let obs_p95 = pct(&mut observe_ms, 95);
+    let set_p50 = pct(&mut settle_ms, 50);
+    let set_p95 = pct(&mut settle_ms, 95);
+
+    // Flag only against OUR budgets: observe must stay interactive
+    // (< 500 ms p95) for agent loops; settle hitting the 1 s ceiling on most
+    // samples means the app never goes quiet — an anti-pattern for waits.
+    let slow_observe = obs_p95 >= 500;
+    const SETTLE_CEILING: u64 = 1000;
+    let settle_saturated = settle_ms.iter().filter(|&&m| m >= SETTLE_CEILING).count() * 2 >= settle_ms.len();
+    findings.push(Finding {
+        id: if slow_observe { "PERF-OBSERVE-SLOW" } else { "PERF-OK" }.into(),
+        severity: if slow_observe { "warn" } else { "info" }.into(),
+        category: "performance".into(),
+        summary: format!(
+            "observe p50={}ms p95={}ms; settle-to-quiet p50={}ms p95={}ms ({} samples)",
+            obs_p50, obs_p95, set_p50, set_p95, samples
+        ),
+        evidence: vec![ev_other(
+            "latency_percentiles",
+            "measured observe and settle latencies over the sampling window",
+            json!({
+                "samples": samples,
+                "observe_ms": { "p50": obs_p50, "p95": obs_p95 },
+                "settle_ms": { "p50": set_p50, "p95": set_p95 },
+                "settle_budget_ms": SETTLE_CEILING,
+                "settle_saturated": settle_saturated,
+            }),
+        )],
+        confidence: 0.95,
+        reproduction: None,
+    });
+    if settle_saturated {
+        findings.push(Finding {
+            id: "PERF-NEVER-QUIET".into(),
+            severity: "warn".into(),
+            category: "performance".into(),
+            summary: "Screen kept changing through most settle windows: waits anchored on screen-stability will burn their budgets (animations, clocks, spinners).".into(),
+            evidence: vec![ev_other(
+                "settle_saturation",
+                "most settle waits hit the budget ceiling without reaching quiet",
+                json!({
+                    "settle_ms": settle_ms,
+                    "budget_ms": SETTLE_CEILING,
+                    "note": "consider contract volatile_patterns normalization or idle waits instead",
+                }),
+            )],
+            confidence: 0.8,
+            reproduction: None,
+        });
+    }
+    findings
+}
+
+/// Run the states audit (Wave G item 66): find disabled controls and probe
+/// whether they can still be focused via Tab (a disabled-but-focusable
+/// control breaks keyboard semantics). One frame of disabled-control
+/// inventory plus a bounded focus probe — never a fake "walked all states".
+pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let screen = match session.observe(50) {
+        Ok(s) => s,
+        Err(e) => {
+            findings.push(Finding {
+                id: "STATES-ERR".into(),
+                severity: "error".into(),
+                category: "states".into(),
+                summary: format!("Cannot observe: {}", e),
+                evidence: vec![ev_other_empty(
+                    "states_observe_failed",
+                    "session.observe failed at states audit start",
+                )],
+                confidence: 1.0,
+                reproduction: None,
+            });
+            return findings;
+        }
+    };
+    let sem = semantic::analyze(&screen);
+    let disabled: Vec<&semantic::Control> =
+        sem.controls.iter().filter(|c| !c.enabled).collect();
+    let empty_like: Vec<&semantic::Control> = sem
+        .controls
+        .iter()
+        .filter(|c| c.enabled && c.label.trim().is_empty())
+        .collect();
+
+    if !disabled.is_empty() {
+        findings.push(Finding {
+            id: "STATES-DISABLED".into(),
+            severity: "info".into(),
+            category: "states".into(),
+            summary: format!(
+                "{} disabled control(s) on this screen: {}",
+                disabled.len(),
+                disabled.iter().map(|c| c.label.clone()).collect::<Vec<_>>().join(", ")
+            ),
+            evidence: vec![ev_other(
+                "disabled_controls",
+                "controls whose enabled state inference reports disabled (grayed/dimmed)",
+                json!({
+                    "disabled": disabled.iter().map(|c| json!({
+                        "id": c.id,
+                        "label": c.label,
+                        "kind": format!("{:?}", c.kind),
+                        "focusable": c.focusable,
+                    })).collect::<Vec<_>>(),
+                }),
+            )],
+            confidence: 0.7,
+            reproduction: None,
+        });
+    }
+    if !empty_like.is_empty() {
+        findings.push(Finding {
+            id: "STATES-EMPTY-CONTROLS".into(),
+            severity: "info".into(),
+            category: "states".into(),
+            summary: format!(
+                "{} enabled control(s) carry an empty label — state may be unreadable to agents",
+                empty_like.len()
+            ),
+            evidence: vec![ev_other(
+                "empty_labeled_controls",
+                "enabled controls with blank labels",
+                json!({
+                    "controls": empty_like.iter().map(|c| json!({
+                        "id": c.id,
+                        "kind": format!("{:?}", c.kind),
+                        "bounds": c.bounds,
+                    })).collect::<Vec<_>>(),
+                }),
+            )],
+            confidence: 0.6,
+            reproduction: None,
+        });
+    }
+
+    // Disabled-but-focusable probe: walk up to max_tabs tabs and check
+    // whether focus ever lands on a disabled control.
+    let disabled_ids: std::collections::HashSet<&str> =
+        disabled.iter().map(|c| c.id.as_str()).collect();
+    if !disabled.is_empty() {
+        let mut focused_disabled: Vec<String> = Vec::new();
+        for _ in 0..max_tabs.min(10) {
+            let tx = match execute_act(
+                session,
+                &CanonicalAction::Key {
+                    key: KeyEvent::new(KeyCode::Tab),
+                },
+                60,
+                400,
+                false,
+            ) {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            let sem_after = semantic::analyze(tx.after());
+            if let (Some(id), Some(_label)) = (
+                sem_after.focus.control_id.as_deref(),
+                sem_after.focus.control.as_deref(),
+            ) {
+                if disabled_ids.contains(id) {
+                    focused_disabled.push(id.to_string());
+                }
+            }
+        }
+        if !focused_disabled.is_empty() {
+            findings.push(Finding {
+                id: "STATES-DISABLED-FOCUSABLE".into(),
+                severity: "error".into(),
+                category: "states".into(),
+                summary: format!(
+                    "Tab reached {} disabled control(s): disabled controls must not take focus",
+                    focused_disabled.len()
+                ),
+                evidence: vec![ev_other(
+                    "disabled_focus_reached",
+                    "focus landed on a control whose enabled inference says disabled",
+                    json!({
+                        "controls": focused_disabled,
+                        "note": "enabled-state inference is heuristic; verify against the app before fixing",
+                    }),
+                )],
+                confidence: 0.75,
+                reproduction: None,
+            });
+        }
+    }
+
+    if findings.is_empty() {
+        findings.push(Finding {
+            id: "STATES-OK".into(),
+            severity: "info".into(),
+            category: "states".into(),
+            summary: format!(
+                "No disabled, empty-labeled, or unfocusable-state issues across {} control(s)",
+                sem.controls.len()
+            ),
+            evidence: vec![ev_other(
+                "states_ok",
+                "no disabled/empty-label findings on this frame",
+                json!({ "controls": sem.controls.len() }),
+            )],
+            confidence: 0.85,
+            reproduction: None,
+        });
+    }
+    findings
+}
+
+/// Run the errors audit (Wave G item 66): crash resistance + on-screen
+/// error scan. Two probes: (1) send a bounded burst of random safe keys —
+/// the app must survive (no exit, no signal) and keep rendering; (2) scan
+/// the final frame for error-shaped text (panic, tracebacks, "error:"-style
+/// prefixes). The burst is SAFE-class keys only (arrows/tab/escape) so the
+/// probe cannot destroy user data by construction.
+pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
+    use crate::backend::KeyModifiers;
+
+    let mut findings = Vec::new();
+    let was_running = match session.observe(30) {
+        Ok(s) => s.process.running,
+        Err(e) => {
+            findings.push(Finding {
+                id: "ERR-AUDIT-ERR".into(),
+                severity: "error".into(),
+                category: "errors".into(),
+                summary: format!("Cannot observe: {}", e),
+                evidence: vec![ev_other_empty(
+                    "errors_observe_failed",
+                    "session.observe failed at errors audit start",
+                )],
+                confidence: 1.0,
+                reproduction: None,
+            });
+            return findings;
+        }
+    };
+
+    // (1) Crash resistance: a bounded burst of safe keys.
+    let safe_keys = [
+        KeyCode::Tab,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Escape,
+    ];
+    let mut seed = 0x5eed_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let burst = burst.min(30);
+    let mut sent = 0u32;
+    for _ in 0..burst {
+        let code = safe_keys[(next() as usize) % safe_keys.len()];
+        let key = if code == KeyCode::Tab && next() % 4 == 0 {
+            KeyEvent::with_modifiers(KeyCode::Tab, KeyModifiers::SHIFT)
+        } else {
+            KeyEvent::new(code)
+        };
+        match execute_act(session, &CanonicalAction::Key { key }, 40, 300, false) {
+            Ok(_) => sent += 1,
+            Err(_) => break,
+        }
+    }
+
+    let after = session.observe(80);
+    let (still_running, exited_clean) = match &after {
+        Ok(s) => (s.process.running, s.process.exit_code.is_some()),
+        Err(_) => (false, false),
+    };
+    if was_running && !still_running {
+        findings.push(Finding {
+            id: "ERR-CRASH".into(),
+            severity: "error".into(),
+            category: "errors".into(),
+            summary: format!(
+                "App exited during a {}-key safe burst (arrows/tab/escape only) — crash resistance failed",
+                sent
+            ),
+            evidence: vec![ev_other(
+                "crash_during_safe_burst",
+                "process left running state during the safe-key burst",
+                json!({
+                    "keys_sent": sent,
+                    "burst_requested": burst,
+                    "key_classes": "tab/shift+tab/arrows/escape",
+                    "exit_state": after.as_ref().ok().map(|s| &s.process),
+                }),
+            )],
+            confidence: 0.9,
+            reproduction: None,
+        });
+        // Skip the error scan on a dead screen; the crash IS the finding.
+        return findings;
+    }
+    let _ = exited_clean;
+
+    // (2) On-screen error scan of the final frame.
+    if let Ok(s) = after {
+        let joined = s.viewport_text.join("\n");
+        let lowered = joined.to_lowercase();
+        let mut markers: Vec<&str> = Vec::new();
+        for m in [
+            "panicked at",
+            "traceback (most recent call last)",
+            "unhandled exception",
+            "segmentation fault",
+            "error:",
+            "fatal:",
+            "exception:",
+        ] {
+            if lowered.contains(m) {
+                markers.push(m);
+            }
+        }
+        if !markers.is_empty() {
+            // Pull the offending lines as evidence (bounded).
+            let lines: Vec<String> = s
+                .viewport_text
+                .iter()
+                .filter(|l| {
+                    let ll = l.to_lowercase();
+                    markers.iter().any(|m| ll.contains(m))
+                })
+                .take(5)
+                .cloned()
+                .collect();
+            findings.push(Finding {
+                id: "ERR-ON-SCREEN".into(),
+                severity: "error".into(),
+                category: "errors".into(),
+                summary: format!(
+                    "Error text visible on screen: {} marker(s) found ({})",
+                    markers.len(),
+                    markers.join(", ")
+                ),
+                evidence: vec![ev_other(
+                    "error_text_on_screen",
+                    "viewport lines matching error-shaped markers",
+                    json!({
+                        "markers": markers,
+                        "lines": lines,
+                        "structure_hash": s.structure_hash,
+                    }),
+                )],
+                confidence: 0.85,
+                reproduction: None,
+            });
+        } else {
+            findings.push(Finding {
+                id: "ERR-OK".into(),
+                severity: "info".into(),
+                category: "errors".into(),
+                summary: format!(
+                    "Survived {} safe keys with no exit and no error text on screen",
+                    sent
+                ),
+                evidence: vec![ev_other(
+                    "crash_resistance_ok",
+                    "no exit, no signal, no error markers after the burst",
+                    json!({
+                        "keys_sent": sent,
+                        "structure_hash": s.structure_hash,
+                    }),
+                )],
+                confidence: 0.9,
+                reproduction: None,
+            });
+        }
+    }
+    findings
+}
+
+/// Check whether the backend reports color capability and whether the
+/// screen uses styled runs (static color audit; Wave G keeps this one
+/// frame-level — a real color-contrast audit needs styled-cell semantics
+/// the portable backend only partially reconstructs, and honesty beats a
+/// fake WCAG pass).
+pub fn color_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let screen = match session.observe(50) {
+        Ok(s) => s,
+        Err(e) => {
+            findings.push(Finding {
+                id: "COLOR-ERR".into(),
+                severity: "error".into(),
+                category: "color".into(),
+                summary: format!("Cannot observe: {}", e),
+                evidence: vec![ev_other_empty(
+                    "color_observe_failed",
+                    "session.observe failed at color audit start",
+                )],
+                confidence: 1.0,
+                reproduction: None,
+            });
+            return findings;
+        }
+    };
+    let caps = session.capabilities();
+    let styled_cells = screen.cells.iter().filter(|c| c.fg.rgb.is_some() || c.fg.palette.is_some() || c.bg.rgb.is_some() || c.bg.palette.is_some()).count();
+    findings.push(Finding {
+        id: "COLOR-INVENTORY".into(),
+        severity: "info".into(),
+        category: "color".into(),
+        summary: format!(
+            "color capability: {}, styled cells: {}/{}",
+            if caps.colors { "present" } else { "absent" },
+            styled_cells,
+            screen.cells.len()
+        ),
+        evidence: vec![ev_other(
+            "color_inventory",
+            "backend color capability + styled-cell census on the current frame",
+            json!({
+                "color_capable": caps.colors,
+                "styled_cells": styled_cells,
+                "total_cells": screen.cells.len(),
+                "note": "a contrast audit needs app-declared palette semantics; use a design contract for color rules",
+            }),
+        )],
+        confidence: 0.9,
+        reproduction: None,
+    });
+    findings
+}
