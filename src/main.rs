@@ -25,8 +25,20 @@ enum Commands {
     Version,
     /// Generate skill documentation.
     Skill,
-    /// Play back a previous run.
-    Replay { run_id: String },
+    /// Print a persisted run's history from disk (item 74): manifest,
+    /// declared-replay ledger, findings summary, graphs. Read-only —
+    /// replay renders what the run recorded; it does not relaunch
+    /// sessions or re-send inputs.
+    Replay {
+        run_id: String,
+        /// Base directory the run lives under (a repo root or a runs dir).
+        /// Defaults to the current directory.
+        #[arg(long)]
+        root: Option<String>,
+        /// Print the full transaction ledger instead of a summary.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[tokio::main]
@@ -45,11 +57,166 @@ async fn main() -> anyhow::Result<()> {
         Commands::Skill => {
             println!("{}", tui_lab::SKILL_DOC);
         }
-        Commands::Replay { run_id } => {
-            println!("Replay not yet implemented for run: {}", run_id);
+        Commands::Replay { run_id, root, full } => {
+            replay(&run_id, root.as_deref(), full)?;
         }
     }
     Ok(())
+}
+
+/// Item 74: render a persisted run's recorded history from its durable
+/// directory. This is deliberately a *read* of what the run recorded —
+/// the ledger (with its declared eviction window), findings, focus graph
+/// summary, and artifact list — not a re-execution: replaying inputs
+/// against live children is what `tui_scenario action=run` is for, and
+/// pretending a dead run's transcript is a live re-drive would be the
+/// exact dishonesty the run model exists to prevent.
+fn replay(run_id: &str, root: Option<&str>, full: bool) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let base = std::path::PathBuf::from(root.unwrap_or("."));
+    let dir = tui_lab::run::RunContext::resolve_run_dir(&base, run_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no persisted run '{}' under {} (is it under .tui-lab/runs? pass --root to point at the repo/runs directory)",
+            run_id,
+            base.to_string_lossy()
+        )
+    })?;
+    let run = tui_lab::run::RunContext::restore(&dir)?;
+    let manifest = tui_lab::run::manifest::load(&dir)?;
+    let sessions = run
+        .launch_specs()
+        .into_iter()
+        .map(|(sid, spec)| format!("  {} — {} {}", sid, spec.command, spec.args.join(" ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let _ = writeln!(out, "run {}", run.id);
+    let _ = writeln!(out, "{}", "=".repeat(16 + run.id.len()));
+    let _ = writeln!(
+        out,
+        "started: {}  closed: {}  history_complete: {}",
+        chrono_like(run.started_at),
+        manifest.closed,
+        manifest.history_complete
+    );
+    if let Some(d) = run.run_dir() {
+        let _ = writeln!(out, "artifacts: {}", d.to_string_lossy());
+    }
+    if !sessions.is_empty() {
+        let _ = writeln!(out, "sessions (from manifest launch specs):");
+        let _ = writeln!(out, "{}", sessions);
+    }
+    if !manifest.history_complete {
+        let _ = writeln!(
+            out,
+            "NOTE: ledger evicted {} record(s) before flush; replay starts at seq {:?} — the run is NOT replay-complete",
+            manifest.dropped_records, manifest.first_available_seq
+        );
+    }
+
+    // The declared-replay transaction ledger.
+    let txs = run.transactions();
+    let _ = writeln!(
+        out,
+        "\ntransactions ({} in ledger, {} lifetime):",
+        txs.len(),
+        run.transaction_total()
+    );
+    if full {
+        for t in txs {
+            let _ = writeln!(
+                out,
+                "  {:>4}  +{:>4}ms  {:<14} settle={:<9} cells={:<5} {}",
+                t.seq, t.elapsed_ms, t.action, t.settle, t.changed_cells, t.session
+            );
+        }
+    } else {
+        // Compact summary: per-action counts and settle outcomes.
+        let mut by_action: std::collections::BTreeMap<String, (u64, u64)> =
+            std::collections::BTreeMap::new(); // action -> (total, settled)
+        for t in txs {
+            let e = by_action.entry(t.action.clone()).or_default();
+            e.0 += 1;
+            if t.settled() {
+                e.1 += 1;
+            }
+        }
+        for (action, (total, settled)) in by_action {
+            let _ = writeln!(out, "  {:<24} {:>4} (settled {})", action, total, settled);
+        }
+        let _ = writeln!(
+            out,
+            "  (full ledger: hermes-tui-lab replay {} --full)",
+            run.id
+        );
+    }
+
+    // Findings summary.
+    let findings = run.findings();
+    let _ = writeln!(out, "\nfindings ({}):", findings.len());
+    for f in findings.iter().take(40) {
+        let _ = writeln!(out, "  [{:<5}] {:<28} {}", f.severity, f.id, f.summary);
+    }
+    if findings.len() > 40 {
+        let _ = writeln!(
+            out,
+            "  … and {} more (findings.json in the run dir)",
+            findings.len() - 40
+        );
+    }
+
+    // Graphs + artifacts.
+    let _ = writeln!(
+        out,
+        "\nstate graph: {} states, {} transitions",
+        run.state_graph.state_count(),
+        run.state_graph.transition_count()
+    );
+    let _ = writeln!(
+        out,
+        "focus graph: {} controls, {} edges (tab cycle: {})",
+        run.focus_graph.nodes.len(),
+        run.focus_graph.edges.len(),
+        run.focus_graph
+            .tab_cycle()
+            .map(|c| c.join("→"))
+            .unwrap_or_else(|| "none".into())
+    );
+    let arts = run.artifacts();
+    if !arts.is_empty() {
+        let _ = writeln!(out, "artifacts ({}):", arts.len());
+        for a in arts {
+            let _ = writeln!(out, "  {:<24} {}", a.id, a.summary);
+        }
+    }
+    let _ = out.flush();
+    Ok(())
+}
+
+/// Unix-millis → local-ish "YYYY-MM-DD HH:MM:SS" without pulling chrono:
+/// civil-from-days is a well-known integer algorithm; good enough for a
+/// header line, and honest (UTC) in a format that says so.
+fn chrono_like(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y, mth, d, h, m, s
+    )
 }
 
 async fn start_mcp() -> anyhow::Result<()> {

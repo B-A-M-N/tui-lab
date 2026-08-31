@@ -2233,6 +2233,120 @@ impl TuiLabServer {
             RA::Context => ok(json!({
                 "registry": crate::mcp::registry::to_json(),
             })),
+            // Wave G item 75: enumerate persisted runs under a resolved
+            // root (explicit root, else the primary session's cwd; neither
+            // present is invalid_request — the same no-guessing rule persist
+            // follows). Corrupt entries are named in place, never dropped.
+            RA::List => {
+                let base: String = match p.root.clone() {
+                    Some(r) => r,
+                    None => match self.run.lock().unwrap().primary_session_cwd() {
+                        Some(cwd) => cwd.to_string(),
+                        None => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                "no root to scan for runs: pass 'root', or start a session whose LaunchSpec.cwd is set",
+                            )
+                        }
+                    },
+                };
+                match crate::run::RunContext::list_persisted(std::path::Path::new(&base)) {
+                    Ok(mut entries) => {
+                        // A directory with no run.json lands here with its
+                        // `skipped` reason; keep it — corruption is evidence.
+                        let runs: Vec<_> = entries
+                            .drain(..)
+                            .filter(|e| e.get("run_id").is_some())
+                            .collect();
+                        let skipped: Vec<_> = entries
+                            .into_iter()
+                            .filter(|e| e.get("skipped").is_some())
+                            .collect();
+                        ok(json!({
+                            "base": base,
+                            "runs": runs,
+                            "skipped": skipped,
+                            "current_run": self.run.lock().unwrap().id.clone(),
+                        }))
+                    }
+                    Err(e) => err(ErrorCategory::InvalidRequest, e.to_string()),
+                }
+            }
+            // Wave G item 74: restore a persisted run as the live run. The
+            // live run is flushed first (identity-preserving; an ephemeral
+            // run with nothing durable simply ends), sessions are left
+            // untouched (they belonged to the old run; the restored run
+            // starts with none — the manifest's launch specs are on disk
+            // for re-creation), and the restored run continues the same
+            // id, ledger, findings, graphs, scenarios, and checkpoints.
+            RA::Resume => {
+                // Resolve the target directory: explicit run_dir wins, else
+                // run_id under the resolved base.
+                let run_dir: std::path::PathBuf = if let Some(d) = p.run_dir.clone() {
+                    std::path::PathBuf::from(d)
+                } else if let Some(rid) = p.run_id.clone() {
+                    let base: String = match p.root.clone() {
+                        Some(r) => r,
+                        None => match self.run.lock().unwrap().primary_session_cwd() {
+                            Some(cwd) => cwd.to_string(),
+                            None => {
+                                return err(
+                                    ErrorCategory::InvalidRequest,
+                                    "resume needs 'run_dir', or 'run_id' with a resolvable 'root' (explicit, or a session cwd)",
+                                )
+                            }
+                        },
+                    };
+                    let candidate =
+                        crate::run::RunContext::resolve_run_dir(std::path::Path::new(&base), &rid);
+                    match candidate {
+                        Some(d) => d,
+                        None => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                format!("no persisted run '{}' under {}", rid, base),
+                            )
+                        }
+                    }
+                } else {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "resume requires 'run_id' (from tui_run action=list) or 'run_dir'",
+                    );
+                };
+                let restored = match crate::run::RunContext::restore(&run_dir) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!("cannot restore {}: {e}", run_dir.to_string_lossy()),
+                        )
+                    }
+                };
+                // Swap under a short lock (never across an await). The old
+                // run is dropped after its Drop-less flush attempt; sessions
+                // stay live regardless — resume never kills anything.
+                let manifest_like = {
+                    let mut guard = self.run.lock().unwrap();
+                    let prev_id = guard.id.clone();
+                    let restored_id = restored.id.clone();
+                    let restored_dir = restored
+                        .run_dir()
+                        .map(|d| d.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let summary = restored.status(Vec::new());
+                    *guard = restored;
+                    json!({
+                        "resumed": true,
+                        "run_id": restored_id,
+                        "previous_run": prev_id,
+                        "artifact_root": restored_dir,
+                        "status": summary,
+                        "note": "sessions are not restored; re-create them with tui_session start and the run will correlate them. history_complete=false runs replay only from their declared first_available_seq",
+                    })
+                };
+                ok(manifest_like)
+            }
         }
     }
 

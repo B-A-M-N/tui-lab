@@ -249,9 +249,13 @@ selector_enum!(
 );
 
 selector_enum!(
-    /// `tui_run` action.
+    /// `tui_run` action. `list` (Wave G item 75) enumerates persisted runs;
+    /// `resume` (Wave G item 74) restores one as the server's live run.
     RunAction;
-    [ Status => "status", Persist => "persist", Close => "close", Context => "context" ]
+    [
+        Status => "status", Persist => "persist", Close => "close",
+        Context => "context", List => "list", Resume => "resume",
+    ]
 );
 
 selector_enum!(
@@ -863,12 +867,22 @@ pub struct TuiRunParams {
     pub action: Known<RunAction>,
     /// persist: explicit artifact root. When omitted, resolved from the
     /// primary session's `LaunchSpec.cwd` — never this process's cwd.
+    /// list: base to scan (same resolution order). resume: base under which
+    /// the run lives.
     #[serde(default)]
     pub root: Option<String>,
     /// close: kill sessions too? (default false — close never touches
     /// sessions unless explicitly told to).
     #[serde(default)]
     pub kill_sessions: Option<bool>,
+    /// resume: the run id to restore (from `tui_run action=list`). Either
+    /// this or `run_dir` must be given.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// resume: the run directory directly (as listed by `action=list`'s
+    /// `dir` field) — for callers that already hold the path.
+    #[serde(default)]
+    pub run_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
