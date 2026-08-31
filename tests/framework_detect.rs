@@ -173,8 +173,23 @@ fn detect_native_adapter_false_when_not_implemented() {
 
     let det = detect(dir.path().to_str().unwrap());
     assert_eq!(det.framework.as_deref(), Some("ratatui"));
-    // Even though ratatui is detected, native_adapter is false
-    // because src/framework/ratatui.rs doesn't exist yet
+    // Wave F items 58–63: ratatui HAS a native adapter now (see
+    // `framework::adapters::snippet_for`). The false-case is covered by
+    // frameworks without one — e.g. the ink detection below — so here we
+    // assert the adapter is reported.
+    assert!(det.native_adapter);
+}
+
+#[test]
+fn detect_native_adapter_false_without_adapter() {
+    let dir = TempDir::new().unwrap();
+    let mut files = HashMap::new();
+    // A framework we detect but have no adapter snippet for.
+    files.insert("package.json", "{\n  \"dependencies\": {\"ink\": \"^5.0.0\"}\n}\n");
+    write_project(&dir, &files);
+
+    let det = detect(dir.path().to_str().unwrap());
+    assert_eq!(det.framework.as_deref(), Some("ink"));
     assert!(!det.native_adapter);
 }
 

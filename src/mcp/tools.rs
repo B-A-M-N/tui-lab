@@ -62,20 +62,25 @@ impl TuiLabServer {
                 };
                 // Honest backend/isolation negotiation (spec section 34). Do not
                 // silently start portable-pty when an unsupported backend is asked.
+                // Wave F items 50–51: `cli` selects the line CLI engine for
+                // non-screen targets (git/npm/pytest-style output).
                 let backend = p.backend.clone().unwrap_or_else(|| "auto".into());
                 let isolation = p.isolation.clone().unwrap_or_else(|| "local".into());
                 match backend.as_str() {
-                    "auto" | "portable_vt100" => {}
+                    "auto" | "portable_vt100" | "cli" | "line_cli" => {}
                     "tui_test" => {
                         return err(
                             ErrorCategory::Unsupported,
-                            "backend 'tui_test' is not wired in this build; only 'auto'/'portable_vt100' are supported",
+                            "backend 'tui_test' is not wired in this build; only 'auto'/'portable_vt100'/'cli' are supported",
                         )
                     }
                     other => {
                         return err(
                             ErrorCategory::InvalidRequest,
-                            format!("unknown backend '{}' (supported: auto, portable_vt100)", other),
+                            format!(
+                                "unknown backend '{}' (supported: auto, portable_vt100, cli)",
+                                other
+                            ),
                         )
                     }
                 }
@@ -192,7 +197,7 @@ impl TuiLabServer {
     /// Observe the screen: summary / screen / cells / region / semantic / diff / scrollback / history.
     #[tool(
         name = "tui_observe",
-        description = "Observe terminal state. Modes: summary, screen, cells, semantic, tree, nodes, diff, scrollback."
+        description = "Observe terminal state. Modes: summary, screen, cells, semantic, tree, nodes, diff, scrollback, search (query in 'text'), command_state."
     )]
     async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> String {
         let p = p.0;
@@ -238,6 +243,9 @@ impl TuiLabServer {
                         sem.focus.control_id.as_deref(),
                         "unknown",
                     );
+                    // Wave F item 64: fold any new native coverage events
+                    // into the run ledger.
+                    run.collect_native_coverage(&sess.id, sess.native_channel());
                 }
                 ok(json!({
                     "screen": format!("{}x{}", screen.cols, screen.rows),
@@ -251,9 +259,23 @@ impl TuiLabServer {
                     "regions": sem.regions.len(),
                     "controls": sem.controls.len(),
                     "dialogs": dialog_count,
+                    // Wave F item 55: OSC8 hyperlinks surfaced in the summary —
+                    // the URI is the actionable fact, the span is where to click.
+                    "hyperlinks": screen.hyperlinks.iter().map(|l| json!({
+                        "uri": l.uri,
+                        "id": l.id,
+                        "start": l.start,
+                        "end": l.end,
+                    })).collect::<Vec<_>>(),
                     "structure_hash": screen.structure_hash,
                     "visual_hash": screen.visual_hash,
                     "cursor": screen.cursor,
+                    // Wave F items 58–63: native cooperation status — the
+                    // app's own view of itself, when it provides one.
+                    "native": {
+                        "active": sess.native_channel().latest.is_some(),
+                        "framework": sess.native_channel().framework,
+                    },
                 }))
             }
             "screen" => ok(json!({ "viewport_text": screen.viewport_text })),
@@ -282,12 +304,25 @@ impl TuiLabServer {
             // type for regions, controls, widget internals (table rows/cells,
             // tree items, scroll edges), hyperlinks, and help hints, with
             // modal layering and provenance-tracked enabled state.
+            // Wave F (items 58–63): when the app cooperates via the native
+            // side channel, its real tree is merged over inference and the
+            // merge report names what matched.
             "nodes" => {
-                let tree = semantic::build_tree(&screen);
+                let mut tree = semantic::build_tree(&screen);
+                let native_report = sess.overlay_native(&mut tree);
                 ok(json!({
                     "tree": tree,
                     "rendered": tree.render(),
                     "layers": tree.layers,
+                    "native": {
+                        "active": native_report.active(),
+                        "framework": sess.native_channel().framework,
+                        "app": sess.native_channel().app,
+                        "matched": native_report.matched,
+                        "native_only": native_report.native_only,
+                        "frames_accepted": sess.native_channel().frames_accepted,
+                        "frames_invalid": sess.native_channel().frames_invalid,
+                    },
                 }))
             }
             "diff" => {
@@ -332,14 +367,51 @@ impl TuiLabServer {
                     },
                 }))
             }
-            // Honest unsupported (re-review Part VIII): an empty scrollback
-            // array is ambiguous with "supported but empty"; until real
-            // scrollback exists, say so explicitly. `history` likewise — a
-            // structure hash is not history.
-            "scrollback" => err(
-                ErrorCategory::Unsupported,
-                "scrollback is not implemented in this backend (capability reports scrollback=false); use mode=screen for the live viewport",
-            ),
+            // Wave F item 53: real scrollback (viewport + history). A backend
+            // that cannot retain history still answers — honestly, with the
+            // capability state named.
+            "scrollback" => {
+                let lines = sess
+                    .backend_scrollback()
+                    .map_err(|e| err(ErrorCategory::BackendError, e.to_string()))
+                    .unwrap_or_default();
+                let supported = sess.capabilities().scrollback;
+                ok(json!({
+                    "supported": supported,
+                    "lines": lines,
+                    "count": lines.len(),
+                    "note": if supported { None } else {
+                        Some("this backend retains no history; the array is empty because there is genuinely nothing to return".to_string())
+                    },
+                }))
+            }
+            // Wave F item 53: search viewport + scrollback.
+            "search" => {
+                let Some(query) = p.text.clone().or(p.query.clone()) else {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "mode=search requires 'text' (the query)",
+                    );
+                };
+                match sess.backend_search(&query) {
+                    Ok(hits) => ok(json!({
+                        "query": query,
+                        "hits": hits,
+                        "count": hits.len(),
+                    })),
+                    Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+                }
+            }
+            // Wave F item 54: OSC 133 shell-integration state.
+            "command_state" => {
+                match sess.backend_command_state() {
+                    Some(cs) => ok(json!({ "command_state": cs })),
+                    None => ok(json!({
+                        "command_state": null,
+                        "note": "no shell integration observed (no OSC 133 traffic); command waits cannot resolve"
+                    })),
+                }
+            }
             "history" => err(
                 ErrorCategory::Unsupported,
                 "run/session event history is not implemented; the current frame identity is available via mode=summary (structure_hash)",
@@ -459,7 +531,7 @@ impl TuiLabServer {
     /// Wait for a state condition without fixed sleeps.
     #[tool(
         name = "tui_wait",
-        description = "Block until a condition holds: text, text_absent, screen_change, screen_stable, process_exit, title, bell."
+        description = "Block until a condition holds: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output (OSC 133 shell integration)."
     )]
     async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> String {
         let p = p.0;
@@ -1007,10 +1079,104 @@ impl TuiLabServer {
                 ErrorCategory::InvalidRequest,
                 "format='cast' is not a lifecycle action; use format=start then format=stop (produces asciinema v3 .cast)",
             ),
+            // Wave F item 57: one-shot screen captures for human debugging.
+            // SVG is the faithful render (styled runs + cursor); PNG is the
+            // raster fallback (ASCII glyphs + block degradation for other
+            // scripts — honest about that in the response).
+            "svg" | "png" => {
+                let screen = match sess.observe(40) {
+                    Ok(s) => s,
+                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                };
+                let is_svg = p.format.as_deref() == Some("svg");
+                let (body, ext) = if is_svg {
+                    (crate::screen::capture::to_svg(&screen).into_bytes(), "svg")
+                } else {
+                    (crate::screen::capture::to_png(&screen), "png")
+                };
+                let file_name = format!(
+                    "{}-{}.{}",
+                    sess.id,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0),
+                    ext,
+                );
+                let size = body.len() as u64;
+                let (path, artifact) = {
+                    let mut run = self.run.lock().unwrap();
+                    let kind = if is_svg {
+                        crate::run::ArtifactKind::Capture
+                    } else {
+                        crate::run::ArtifactKind::Capture
+                    };
+                    match run.run_dir().cloned() {
+                        Some(dir) => {
+                            let cap_dir = dir.join("captures");
+                            let _ = std::fs::create_dir_all(&cap_dir);
+                            let file = cap_dir.join(&file_name);
+                            match std::fs::write(&file, &body) {
+                                Ok(()) => {
+                                    let rel =
+                                        std::path::PathBuf::from("captures").join(&file_name);
+                                    let r = run.register_artifact(
+                                        kind,
+                                        Some(rel),
+                                        Some(size),
+                                        Some(sess.id.clone()),
+                                        format!(
+                                            "screen capture {}x{} ({} format)",
+                                            screen.cols, screen.rows, ext
+                                        ),
+                                    );
+                                    (Some(file.to_string_lossy().to_string()), Some(r))
+                                }
+                                Err(e) => {
+                                    return err(
+                                        ErrorCategory::BackendError,
+                                        format!("capture write failed: {e}"),
+                                    )
+                                }
+                            }
+                        }
+                        None => {
+                            run.hold_capture(file_name, body.clone(), ext);
+                            let r = run.register_artifact(
+                                kind,
+                                None,
+                                Some(size),
+                                Some(sess.id.clone()),
+                                format!(
+                                    "screen capture {}x{} ({} format, held, ephemeral run)",
+                                    screen.cols, screen.rows, ext
+                                ),
+                            );
+                            (None, Some(r))
+                        }
+                    }
+                };
+                ok(json!({
+                    "format": ext,
+                    "dimensions": format!("{}x{}", screen.cols, screen.rows),
+                    "saved_to": path,
+                    "artifact": artifact.as_ref().map(|a| serde_json::json!({
+                        "id": a.id,
+                        "kind": a.kind,
+                        "path": a.path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        "size": a.size,
+                        "summary": a.summary,
+                    })),
+                    "held_in_run": path.is_none(),
+                    "note": if is_svg { None } else {
+                        Some("PNG glyphs cover printable ASCII; other scripts render as blocks — use format=svg for a faithful render".to_string())
+                    },
+                }))
+            }
             other => err(
                 ErrorCategory::Unsupported,
                 format!(
-                    "recording format '{}' is not implemented by the current backend; only the pty-boundary .cast lifecycle (start/stop) is available",
+                    "recording format '{}' is not implemented by the current backend; available: start/stop (.cast lifecycle), svg, png (one-shot captures)",
                     other
                 ),
             ),
@@ -1412,24 +1578,52 @@ impl TuiLabServer {
         }))
     }
 
-    /// Coverage (spec section 5). Backed by `tuicov` when present; reports
-    /// "unavailable" otherwise (it is not a published crate — §36/§51).
+    /// Coverage (spec section 5; Wave F item 64). Two providers, merged:
+    /// the optional tuicov executable and the NativeSemanticProtocol
+    /// coverage events the run ledger accumulates.
     #[tool(
         name = "tui_coverage",
-        description = "Native coverage via optional tuicov executable. Reports availability honestly."
+        description = "Native coverage: run ledger (native events) plus optional tuicov executable. Actions: detect, summary, collect, delta, uncovered."
     )]
     async fn tui_coverage(&self, p: Parameters<TuiCoverageParams>) -> String {
         let p = p.0;
-        match crate::coverage::tuicov::handle(&p) {
-            Ok(s) => s,
-            Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+        let action = p.action.clone().unwrap_or_else(|| "summary".into());
+        // The run-ledger views are answered here (session-scoped); the
+        // rest delegates to the provider module.
+        match action.as_str() {
+            "ledger" => {
+                let run = self.run.lock().unwrap();
+                let entries: Vec<serde_json::Value> = run
+                    .coverage_ledger
+                    .iter()
+                    .map(|(target, e)| json!({
+                        "target": target,
+                        "hits": e.hits,
+                        "sessions": e.sessions,
+                        "first_seen": e.first_seen,
+                        "last_seen": e.last_seen,
+                    }))
+                    .collect();
+                ok(json!({
+                    "entries": entries,
+                    "targets": entries.len(),
+                    "note": if entries.is_empty() { Some("no native coverage events yet; cooperative apps send coverage events over TUI_LAB_SEMANTIC".to_string()) } else { None },
+                }))
+            }
+            _ => match crate::coverage::tuicov::handle(&p) {
+                Ok(s) => s,
+                Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+            },
         }
     }
 
     /// Framework detection + native adapters (spec section 26/27).
+    /// Wave F items 58–63: `adapter_snippet` returns the NativeSemanticProtocol
+    /// wiring for the detected framework — the cooperation contract the app
+    /// adopts in its own source.
     #[tool(
         name = "tui_framework",
-        description = "Detect the TUI framework and (optionally) run native probes."
+        description = "Detect the TUI framework, run native probes, and fetch NativeSemanticProtocol adapter snippets (action=adapter_snippet)."
     )]
     async fn tui_framework(&self, p: Parameters<TuiFrameworkParams>) -> String {
         let p = p.0;
@@ -1440,9 +1634,32 @@ impl TuiLabServer {
             "capabilities" => ok(
                 json!({ "framework": det, "note": "native probes invoke project-local tooling" }),
             ),
+            "adapter_snippet" => {
+                let fw = p
+                    .source
+                    .clone()
+                    .or_else(|| det.framework.clone())
+                    .unwrap_or_else(|| "python".into());
+                match crate::framework::adapters::snippet_for(&fw.to_lowercase()) {
+                    Some(code) => ok(json!({
+                        "framework": fw,
+                        "language": if fw == "ratatui" { "rust" } else { "python" },
+                        "protocol_version": crate::semantic::native::PROTOCOL_VERSION,
+                        "env_var": crate::semantic::native::ENV_VAR,
+                        "snippet": code,
+                    })),
+                    None => err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "no adapter snippet for '{}' (available: ratatui, textual, python/reference)",
+                            fw
+                        ),
+                    ),
+                }
+            }
             other => err(
                 ErrorCategory::InvalidRequest,
-                format!("unknown action '{}'", other),
+                format!("unknown action '{}' (detect|capabilities|adapter_snippet)", other),
             ),
         }
     }

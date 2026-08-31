@@ -7,8 +7,8 @@
 //! generation of the same logical session, not a replacement.
 
 use crate::backend::{
-    Capabilities, PortablePtyBackend, RecordingHook, RecordingHookSlot, TerminalBackend,
-    TerminalEventState, WaitCond, WaitOutcome,
+    Capabilities, LineCliBackend, PortablePtyBackend, RecordingHook, RecordingHookSlot,
+    TerminalBackend, TerminalEventState, WaitCond, WaitOutcome,
 };
 use crate::recording::AsciicastRecorder;
 use crate::screen::{ProcessState, ScreenState};
@@ -98,6 +98,11 @@ pub struct Session {
     /// reconnecting consumer resumes where it left off, but reading is
     /// stateless — `events_since` never mutates a cursor implicitly.
     cursors: std::collections::HashMap<String, u64>,
+    /// Wave F items 58–63: the NativeSemanticProtocol side channel. The
+    /// session creates it at start and injects `TUI_LAB_SEMANTIC` into the
+    /// child's env; cooperative apps write their real semantic tree there
+    /// and observation merges it over inference.
+    native: crate::semantic::native::NativeChannel,
 }
 
 /// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`].
@@ -125,6 +130,20 @@ impl RecordingHook for RecorderHook {
 }
 
 impl Session {
+    /// Wave F items 50–51: backend selection. `auto` / `portable_vt100` map
+    /// to the PTY engine; `cli` / `line_cli` map to the line CLI engine.
+    /// Unknown names are an error — never a silent fallback.
+    fn make_backend(kind: &str, cols: u16, rows: u16) -> anyhow::Result<Box<dyn TerminalBackend>> {
+        match kind {
+            "auto" | "portable_vt100" => Ok(Box::new(PortablePtyBackend::new(cols, rows))),
+            "cli" | "line_cli" => Ok(Box::new(LineCliBackend::new(cols, rows))),
+            other => Err(anyhow::anyhow!(
+                "unknown backend '{}' (supported: auto, portable_vt100, cli)",
+                other
+            )),
+        }
+    }
+
     pub fn new(id: String, command: String) -> Self {
         Session {
             id,
@@ -142,6 +161,7 @@ impl Session {
             next_anchor_seq: 0,
             events: crate::events::TerminalEventQueue::new(),
             cursors: std::collections::HashMap::new(),
+            native: crate::semantic::native::NativeChannel::default(),
         }
     }
 
@@ -364,14 +384,48 @@ impl Session {
 
     /// Start (or restart) the target program from a full spec (spec section 11).
     pub fn start_with_spec(&mut self, spec: LaunchSpec) -> anyhow::Result<()> {
+        // Wave F items 50–51: the LaunchSpec's backend field is now real
+        // selection. On restart the engine kind may not change (identity is
+        // preserved), but a first start builds the requested engine.
+        let wants_line = matches!(spec.backend.as_str(), "cli" | "line_cli");
+        let current_is_line = self.backend_kind == "line-cli+lines";
+        if wants_line != current_is_line {
+            // First start (or engine-kind change): build the requested
+            // backend. Recording hook and normalization policy re-attach
+            // below.
+            self.backend = Self::make_backend(&spec.backend, spec.cols, spec.rows)?;
+            self.backend_kind = if wants_line {
+                "line-cli+lines".to_string()
+            } else {
+                "portable-pty+vt100".to_string()
+            };
+        }
         // Re-attach any active recording hook (the backend was just replaced
         // internally on restart).
         self.backend.set_recording_hook(self.recording_slot.clone());
+        // Wave F items 58–63: create the native semantic channel for this
+        // generation and inject its path into the child's env. Apps that
+        // never read TUI_LAB_SEMANTIC are unaffected; cooperative adapters
+        // write their real tree there. A channel from a prior generation is
+        // reset (same path, fresh content).
+        if self.native.path.is_none() {
+            if let Ok(ch) = crate::semantic::native::NativeChannel::create() {
+                self.native = ch;
+            }
+        } else {
+            self.native.reset();
+        }
+        let mut effective_env = spec.env.clone();
+        if let Some(pair) = self.native.env_pair() {
+            if !crate::semantic::native::env_has_channel(&effective_env) {
+                effective_env.push(pair);
+            }
+        }
         self.backend.start(
             &spec.command,
             &spec.args,
             spec.cwd.as_deref(),
-            &spec.env,
+            &effective_env,
             spec.cols,
             spec.rows,
         )?;
@@ -417,6 +471,10 @@ impl Session {
     /// CursorMoved / TitleChanged / ProcessExited / SemanticChanged-class
     /// transitions are derived by diffing against the previous frame.
     pub fn observe(&mut self, idle_ms: u64) -> anyhow::Result<ScreenState> {
+        // Wave F items 58–63: drain any native semantic frames the app has
+        // written since the last observation (bounded read, partial lines
+        // stay pending).
+        self.native.poll();
         let s = self
             .backend
             .observe(std::time::Duration::from_millis(idle_ms))?;
@@ -430,6 +488,23 @@ impl Session {
         }
         self.last = Some(s.screen.clone());
         Ok(s.screen)
+    }
+
+    /// Wave F items 58–63: the session's native channel snapshot (or None
+    /// when the app never wrote one).
+    pub fn native_channel(&self) -> &crate::semantic::native::NativeChannel {
+        &self.native
+    }
+
+    /// Overlay the latest native snapshot onto an inferred semantic tree,
+    /// returning the merge report. Native claims win over inference with
+    /// `source: "native"` / confidence 1.0; unmatched native ids are
+    /// reported (never dropped).
+    pub fn overlay_native(
+        &self,
+        tree: &mut crate::semantic::node::SemanticTree,
+    ) -> crate::semantic::native::NativeOverlayReport {
+        self.native.overlay(tree)
     }
 
     /// Diff two frames and push the events the transition implies. Kept
@@ -565,7 +640,27 @@ impl Session {
         self.backend.process()
     }
 
+    /// Wave F item 53: true scrollback from the backend.
+    pub fn backend_scrollback(&mut self) -> anyhow::Result<Vec<String>> {
+        Ok(self.backend.scrollback_lines()?)
+    }
+
+    /// Wave F item 53: search viewport + scrollback.
+    pub fn backend_search(&mut self, query: &str) -> anyhow::Result<Vec<crate::backend::SearchHit>> {
+        Ok(self.backend.search(query)?)
+    }
+
+    /// Wave F item 54: OSC 133 shell-integration state (None when the
+    /// application emits no shell integration).
+    pub fn backend_command_state(&mut self) -> Option<crate::backend::CommandState> {
+        self.backend.command_state()
+    }
+
     pub fn backend_version(&self) -> &'static str {
-        "portable-pty+vt100/0.1"
+        if self.backend_kind == "line-cli+lines" {
+            "line-cli+lines/0.1"
+        } else {
+            "portable-pty+vt100/0.1"
+        }
     }
 }

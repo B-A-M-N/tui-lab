@@ -24,6 +24,8 @@ pub enum ArtifactKind {
     StateGraph,
     /// A captured frame (canonical or rendered).
     Frame,
+    /// Wave F item 57: a human-debugging screen capture (SVG/PNG).
+    Capture,
     /// Anything else (scenarios, findings bundles, ...).
     Other,
 }
@@ -55,6 +57,7 @@ impl ArtifactRef {
             ArtifactKind::TransactionLog => "transaction_log",
             ArtifactKind::StateGraph => "state_graph",
             ArtifactKind::Frame => "frame",
+            ArtifactKind::Capture => "capture",
             ArtifactKind::Other => "other",
         };
         format!("{}:{}", self.id, kind)

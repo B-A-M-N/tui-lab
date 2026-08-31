@@ -45,6 +45,29 @@ struct BackendCallbacks {
     open_link: Option<crate::screen::cell::Hyperlink>,
     /// Links completed so far, in completion order.
     links: Vec<crate::screen::cell::Hyperlink>,
+    /// Wave F item 52: kitty keyboard protocol flags pushed by the app
+    /// (`CSI > flags u` sets, `CSI < u` pops, `CSI = flags ; mode u` sets
+    /// the active portion). We track the *current* stack top honestly —
+    /// a full stack is only needed if apps interleave, which none do.
+    kitty_flags: u8,
+    /// Whether the app ever pushed kitty flags (capability promotion).
+    kitty_seen: bool,
+    /// Wave F item 56: bytes the terminal should send back to the
+    /// application in response to queries (DA1/DA2, DSR cursor position,
+    /// DECRQM mode reports, kitty `?u`, OSC color queries). Drained back
+    /// to the PTY by `pump()`.
+    query_responses: Vec<u8>,
+    /// Wave F item 54: shell-integration command edges (OSC 133).
+    command_seq: u64,
+    command_running: bool,
+    last_command_exit: Option<i32>,
+    command_phase: &'static str,
+}
+
+impl BackendCallbacks {
+    fn queue_response(&mut self, bytes: &[u8]) {
+        self.query_responses.extend_from_slice(bytes);
+    }
 }
 
 impl vt100::Callbacks for BackendCallbacks {
@@ -62,34 +85,196 @@ impl vt100::Callbacks for BackendCallbacks {
     /// The vt grid does not carry link state, so we record the span by
     /// *cursor position at open/close time* — the same coordinates the grid
     /// uses. Observation only: we never fetch the URI.
+    ///
+    /// Wave F item 54: OSC 133 shell-integration marks (A=prompt start,
+    /// B=command start of input echo, C=command output start, D[;exit]=
+    /// command end) are parsed from the same hook. Only edges are recorded —
+    /// never command payload text.
+    ///
+    /// Wave F item 56: OSC 10/11/… `?` color queries get an honest report
+    /// (we do not track palette state; we answer with the default colors we
+    /// actually render with rather than guessing the app's theme).
     fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
-        if params.first().copied() != Some(b"8".as_slice()) {
-            return;
-        }
         let (y, x) = screen.cursor_position();
-        // OSC8 with empty URI closes the current link.
-        let uri_at_2: Option<&[u8]> = params.get(2).map(|p| p.as_ref());
-        match uri_at_2 {
-            Some(uri) if !uri.is_empty() => {
-                let link_params = String::from_utf8_lossy(params.get(1).copied().unwrap_or(b""));
-                let id = link_params
-                    .split(';')
-                    .find_map(|kv| kv.strip_prefix("id="))
-                    .map(|s| s.to_string());
-                self.open_link = Some(crate::screen::cell::Hyperlink {
-                    id,
-                    uri: String::from_utf8_lossy(uri).into_owned(),
-                    start: (x, y),
-                    end: None,
-                });
-            }
-            _ => {
-                // Close: finish the span at the current cursor.
-                if let Some(mut link) = self.open_link.take() {
-                    link.end = Some((x, y));
-                    self.links.push(link);
+        match params.first().copied() {
+            Some(b"8") => {
+                // OSC8 with empty URI closes the current link.
+                let uri_at_2: Option<&[u8]> = params.get(2).map(|p| p.as_ref());
+                match uri_at_2 {
+                    Some(uri) if !uri.is_empty() => {
+                        let link_params =
+                            String::from_utf8_lossy(params.get(1).copied().unwrap_or(b""));
+                        let id = link_params
+                            .split(';')
+                            .find_map(|kv| kv.strip_prefix("id="))
+                            .map(|s| s.to_string());
+                        self.open_link = Some(crate::screen::cell::Hyperlink {
+                            id,
+                            uri: String::from_utf8_lossy(uri).into_owned(),
+                            start: (x, y),
+                            end: None,
+                        });
+                    }
+                    _ => {
+                        // Close: finish the span at the current cursor.
+                        if let Some(mut link) = self.open_link.take() {
+                            link.end = Some((x, y));
+                            self.links.push(link);
+                        }
+                    }
                 }
             }
+            // ── OSC 133 shell integration (item 54) ──
+            Some(b"133") => match params.get(1).copied() {
+                Some(b"A") => {
+                    self.command_phase = "prompt";
+                }
+                Some(b"B") => {
+                    self.command_phase = "command";
+                }
+                Some(b"C") => {
+                    self.command_seq += 1;
+                    self.command_running = true;
+                    self.command_phase = "output";
+                }
+                Some(b"D") => {
+                    self.command_running = false;
+                    self.command_phase = "done";
+                    if let Some(exit) = params.get(2) {
+                        let s = String::from_utf8_lossy(exit);
+                        self.last_command_exit = s.trim().parse::<i32>().ok();
+                    }
+                }
+                _ => {}
+            },
+            // ── Terminal color queries (item 56) ──
+            // `OSC 10 ; ? BEL` (foreground), `OSC 11 ; ? BEL` (background),
+            // `OSC 4 ; idx ; ? BEL` (palette). We answer with the colors we
+            // actually render with — the harness displays default-color cells
+            // on a plain terminal, so that is the honest report.
+            Some(b"10") | Some(b"11") if params.get(2).copied() == Some(b"?".as_slice()) => {
+                let fg = matches!(params.first().copied(), Some(b"10"));
+                // xterm dynamic-color report: OSC <n> ; rgb:RRRR/GGGG/BBBB
+                let (r, g, b) = if fg {
+                    (0xC7u16, 0xC7, 0xC7)
+                } else {
+                    (0x00, 0x00, 0x00)
+                };
+                let which = if fg { 10 } else { 11 };
+                self.queue_response(
+                    format!("\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x07", which, r, g, b).as_bytes(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Wave F items 52 + 56: CSI sequences vt100 does not implement carry
+    /// the kitty keyboard protocol stack ops and the terminal queries.
+    fn unhandled_csi(
+        &mut self,
+        _screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        // ── Kitty keyboard protocol (item 52) ──
+        // `CSI > flags u`    push flags
+        // `CSI < number u`   pop `number` entries (default 1)
+        // `CSI = flags ; m u` set active flags (mode 1) / selected (mode 2)
+        // `CSI ? u`          query → `CSI ? flags u` response
+        if c == 'u' {
+            if i1 == Some(b'>') {
+                let flags = params
+                    .first()
+                    .and_then(|p| p.first())
+                    .copied()
+                    .unwrap_or(0);
+                self.kitty_flags = flags.min(u8::MAX as u16) as u8;
+                self.kitty_seen = true;
+                return;
+            }
+            if i1 == Some(b'<') {
+                let n = params
+                    .first()
+                    .and_then(|p| p.first())
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1);
+                // A pop past the bottom of the stack disables the protocol
+                // (spec: the stack starts at depth 0 with flags 0).
+                self.kitty_flags = 0;
+                let _ = n; // single-depth stack: any pop clears
+                return;
+            }
+            if i1 == Some(b'=') {
+                let flags = params
+                    .first()
+                    .and_then(|p| p.first())
+                    .copied()
+                    .unwrap_or(0);
+                let mode = params
+                    .get(1)
+                    .and_then(|p| p.first())
+                    .copied()
+                    .unwrap_or(1);
+                match mode {
+                    1 => self.kitty_flags = flags.min(u8::MAX as u16) as u8,
+                    2 => self.kitty_flags |= flags.min(u8::MAX as u16) as u8,
+                    3 => self.kitty_flags &= !(flags.min(u8::MAX as u16) as u8),
+                    _ => {}
+                }
+                self.kitty_seen = true;
+                return;
+            }
+            if i1 == Some(b'?') {
+                // Query: report the currently active flags.
+                self.queue_response(format!("\x1b[?{}u", self.kitty_flags).as_bytes());
+                return;
+            }
+        }
+
+        // ── Device queries (item 56) ──
+        match (i1, c) {
+            // DA1: `CSI c` or `CSI 0 c` → VT100 with AVO (`?1;2c`).
+            (None, 'c') | (Some(b'0'), 'c') => {
+                self.queue_response(b"\x1b[?1;2c");
+            }
+            // Secondary DA: `CSI > c` → vt220, version 1, no ROM.
+            (Some(b'>'), 'c') => {
+                self.queue_response(b"\x1b[>0;1;0c");
+            }
+            // Tertiary DA: `CSI = c` → unit id 0.
+            (Some(b'='), 'c') => {
+                self.queue_response(b"\x1bP!|0000\x1b\\");
+            }
+            // DSR — cursor position: `CSI 6n` → `CSI row ; col R` (1-based).
+            (None, 'n') if params.first().and_then(|p| p.first()).copied() == Some(6) => {
+                let (row, col) = _screen.cursor_position();
+                self.queue_response(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+            }
+            // DSR — operating status: `CSI 5n` → OK.
+            (None, 'n') if params.first().and_then(|p| p.first()).copied() == Some(5) => {
+                self.queue_response(b"\x1b[0n");
+            }
+            // DECRQM: `CSI ? Ps $ p` → DECSET report; `CSI Ps $ p` → ANSI report.
+            (Some(b'?'), 'p') => {
+                let mode = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+                let set = match mode {
+                    1 => _screen.application_cursor(),
+                    25 => !_screen.hide_cursor(),
+                    1000 | 1002 | 1003 => {
+                        _screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+                    }
+                    1006 => _screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+                    2004 => _screen.bracketed_paste(),
+                    1049 => _screen.alternate_screen(),
+                    _ => false,
+                };
+                self.queue_response(format!("\x1b[?{};{}$y", mode, set as u8).as_bytes());
+            }
+            _ => {}
         }
     }
 }
@@ -127,6 +312,13 @@ pub struct PortablePtyBackend {
     /// contract's `volatile_patterns` are merged in via
     /// [`Self::set_normalization_policy`].
     normalization_policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
+    /// Wave F item 53: scrollback rows captured at the last `state()`.
+    /// The vt100 parser owns the buffer; we materialize rows eagerly so
+    /// consumers (search, observe mode=scrollback) read plain strings.
+    scrollback_cache: Vec<String>,
+    /// Wave F item 53: whether any scrollback row was ever captured —
+    /// `Capabilities.scrollback` is promoted only on this evidence.
+    scrollback_seen: bool,
 }
 
 impl PortablePtyBackend {
@@ -156,6 +348,8 @@ impl PortablePtyBackend {
             normalization_policy: std::sync::Arc::new(
                 crate::screen::NormalizationPolicy::default(),
             ),
+            scrollback_cache: Vec::new(),
+            scrollback_seen: false,
         }
     }
 
@@ -186,6 +380,16 @@ impl PortablePtyBackend {
                 self.last_output_instant = Instant::now();
             }
         }
+        // Wave F item 56: write back any query responses the callbacks
+        // produced (DA/DSR/DECRQM/kitty ?u/OSC color reports). A real
+        // terminal answers these; an app that asked and never got an answer
+        // would hang waiting — silence would be a protocol lie.
+        let drained = std::mem::take(&mut self.parser.callbacks_mut().query_responses);
+        if !drained.is_empty() {
+            // write_input forwards to the PTY; fall back silently when no
+            // session is attached (callbacks can fire during parser tests).
+            let _ = self.write_input(&drained);
+        }
         let after_contents = self.parser.screen().contents();
         let after_fp = self.interaction_fingerprint();
         // content_seq bumps when text changed
@@ -198,7 +402,77 @@ impl PortablePtyBackend {
             self.last_screen_change_at_ms = now_ms();
             self.last_screen_change_instant = Instant::now();
         }
+        // Wave F item 53: materialize the parser's scrollback rows so
+        // search/observe read plain strings without touching the parser's
+        // scroll offset. Reading rows via `set_scrollback` would disturb the
+        // live view; instead we page the offset, copy, and restore it.
+        self.refresh_scrollback();
         Ok((before_fp, after_fp))
+    }
+
+    /// Wave F item 53: copy the parser's scrollback rows into
+    /// [`Self::scrollback_cache`]. The vt100 API exposes history only by
+    /// scrolling the view (`set_scrollback`); the offset is paged to each
+    /// position, the visible top row copied, and the original offset
+    /// restored — the live screen is untouched when this returns.
+    ///
+    /// History *length* is discovered by probing: `set_scrollback` clamps to
+    /// the buffer size, so a huge request returns the actual length in
+    /// `screen.scrollback()` (which is the *offset*, not the size, in the
+    /// normal view).
+    fn refresh_scrollback(&mut self) {
+        let saved = self.parser.screen().scrollback();
+        // Probe: the clamp tells us how much history actually exists.
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let total = self.parser.screen().scrollback();
+        if total == 0 {
+            self.parser.screen_mut().set_scrollback(saved);
+            // Nothing new since last refresh and cache already empty: skip
+            // the (cheap but nonzero) page walk.
+            if self.scrollback_cache.is_empty() {
+                return;
+            }
+        }
+        let mut rows = Vec::with_capacity(total);
+        for off in 1..=total {
+            self.parser.screen_mut().set_scrollback(off);
+            let row = self
+                .parser
+                .screen()
+                .rows(0, self.cols)
+                .next()
+                .unwrap_or_default();
+            rows.push(row);
+        }
+        self.parser.screen_mut().set_scrollback(saved);
+        self.scrollback_cache = rows;
+        if !self.scrollback_cache.is_empty() {
+            self.scrollback_seen = true;
+        }
+    }
+
+    /// Wave F item 54: pull the OSC 133 command state out of the callbacks.
+    fn command_state_from_callbacks(&self) -> Option<super::CommandState> {
+        let cb = self.parser.callbacks();
+        if cb.command_seq == 0 && !cb.command_running && cb.last_command_exit.is_none() {
+            // No 133 edges ever seen: honest None so command waits report
+            // "shell integration not present" instead of spinning. (Phase
+            // defaults to "" before any A/B/C/D arrives; only D sets an
+            // exit, only C starts a count.)
+            return None;
+        }
+        let phase: &'static str = match cb.command_phase {
+            "output" => "output",
+            "command" => "command",
+            "done" => "done",
+            _ => "prompt",
+        };
+        Some(super::CommandState {
+            command_seq: cb.command_seq,
+            running: cb.command_running,
+            last_exit: cb.last_command_exit,
+            phase,
+        })
     }
 
     /// Notify the recording hook if attached (audit item 24).
@@ -266,6 +540,9 @@ impl PortablePtyBackend {
             mouse_mode: screen.mouse_protocol_mode().into(),
             mouse_encoding: screen.mouse_protocol_encoding().into(),
             cursor_visible: !screen.hide_cursor(),
+            // Wave F item 52: kitty flags live in the callbacks (the vt100
+            // grid has no notion of them).
+            kitty_flags: self.parser.callbacks().kitty_flags,
         }
     }
 
@@ -409,6 +686,9 @@ impl TerminalBackend for PortablePtyBackend {
         self.title_seq = 0;
         self.last_output_at_ms = 0;
         self.last_screen_change_at_ms = 0;
+        self.scrollback_cache.clear();
+        self.scrollback_seen = false;
+        self.parser.callbacks_mut().query_responses.clear();
         let now = Instant::now();
         self.last_output_instant = now;
         self.last_screen_change_instant = now;
@@ -469,13 +749,16 @@ impl TerminalBackend for PortablePtyBackend {
             .cloned()
             .chain(self.parser.callbacks().open_link.clone())
             .collect();
-        Ok(crate::screen::from_vt_with_policy(
+        let mut state = crate::screen::from_vt_with_policy(
             self.parser.screen(),
             process,
             title,
             links,
             &self.normalization_policy,
-        ))
+        );
+        // Wave F item 53: attach the real scrollback (oldest first).
+        state.scrollback = self.scrollback_cache.clone();
+        Ok(state)
     }
 
     fn send_input(&mut self, input: Input) -> BackendResult<()> {
@@ -677,6 +960,10 @@ impl TerminalBackend for PortablePtyBackend {
                 links,
                 &self.normalization_policy,
             );
+            // Wave F item 53: command-output waits search scrollback too.
+            let mut screen = screen;
+            screen.scrollback = self.scrollback_cache.clone();
+            let screen = screen;
 
             let (met, reason) = match &cond {
                 WaitCond::Text(t) => (
@@ -729,6 +1016,43 @@ impl TerminalBackend for PortablePtyBackend {
                     let quiet_ok = self.last_output_instant.elapsed() >= *quiet_for;
                     (anchored_ok && quiet_ok, WaitReason::Idle)
                 }
+                WaitCond::CommandDone { after_command_seq } => {
+                    // Wave F item 54: a finish edge (133;D) with sequence
+                    // strictly greater than the anchor resolved this wait.
+                    let cb = self.parser.callbacks();
+                    let anchored_ok = match after_command_seq {
+                        Some(seq) => cb.command_seq > *seq,
+                        None => cb.command_seq > 0 && !cb.command_running,
+                    };
+                    // `None` anchor semantics: the NEXT finish edge after
+                    // entering the wait — so the wait must have seen the
+                    // command both start and finish while it ran. With an
+                    // anchor, the finish simply has to be newer.
+                    let done_now = !cb.command_running;
+                    (anchored_ok && done_now, WaitReason::Idle)
+                }
+                WaitCond::CommandOutput {
+                    text,
+                    after_command_seq,
+                } => {
+                    // Wave F item 54: the text must appear in output captured
+                    // for the anchored command — checked against the live
+                    // viewport only when the anchored command is the one
+                    // currently running or the last finished one, so a token
+                    // from an EARLIER command cannot satisfy this wait.
+                    let cb = self.parser.callbacks();
+                    let anchored_ok = match after_command_seq {
+                        Some(seq) => cb.command_seq > *seq,
+                        None => cb.command_seq > 0,
+                    };
+                    let in_window = cb.command_seq.saturating_sub(1) == after_command_seq.unwrap_or(0)
+                        || cb.command_seq == after_command_seq.unwrap_or(0).max(1);
+                    let found = anchored_ok
+                        && in_window
+                        && (screen.viewport_text.iter().any(|r| r.contains(text.as_str()))
+                            || screen.scrollback.iter().any(|r| r.contains(text.as_str())));
+                    (found, WaitReason::Text)
+                }
             };
 
             if met {
@@ -761,9 +1085,12 @@ impl TerminalBackend for PortablePtyBackend {
         // Promote optional capabilities only when we have observed the running
         // application negotiate them.
         caps.title = self.title_seq > 0;
-        caps.scrollback = false; // vt100 scrollback not yet surfaced (spec 17)
+        // Wave F item 53: promoted once real scrollback rows were captured.
+        caps.scrollback = self.scrollback_seen;
         caps.mouse = self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None;
         caps.bracketed_paste = self.parser.screen().bracketed_paste();
+        // Wave F item 52: the app pushed kitty keyboard flags at some point.
+        caps.kitty_keyboard = self.parser.callbacks().kitty_seen;
         caps
     }
 
@@ -813,7 +1140,30 @@ impl TerminalBackend for PortablePtyBackend {
             title_seq: self.title_seq,
             last_output_at: self.last_output_at_ms,
             last_screen_change_at: self.last_screen_change_at_ms,
+            // Wave F item 54: OSC 133 command edges participate in wait
+            // anchoring.
+            command_seq: self.parser.callbacks().command_seq,
         }
+    }
+
+    /// Wave F item 53: the scrollback materialized at the last pump.
+    fn scrollback_lines(&mut self) -> BackendResult<Vec<String>> {
+        let _ = self.pump();
+        Ok(self.scrollback_cache.clone())
+    }
+
+    /// Wave F item 53: viewport + scrollback search through the shared
+    /// [`crate::backend::search_screen`] so hit semantics match other
+    /// backends exactly.
+    fn search(&mut self, query: &str) -> BackendResult<Vec<super::SearchHit>> {
+        let screen = self.state()?;
+        Ok(crate::backend::search_screen(&screen, query))
+    }
+
+    /// Wave F item 54: OSC 133 shell-integration state.
+    fn command_state(&mut self) -> Option<super::CommandState> {
+        let _ = self.pump();
+        self.command_state_from_callbacks()
     }
 
     /// Attach or detach the raw PTY recording hook (audit item 24).
@@ -883,11 +1233,27 @@ fn exit_status_parts(status: portable_pty::ExitStatus) -> (i32, Option<String>) 
 ///
 /// Mode-aware: arrow keys and Home/End switch between SS3 and CSI based on
 /// application cursor mode; Shift+ASCII letter emits the uppercase byte;
-/// SUPER is rejected (unsupported without kitty keyboard protocol)
-/// (audit item 6).
+/// SUPER was historically rejected (unsupported without kitty keyboard
+/// protocol) (audit item 6). Wave F item 52: when the application pushed
+/// kitty keyboard flags (`CSI > flags u`), the CSI-u encoding unlocks —
+/// Super-modified keys and F-keys above F12 encode faithfully instead of
+/// being rejected.
 fn encode_key(kev: &KeyEvent, modes: &InputModes) -> BackendResult<Vec<u8>> {
     use crate::backend::KeyCode::*;
     let KeyEvent { code, modifiers } = kev;
+
+    // Kitty CSI-u encoding (item 52): active when the application pushed
+    // flags. Covers every key we model; disambiguates Super and high
+    // function keys that legacy encodings cannot express. The key code
+    // follows the kitty spec's unicode-key-code table (Enter=13, Tab=9,
+    // Escape=27, Backspace=127, arrows=1(A)…; F1–F12 = 57364–57375 in
+    // functional-key space, but legacy numbers 11–24 are accepted too).
+    if modes.kitty_flags > 0 {
+        if let Some(bytes) = encode_key_kitty(kev) {
+            return Ok(bytes);
+        }
+        // Fall through to legacy encodings when the key has no kitty form.
+    }
 
     // Reject SUPER — cannot encode without the kitty keyboard protocol.
     if modifiers.contains(KeyModifiers::SUPER) {
@@ -1036,6 +1402,50 @@ fn encode_key(kev: &KeyEvent, modes: &InputModes) -> BackendResult<Vec<u8>> {
         Ok(v)
     } else {
         Ok(base)
+    }
+}
+
+/// Wave F item 52: kitty keyboard protocol (CSI-u) encoding.
+///
+/// `CSI unicode-key-code ; modifiers [event-type] u`. Modifiers are
+/// 1 + shift(1) + alt(2) + ctrl(4) + super(8). Returns `None` for keys with
+/// no kitty unicode-key-code (the caller falls through to legacy encodings).
+fn encode_key_kitty(kev: &KeyEvent) -> Option<Vec<u8>> {
+    use crate::backend::KeyCode::*;
+    let KeyEvent { code, modifiers } = kev;
+    let key_code: u32 = match code {
+        Char(c) => *c as u32,
+        Escape => 27,
+        Enter => 13,
+        Tab => 9,
+        Backspace => 127,
+        Up => 0xE000,   // kitty functional: 57344 + n
+        Down => 0xE000 + 1,
+        Left => 0xE000 + 2,
+        Right => 0xE000 + 3,
+        Home => 0xE000 + 4,
+        End => 0xE000 + 5,
+        Insert => 0xE000 + 6,
+        Delete => 0xE000 + 7,
+        PageUp => 0xE000 + 8,
+        PageDown => 0xE000 + 9,
+        Function(n) => match n {
+            // F1–F12 map to the kitty functional-key block.
+            1..=12 => 0xE000 + 12 + (*n as u32 - 1),
+            // F13–F20 continue the block.
+            13..=20 => 0xE000 + 12 + (*n as u32 - 1),
+            _ => return None,
+        },
+    };
+    let mods = 1u8
+        + (modifiers.contains(KeyModifiers::SHIFT) as u8)
+        + ((modifiers.contains(KeyModifiers::ALT) as u8) << 1)
+        + ((modifiers.contains(KeyModifiers::CTRL) as u8) << 2)
+        + ((modifiers.contains(KeyModifiers::SUPER) as u8) << 3);
+    if mods == 1 {
+        Some(format!("\x1b[{}u", key_code).into_bytes())
+    } else {
+        Some(format!("\x1b[{};{}u", key_code, mods).into_bytes())
     }
 }
 

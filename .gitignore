@@ -27,3 +27,4 @@ Thumbs.db
 
 # nested leftover scaffold repo (not part of this crate)
 /tui-lab/
+fixtures/__pycache__/

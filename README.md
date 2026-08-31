@@ -74,12 +74,18 @@ the stored launch spec.
 ### tui_observe
 Observe terminal state.
 
-**Modes:** `summary`, `screen`, `cells`, `semantic`, `tree`, `diff`, `scrollback`
+**Modes:** `summary`, `screen`, `cells`, `semantic`, `tree`, `nodes`, `diff`, `scrollback`, `search`, `command_state`
 
 `diff` compares the previous observation to the current one through the one
 canonical `screen::diff`, returning the same `Transition` shape as
 `tui_act` (screen + semantic diff). A session with no prior frame reports
 `since: null` honestly instead of diffing a frame with itself.
+
+`search` scans viewport + scrollback (takes `text`/`query`); `command_state`
+reports OSC 133 shell-integration state or honest `null` when the session
+never emitted integration marks. When the app cooperates over
+`TUI_LAB_SEMANTIC`, `nodes` overlays the app's declared tree (native focus,
+enabled, labels win over inference) and `summary` reports `native.active`.
 
 `tree` returns the hierarchical terminal-state tree: regions nested per
 containment, controls inside their regions with state flags, focus, and
@@ -115,7 +121,11 @@ payload out of scenario recordings.
 ### tui_wait
 Block until a condition holds.
 
-**Conditions:** `text`, `text_absent`, `screen_change`, `screen_stable`, `process_exit`, `title`, `bell`, `idle`
+**Conditions:** `text`, `text_absent`, `screen_change`, `screen_stable`, `process_exit`, `title`, `bell`, `idle`, `command_done`, `command_output`
+
+`command_done`/`command_output` anchor on OSC 133 shell-integration edges
+(command_seq). A session with no integration marks fails honestly rather
+than spinning.
 
 The outcome includes reason, elapsed, event sequence, and process state — not
 just a boolean.
@@ -193,13 +203,24 @@ Shift+Tab truly reverses Tab (missing inverses are named by control ID, not
 shrugged at).
 
 ### tui_coverage
-Native coverage via optional tuicov executable. Reports "unavailable" honestly
-when tuicov is not on PATH.
+Coverage with two providers, merged honestly. Native coverage: a cooperative
+app sends `{"type":"event","event":"coverage","target":"…"}` frames over the
+`TUI_LAB_SEMANTIC` side channel; the run ledger aggregates them per session
+and `action=ledger` returns the entries (hits, sessions, first/last seen) —
+so an agent can check whether an interaction exercised new application code.
+Optional tuicov executable: `delta`/`uncovered`/`start`/`stop` invoke it for
+normalized JSON and fail with `unsupported` when it is not on PATH — never a
+fabricated percentage.
 
 ### tui_framework
-Detect TUI framework and run native probes.
+Detect TUI framework, run native probes, and hand out adapter snippets.
 
-**Actions:** `detect`, `capabilities`
+**Actions:** `detect`, `capabilities`, `adapter_snippet`
+
+`adapter_snippet` returns a ready-to-paste NativeSemanticProtocol declarer
+for the detected framework (Ratatui, Textual, or the dependency-free Python
+reference in `fixtures/nsproto.py`): the app declares its widget tree over
+the side channel and the harness's inference yields to it.
 
 ### tui_contract
 Design contracts: describe what the TUI is *supposed* to be in YAML, and check
@@ -270,11 +291,16 @@ integrated until the real MCP path can exercise it.
 |-----------|-------|
 | Terminal PTY | working |
 | Screen parsing | working |
-| Keyboard | working (legacy + xterm modified-navigation `CSI 1;<m>`; kitty protocol not implemented — SUPER rejected) |
+| Keyboard | working (legacy + xterm modified-navigation `CSI 1;<m>` + kitty keyboard protocol: app-pushed `CSI > flags u` promotes the capability and unlocks CSI-u encoding incl. SUPER and F13–F20; SUPER rejected without it) |
 | Mouse | working (SGR/X10/UTF-8 byte-conformance-tested: press/release/move/drag/wheel) |
 | Resize | working (single-record, backend-owned) |
-| State waits | working (causality-anchored) |
+| State waits | working (causality-anchored; + `command_done`/`command_output` on OSC 133 shell-integration edges) |
+| Scrollback | working (captured by paging the parser buffer; searchable across viewport+history; capability promoted only after rows are real) |
+| Terminal queries | working (responder: DA1/DA2/DA3, DSR 5n/6n, DECRQM, kitty `?u`, OSC 10/11 color reports — answered with actually-true state) |
+| Line CLI backend | working (second engine behind the same trait for non-screen CLIs; pipes not PTY; line history with honest capabilities; select via `backend: "cli"`) |
 | Semantic model | v3 (border graph + SemanticNode tree, modal layering, widget families, provenance-tracked enabled, OSC8 hyperlinks) |
+| Native semantic protocol | working (TUI_LAB_SEMANTIC NDJSON side-channel: app-declared trees overlay inference with source=native/confidence=1.0; adapters + `tui_framework action=adapter_snippet` for Ratatui/Textual/Python) |
+| Screen capture | working (SVG with style runs + PNG via dependency-free encoder; `tui_record format=svg\|png`) |
 | MCP surface | working (13 tools, stdio E2E-proven) |
 | Run lifecycle | working (ephemeral default, explicit persist/close) |
 | Checkpoints | working (durable under persistent runs) |
@@ -283,8 +309,8 @@ integrated until the real MCP path can exercise it.
 | Audits | working (active + static + contract conformance) |
 | Contracts | working (YAML/JSON load, oracle language, conformance PASS/FAIL/WARN, compare) |
 | Exploration | working (seeded, live transitions, budget-authoritative, contract-fed) |
-| Coverage | honest stub (tuicov optional executable) |
-| Framework probes | working (detection) |
+| Coverage | working (native NSP coverage events → run ledger with per-session correlation; optional tuicov executable invoked on demand, absent = honest Unsupported) |
+| Framework probes | working (detection + adapter snippets) |
 
 ## License
 
