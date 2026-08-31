@@ -511,6 +511,95 @@ impl StateGraph {
         })
     }
 
+    /// Rebuild a graph from a previously exported snapshot (Wave G item 74:
+    /// run restore). The export carries transition endpoints as full StateId
+    /// strings but node entries only as structure hashes, so content-keyed
+    /// nodes restore with their visit counts intact and interaction-keyed
+    /// nodes restore from the edges that reference them (visit counts the
+    /// export cannot re-attach honestly stay at 0 — the restore never
+    /// invents counts).
+    pub fn from_export(value: &serde_json::Value, budget: ExplorationBudget) -> Self {
+        let mut graph = StateGraph::new(budget);
+        let Some(transitions) = value.get("transitions").and_then(|t| t.as_array()) else {
+            return graph;
+        };
+        for edge in transitions {
+            let (Some(from), Some(to), Some(action)) = (
+                edge.get("from").and_then(|v| v.as_str()),
+                edge.get("to").and_then(|v| v.as_str()),
+                edge.get("action").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let count = edge
+                .get("count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .min(u32::MAX as u64) as u32;
+            let from_id = StateId::from_structure_hash(from);
+            let to_id = StateId::from_structure_hash(to);
+            graph
+                .nodes
+                .entry(from_id.clone())
+                .or_insert_with(|| StateNode {
+                    id: from_id.clone(),
+                    first_seen_at: 0,
+                    visit_count: 0,
+                    structure_hash: from.to_string(),
+                    semantic_hash: None,
+                });
+            graph
+                .nodes
+                .entry(to_id.clone())
+                .or_insert_with(|| StateNode {
+                    id: to_id.clone(),
+                    first_seen_at: 0,
+                    visit_count: 0,
+                    structure_hash: to.to_string(),
+                    semantic_hash: None,
+                });
+            // Insert or increment by the exported count (not the shared
+            // push_edge, which increments by one).
+            if let Some(existing) = graph
+                .edges
+                .iter_mut()
+                .find(|e| e.from == from_id && e.to == to_id && e.action_name == action)
+            {
+                existing.count = existing.count.saturating_add(count);
+            } else {
+                graph.edges.push(StateTransition {
+                    from: from_id,
+                    to: to_id,
+                    action_name: action.to_string(),
+                    count,
+                });
+            }
+        }
+        // Fold exported node metadata (visit counts, first-seen) where the
+        // node id is recoverable — i.e. content-keyed nodes whose id IS the
+        // structure hash. Interaction-keyed ids are digests, not hashes, so
+        // a mismatch here leaves the edge-derived node untouched.
+        if let Some(states) = value.get("states").and_then(|s| s.as_array()) {
+            for st in states {
+                let (Some(hash), Some(vc)) = (
+                    st.get("structure_hash").and_then(|v| v.as_str()),
+                    st.get("visit_count").and_then(|v| v.as_u64()),
+                ) else {
+                    continue;
+                };
+                let first_seen = st
+                    .get("first_seen_at")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if let Some(node) = graph.nodes.get_mut(&StateId::from_structure_hash(hash)) {
+                    node.visit_count = vc.min(u32::MAX as u64) as u32;
+                    node.first_seen_at = first_seen;
+                }
+            }
+        }
+        graph
+    }
+
     /// Merge another graph into this one.
     pub fn merge(&mut self, other: &StateGraph) {
         for (id, node) in &other.nodes {

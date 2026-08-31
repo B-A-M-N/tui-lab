@@ -293,6 +293,323 @@ impl RunContext {
         self.run_dir.as_ref()
     }
 
+    /// Wave G item 74/75 helper: resolve a run id to its directory under
+    /// `base`, accepting both root shapes persist uses (`<base>/<id>` when
+    /// base IS the runs dir, `<base>/.tui-lab/runs/<id>` otherwise) plus a
+    /// direct `<base>/<id>` hit for callers that pass the runs dir. Returns
+    /// the first directory whose manifest declares the id.
+    pub fn resolve_run_dir(base: &std::path::Path, run_id: &str) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let is_runs_dir = base
+            .file_name()
+            .map(|f| f == std::ffi::OsStr::new("runs"))
+            .unwrap_or(false);
+        if is_runs_dir {
+            candidates.push(base.join(run_id));
+        } else {
+            candidates.push(base.join(".tui-lab").join("runs").join(run_id));
+            candidates.push(base.join(run_id));
+        }
+        for c in candidates {
+            if let Ok(m) = crate::run::manifest::load(&c) {
+                if m.run_id == run_id {
+                    return Some(c);
+                }
+            }
+        }
+        None
+    }
+
+    /// Wave G item 75: every persisted run under `base`, newest first.
+    /// A directory counts as a run when it holds a parseable `run.json`;
+    /// anything else (scratch, corrupt, foreign) is named in `skipped`
+    /// rather than hidden — a corrupt run is evidence, not noise.
+    pub fn list_persisted(base: &std::path::Path) -> anyhow::Result<Vec<serde_json::Value>> {
+        let runs_dir = base.join(".tui-lab").join("runs");
+        let direct = base.file_name().map(|f| f == std::ffi::OsStr::new("runs"));
+        let dir = if direct.unwrap_or(false) {
+            base.to_path_buf()
+        } else {
+            runs_dir
+        };
+        let mut out: Vec<(u64, serde_json::Value)> = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cannot read runs directory {}: {e}",
+                    dir.to_string_lossy()
+                ))
+            }
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let run_dir = entry.path();
+            let manifest = match crate::run::manifest::load(&run_dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    out.push((
+                        0,
+                        json!({
+                            "path": run_dir.to_string_lossy(),
+                            "skipped": format!("unreadable manifest: {e}"),
+                        }),
+                    ));
+                    continue;
+                }
+            };
+            // Transaction ledger size on disk (the durable history — memory
+            // is only a bounded window).
+            let ledger = run_dir.join("transactions.jsonl");
+            let ledger_lines = std::fs::read_to_string(&ledger)
+                .map(|s| s.lines().count() as u64)
+                .unwrap_or(0);
+            out.push((
+                manifest.started_at,
+                json!({
+                    "run_id": manifest.run_id,
+                    "started_at": manifest.started_at,
+                    "closed": manifest.closed,
+                    "history_complete": manifest.history_complete,
+                    "dropped_records": manifest.dropped_records,
+                    "sessions": manifest.sessions.keys().cloned().collect::<Vec<_>>(),
+                    "primary_session": manifest.primary_session,
+                    "dir": run_dir.to_string_lossy(),
+                    "ledger_transactions": ledger_lines,
+                }),
+            ));
+        }
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(out.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Wave G item 74: restore a run from its durable directory. Reads the
+    /// manifest, transaction ledger, findings, focus graph(s), state graph,
+    /// coverage ledger, and saved scenarios back into memory and re-roots
+    /// the checkpoint store — the SAME run identity continues (future
+    /// interactions append to the same artifacts; `tui_run status` reports
+    /// persistent again).
+    ///
+    /// What restore deliberately does NOT do: relaunch sessions (the
+    /// manifest records their launch specs, but a restored run starts with
+    /// no live sessions — `tui_session start` re-creates them and the run
+    /// correlates them like any other), resurrect evicted ledger records
+    /// (an evicted window is declared in the manifest and stays declared),
+    /// or pretend a `closed` run is open (it stays closed until a fresh
+    /// run takes over — replay/read paths still work on closed runs).
+    pub fn restore(run_dir: &std::path::Path) -> anyhow::Result<Self> {
+        let manifest = crate::run::manifest::load(run_dir)?;
+        // Restore over the id the manifest declares — a mismatched directory
+        // name is fine (identity lives in run.json), a missing id is not.
+        let mut run = RunContext::ephemeral();
+        run.id = manifest.run_id.clone();
+        run.started_at = manifest.started_at;
+        run.closed = manifest.closed;
+        run.dropped_records = manifest.dropped_records;
+        run.first_available_seq = manifest.first_available_seq;
+        run.session_specs = manifest.sessions.clone();
+        run.primary_session = manifest.primary_session.clone();
+        run.run_dir = Some(run_dir.to_path_buf());
+        run.checkpoints = CheckpointStore::with_run_dir(
+            run_dir.join("checkpoints").to_string_lossy().to_string(),
+        );
+        // Load every persisted checkpoint back into memory (per-session
+        // subdirectories). A restored run can compare against pre-close
+        // snapshots again.
+        if let Ok(entries) = std::fs::read_dir(run_dir.join("checkpoints")) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if let Some(sid) = entry.file_name().to_str() {
+                        run.checkpoints.load_session(sid);
+                    }
+                }
+            }
+        }
+        run.ledger_flushed_upto = run.transaction_count; // 0 — file is authoritative
+
+        // Transaction ledger: every line that is still parseable comes back.
+        // A torn final line (crash mid-append) is skipped and *counted*, not
+        // silently dropped.
+        let ledger_path = run_dir.join("transactions.jsonl");
+        if let Ok(body) = std::fs::read_to_string(&ledger_path) {
+            let mut torn = 0u64;
+            for line in body.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<TransactionRecord>(line) {
+                    Ok(rec) => {
+                        run.transaction_count = run.transaction_count.max(rec.seq + 1);
+                        run.transactions.push(rec);
+                    }
+                    Err(_) => torn += 1,
+                }
+            }
+            if torn > 0 {
+                run.dropped_records += torn;
+                run.first_available_seq = run.transactions.first().map(|t| t.seq);
+            }
+            run.ledger_flushed_upto = run.transaction_count;
+        }
+
+        // Findings.
+        if let Ok(bytes) = std::fs::read(run_dir.join("findings.json")) {
+            if let Ok(f) = serde_json::from_slice::<Vec<crate::audit::Finding>>(&bytes) {
+                run.findings = f;
+            }
+        }
+        // Focus graphs (both ledgers).
+        if let Ok(bytes) = std::fs::read(run_dir.join("focus_graph.json")) {
+            if let Ok(t) =
+                serde_json::from_slice::<Vec<(u64, String, Option<String>, Option<String>)>>(&bytes)
+            {
+                run.focus_transitions = t;
+            }
+        }
+        if let Ok(bytes) = std::fs::read(run_dir.join("focus_graph_ids.json")) {
+            if let Ok(g) =
+                serde_json::from_slice::<crate::semantic::focus_graph::FocusGraph>(&bytes)
+            {
+                run.focus_graph = g;
+            }
+        }
+        // State graph (from its export snapshot; keeps the default budget).
+        if let Ok(bytes) = std::fs::read(run_dir.join("state_graph.json")) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                run.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
+            }
+        }
+        // Coverage ledger.
+        if let Ok(bytes) = std::fs::read(run_dir.join("coverage.json")) {
+            if let Ok(l) =
+                serde_json::from_slice::<std::collections::BTreeMap<String, CoverageEntry>>(&bytes)
+            {
+                run.coverage_ledger = l;
+            }
+        }
+        // Saved scenarios from the durable dir (id-keyed; name index rebuilt).
+        let scen_dir = run_dir.join("scenarios");
+        if let Ok(entries) = std::fs::read_dir(&scen_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(sc) =
+                        serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes)
+                    {
+                        run.saved_scenarios.insert(sc.id.clone(), sc);
+                    }
+                }
+            }
+        }
+        run.rebuild_scenario_name_index();
+        // Findings baselines: not persisted as a file (they are a live-run
+        // working set); a restored run starts without them and `tui_audit
+        // label=X` can rebuild one in one call. Same for contract baselines
+        // and the loaded contract itself (contract_path survives in the
+        // manifest? no — the run dir carries no contract copy; the caller
+        // re-loads with tui_contract action=load).
+
+        // Artifacts: re-register what is actually on disk so references
+        // survive restore.
+        fn reg(
+            run: &mut RunContext,
+            n: usize,
+            kind: crate::run::ArtifactKind,
+            rel: std::path::PathBuf,
+            summary: String,
+        ) {
+            run.artifacts.push(crate::run::ArtifactRef {
+                id: format!("art-{}", n),
+                kind,
+                path: Some(rel.clone()),
+                size: None,
+                session: None,
+                summary: format!("{summary} ({})", rel.to_string_lossy()),
+            });
+        }
+        fn scan_dir(
+            run: &mut RunContext,
+            run_dir: &std::path::Path,
+            n: &mut usize,
+            sub: &str,
+            kind: crate::run::ArtifactKind,
+            summary: &str,
+        ) {
+            let dir = run_dir.join(sub);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut files: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+                files.sort();
+                for f in files {
+                    if f.is_file() {
+                        *n += 1;
+                        let rel = std::path::PathBuf::from(sub).join(
+                            f.file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                        );
+                        reg(run, *n, kind.clone(), rel, summary.to_string());
+                    }
+                }
+            }
+        }
+        let mut n = 0usize;
+        scan_dir(
+            &mut run,
+            run_dir,
+            &mut n,
+            "recordings",
+            crate::run::ArtifactKind::Recording,
+            "pty recording (restored run)",
+        );
+        scan_dir(
+            &mut run,
+            run_dir,
+            &mut n,
+            "captures",
+            crate::run::ArtifactKind::Capture,
+            "screen capture (restored run)",
+        );
+        scan_dir(
+            &mut run,
+            run_dir,
+            &mut n,
+            "events",
+            crate::run::ArtifactKind::EventLog,
+            "terminal event log (restored run)",
+        );
+        scan_dir(
+            &mut run,
+            run_dir,
+            &mut n,
+            "recordings",
+            crate::run::ArtifactKind::Recording,
+            "pty recording (restored run)",
+        );
+        scan_dir(
+            &mut run,
+            run_dir,
+            &mut n,
+            "captures",
+            crate::run::ArtifactKind::Capture,
+            "screen capture (restored run)",
+        );
+        scan_dir(
+            &mut run,
+            run_dir,
+            &mut n,
+            "events",
+            crate::run::ArtifactKind::EventLog,
+            "terminal event log (restored run)",
+        );
+
+        Ok(run)
+    }
+
     /// Record the launch spec of the session this run is attached to
     /// (per-session map, P0 fix 6). The first session recorded becomes the
     /// run's primary (cwd/root resolution).
@@ -910,6 +1227,18 @@ impl RunContext {
     /// The launch spec cwd of the primary session, if attached.
     pub fn primary_session_cwd(&self) -> Option<&str> {
         self.primary_launch_spec().and_then(|s| s.cwd.as_deref())
+    }
+
+    /// Launch specs the run recorded, sorted by session id (replay CLI:
+    /// the manifest's per-session launch table).
+    pub fn launch_specs(&self) -> Vec<(String, crate::session::state::LaunchSpec)> {
+        let mut out: Vec<(String, _)> = self
+            .session_specs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Status snapshot for `tui_run status` (goal spec shape).
@@ -1647,5 +1976,195 @@ mod tests {
         assert_eq!(st2["persistent"], true);
         assert_eq!(st2["sessions"], serde_json::json!(["sess-x"]));
         assert!(st2["artifact_root"].as_str().is_some());
+    }
+
+    // ── Wave G item 74: run restore ─────────────────────────────────────
+
+    /// Build a durable run with everything restore is expected to bring
+    /// back: launch spec, transactions, findings, focus ledger, scenarios,
+    /// a held recording.
+    fn persisted_fixture(base: &std::path::Path) -> (String, std::path::PathBuf) {
+        let mut run = RunContext::ephemeral();
+        let run_id = run.id.clone();
+        run.set_launch_spec(
+            "sess-fix",
+            crate::session::state::LaunchSpec::new("python3", 90, 26),
+        );
+        run.record_event("sess-fix", "wait");
+        run.extend_findings(vec![crate::audit::Finding {
+            id: "RESTORE-ME".into(),
+            severity: "warn".into(),
+            category: "test".into(),
+            summary: "finding that must survive restore".into(),
+            evidence: vec![crate::audit::EvidenceRef::point(
+                crate::audit::EvidenceKind::Other,
+                "fixture",
+                "restore test",
+            )],
+            confidence: 1.0,
+            reproduction: None,
+        }]);
+        run.record_focus_transition("sess-fix", None, Some("file".into()));
+        let sc = crate::scenario::model::Scenario::new("restored-flow")
+            .act(serde_json::json!({"action": "key", "key": "enter"}));
+        let expected_stem = format!("restored-flow-{}", sc.id.rsplit('-').next().unwrap_or("0"));
+        run.save_scenario(sc);
+        run.hold_recording("sess-fix-42.cast".into(), "x\n".into());
+
+        let root = run.promote(base).expect("promote");
+        assert!(root.join("run.json").exists());
+        (expected_stem, root)
+    }
+
+    #[test]
+    fn restore_brings_back_identity_ledger_findings_scenarios() {
+        let base = tempfile::tempdir().expect("base");
+        let (scenario_stem, root) = persisted_fixture(base.path());
+        let run_id = root.file_name().unwrap().to_string_lossy().to_string();
+
+        let restored = RunContext::restore(&root).expect("restore");
+        assert_eq!(restored.id, run_id, "identity survives");
+        assert!(restored.run_dir().is_some(), "durable root survives");
+        assert_eq!(restored.transaction_total(), 1, "ledger count restored");
+        assert_eq!(restored.transactions().len(), 1);
+        assert_eq!(
+            restored.transactions()[0].settle,
+            "skipped",
+            "non-interaction entries keep their honest settle"
+        );
+        assert_eq!(restored.findings().len(), 1);
+        assert_eq!(restored.findings()[0].id, "RESTORE-ME");
+        assert_eq!(restored.focus_transitions().len(), 1);
+        // Scenario listable + loadable by id (name index rebuilt). The list
+        // is keyed by id; the unambiguous name resolves to the same thing.
+        let listed = restored.list_saved_scenarios().expect("list");
+        assert_eq!(listed.len(), 1, "scenario listed after restore: {listed:?}");
+        let loaded = restored
+            .load_scenario("restored-flow")
+            .expect("load by unambiguous name");
+        assert_eq!(loaded.step_count(), 1);
+        assert!(root
+            .join("scenarios")
+            .join(format!("{scenario_stem}.json"))
+            .exists());
+        // Launch specs restored → primary cwd resolvable again.
+        let specs = restored.launch_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].1.cols, 90);
+        assert_eq!(restored.primary_session_cwd(), None, "fixture cwd was None");
+        // Held recording flushed at promotion → restored as an artifact ref.
+        assert!(
+            restored
+                .artifacts()
+                .iter()
+                .any(|a| a.summary.contains("pty recording")),
+            "recording re-registered: {:?}",
+            restored.artifacts()
+        );
+    }
+
+    #[test]
+    fn restored_run_continues_appending_to_the_same_dir() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        let run_id = root.file_name().unwrap().to_string_lossy().to_string();
+
+        let mut restored = RunContext::restore(&root).expect("restore");
+        restored.record_event("sess-fix", "wait");
+        // The new record appends to the SAME ledger file (id preserved, no
+        // fork into a new run dir).
+        let body = std::fs::read_to_string(root.join("transactions.jsonl")).expect("ledger");
+        assert_eq!(body.lines().count(), 2, "ledger appended in place: {body}");
+        // And the manifest still declares the same run id.
+        let m = crate::run::manifest::load(&root).expect("manifest");
+        assert_eq!(m.run_id, run_id);
+    }
+
+    #[test]
+    fn restore_reports_torn_ledger_tail_honestly() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        // Simulate a crash mid-append: a torn final line.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.join("transactions.jsonl"))
+                .expect("open ledger");
+            write!(f, "{{\"seq\":9,\"at\":1,\"session\":\"sess-fi").unwrap();
+        }
+        let restored = RunContext::restore(&root).expect("restore still succeeds");
+        assert_eq!(restored.transactions().len(), 1, "only the good line");
+        assert_eq!(
+            restored.dropped_records, 1,
+            "the torn line is DECLARED, not dropped silently"
+        );
+        assert!(
+            !restored.history_complete(),
+            "torn tail breaks completeness"
+        );
+    }
+
+    #[test]
+    fn resolve_run_dir_accepts_both_root_shapes() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        let run_id = root.file_name().unwrap().to_string_lossy().to_string();
+        // Repo-root shape.
+        assert_eq!(
+            RunContext::resolve_run_dir(base.path(), &run_id),
+            Some(root.clone())
+        );
+        // Runs-dir shape (the spec example).
+        let runs = base.path().join(".tui-lab").join("runs");
+        assert_eq!(
+            RunContext::resolve_run_dir(&runs, &run_id),
+            Some(root.clone())
+        );
+        // Unknown id → None.
+        assert_eq!(RunContext::resolve_run_dir(base.path(), "run-nope"), None);
+    }
+
+    #[test]
+    fn list_persisted_names_runs_and_corrupt_entries() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        // A corrupt entry (no manifest).
+        let scratch = base.path().join(".tui-lab").join("runs").join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let listed = RunContext::list_persisted(base.path()).expect("list");
+        let run_entry = listed
+            .iter()
+            .find(|e| {
+                e.get("run_id").and_then(|r| r.as_str())
+                    == Some(root.file_name().unwrap().to_string_lossy().as_ref())
+            })
+            .expect("fixture run listed");
+        assert_eq!(run_entry["closed"], false);
+        assert_eq!(run_entry["history_complete"], true);
+        assert_eq!(run_entry["ledger_transactions"], 1);
+        let skipped = listed
+            .iter()
+            .find(|e| e.get("skipped").is_some())
+            .expect("corrupt dir named, not hidden");
+        assert!(
+            skipped["path"].as_str().unwrap_or("").ends_with("scratch"),
+            "{skipped}"
+        );
+    }
+
+    /// A closed run restores as closed — resume never resurrects a
+    /// finished run into pretending it is open.
+    #[test]
+    fn closed_run_stays_closed_after_restore() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        {
+            let mut run = RunContext::restore(&root).expect("restore");
+            run.close().expect("close");
+        }
+        let restored = RunContext::restore(&root).expect("restore again");
+        assert!(restored.is_closed(), "closed flag is durable");
+        assert_eq!(restored.status(Vec::new())["closed"], true);
     }
 }

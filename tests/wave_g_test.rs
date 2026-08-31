@@ -629,3 +629,309 @@ async fn lease_is_exclusive_and_status_reports_it() {
         ))
         .await;
 }
+
+// ─────────────────────────── items 74 + 75: run restore / browser ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_list_resume_restores_identity_and_artifacts() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // Session with cwd=base, do real work, persist, accumulate more, close.
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('resume-me'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "session start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+    let original_run = start["run"].as_str().unwrap().to_string();
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+            ))
+            .await,
+        "act before persist",
+    );
+    unwrap_ok(
+        &server
+            .tui_checkpoint(params_typed(
+                serde_json::json!({ "action": "save", "name": "cp-r", "id": sid }),
+            ))
+            .await,
+        "checkpoint",
+    );
+    let persisted = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "persist" })))
+            .await,
+        "persist",
+    );
+    assert_eq!(persisted["run_id"], original_run.as_str());
+    let artifact_root = persisted["artifact_root"].as_str().unwrap().to_string();
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "escape", "id": sid }),
+            ))
+            .await,
+        "act after persist",
+    );
+    let st = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "status" })))
+            .await,
+        "status",
+    );
+    let tx_before = st["counts"]["transactions"].as_u64().unwrap();
+
+    // list: the persisted run is discoverable from the base dir.
+    let list = unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "list", "root": base.to_string_lossy() }),
+            ))
+            .await,
+        "run list",
+    );
+    let entry = list["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .find(|r| r["run_id"] == original_run.as_str())
+        .expect("our run listed")
+        .clone();
+    assert_eq!(entry["closed"], false, "{entry}");
+    assert_eq!(entry["history_complete"], true, "{entry}");
+    assert_eq!(
+        entry["ledger_transactions"].as_u64().unwrap(),
+        tx_before,
+        "ledger line count matches the run's transaction count"
+    );
+
+    // Close the live run (kill the session), then resume it in the SAME server.
+    unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "close", "kill_sessions": true }),
+            ))
+            .await,
+        "close",
+    );
+
+    let resumed = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({
+                "action": "resume", "run_id": original_run,
+                "root": base.to_string_lossy(),
+            })))
+            .await,
+        "resume",
+    );
+    assert_eq!(resumed["resumed"], true, "{resumed}");
+    assert_eq!(
+        resumed["run_id"],
+        original_run.as_str(),
+        "identity restored"
+    );
+    assert_eq!(
+        resumed["artifact_root"],
+        artifact_root.as_str(),
+        "same durable root"
+    );
+    assert_eq!(resumed["status"]["mode"], "persistent", "{resumed}");
+    assert_eq!(
+        resumed["status"]["counts"]["transactions"]
+            .as_u64()
+            .unwrap(),
+        tx_before,
+        "ledger count restored from disk"
+    );
+    // The checkpoint saved before persist came back with the run (keyed by
+    // its original session id — a fresh session has a new id, so the
+    // durable proof is the restored count, and the old file is on disk).
+    assert!(
+        resumed["status"]["counts"]["checkpoints"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "checkpoints restored: {resumed}"
+    );
+    assert!(
+        std::path::Path::new(&artifact_root)
+            .join("checkpoints")
+            .read_dir()
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+            >= 1,
+        "checkpoint files under the durable root"
+    );
+
+    // The restored run is LIVE: new interactions append to the same run dir.
+    let start2 = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('post-resume'); input()"],
+                "cwd": base.to_string_lossy(),
+            })))
+            .await,
+        "session after resume",
+    );
+    let sid2 = start2["session"].as_str().unwrap().to_string();
+    assert_eq!(
+        start2["run"],
+        original_run.as_str(),
+        "new sessions correlate to the resumed run"
+    );
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "tab", "id": sid2 }),
+            ))
+            .await,
+        "act on resumed run",
+    );
+    let ledger =
+        std::fs::read_to_string(std::path::Path::new(&artifact_root).join("transactions.jsonl"))
+            .expect("ledger");
+    assert_eq!(
+        ledger.lines().count() as u64,
+        tx_before + 1,
+        "resumed run appends to the SAME ledger file"
+    );
+
+    // Resuming a run id that does not exist is an honest invalid_request.
+    let bad = unwrap_err(
+        &server
+            .tui_run(params_typed(serde_json::json!({
+                "action": "resume", "run_id": "run-missing",
+                "root": base.to_string_lossy(),
+            })))
+            .await,
+        "resume missing",
+    );
+    assert!(
+        bad["error"].as_str().unwrap_or("").contains("run-missing"),
+        "{bad}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The replay CLI renders a persisted run from disk (item 74): identity,
+/// ledger summary, findings, artifacts — and fails honestly for an unknown
+/// run id.
+#[test]
+fn replay_cli_renders_persisted_run() {
+    use std::process::Command;
+    let base = std::env::temp_dir().join(format!("tui-lab-replay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // Build a durable run through the MCP surface.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let run_id = rt.block_on(async {
+        let server = tui_lab::mcp::tools::TuiLabServer::new();
+        let start = unwrap_ok(
+            &server
+                .tui_session(params_typed(serde_json::json!({
+                    "action": "start", "command": "python3",
+                    "args": ["-c", "print('replay'); input()"],
+                    "cwd": base.to_string_lossy(),
+                })))
+                .await,
+            "session",
+        );
+        let sid = start["session"].as_str().unwrap().to_string();
+        let run_id = start["run"].as_str().unwrap().to_string();
+        unwrap_ok(
+            &server
+                .tui_act(params_typed(
+                    serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+                ))
+                .await,
+            "act",
+        );
+        unwrap_ok(
+            &server
+                .tui_audit(params_typed(
+                    serde_json::json!({ "profile": "discoverability", "id": sid }),
+                ))
+                .await,
+            "audit for findings",
+        );
+        unwrap_ok(
+            &server
+                .tui_run(params_typed(
+                    serde_json::json!({ "action": "persist", "root": base.to_string_lossy() }),
+                ))
+                .await,
+            "persist",
+        );
+        unwrap_ok(
+            &server
+                .tui_run(params_typed(
+                    serde_json::json!({ "action": "close", "kill_sessions": true }),
+                ))
+                .await,
+            "close",
+        );
+        run_id
+    });
+
+    let bin = env!("CARGO_BIN_EXE_hermes-tui-lab");
+    let out = Command::new(bin)
+        .args(["replay", &run_id, "--root", base.to_string_lossy().as_ref()])
+        .output()
+        .expect("replay runs");
+    assert!(
+        out.status.success(),
+        "replay failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&run_id), "header names the run: {text}");
+    assert!(text.contains("key"), "ledger summary shows actions: {text}");
+    assert!(text.contains("findings"), "findings section: {text}");
+    assert!(text.contains("state graph"), "graph section: {text}");
+    // --full prints the per-transaction lines.
+    let out_full = Command::new(bin)
+        .args([
+            "replay",
+            &run_id,
+            "--root",
+            base.to_string_lossy().as_ref(),
+            "--full",
+        ])
+        .output()
+        .expect("replay --full");
+    let full_text = String::from_utf8_lossy(&out_full.stdout);
+    assert!(
+        full_text.contains("settle="),
+        "full ledger lines carry settle status: {full_text}"
+    );
+    // Unknown run id: non-zero exit naming the miss.
+    let bad = Command::new(bin)
+        .args([
+            "replay",
+            "run-nope",
+            "--root",
+            base.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("replay missing");
+    assert!(!bad.status.success(), "unknown run must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("run-nope"),
+        "error names the missing run"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
