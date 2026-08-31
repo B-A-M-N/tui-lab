@@ -122,6 +122,11 @@ pub struct PortablePtyBackend {
     child_pid: Option<u32>,
     last_output_instant: Instant,
     last_screen_change_instant: Instant,
+    /// Item 48: the normalization policy applied when building structure
+    /// hashes. Defaults to the built-in conservative classes; a loaded
+    /// contract's `volatile_patterns` are merged in via
+    /// [`Self::set_normalization_policy`].
+    normalization_policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
 }
 
 impl PortablePtyBackend {
@@ -148,7 +153,19 @@ impl PortablePtyBackend {
             child_pid: None,
             last_output_instant: now,
             last_screen_change_instant: now,
+            normalization_policy: std::sync::Arc::new(
+                crate::screen::NormalizationPolicy::default(),
+            ),
         }
+    }
+
+    /// Item 48: install a contract-derived normalization policy. Affects
+    /// every subsequent `state()` / `observe()` structure hash.
+    pub fn set_normalization_policy(
+        &mut self,
+        policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
+    ) {
+        self.normalization_policy = policy;
     }
 
     /// Drain buffered PTY bytes, feed the parser, and bump `screen_seq` on
@@ -301,8 +318,24 @@ impl TerminalBackend for PortablePtyBackend {
         for a in args {
             cmd.arg(a);
         }
-        if let Some(cwd) = cwd {
-            cmd.cwd(cwd);
+        // portable-pty's CommandBuilder defaults a child with no explicit
+        // cwd to $HOME — not the parent's cwd like std::process. A test
+        // harness launching relative-path targets ("python3 fixtures/app.py")
+        // from the project dir would silently run from ~. Inherit the
+        // parent's cwd instead; an explicit `cwd` still wins.
+        let cwd_owned: String;
+        let cwd_arg: Option<&str> = match cwd {
+            Some(c) => Some(c),
+            None => match std::env::current_dir() {
+                Ok(d) => {
+                    cwd_owned = d.to_string_lossy().to_string();
+                    Some(cwd_owned.as_str())
+                }
+                Err(_) => None,
+            },
+        };
+        if let Some(c) = cwd_arg {
+            cmd.cwd(c);
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -436,11 +469,12 @@ impl TerminalBackend for PortablePtyBackend {
             .cloned()
             .chain(self.parser.callbacks().open_link.clone())
             .collect();
-        Ok(crate::screen::from_vt(
+        Ok(crate::screen::from_vt_with_policy(
             self.parser.screen(),
             process,
             title,
             links,
+            &self.normalization_policy,
         ))
     }
 
@@ -636,11 +670,12 @@ impl TerminalBackend for PortablePtyBackend {
             if let Some(open) = &self.parser.callbacks().open_link {
                 links.push(open.clone());
             }
-            let screen = crate::screen::from_vt(
+            let screen = crate::screen::from_vt_with_policy(
                 self.parser.screen(),
                 process,
                 title,
                 links,
+                &self.normalization_policy,
             );
 
             let (met, reason) = match &cond {

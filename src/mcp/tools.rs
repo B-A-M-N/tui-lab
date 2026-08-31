@@ -523,22 +523,63 @@ impl TuiLabServer {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
         };
-        // Go through the canonical assert executor (re-review P0).
-        let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
-        {
-            // Scoped to the resolved session generation (item 5).
-            let (sid, gen) = (sess.id.clone(), sess.generation);
-            let mut run = self.run.lock().unwrap();
-            run.record_scenario_assert(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
-        }
-        if passed {
-            ok(json!({ "passed": true, "assertion": p.assertion }))
-        } else if let Some(ErrorCategory::InvalidRequest) = invalid {
-            // Unknown assertion name (or missing required param): a caller error,
-            // NOT a UI failure (spec section 37).
-            err(ErrorCategory::InvalidRequest, detail)
+        // Wave E: `assertion: "oracle"` evaluates a declarative oracle
+        // expression (shared language with contracts and audits). Any other
+        // assertion name goes through the canonical assert executor.
+        if p.assertion == "oracle" {
+            let Some(expr) = p.text.as_deref().or(p.reference.as_deref()) else {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    "oracle assertion requires the expression in 'text' (e.g. text: \"modal_open()\")",
+                );
+            };
+            let sem = semantic::analyze(&screen);
+            let outcome = crate::design::eval_static(expr, &screen, &sem);
+            {
+                // Scoped to the resolved session generation (item 5).
+                let (sid, gen) = (sess.id.clone(), sess.generation);
+                let mut run = self.run.lock().unwrap();
+                run.record_scenario_assert(
+                    &sid,
+                    gen,
+                    serde_json::json!({ "assertion": "oracle", "text": expr }),
+                );
+            }
+            if outcome.passed {
+                ok(json!({
+                    "passed": true,
+                    "assertion": "oracle",
+                    "expression": expr,
+                    "detail": outcome.detail,
+                    "flavor": outcome.flavor,
+                }))
+            } else if outcome.parse_error.is_some() {
+                // A malformed expression is a caller error, not a UI failure.
+                err(ErrorCategory::InvalidRequest, outcome.detail)
+            } else {
+                err_continued(
+                    ErrorCategory::AssertionFailed,
+                    format!("oracle '{}' failed: {}", expr, outcome.detail),
+                )
+            }
         } else {
-            err_continued(ErrorCategory::AssertionFailed, detail)
+            // Go through the canonical assert executor (re-review P0).
+            let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
+            {
+                // Scoped to the resolved session generation (item 5).
+                let (sid, gen) = (sess.id.clone(), sess.generation);
+                let mut run = self.run.lock().unwrap();
+                run.record_scenario_assert(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
+            }
+            if passed {
+                ok(json!({ "passed": true, "assertion": p.assertion }))
+            } else if let Some(ErrorCategory::InvalidRequest) = invalid {
+                // Unknown assertion name (or missing required param): a caller error,
+                // NOT a UI failure (spec section 37).
+                err(ErrorCategory::InvalidRequest, detail)
+            } else {
+                err_continued(ErrorCategory::AssertionFailed, detail)
+            }
         }
     }
 
@@ -1142,12 +1183,16 @@ impl TuiLabServer {
                         .map(|t| t.action.clone())
                         .collect();
                     let coverage: Vec<String> = run.focus_graph.nodes.keys().cloned().collect();
+                    // Item 49: a loaded contract feeds the `contract` evidence
+                    // source — declared keys never exercised become candidates
+                    // citing the contract, not guesses.
+                    let contract = run.contract();
                     let ctx = crate::exploration::candidates::CandidateContext {
                         state_graph: &run.state_graph,
                         current,
                         action_history: &action_history,
                         coverage: &coverage,
-                        contract: None,
+                        contract,
                         allowed_risk: p
                             .max_risk
                             .as_deref()
@@ -1242,11 +1287,12 @@ impl TuiLabServer {
                     .as_deref()
                     .and_then(crate::intent::ActionRisk::parse)
                     .unwrap_or(crate::intent::ActionRisk::Mutating);
-                let (graph_budget, run_graph_summary) = {
+                let (graph_budget, run_graph_summary, contract) = {
                     let run = self.run.lock().unwrap();
                     (
                         run.state_graph.budget().clone(),
                         (run.state_graph.state_count(), run.state_graph.transition_count()),
+                        run.contract().cloned(),
                     )
                 };
                 let max_actions = p.actions.unwrap_or(20);
@@ -1256,13 +1302,14 @@ impl TuiLabServer {
                     graph_budget.clone(),
                 );
                 let mut focus_graph = crate::semantic::focus_graph::FocusGraph::new();
-                let report = match crate::exploration::semantic::run(
+                let report = match crate::exploration::semantic::run_with_contract(
                     sess,
                     &mut local_graph,
                     &mut focus_graph,
                     &graph_budget,
                     max_actions,
                     max_risk,
+                    contract.as_ref(),
                 ) {
                     Ok(r) => r,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
@@ -1327,12 +1374,19 @@ impl TuiLabServer {
         // The audit ENGINE owns the static-vs-active decision (re-review
         // P0 fix 2): `full` is the composite (static + every active driver),
         // and no profile is weaker than its members. The MCP layer only
-        // surfaces the resulting mode.
-        let report =
-            match crate::audit::orchestrator::run_profile(sess, &profile) {
+        // surfaces the resulting mode. Item 49: the loaded contract rides
+        // along for profile=contract.
+        let report = {
+            let contract = self.run.lock().unwrap().contract().cloned();
+            match crate::audit::orchestrator::run_profile_with_contract(
+                sess,
+                &profile,
+                contract.as_ref(),
+            ) {
                 Ok(r) => r,
                 Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
-            };
+            }
+        };
 
         // Findings accumulate in the run context (composition root) so a
         // later audit/coverage query can see prior evidence. Driven focus
@@ -1512,6 +1566,299 @@ impl TuiLabServer {
             ),
         }
     }
+
+    /// Contracts (Wave E items 39–49): load a design contract, validate the
+    /// document, check the running app's conformance (PASS/FAIL/WARN), and
+    /// compare conformance across points in time. Loading a contract also
+    /// installs its `volatile_patterns` into the session's normalization
+    /// policy (item 48) and arms contract-guided exploration (item 49).
+    #[tool(
+        name = "tui_contract",
+        description = "Design contracts: load, validate, check conformance (PASS/FAIL/WARN against the running app), and compare runs."
+    )]
+    pub async fn tui_contract(&self, p: Parameters<TuiContractParams>) -> String {
+        let p = p.0;
+        match p.action.as_str() {
+            // ── load: parse + validate + remember + apply policy ──
+            "load" => {
+                let Some(path) = p.path.clone() else {
+                    return err(ErrorCategory::InvalidRequest, "load requires 'path'");
+                };
+                let contract = match crate::design::load_design_contract(std::path::Path::new(&path))
+                {
+                    Ok(c) => c,
+                    Err(e) => return err(ErrorCategory::InvalidRequest, e),
+                };
+                // Apply the contract's normalization policy to every live
+                // session (item 48): subsequent structure hashes collapse the
+                // declared volatile patterns.
+                let policy = match contract.normalization_policy() {
+                    Ok(pol) => std::sync::Arc::new(pol),
+                    Err(e) => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!("contract volatile_patterns invalid: {e}"),
+                        )
+                    }
+                };
+                let applied: Vec<String> = {
+                    let mut mgr = self.manager.lock().unwrap();
+                    let ids = mgr.list();
+                    for sid in &ids {
+                        if let Ok(sess) = mgr.get_mut(sid) {
+                            sess.set_normalization_policy(policy.clone());
+                        }
+                    }
+                    ids
+                };
+                let summary = {
+                    let mut run = self.run.lock().unwrap();
+                    run.set_contract(contract.clone(), path.clone());
+                    json!({
+                        "name": contract.schema.name,
+                        "version": contract.schema.version,
+                        "viewports": contract.viewports.len(),
+                        "components": contract.components.len(),
+                        "interactions": contract.interactions.len(),
+                        "layout_constraints": contract.layout.len(),
+                        "oracles": contract.oracles.len(),
+                        "volatile_patterns": contract.volatile_patterns.len(),
+                        "policy_applied_to_sessions": applied,
+                    })
+                };
+                ok(json!({ "loaded": true, "path": path, "contract": summary }))
+            }
+            // ── validate: document-only, no session needed ──
+            "validate" => {
+                let Some(path) = p.path.clone() else {
+                    return err(ErrorCategory::InvalidRequest, "validate requires 'path'");
+                };
+                // Parse WITHOUT the load-time hard stop, so a report of every
+                // problem comes back instead of only the first.
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => return err(ErrorCategory::InvalidRequest, format!("cannot read: {e}")),
+                };
+                let parsed: Result<crate::design::ProjectContract, _> = if path.ends_with(".json") {
+                    serde_json::from_str(&content)
+                        .map_err(|e| format!("Failed to parse design contract JSON: {e}"))
+                } else {
+                    serde_yaml::from_str(&content)
+                        .map_err(|e| format!("Failed to parse design contract YAML: {e}"))
+                };
+                match parsed {
+                    Err(e) => err(ErrorCategory::InvalidRequest, e),
+                    Ok(contract) => {
+                        let results = crate::design::conformance::validate_document(&contract);
+                        let verdict = results.iter().fold(
+                            crate::design::Verdict::Pass,
+                            |acc, r| acc.merge(r.verdict),
+                        );
+                        ok(json!({
+                            "contract": contract.schema.name,
+                            "version": contract.schema.version,
+                            "verdict": verdict.as_str(),
+                            "results": results,
+                        }))
+                    }
+                }
+            }
+            // ── status: full conformance check against the running app ──
+            "status" => {
+                let contract = {
+                    let run = self.run.lock().unwrap();
+                    match run.contract() {
+                        Some(c) => c.clone(),
+                        None => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                "no contract loaded; call tui_contract action=load path=... first",
+                            )
+                        }
+                    }
+                };
+                self.check_contract_against(p.id.as_deref(), &contract)
+            }
+            // ── compare: run conformance now, diff against the baseline ──
+            "compare" => {
+                let contract = {
+                    let run = self.run.lock().unwrap();
+                    match run.contract() {
+                        Some(c) => c.clone(),
+                        None => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                "no contract loaded; call tui_contract action=load path=... first",
+                            )
+                        }
+                    }
+                };
+                let current = match self.check_contract_inner(p.id.as_deref(), &contract) {
+                    Ok(r) => r,
+                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                };
+                let label = p.label.clone().unwrap_or_else(|| "current".into());
+                let mut run = self.run.lock().unwrap();
+                let baseline_label = p.baseline.clone().unwrap_or_else(|| "baseline".into());
+                let baseline = run
+                    .contract_baselines()
+                    .get(&baseline_label)
+                    .cloned();
+                // Record the current result under its label for future compares.
+                run.record_contract_baseline(&label, &current);
+                match baseline {
+                    None => ok(json!({
+                        "baseline": baseline_label,
+                        "baseline_available": false,
+                        "note": format!("no baseline '{baseline_label}' recorded yet; this run's result is now stored as '{label}' — fix what you need to fix, then compare again"),
+                        "current": current.summary(),
+                        "current_results": current.results,
+                        "regressions": [],
+                        "fixed": [],
+                    })),
+                    Some(base) => {
+                        let (regressions, fixed) = diff_contract_reports(&base, &current);
+                        let verdict = if !regressions.is_empty() {
+                            crate::design::Verdict::Fail
+                        } else {
+                            current.verdict
+                        };
+                        // Failed comparisons become findings (item 49).
+                        if !regressions.is_empty() {
+                            let findings: Vec<crate::audit::Finding> = regressions
+                                .iter()
+                                .map(|(name, before, after)| crate::audit::Finding {
+                                    id: "CONTRACT-REGRESSION".into(),
+                                    severity: "error".into(),
+                                    category: "contract/compare".into(),
+                                    summary: format!(
+                                        "{name}: was {} ({}), now {} ({})",
+                                        before.verdict.as_str(),
+                                        before.detail,
+                                        after.verdict.as_str(),
+                                        after.detail
+                                    ),
+                                    evidence: vec![crate::audit::EvidenceRef::point(
+                                        crate::audit::EvidenceKind::Other,
+                                        "contract_compare",
+                                        name.clone(),
+                                    )
+                                    .with_detail(json!({
+                                        "contract": contract.schema.name,
+                                        "baseline": baseline_label,
+                                        "check": name,
+                                        "before": before.detail,
+                                        "after": after.detail,
+                                    }))],
+                                    confidence: 1.0,
+                                    reproduction: None,
+                                })
+                                .collect();
+                            run.extend_findings(findings);
+                        }
+                        ok(json!({
+                            "baseline": baseline_label,
+                            "baseline_available": true,
+                            "current": current.summary(),
+                            "baseline_summary": base.summary(),
+                            "verdict": verdict.as_str(),
+                            "regressions": regressions.iter().map(|(n, b, a)| json!({
+                                "check": n,
+                                "before": b.verdict.as_str(),
+                                "before_detail": b.detail,
+                                "after": a.verdict.as_str(),
+                                "after_detail": a.detail,
+                            })).collect::<Vec<_>>(),
+                            "fixed": fixed.iter().map(|(n, b, a)| json!({
+                                "check": n,
+                                "before": b.verdict.as_str(),
+                                "after": a.verdict.as_str(),
+                                "after_detail": a.detail,
+                            })).collect::<Vec<_>>(),
+                        }))
+                    }
+                }
+            }
+            other => err(
+                ErrorCategory::InvalidRequest,
+                format!("unknown contract action '{}' (load|validate|status|compare)", other),
+            ),
+        }
+    }
+
+    /// Lock-and-resolve wrapper around [`Self::check_contract_inner`].
+    fn check_contract_against(
+        &self,
+        id: Option<&str>,
+        contract: &crate::design::ProjectContract,
+    ) -> String {
+        match self.check_contract_inner(id, contract) {
+            Ok(report) => {
+                // Findings feed the run ledger (item 49).
+                let findings = report.findings();
+                let summary = report.summary();
+                let results = report.results.clone();
+                let mut run = self.run.lock().unwrap();
+                run.extend_findings(findings);
+                run.record_contract_baseline("baseline", &report);
+                ok(json!({
+                    "verdict": report.verdict.as_str(),
+                    "summary": summary,
+                    "results": results,
+                }))
+            }
+            Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+        }
+    }
+
+    fn check_contract_inner(
+        &self,
+        id: Option<&str>,
+        contract: &crate::design::ProjectContract,
+    ) -> anyhow::Result<crate::design::ContractReport> {
+        let mut mgr = self.manager.lock().unwrap();
+        let sess = mgr.resolve_mut(id)?;
+        crate::design::check_contract(sess, contract)
+    }
+}
+
+/// Diff two contract reports result-by-result, keyed by `group + name`.
+/// Regressions: Pass→Fail (and Pass→Warn for required checks). Fixed:
+/// Fail→Pass, Warn→Pass. Verdict-neutral changes (Warn→Fail on optional
+/// checks etc.) are reported as regressions too — stricter is a regression
+/// whenever the check was required.
+/// One (key, before, after) row per changed check in a contract comparison.
+type ContractCheckDiff = Vec<(String, crate::design::CheckResult, crate::design::CheckResult)>;
+
+fn diff_contract_reports(
+    base: &crate::design::ContractReport,
+    current: &crate::design::ContractReport,
+) -> (ContractCheckDiff, ContractCheckDiff) {
+    use crate::design::{CheckResult, Verdict};
+    let key = |r: &CheckResult| format!("{}/{}", r.group, r.name);
+    let mut regressions = Vec::new();
+    let mut fixed = Vec::new();
+    for cur in &current.results {
+        let Some(prev) = base.results.iter().find(|r| key(r) == key(cur)) else {
+            continue; // new check, no history
+        };
+        let worsened = match (prev.verdict, cur.verdict) {
+            (Verdict::Pass, Verdict::Fail) => true,
+            (Verdict::Pass, Verdict::Warn) => cur.required,
+            (Verdict::Warn, Verdict::Fail) => cur.required,
+            _ => false,
+        };
+        let improved = matches!(
+            (prev.verdict, cur.verdict),
+            (Verdict::Fail, Verdict::Pass) | (Verdict::Warn, Verdict::Pass) | (Verdict::Fail, Verdict::Warn)
+        );
+        if worsened {
+            regressions.push((key(cur), prev.clone(), cur.clone()));
+        } else if improved {
+            fixed.push((key(cur), prev.clone(), cur.clone()));
+        }
+    }
+    (regressions, fixed)
 }
 
 // Generate `call_tool`/`list_tools`/`get_info` from the tool router above.

@@ -606,9 +606,8 @@ mod tests {
 
 
     /// Item 29, end to end: an OSC8 link in ScreenState becomes a Hyperlink
-    /// node in the tree, value = URI (observation only).
-
-    /// Item 28: a control rendered all-dim infers disabled with dim-style
+    /// node in the tree, value = URI (observation only). Item 28: a control
+    /// rendered all-dim infers disabled with dim-style
     /// provenance, not the default assumption.
     #[test]
     fn dim_control_infers_disabled() {

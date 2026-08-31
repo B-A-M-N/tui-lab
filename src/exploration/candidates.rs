@@ -35,8 +35,10 @@ pub struct CandidateContext<'a> {
     pub action_history: &'a [String],
     /// Control IDs the interaction has reached so far (focused/activated).
     pub coverage: &'a [String],
-    /// The app's declared keybinding contract, when one exists.
-    pub contract: Option<&'a crate::design::schema::DesignContract>,
+    /// The app's declared contract, when one is loaded. Feeds the
+    /// `contract` evidence source: declared keys never exercised are
+    /// coverage claims, not guesses (Wave E item 49).
+    pub contract: Option<&'a crate::design::schema::ProjectContract>,
     /// Highest risk the caller accepts. Candidates above this are filtered
     /// out entirely — never offered with a warning, just absent.
     pub allowed_risk: ActionRisk,
@@ -133,24 +135,52 @@ pub fn suggest(
         }
     }
 
-    // ── 2) Contract keybindings declared but never exercised ──
+    // ── 2) Contract-declared keys never exercised (Wave E item 49) ──
+    //
+    // The contract declares what the app is supposed to respond to: the
+    // legacy keybinding table AND every interaction's key sequence. A
+    // declared key with zero graph evidence from this state is a coverage
+    // claim. Interaction-level keys cite their declared expect oracles so
+    // the explorer knows what the contract says SHOULD happen.
     if let Some(contract) = ctx.contract {
+        // (key, declared-for, declared-expect)
+        let mut declared: Vec<(&String, String, Vec<String>)> = Vec::new();
         for kb in &contract.keybindings {
             for key in &kb.keys {
-                let taken = ctx.state_graph.action_taken_from(&ctx.current, key);
-                if taken == 0 && !ctx.action_history.iter().any(|a| a == key) {
-                    // Risk of an unexercised declared binding is unknown —
-                    // treat as mutating so it cannot slip past a safe gate.
-                    out.push(Candidate {
-                        action: json!({ "action": "key", "key": key }),
-                        reasons: vec![Evidence::contract(
-                            format!("'{key}' is declared for '{} 'in the contract but never exercised in this run", kb.action.trim_end()),
-                            json!({ "declared_action": kb.action, "key": key, "times_exercised": 0 }),
-                        )],
-                        risk: ActionRisk::Mutating,
-                        control_id: None,
-                    });
+                declared.push((key, kb.action.trim_end().to_string(), Vec::new()));
+            }
+        }
+        for inter in &contract.interactions {
+            if !inter.keys.is_empty() {
+                declared.push((
+                    &inter.keys[0],
+                    format!("interaction '{}'", inter.name),
+                    inter.expect.clone(),
+                ));
+            }
+        }
+        for (key, declared_for, expects) in declared {
+            let taken = ctx.state_graph.action_taken_from(&ctx.current, key);
+            if taken == 0 && !ctx.action_history.iter().any(|a| a == key) {
+                // Risk of an unexercised declared binding is unknown —
+                // treat as mutating so it cannot slip past a safe gate.
+                let mut detail = json!({
+                    "declared_for": declared_for,
+                    "key": key,
+                    "times_exercised": 0,
+                });
+                if !expects.is_empty() {
+                    detail["contract_expects"] = json!(expects);
                 }
+                out.push(Candidate {
+                    action: json!({ "action": "key", "key": key }),
+                    reasons: vec![Evidence::contract(
+                        format!("'{key}' is declared for '{declared_for}' in the contract but never exercised in this run"),
+                        detail,
+                    )],
+                    risk: ActionRisk::Mutating,
+                    control_id: None,
+                });
             }
         }
     }
@@ -441,20 +471,12 @@ mod tests {
     fn affordance_and_contract_evidence() {
         let s = screen();
         let sem = sem_with(vec![], vec![aff("q", "quit")]);
-        let contract = crate::design::schema::DesignContract {
-            schema: crate::design::schema::ContractSchema {
-                name: "t".into(),
-                version: "1".into(),
-            },
-            viewports: vec![],
+        let contract = crate::design::schema::ProjectContract {
             keybindings: vec![crate::design::schema::Keybinding {
                 action: "quit".into(),
                 keys: vec!["q".into()],
             }],
-            escape_closes_modal: true,
-            reverse_tab_required: true,
-            destructive_require_confirmation: true,
-            volatile_patterns: vec![],
+            ..crate::design::schema::ProjectContract::default()
         };
         let g = StateGraph::new(crate::exploration::state_graph::ExplorationBudget::default());
         let ctx = CandidateContext {

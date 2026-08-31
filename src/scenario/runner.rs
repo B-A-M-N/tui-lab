@@ -108,17 +108,62 @@ impl ScenarioRunner {
                 StepKind::Assert => {
                     match session.observe(50) {
                         Ok(screen) => {
-                            match serde_json::from_value::<TuiAssertParams>(step.params.clone()) {
-                                Ok(ap) => {
-                                    let (p, d, invalid) =
-                                        crate::execution::execute_assert(&ap, &screen);
-                                    if invalid.is_some() {
-                                        (false, format!("invalid assertion: {d}"))
-                                    } else {
-                                        (p, d)
+                            // Wave E: an oracle assert step carries a
+                            // declarative oracle expression ({"assertion":
+                            // "oracle", "text": "modal_open()"}), evaluated
+                            // through the same language contracts and audits
+                            // use.
+                            let is_oracle = step
+                                .params
+                                .get("assertion")
+                                .and_then(|a| a.as_str())
+                                == Some("oracle");
+                            if is_oracle {
+                                let expr = step
+                                    .params
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .or_else(|| {
+                                        step.params.get("reference").and_then(|t| t.as_str())
+                                    });
+                                match expr {
+                                    Some(expr) => {
+                                        let sem = crate::semantic::analyze(&screen);
+                                        let outcome =
+                                            crate::design::eval_static(expr, &screen, &sem);
+                                        if outcome.parse_error.is_some() {
+                                            (
+                                                false,
+                                                format!("invalid oracle: {}", outcome.detail),
+                                            )
+                                        } else if outcome.passed {
+                                            (true, format!("oracle '{expr}': {}", outcome.detail))
+                                        } else {
+                                            (
+                                                false,
+                                                format!("oracle '{expr}' failed: {}", outcome.detail),
+                                            )
+                                        }
                                     }
+                                    None => (
+                                        false,
+                                        "oracle step missing expression (expected 'text')".into(),
+                                    ),
                                 }
-                                Err(e) => (false, format!("unparseable assert step: {e}")),
+                            } else {
+                                match serde_json::from_value::<TuiAssertParams>(step.params.clone())
+                                {
+                                    Ok(ap) => {
+                                        let (p, d, invalid) =
+                                            crate::execution::execute_assert(&ap, &screen);
+                                        if invalid.is_some() {
+                                            (false, format!("invalid assertion: {d}"))
+                                        } else {
+                                            (p, d)
+                                        }
+                                    }
+                                    Err(e) => (false, format!("unparseable assert step: {e}")),
+                                }
                             }
                         }
                         // A failed observation is an execution error, never a

@@ -37,6 +37,25 @@ pub fn from_vt(
     title: Option<String>,
     hyperlinks: Vec<super::cell::Hyperlink>,
 ) -> ScreenState {
+    from_vt_with_policy(
+        screen,
+        process,
+        title,
+        hyperlinks,
+        &super::normalize::NormalizationPolicy::default(),
+    )
+}
+
+/// Item 48: the contract's `volatile_patterns` are part of the structure
+/// hash's identity. This variant takes the caller's [`NormalizationPolicy`]
+/// — the default conservative policy when no contract is loaded.
+pub fn from_vt_with_policy(
+    screen: &VtScreen,
+    process: ProcessState,
+    title: Option<String>,
+    hyperlinks: Vec<super::cell::Hyperlink>,
+    policy: &super::normalize::NormalizationPolicy,
+) -> ScreenState {
     let rows = screen.size().0;
     let cols = screen.size().1;
     let mut cells = Vec::with_capacity((rows * cols) as usize);
@@ -120,11 +139,11 @@ pub fn from_vt(
         viewport_text.push(rendered);
     }
 
-    // Structure hash: normalize per-row (item 19). We build the structure
-    // hash from row-normalized text so that volatile tokens like
-    // "CPU 37%" or "12:42:03" collapse properly across cells.
+    // Structure hash: normalize per-row (item 19) under the caller's policy
+    // (item 48 — contract volatile patterns feed the same normalization the
+    // built-in classes do).
     for (y, row) in viewport_text.iter().enumerate() {
-        let normalized = crate::screen::normalize::normalize_row(row);
+        let normalized = crate::screen::normalize::normalize_row_with(row, policy);
         let st_s = format!("{}:{}:{}", y, normalized, false);
         structure.update(st_s.as_bytes());
     }

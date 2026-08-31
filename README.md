@@ -2,6 +2,18 @@
 
 Agent-native TUI instrumentation, testing, exploration, and UX evaluation harness.
 
+## Support free inference
+
+If you found this project useful, please consider supporting
+[freeinference.org](https://freeinference.org). Open access to AI for
+everyone — not just those who can pay — is an important thing, and efforts
+toward it survive on community support.
+
+**Disclaimer:** freeinference.org has not reviewed, instructed, or sponsored
+this project. This is an independent effort with no affiliation, endorsement,
+or involvement of any kind claimed or implied — the pointer above is a
+recommendation, nothing more.
+
 ## Installation
 
 ```bash
@@ -189,6 +201,50 @@ Detect TUI framework and run native probes.
 
 **Actions:** `detect`, `capabilities`
 
+### tui_contract
+Design contracts: describe what the TUI is *supposed* to be in YAML, and check
+the running app against that description.
+
+**Actions:** `load`, `validate`, `status`, `compare`
+
+A contract declares viewports the layout must survive, components that must be
+present, interactions (a key sequence plus the oracle expressions that must
+hold after it), layout constraints, and standalone oracles:
+
+```yaml
+schema: { name: my-tui, version: "1" }
+escape_closes_modal: true
+reverse_tab_required: true
+volatile_patterns: ['\bCPU \d+%']
+components:
+  - { name: main-table, role: table, required: true }
+interactions:
+  - name: open-confirm
+    keys: ["n"]
+    expect: ['modal_open()', 'text_present("Confirm")']
+oracles:
+  - { id: host-field, expr: 'visible("Host")' }
+```
+
+`status` runs the full conformance check and returns PASS / WARN / FAIL per
+check group (document, component, interaction, layout, behavior) — driving the
+app where the claim requires it: interactions send their keys, the Escape and
+reverse-Tab properties are proven by observation, never assumed. `compare`
+diffs the current conformance against a stored baseline and names every
+regression (Pass→Fail) and fix (Fail→Pass); regressions become findings.
+Loading a contract also installs its `volatile_patterns` into the session's
+normalization policy, so declared-volatile tokens stop fragmenting structure
+hashes and the state graph.
+
+The oracle language (`focused("#field/host")`, `modal_open()`,
+`escape_closes_modal()`, `reverse_tab_is_inverse()`, `no_clipping()`,
+`text_present("...")`, …) is shared by contracts, `tui_assert
+assertion=oracle`, and scenario replay — one assertion language, three
+consumers. `tui_audit profile=contract` runs the loaded contract's checks and
+folds failures into the findings ledger; a loaded contract also feeds
+`tui_explore`: declared-but-never-exercised keys join the candidate queue
+citing the contract as evidence.
+
 ## Architecture
 
 ```
@@ -219,13 +275,14 @@ integrated until the real MCP path can exercise it.
 | Resize | working (single-record, backend-owned) |
 | State waits | working (causality-anchored) |
 | Semantic model | v3 (border graph + SemanticNode tree, modal layering, widget families, provenance-tracked enabled, OSC8 hyperlinks) |
-| MCP surface | working (12 tools, stdio E2E-proven) |
+| MCP surface | working (13 tools, stdio E2E-proven) |
 | Run lifecycle | working (ephemeral default, explicit persist/close) |
 | Checkpoints | working (durable under persistent runs) |
 | Scenarios | working (session+generation scoped, real replay) |
 | Recording | working (asciicast v3, PTY-boundary hook) |
-| Audits | working (active + static) |
-| Exploration | working (seeded, live transitions, budget-authoritative) |
+| Audits | working (active + static + contract conformance) |
+| Contracts | working (YAML/JSON load, oracle language, conformance PASS/FAIL/WARN, compare) |
+| Exploration | working (seeded, live transitions, budget-authoritative, contract-fed) |
 | Coverage | honest stub (tuicov optional executable) |
 | Framework probes | working (detection) |
 

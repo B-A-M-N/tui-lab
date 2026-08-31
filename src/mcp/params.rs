@@ -628,3 +628,23 @@ pub struct TuiFrameworkParams {
     #[serde(default)]
     pub source: Option<String>,
 }
+
+/// Wave E items 45–47: contract loading, validation, conformance status,
+/// and comparison against a saved baseline.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TuiContractParams {
+    /// load | validate | status | compare
+    pub action: String,
+    /// Path to the contract document (YAML or JSON).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Target session (defaults to the active one).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// compare: baseline label to compare against (defaults to "baseline").
+    #[serde(default)]
+    pub baseline: Option<String>,
+    /// compare: label for the current run being compared (defaults to "current").
+    #[serde(default)]
+    pub label: Option<String>,
+}

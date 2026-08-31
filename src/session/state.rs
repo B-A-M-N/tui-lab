@@ -340,6 +340,19 @@ impl Session {
         self.backend.capabilities()
     }
 
+    /// Item 48: apply a project contract's normalization policy to this
+    /// session's backend. Every subsequent structure hash normalizes the
+    /// contract's `volatile_patterns` on top of the built-in classes, so a
+    /// clock the contract declares volatile stops fragmenting the state
+    /// graph. Invalid patterns were rejected at contract load; this only
+    /// receives compiled policies.
+    pub fn set_normalization_policy(
+        &mut self,
+        policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
+    ) {
+        self.backend.set_normalization_policy(policy);
+    }
+
     /// Capabilities as they were when the session last (re)started.
     pub fn capabilities_at_start(&self) -> Capabilities {
         self.caps_at_start.clone()

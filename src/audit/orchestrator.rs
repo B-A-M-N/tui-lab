@@ -40,6 +40,10 @@ pub enum AuditProfile {
     /// Tab-order / reverse-traversal proof over the ID-keyed focus graph
     /// (active — Wave D item 37; previously a static placeholder).
     Navigation,
+    /// Contract conformance (Wave E item 49): run the loaded project
+    /// contract's checks and fold the results into findings. Requires a
+    /// contract to have been loaded (`tui_contract action=load`).
+    Contract,
     Color,
     Performance,
     Mouse,
@@ -60,13 +64,14 @@ impl AuditProfile {
             "clipping" => Ok(AuditProfile::Clipping),
             "discoverability" => Ok(AuditProfile::Discoverability),
             "navigation" => Ok(AuditProfile::Navigation),
+            "contract" => Ok(AuditProfile::Contract),
             "color" => Ok(AuditProfile::Color),
             "performance" => Ok(AuditProfile::Performance),
             "mouse" => Ok(AuditProfile::Mouse),
             "states" => Ok(AuditProfile::States),
             "errors" => Ok(AuditProfile::Errors),
             other => Err(format!(
-                "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, color, performance, mouse, states, errors",
+                "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors",
                 other
             )),
         }
@@ -83,6 +88,7 @@ impl AuditProfile {
                 | AuditProfile::Layout
                 | AuditProfile::Clipping
                 | AuditProfile::Navigation
+                | AuditProfile::Contract
         )
     }
 
@@ -107,11 +113,40 @@ pub struct ProfileReport {
 
 /// Run one audit profile against a session (re-review P0 fix 2). The engine
 /// decides static-vs-active; the caller never interprets profile names.
+/// `contract` feeds `profile=contract` (Wave E item 49); other profiles
+/// ignore it.
 pub fn run_profile(
     session: &mut Session,
     profile_name: &str,
 ) -> Result<ProfileReport, String> {
+    run_profile_with_contract(session, profile_name, None)
+}
+
+/// Contract-armed variant: `profile=contract` requires the loaded contract.
+pub fn run_profile_with_contract(
+    session: &mut Session,
+    profile_name: &str,
+    contract: Option<&crate::design::ProjectContract>,
+) -> Result<ProfileReport, String> {
     let profile = AuditProfile::parse(profile_name)?;
+
+    // Contract profile: conformance results folded into findings.
+    if profile == AuditProfile::Contract {
+        let Some(contract) = contract else {
+            return Err(
+                "profile 'contract' requires a loaded contract — call tui_contract action=load first"
+                    .to_string(),
+            );
+        };
+        let report = crate::design::check_contract(session, contract)
+            .map_err(|e| format!("contract check failed: {e}"))?;
+        return Ok(ProfileReport {
+            profile,
+            mode: "composite",
+            findings: report.findings(),
+            focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+        });
+    }
 
     // Placeholder classes: honest info finding, no fake rigor.
     if !profile.is_active() {

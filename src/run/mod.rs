@@ -192,6 +192,14 @@ pub struct RunContext {
     /// (session id, events). Filled by the MCP layer before flush; written
     /// to `events/<session>.jsonl` when the run persists.
     held_events: Vec<(String, Vec<crate::events::TerminalEvent>)>,
+    /// The loaded project contract (Wave E item 39): feeds conformance
+    /// checks, exploration candidates, and audits.
+    contract: Option<crate::design::ProjectContract>,
+    /// Where that contract was loaded from (display/evidence).
+    contract_path: Option<String>,
+    /// Conformance baselines for `compare` (Wave E item 47): label → the
+    /// report captured under that label.
+    contract_baselines: HashMap<String, crate::design::ContractReport>,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
 }
@@ -223,6 +231,9 @@ impl RunContext {
             artifacts: Vec::new(),
             ledger_flushed_upto: 0,
             held_events: Vec::new(),
+            contract: None,
+            contract_path: None,
+            contract_baselines: HashMap::new(),
             closed: false,
         }
     }
@@ -292,6 +303,49 @@ impl RunContext {
 
     pub fn first_available_seq(&self) -> Option<u64> {
         self.first_available_seq
+    }
+
+    // ── Contracts (Wave E items 39–49) ──────────────────────────────────
+
+    /// The loaded project contract, if any. Feeds exploration candidates
+    /// (item 49) and `tui_contract status/compare`.
+    pub fn contract(&self) -> Option<&crate::design::ProjectContract> {
+        self.contract.as_ref()
+    }
+
+    /// Record the loaded contract (replaces any previous one — the newest
+    /// contract wins, matching the tool's load semantics).
+    pub fn set_contract(
+        &mut self,
+        contract: crate::design::ProjectContract,
+        path: String,
+    ) {
+        self.contract = Some(contract);
+        self.contract_path = Some(path);
+        self.write_manifest().ok();
+    }
+
+    /// Where the current contract was loaded from.
+    pub fn contract_path(&self) -> Option<&str> {
+        self.contract_path.as_deref()
+    }
+
+    /// Named conformance baselines for `tui_contract compare`: label →
+    /// report. `status` writes "baseline" (the first trusted state);
+    /// `compare` writes the label it was given so later comparisons have
+    /// history.
+    pub fn contract_baselines(
+        &self,
+    ) -> &HashMap<String, crate::design::ContractReport> {
+        &self.contract_baselines
+    }
+
+    pub fn record_contract_baseline(
+        &mut self,
+        label: &str,
+        report: &crate::design::ContractReport,
+    ) {
+        self.contract_baselines.insert(label.to_string(), report.clone());
     }
 
     /// Start recording a scenario bound to one session generation. Returns
@@ -784,6 +838,15 @@ impl RunContext {
             "closed": self.closed,
             "primary_session_cwd": self.primary_session_cwd().map(str::to_string),
             "counts": self.counts(),
+            "contract": self.contract.as_ref().map(|c| json!({
+                "name": c.schema.name,
+                "version": c.schema.version,
+                "path": self.contract_path,
+                "components": c.components.len(),
+                "interactions": c.interactions.len(),
+                "oracles": c.oracles.len(),
+            })),
+            "contract_baselines": self.contract_baselines.keys().cloned().collect::<Vec<_>>(),
             "artifacts": self.artifacts.iter().map(|a| serde_json::json!({
                 "id": a.id,
                 "kind": a.kind,
