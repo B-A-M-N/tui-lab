@@ -660,6 +660,7 @@ mod tests {
             cells: vec![],
             viewport_text: vec![],
             scrollback: vec![],
+            hyperlinks: Vec::new(),
             raw_hash: "r".into(),
             visual_hash: "v".into(),
             structure_hash: hash.into(),
