@@ -38,7 +38,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_act",
-        summary: "Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema).",
+        summary: "Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how \"done\" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.",
         selector: None,
     },
     ToolCapability {
@@ -95,6 +95,13 @@ pub const TOOLS: &[ToolCapability] = &[
         name: "tui_contract",
         summary: "Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).",
         selector: Some(("action", <crate::mcp::params::ContractAction as EnumVariants>::VARIANTS)),
+    },
+    ToolCapability {
+        name: "tui_explain",
+        // `finding_id` is an open set (any recorded finding), not a closed
+        // selector — like `tui_act`.
+        summary: "Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.",
+        selector: None,
     },
 ];
 

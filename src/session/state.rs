@@ -7,7 +7,7 @@
 //! generation of the same logical session, not a replacement.
 
 use crate::backend::{
-    Capabilities, LineCliBackend, PortablePtyBackend, RecordingHook, RecordingHookSlot,
+    Capabilities, PortablePtyBackend, PtyLineBackend, RecordingHook, RecordingHookSlot,
     TerminalBackend, TerminalEventState, WaitCond, WaitOutcome,
 };
 use crate::recording::AsciicastRecorder;
@@ -98,6 +98,11 @@ pub struct Session {
     /// reconnecting consumer resumes where it left off, but reading is
     /// stateless — `events_since` never mutates a cursor implicitly.
     cursors: std::collections::HashMap<String, u64>,
+    /// Per-frame semantic cache (Wave G review): repeated `semantic::analyze`
+    /// on an unchanged frame (same `structure_hash`) is served from cache
+    /// instead of re-running all seven detectors. Interior-mutated by the
+    /// read-only `analyze_frame` path.
+    semantic_cache: std::cell::RefCell<crate::semantic::SemanticCache>,
     /// Wave F items 58–63: the NativeSemanticProtocol side channel. The
     /// session creates it at start and injects `TUI_LAB_SEMANTIC` into the
     /// child's env; cooperative apps write their real semantic tree there
@@ -141,9 +146,13 @@ impl Session {
     fn make_backend(kind: &str, cols: u16, rows: u16) -> anyhow::Result<Box<dyn TerminalBackend>> {
         match kind {
             "auto" | "portable_vt100" => Ok(Box::new(PortablePtyBackend::new(cols, rows))),
-            "cli" | "line_cli" => Ok(Box::new(LineCliBackend::new(cols, rows))),
+            "cli" | "line_cli" => Ok(Box::new(PtyLineBackend::new(cols, rows))),
+            // True pipe semantics (no PTY, isatty() false), genuine
+            // stdout/stderr separation (review P1 #28). Implements the trait
+            // and reports working behavior.
+            "pipe" => Ok(Box::new(crate::backend::pipe::PipeBackend::new(cols, rows))),
             other => Err(anyhow::anyhow!(
-                "unknown backend '{}' (supported: auto, portable_vt100, cli)",
+                "unknown backend '{}' (supported: auto, portable_vt100, cli, pipe)",
                 other
             )),
         }
@@ -166,6 +175,7 @@ impl Session {
             next_anchor_seq: 0,
             events: crate::events::TerminalEventQueue::new(),
             cursors: std::collections::HashMap::new(),
+            semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
             native: crate::semantic::native::NativeChannel::default(),
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
@@ -398,6 +408,20 @@ impl Session {
         self.backend.capabilities()
     }
 
+    /// Evidence-backed terminal profile for this session (Wave G review P1/P2
+    /// 16): lifts the live [`Capabilities`] into per-feature rows that each
+    /// carry the observation that proved (or failed to prove) the capability,
+    /// so an agent never assumes mouse/kitty/title that was never negotiated.
+    pub fn terminal_profile(&mut self) -> crate::terminal::TerminalProfile {
+        let caps = self.capabilities();
+        // The backend enumerates observation from the live backend, so no
+        // foreign evidence map is needed here.
+        crate::terminal::TerminalProfile::build(
+            caps,
+            &std::collections::HashMap::new(),
+        )
+    }
+
     /// Item 48: apply a project contract's normalization policy to this
     /// session's backend. Every subsequent structure hash normalizes the
     /// contract's `volatile_patterns` on top of the built-in classes, so a
@@ -445,9 +469,14 @@ impl Session {
         // and the backend is told to drop inherited env for clean/strict.
         let isolation = crate::session::isolation::Isolation::parse(&spec.isolation)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let effective_env = isolation.effective_env(&spec.env);
-        let (command, args, network_isolated) =
+        // Session-unique scratch HOME/TMPDIR keyed by (id, generation).
+        let effective_env = isolation.effective_env(&self.id, self.generation, &spec.env);
+        let (command, args, wrapper_available, network_isolated) =
             isolation.apply_to_command(&spec.command, &spec.args);
+        let requested_network_ns = matches!(
+            isolation,
+            crate::session::isolation::Isolation::Strict
+        );
         self.backend.set_clear_env(!matches!(
             isolation,
             crate::session::isolation::Isolation::Local
@@ -484,9 +513,14 @@ impl Session {
         self.caps_at_start = self.backend.capabilities();
         self.command = command.clone();
         // Evidence of what actually launched (item 77) — kept per generation.
+        // `launch_succeeded` is set only here, after `backend.start()` above
+        // returned Ok: the wrapper (if any) actually brought the child up.
         self.isolation_evidence = Some(crate::session::isolation::IsolationEvidence::for_profile(
             isolation,
+            requested_network_ns,
+            wrapper_available,
             network_isolated,
+            true,
             &effective_env
                 .iter()
                 .map(|(k, _)| k.clone())
@@ -650,6 +684,16 @@ impl Session {
     /// Current event sequence state (for action-anchored waits).
     pub fn event_state(&self) -> TerminalEventState {
         self.backend.event_state()
+    }
+
+    /// Semantic analysis of the last settled frame, served from the per-session
+    /// [`crate::semantic::SemanticCache`]. Returns `None` when no observation
+    /// has happened yet. The cache is keyed on `ScreenState::structure_hash`, so
+    /// an unchanged frame returns instantly instead of re-running all seven
+    /// detectors (Wave G review P1 15/16).
+    pub fn analyze_frame(&self) -> Option<crate::semantic::CacheResult> {
+        let screen = self.last()?;
+        Some(self.semantic_cache.borrow_mut().analyze(screen))
     }
 
     /// Send input. When recording, the backend has already delivered the exact

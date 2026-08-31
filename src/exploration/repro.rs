@@ -321,12 +321,13 @@ mod tests {
     /// Item 38: the pipeline confirms reproduction before saving a
     /// scenario. These tests run the pure parts; the live restart-replay
     /// path is exercised end-to-end by the e2e suite against the fixture.
-    #[test]
-    fn empty_trace_never_reproduces() {
+    #[tokio::test]
+    async fn empty_trace_never_reproduces() {
         // A real session (cheap python sleeper): the empty trace must
-        // short-circuit before it is touched.
-        let mut mgr = crate::session::manager::SessionManager::new();
-        let id = mgr
+        // short-circuit before it is touched. Actor-backed launch (the
+        // legacy blocking SessionManager is removed).
+        let pool = crate::session::SessionPool::new();
+        let id = pool
             .start(
                 "python3",
                 &["-c".into(), "print('repro-empty'); input()".to_string()],
@@ -337,12 +338,16 @@ mod tests {
                 "auto",
                 "local",
             )
+            .await
             .expect("start");
-        let sess = mgr.resolve_mut(Some(&id)).expect("session");
-        let pipeline = minimize_crash(sess, &[], FailureKind::Crash, "t");
+        let pipeline = pool
+            .with_session(Some(&id), |s| minimize_crash(s, &[], FailureKind::Crash, "t"))
+            .await
+            .expect("actor run");
         assert!(!pipeline.reproduced);
         assert!(pipeline.scenario_id().is_none());
         assert_eq!(pipeline.original_len, 0);
+        pool.stop(&id).await.ok();
     }
 
     /// The saved scenario shape: acts carry tagged canonical JSON; the

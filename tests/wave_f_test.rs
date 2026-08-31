@@ -7,15 +7,16 @@
 
 use std::time::Duration;
 
-use tui_lab::backend::line_cli::LineCliBackend;
+use tui_lab::backend::line_cli::PtyLineBackend;
+use tui_lab::backend::pipe::PipeBackend;
 use tui_lab::backend::portable_pty::PortablePtyBackend;
 use tui_lab::backend::{
     Capabilities, CommandState, Input, KeyCode, KeyEvent, SearchHit, TerminalBackend, WaitCond,
 };
 
 /// Spawn a child that prints lines slowly (CLI-style output).
-fn cli_backend(script: &str) -> LineCliBackend {
-    let mut b = LineCliBackend::new(80, 24);
+fn cli_backend(script: &str) -> PtyLineBackend {
+    let mut b = PtyLineBackend::new(80, 24);
     b.start(
         "python3",
         &["-c".to_string(), script.to_string()],
@@ -25,6 +26,22 @@ fn cli_backend(script: &str) -> LineCliBackend {
         24,
     )
     .expect("start python");
+    b
+}
+
+/// Spawn a child under genuine pipes (no PTY) — `isatty()` is false for the
+/// child, which is the whole point of the pipe transport.
+fn pipe_backend(script: &str) -> PipeBackend {
+    let mut b = PipeBackend::new(80, 24);
+    b.start(
+        "python3",
+        &["-c".to_string(), script.to_string()],
+        None,
+        &[],
+        80,
+        24,
+    )
+    .expect("start python via pipes");
     b
 }
 
@@ -42,7 +59,7 @@ fn pty_backend(script: &str) -> PortablePtyBackend {
     b
 }
 
-// ── Items 50–51: LineCliBackend ─────────────────────────────────────────
+// ── Items 50–51: PtyLineBackend ─────────────────────────────────────────
 
 #[test]
 fn line_cli_output_becomes_lines_with_scrollback() {
@@ -91,6 +108,54 @@ fn line_cli_text_input_reaches_child() {
         .wait(WaitCond::Text("HELLO ada".into()), Duration::from_secs(5))
         .expect("wait");
     assert!(out.met, "child must see the piped input");
+    b.stop().ok();
+}
+
+/// Regression for review item "unterminated prompts lose visibility":
+/// a prompt that has not received a newline must be rendered as the live
+/// viewport line, and its mutation (no `\n`) must advance `screen_seq` so an
+/// anchored ScreenStable/ScreenChange wait is satisfied by a real visible
+/// change rather than sleeping past it.
+#[test]
+fn line_cli_pending_prompt_is_visible_and_moves_screen_seq() {
+    let mut b = cli_backend(
+        "import sys,time\n\
+         sys.stdout.write('Enter value> ') ; sys.stdout.flush()\n\
+         time.sleep(0.8)\n\
+         sys.stdout.write('Enter value> x') ; sys.stdout.flush()\n\
+         time.sleep(0.8)\n\
+         print('done')\n\
+         time.sleep(1)",
+    );
+    // First wait: the unterminated prompt appears even with no newline yet.
+    let out = b
+        .wait(
+            WaitCond::Text("Enter value> ".into()),
+            Duration::from_secs(5),
+        )
+        .expect("wait prompt");
+    assert!(out.met, "unterminated prompt must be visible");
+    assert!(
+        out.screen_seq > 0,
+        "a visible live line must have moved screen_seq"
+    );
+
+    // The pending line mutates ('Enter value> ' -> 'Enter value> x') without
+    // committing a line. That is a visible change and must advance screen_seq
+    // again; otherwise a wait anchored on the prior seq would be satisfied
+    // before the mutating output landed.
+    let baseline_seq = out.screen_seq;
+    let out2 = b
+        .wait(WaitCond::Text("x".into()), Duration::from_secs(5))
+        .expect("wait mutation");
+    assert!(out2.met, "mutated pending line must be visible");
+    assert!(
+        out2.screen_seq > baseline_seq,
+        "pending mutation must advance screen_seq ({} -> {})",
+        baseline_seq,
+        out2.screen_seq
+    );
+
     b.stop().ok();
 }
 
@@ -429,4 +494,124 @@ fn command_state_tracks_osc133_edges() {
     assert!(!cs.running, "command finished");
     assert_eq!(cs.last_exit, Some(0), "exit status parsed from 133;D;0");
     b.stop().ok();
+}
+
+// ── PipeBackend (review P0 #1): genuine pipes, stdout/stderr separation ──
+
+/// The pipe transport is NOT a terminal: the child must see `isatty()`
+/// false on stdin/stdout/stderr — the exact behavior a real `<cmd> | …`
+/// redirect would produce. This is what "genuine pipe semantics" buys.
+#[test]
+fn pipe_child_sees_no_tty() {
+    let mut b = pipe_backend(
+        "import os,sys\n\
+         sys.stdout.write(f'IN-{os.isatty(0)} OUT-{os.isatty(1)} ERR-{os.isatty(2)}')\n\
+         sys.stdout.flush()\n\
+         import time; time.sleep(1)",
+    );
+    let out = b
+        .wait(WaitCond::Text("IN-False OUT-False ERR-False".into()), Duration::from_secs(5))
+        .expect("wait");
+    assert!(
+        out.met,
+        "child must observe no TTY on any fd (all False): state={:?}",
+        out.state.viewport_text
+    );
+    b.stop().ok();
+}
+
+/// Review P1 #28: genuine stdout/stderr separation. A child writing to both
+/// file descriptors must surface each stream distinctly — the fused screen
+/// interleaves them, but `stdout_lines()` / `stderr_lines()` keep them apart.
+#[test]
+fn pipe_separates_stdout_from_stderr() {
+    let mut b = pipe_backend(
+        "import sys\n\
+         sys.stdout.write('OUT-APPLE\\n')\n\
+         sys.stdout.flush()\n\
+         sys.stderr.write('ERR-BANANA\\n')\n\
+         sys.stderr.flush()\n\
+         sys.stdout.write('OUT-CHERRY\\n')\n\
+         sys.stdout.flush()\n\
+         import time; time.sleep(1)",
+    );
+    let _ = b.wait(WaitCond::Text("OUT-CHERRY".into()), Duration::from_secs(5));
+    let out = b.stdout_lines();
+    let err = b.stderr_lines();
+    assert!(out.iter().any(|l| l.contains("OUT-APPLE")), "stdout: {out:?}");
+    assert!(out.iter().any(|l| l.contains("OUT-CHERRY")), "stdout: {out:?}");
+    assert!(!out.iter().any(|l| l.contains("BANANA")), "stdout polluted: {out:?}");
+    assert!(err.iter().any(|l| l.contains("ERR-BANANA")), "stderr: {err:?}");
+    assert!(!err.iter().any(|l| l.contains("APPLE")), "stderr polluted: {err:?}");
+    b.stop().ok();
+}
+
+/// The pipe screen model mirrors the line backend: output splits into the
+/// (bounded) line history, the last `rows` lines render as the viewport and
+/// the rest is scrollback — real and searchable, exactly like a terminal
+/// consumer would see the interleaved stream.
+#[test]
+fn pipe_screen_has_viewport_scrollback_and_search() {
+    let mut b = pipe_backend(
+        "import sys,time\n\
+         sys.stderr.write('TOP-STDERR\\n'); sys.stderr.flush()\n\
+         for i in range(30):\n\
+         \x20   print(f'pl-{i}')\n\
+         \x20   sys.stdout.flush()\n\
+         \x20   time.sleep(0.01)\n\
+         time.sleep(1)",
+    );
+    let _ = b.wait(WaitCond::Text("pl-29".into()), Duration::from_secs(10));
+    let st = b.state().expect("state");
+    // Scrollback is real (interleaved stderr earlier + evicted stdout rows).
+    assert!(
+        st.scrollback.iter().any(|r| r.contains("TOP-STDERR")),
+        "stderr line appears in history: {}",
+        st.scrollback.len()
+    );
+    // Search covers history (the evicted-from-viewport early pl-* rows).
+    let hits = b.search("pl-0").expect("search");
+    assert!(hits.iter().any(|h: &SearchHit| h.region == "scrollback"), "{hits:?}");
+    // Honest capability: real history, no terminal grid features.
+    let caps: Capabilities = b.capabilities();
+    assert!(caps.scrollback);
+    assert!(!caps.mouse && !caps.colors && !caps.title);
+    b.stop().ok();
+}
+
+/// A short pipe child exits; `ProcessExit` must surface the real code.
+#[test]
+fn pipe_reports_exit_status() {
+    let mut b = pipe_backend("import sys; sys.exit(7)\n");
+    let out = b
+        .wait(WaitCond::ProcessExit, Duration::from_secs(5))
+        .expect("wait exit");
+    assert!(out.met, "short script exits");
+    let st = b.process();
+    assert!(!st.running, "finished");
+    assert_eq!(st.exit_code, Some(7), "exit code surfaced from the pipe child");
+    b.stop().ok();
+}
+
+/// `pipe` is selectable through the session's `make_backend`, not just the
+/// trait directly — the whole MCP surface can drive a genuine-pipe session.
+#[test]
+fn pipe_is_selectable_backend() {
+    use tui_lab::session::state::{LaunchSpec, Session};
+
+    let mut sess = Session::new("pipe-test".into(), "python3".into());
+    let spec = LaunchSpec {
+        command: "python3".into(),
+        args: vec!["-c".into(), "print('PIPE-LIVE')\n".into()],
+        cwd: None,
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        backend: "pipe".into(),
+        isolation: "local".into(),
+    };
+    sess.start_with_spec(spec).expect("start pipe session");
+    let text = sess.observe(40).expect("observe").viewport_text.join("\n");
+    assert!(text.contains("PIPE-LIVE"), "{text}");
+    sess.stop().ok();
 }

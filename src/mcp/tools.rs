@@ -35,6 +35,16 @@ pub struct TuiLabServer {
     run: Arc<std::sync::Mutex<crate::run::RunContext>>,
 }
 
+/// Which named view of a session a `tui://sessions/<id>/<view>` resource
+/// resolves to. `TerminalProfile` is observationally pure — it never forces a
+/// screen settle, unlike the screen-backed views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionView {
+    TerminalProfile,
+    Semantic,
+    Screen,
+}
+
 impl TuiLabServer {
     pub fn new() -> Self {
         TuiLabServer {
@@ -112,12 +122,16 @@ impl TuiLabServer {
                 Some((sid, view)) => (sid, view.trim_end_matches('/')),
                 None => (rest, ""),
             };
-            let semantic_view = match view {
-                "semantic" => true,
-                "screen" => false,
+            let session_view = match view {
+                // TerminalProfile needs no screen: it reads the live backend
+                // capabilities without triggering an observation.
+                "terminal-profile" => SessionView::TerminalProfile,
+                "semantic" => SessionView::Semantic,
+                "screen" => SessionView::Screen,
                 other => {
                     return Err(not_found(format!(
-                        "unknown session resource view '{other}' (expected 'semantic' or 'screen')"
+                        "unknown session resource view '{other}' (expected \
+                         'terminal-profile', 'semantic', or 'screen')"
                     )))
                 }
             };
@@ -127,10 +141,37 @@ impl TuiLabServer {
                 .sessions
                 .with_session(Some(&selector), move |s| {
                     let selector = in_job;
-                    let screen = s.observe(40).ok()?;
-                    if semantic_view {
-                        let sem = semantic::analyze(&screen);
-                        Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
+                    if let SessionView::TerminalProfile = session_view {
+                        // Evidence-backed capability report, no screen settle.
+                        let profile = s.terminal_profile();
+                        return Some(
+                            serde_json::to_string_pretty(&profile).unwrap_or_default(),
+                        );
+                    }
+                    // Passive resource read: consume the latest COMMITTED
+                    // frame without triggering a settle cycle and WITHOUT
+                    // advancing the session-global previous/current baseline.
+                    // The explicit `observe()` path (tui_observe) is the only
+                    // thing that should move a consumer's diff cursor; a peek
+                    // at the screen must be observationally pure. We only
+                    // settle once to establish a first frame if none exists
+                    // (a freshly-started session that was never observed).
+                    let screen = match s.last() {
+                        Some(f) => f.clone(),
+                        None => s.observe(40).ok()?,
+                    };
+                    if matches!(session_view, SessionView::Semantic) {
+                        // Serve from the per-session semantic cache when the
+                        // frame is unchanged (same structure_hash); only a
+                        // genuinely new screen re-runs the seven detectors.
+                        let cached = s.analyze_frame();
+                        match cached {
+                            Some(cr) => Some(serde_json::to_string_pretty(&cr.sem).unwrap_or_default()),
+                            None => {
+                                let sem = semantic::analyze(&screen);
+                                Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
+                            }
+                        }
                     } else {
                         Some(
                             serde_json::to_string_pretty(&serde_json::json!({
@@ -459,17 +500,41 @@ impl TuiLabServer {
         let selector = p.id.clone();
         let run = self.run.clone();
         self.with_sess(selector.as_deref(), move |sess| {
-            let screen = match sess.observe(p.idle_ms.unwrap_or(80)) {
-                Ok(s) => s,
-                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+            // Lazy screen capture (re-review item 5): only the modes that
+            // render a screen need to pay a settle cycle and advance the
+            // session baseline. `changes`/`scrollback`/`search`/
+            // `command_state` read their own retained state instead, so they
+            // cost no PTY round-trip and do NOT move `previous` — a passive
+            // read must not re-anchor someone's diff baseline.
+            let idle = p.idle_ms.unwrap_or(80);
+            // Returns the screen, or the error that already belongs to a
+            // `return err(...)` in the calling arm (the callback body is not a
+            // Result, so `?` is not available — the call sites match instead).
+            let sweep = |s: &mut crate::session::Session| {
+                match s.observe(idle) {
+                    Ok(screen) => {
+                        run.lock().unwrap().bump_event();
+                        Ok(screen)
+                    }
+                    Err(e) => Err((ErrorCategory::BackendError, e.to_string())),
+                }
             };
-            run.lock().unwrap().bump_event();
+            // First error from a lazy screen capture short-circuits the arm.
+            macro_rules! cap {
+                () => {
+                    match sweep(sess) {
+                        Ok(screen) => screen,
+                        Err((c, m)) => return err(c, m),
+                    }
+                };
+            }
 
             if mode.known().is_none() {
                 unreachable!("validated above");
             }
         match mode.known().copied().unwrap() {
             OM::Summary => {
+                let screen = cap!();
                 // Compact summary for agent consumption (spec 36). Avoids
                 // returning the full viewport text (which could be 160x50).
                 // Use mode=screen for full text.
@@ -534,9 +599,16 @@ impl TuiLabServer {
                     },
                 }))
             }
-            OM::Screen => ok(json!({ "viewport_text": screen.viewport_text })),
-            OM::Cells => ok(json!({ "cells": screen.cells })),
+            OM::Screen => {
+                let screen = cap!();
+                ok(json!({ "viewport_text": screen.viewport_text }))
+            }
+            OM::Cells => {
+                let screen = cap!();
+                ok(json!({ "cells": screen.cells }))
+            }
             OM::Semantic => {
+                let screen = cap!();
                 let sem = semantic::analyze(&screen);
                 ok(json!({ "semantic": sem }))
             }
@@ -545,6 +617,7 @@ impl TuiLabServer {
             // screen-level components attached. This is the shape to compare
             // against an intended design without re-deriving containment.
             OM::Tree => {
+                let screen = cap!();
                 let sem = semantic::analyze(&screen);
                 let tree = semantic::build_state_tree(
                     screen.cols,
@@ -564,6 +637,7 @@ impl TuiLabServer {
             // side channel, its real tree is merged over inference and the
             // merge report names what matched.
             OM::Nodes => {
+                let screen = cap!();
                 let mut tree = semantic::build_tree(&screen);
                 let native_report = sess.overlay_native(&mut tree);
                 ok(json!({
@@ -582,7 +656,8 @@ impl TuiLabServer {
                 }))
             }
             OM::Diff => {
-                // ONE diff path (re-review item 7): observe() above stashed
+                let screen = cap!();
+                // ONE diff path (re-review item 7): the sweep above stashed
                 // the prior frame in `previous`, so this is a real
                 // previous→current comparison through the canonical
                 // `screen::diff`, returning the same `Transition` shape used
@@ -709,18 +784,25 @@ impl TuiLabServer {
         let quiet = p.wait_ms().unwrap_or(150);
         let selector = p.id().map(str::to_string);
         let run = self.run.clone();
+        // Review P0 rigidity #4: an agent may declare how "done" means for this
+        // action. A declared completion overrides the default "screen settles"
+        // so silent/exit/signal actions are classified honestly (never a false
+        // `settled=false`). `Resize`/`Signal` have no settle semantics and
+        // always resolve the default.
+        let completion = p.completion().unwrap_or(crate::capture::CompletionPolicy::StableScreen);
         self.with_sess(selector.as_deref(), move |sess| {
             // Wave G item 76: a live human control lease blocks driving.
             if let Some(refused) = lease_refused(sess) {
                 return refused;
             }
-            let tx = match crate::execution::execute_act_with_visibility(
+            let tx = match crate::execution::execute_act_with_completion(
                 sess,
                 &action,
                 quiet,
                 quiet.saturating_add(1000),
                 p.no_wait(),
                 visibility,
+                completion,
             ) {
                 Ok(t) => t,
                 Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
@@ -2023,6 +2105,60 @@ impl TuiLabServer {
         .unwrap_or_else(|e| e)
     }
 
+    /// Explain a recorded finding (Wave G review P1/P2 16): trace its evidence
+    /// to the source that produced it, and condition the interpretation on the
+    /// session's live terminal profile.
+    #[tool(
+        name = "tui_explain",
+        description = "Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities the finding is conditional on."
+    )]
+    pub async fn tui_explain(&self, p: Parameters<TuiExplainParams>) -> rmcp::model::CallToolResult {
+        let p = p.0;
+        let run = self.run.clone();
+
+        // Resolve the finding from the run ledger.
+        let finding = {
+            let run = run.lock().unwrap();
+            run.findings()
+                .iter()
+                .find(|f| f.id == p.finding_id)
+                .cloned()
+        };
+        let finding = match finding {
+            Some(f) => f,
+            None => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown finding id '{}' — not in the current run (run '{}'); \
+                         re-run tui_audit or read tui://findings",
+                        p.finding_id,
+                        run.lock().unwrap().id,
+                    ),
+                );
+            }
+        };
+
+        // Explain it, optionally conditioned on a session's live profile.
+        let finding_for_job = finding.clone();
+        let selector = p.id.clone();
+        let explanation = match selector {
+            Some(id) => self
+                .with_sess(Some(&id), move |sess| {
+                    let profile = sess.terminal_profile();
+                    crate::terminal::explain::explain_finding(&finding_for_job, None, Some(&profile))
+                })
+                .await
+                .unwrap_or_else(|_e| {
+                    // Session lookup failed; explain without terminal context.
+                    crate::terminal::explain::explain_finding(&finding, None, None)
+                }),
+            None => crate::terminal::explain::explain_finding(&finding, None, None),
+        };
+
+        ok(serde_json::to_value(explanation).unwrap_or(serde_json::json!({})))
+    }
+
     /// Coverage (spec section 5; Wave F item 64). Two providers, merged:
     /// the optional tuicov executable and the NativeSemanticProtocol
     /// coverage events the run ledger accumulates.
@@ -2082,7 +2218,22 @@ impl TuiLabServer {
     ) -> rmcp::model::CallToolResult {
         let p = p.0;
         let cwd = p.cwd.clone().unwrap_or_else(|| ".".into());
-        let det = crate::framework::detect::detect(&cwd);
+        // Resolve the project root through the bounded-upward ProjectLocator
+        // BEFORE detection (re-review "frame detection makes a hidden
+        // manifest-is-in-cwd assumption"): a monorepo caller passing a nested
+        // package dir (`packages/foo/src`) should have the dependency scan run
+        // against the package boundary, not the nested dir with no manifest at
+        // that exact path. The locator never errors and degrades to `cwd` when
+        // no manifest is found, so no-manifest raw projects detect identically.
+        let project = crate::session::ProjectLocator::locate(None, &cwd);
+        let detect_cwd = project.root().to_string();
+        let mut det = crate::framework::detect::detect(&detect_cwd);
+        // Surface the resolved root as evidence so the agent sees *which*
+        // directory the detection ran against (and can pass an explicit one).
+        if project.root() != cwd {
+            det.evidence
+                .push(format!("resolved project root: {}", project.root()));
+        }
         use crate::mcp::params::FrameworkAction as FA;
         let Some(fw_action) = (match &p.action {
             crate::mcp::params::Known::Known(a) => Some(*a),

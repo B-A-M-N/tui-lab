@@ -81,7 +81,7 @@ attributes, cursor, title), not screenshots.
   - action: start, restart, stop, list, status, lease, release
 - `tui_observe` — Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state.
   - mode: summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history
-- `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema).
+- `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how "done" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.
 - `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
   - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output
 - `tui_assert` — Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
@@ -104,6 +104,7 @@ attributes, cursor, title), not screenshots.
   - action: status, persist, close, context, list, resume
 - `tui_contract` — Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).
   - action: load, validate, status, compare
+- `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
 
 ## Resources (tui://)
 

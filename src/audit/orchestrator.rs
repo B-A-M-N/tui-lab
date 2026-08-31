@@ -336,11 +336,12 @@ mod tests {
 
     /// The live orchestrator: `full` returns composite mode and includes
     /// findings from the active drivers (a static-only run cannot produce
-    /// keyboard-traversal evidence).
-    #[test]
-    fn full_profile_runs_active_drivers() {
-        let mut mgr = crate::session::manager::SessionManager::new();
-        let id = mgr
+    /// keyboard-traversal evidence). Runs against the actor-backed test
+    /// launch (the legacy blocking `SessionManager` is removed).
+    #[tokio::test]
+    async fn full_profile_runs_active_drivers() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
             .start(
                 "python3",
                 &["-c".into(), "print('audit-full'); input()".to_string()],
@@ -351,9 +352,13 @@ mod tests {
                 "auto",
                 "local",
             )
+            .await
             .expect("start");
-        let sess = mgr.resolve_mut(Some(&id)).expect("session");
-        let report = run_profile(sess, "full").expect("run full");
+        let report = pool
+            .with_session(Some(&id), |s| run_profile(s, "full"))
+            .await
+            .expect("actor run")
+            .expect("run full");
         assert_eq!(report.mode, "composite");
         // A plain python echo screen has little to audit, but the composite
         // must include the static passes AND have attempted the drivers.
@@ -370,12 +375,13 @@ mod tests {
             "static composite categories must be present: {:?}",
             cats
         );
+        pool.stop(&id).await.ok();
     }
 
-    #[test]
-    fn keyboard_profile_reports_active_mode() {
-        let mut mgr = crate::session::manager::SessionManager::new();
-        let id = mgr
+    #[tokio::test]
+    async fn keyboard_profile_reports_active_mode() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
             .start(
                 "python3",
                 &["-c".into(), "print('audit-kb'); input()".to_string()],
@@ -386,9 +392,14 @@ mod tests {
                 "auto",
                 "local",
             )
+            .await
             .expect("start");
-        let sess = mgr.resolve_mut(Some(&id)).expect("session");
-        let report = run_profile(sess, "keyboard").expect("run keyboard");
+        let report = pool
+            .with_session(Some(&id), |s| run_profile(s, "keyboard"))
+            .await
+            .expect("actor run")
+            .expect("run keyboard");
         assert_eq!(report.mode, "active");
+        pool.stop(&id).await.ok();
     }
 }

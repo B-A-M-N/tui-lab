@@ -55,41 +55,26 @@ impl Isolation {
 
     /// The environment actually handed to the child for this profile.
     ///
-    /// `inherited` is the server's captured environment. Returns the
-    /// effective pairs; the caller passes them to the backend verbatim.
-    pub fn effective_env(&self, inherited: &[(String, String)]) -> Vec<(String, String)> {
-        match self {
-            Isolation::Local => inherited.to_vec(),
-            Isolation::Clean | Isolation::Strict => {
-                let mut out: Vec<(String, String)> = Vec::new();
-                // Terminal-critical variables the harness itself relies on
-                // (color/term detection inside the child).
-                for key in ["TERM", "COLORTERM", "LANG", "LC_ALL"] {
-                    if let Some((_, v)) = inherited.iter().find(|(k, _)| k == key) {
-                        out.push((key.to_string(), v.clone()));
-                    }
-                }
-                if !out.iter().any(|(k, _)| k == "TERM") {
-                    out.push(("TERM".to_string(), "xterm-256color".to_string()));
-                }
-                // Fresh per-run scratch HOME/TMPDIR so user dotfiles and
-                // shared temp cannot leak between runs.
-                let tag = std::process::id();
-                let scratch = std::env::temp_dir().join(format!("tui-lab-{}-{}", tag, self.name()));
-                let home = scratch.join("home");
-                let tmp = scratch.join("tmp");
-                let _ = std::fs::create_dir_all(&home);
-                let _ = std::fs::create_dir_all(&tmp);
-                out.push(("HOME".to_string(), home.to_string_lossy().to_string()));
-                out.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
-                // Minimal PATH so `sh -c 'ls'` still resolves system tools.
-                out.push((
-                    "PATH".to_string(),
-                    "/usr/local/bin:/usr/bin:/bin".to_string(),
-                ));
-                out
-            }
-        }
+    /// `session_id` and `generation` key the scratch `HOME`/`TMPDIR` so
+    /// parallel sessions / restarted generations never collide (review P0:
+    /// session-unique scratch; the old per-process scratch leaked between
+    /// them). `inherited` is the server's captured environment. The effective
+    /// policy is spelled out in [`EnvironmentPolicy`] and applies here:
+    /// Local inherits, Clean/Strict run under `Hermetic` (fresh scratch + a
+    /// derived minimal PATH — honest, not a hardcoded list).
+    pub fn effective_env(
+        &self,
+        session_id: &str,
+        generation: u32,
+        inherited: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        use crate::session::scratch::{EnvironmentPolicy, ScratchDir};
+        let scratch = ScratchDir::resolve(session_id, generation, self.name());
+        let policy = match self {
+            Isolation::Local => EnvironmentPolicy::Inherit,
+            Isolation::Clean | Isolation::Strict => EnvironmentPolicy::Hermetic,
+        };
+        policy.effective_env(inherited, &scratch)
     }
 
     /// True when this profile runs the child under `unshare -n`.
@@ -98,44 +83,110 @@ impl Isolation {
     }
 
     /// Apply the profile to a launch command. Returns the rewritten
-    /// `(command, args)` plus the honest `network_isolated` verdict.
+    /// `(command, args)`, whether the `unshare` wrapper is present on PATH,
+    /// and the honest network-isolation verdict.
     ///
-    /// Strict runs `<child>` as `unshare --net -- <child>` when `unshare`
-    /// exists and creating a net namespace works; otherwise the launch
-    /// proceeds clean-but-networked and says so. `which unshare` is a real
-    /// PATH probe, not an assumption.
-    pub fn apply_to_command(&self, command: &str, args: &[String]) -> (String, Vec<String>, bool) {
+    /// Strict runs `<child>` as `unshare --net -- <child>` ONLY when `unshare`
+    /// is present AND an actual net namespace can be created. Merely checking
+    /// that the `unshare` executable exists is not evidence of isolation —
+    /// a host may have `unshare` installed while `unshare --net` fails with
+    /// `Operation not permitted` (containers, hardened kernels, seccomp). So
+    /// we preflight the exact namespace operation (`unshare --net true`):
+    ///
+    /// - executable absent → `wrapper_available=false`, `NotApplied`; launch
+    ///   proceeds clean-but-networked and says so.
+    /// - executable present, probe succeeds → `wrapper_available=true`,
+    ///   `Verified`; the child is wrapped.
+    /// - executable present, probe fails (e.g. not permitted) →
+    ///   `wrapper_available=true`, `Failed`; the launch CANNOT be isolated,
+    ///   so we do NOT wrap (a failed wrapper would just abort the child) and
+    ///   we report `Failed` honestly rather than claiming isolation.
+    ///
+    /// This is a pre-launch verdict; whether the wrapped child actually
+    /// started is captured separately (`IsolationEvidence.launch_succeeded`).
+    pub fn apply_to_command(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> (String, Vec<String>, bool, VerifiedState) {
         if !self.wants_network_ns() {
-            return (command.to_string(), args.to_vec(), false);
+            return (
+                command.to_string(),
+                args.to_vec(),
+                false,
+                VerifiedState::NotApplied,
+            );
         }
-        let unshare = std::process::Command::new("unshare")
+        // Presence of the executable: a cheap upper bound. Not proof.
+        let present = std::process::Command::new("unshare")
             .arg("--help")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if !unshare {
-            return (command.to_string(), args.to_vec(), false);
+        if !present {
+            return (
+                command.to_string(),
+                args.to_vec(),
+                false,
+                VerifiedState::NotApplied,
+            );
+        }
+        // Preflight the exact operation. If it cannot run (not permitted),
+        // isolation is Failed — do not wrap, do not claim success.
+        let probe_ok = std::process::Command::new("unshare")
+            .arg("--net")
+            .arg("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !probe_ok {
+            return (
+                command.to_string(),
+                args.to_vec(),
+                true,
+                VerifiedState::Failed,
+            );
         }
         let mut wrapped = vec!["--net".to_string(), "--".to_string()];
         wrapped.push(command.to_string());
         wrapped.extend(args.iter().cloned());
-        ("unshare".to_string(), wrapped, true)
+        ("unshare".to_string(), wrapped, true, VerifiedState::Verified)
     }
 }
 
 /// Evidence block describing what a launch actually got (status/launch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerifiedState { Verified, NotApplied, Unverified, Failed }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationEvidence {
     pub profile: String,
-    pub network_isolated: bool,
-    /// What was scrubbed or kept, for reproducibility.
+    pub requested: bool,
+    pub wrapper_available: bool,
+    pub launch_succeeded: bool,
+    pub network_isolated: VerifiedState,
     pub env_policy: String,
 }
 
 impl IsolationEvidence {
-    pub fn for_profile(profile: Isolation, network_isolated: bool, env_keys: &[String]) -> Self {
+    /// Build the evidence block from what actually happened at launch.
+    ///
+    /// `requested` is whether the caller asked for a namespace profile
+    /// (`Strict`); `wrapper_available` and `network_isolated` come from
+    /// `apply_to_command`'s pre-launch probe; `launch_succeeded` is the one
+    /// fact only the caller knows — it sets it after `backend.start()`.
+    pub fn for_profile(
+        profile: Isolation,
+        requested: bool,
+        wrapper_available: bool,
+        network_isolated: VerifiedState,
+        launch_succeeded: bool,
+        env_keys: &[String],
+    ) -> Self {
         let env_policy = match profile {
             Isolation::Local => format!("inherited ({} vars)", env_keys.len()),
             Isolation::Clean | Isolation::Strict => {
@@ -147,6 +198,9 @@ impl IsolationEvidence {
         };
         IsolationEvidence {
             profile: profile.name().to_string(),
+            requested,
+            wrapper_available,
+            launch_succeeded,
             network_isolated,
             env_policy,
         }
@@ -169,7 +223,7 @@ mod tests {
     #[test]
     fn local_inherits_everything() {
         let inh = vec![("SECRET_TOKEN".to_string(), "x".to_string())];
-        let eff = Isolation::Local.effective_env(&inh);
+        let eff = Isolation::Local.effective_env("s1", 1, &inh);
         assert_eq!(eff, inh);
     }
 
@@ -178,8 +232,9 @@ mod tests {
         let inh = vec![
             ("SECRET_TOKEN".to_string(), "x".to_string()),
             ("TERM".to_string(), "xterm-256color".to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
         ];
-        let eff = Isolation::Clean.effective_env(&inh);
+        let eff = Isolation::Clean.effective_env("s1", 1, &inh);
         assert!(!eff.iter().any(|(k, _)| k == "SECRET_TOKEN"));
         let home = eff
             .iter()
@@ -196,15 +251,44 @@ mod tests {
     }
 
     #[test]
-    fn strict_wraps_command_or_reports_honestly() {
-        let (cmd, args, isolated) = Isolation::Strict.apply_to_command("python3", &["-c".into()]);
-        if isolated {
-            assert_eq!(cmd, "unshare");
-            assert_eq!(args.first().map(String::as_str), Some("--net"));
-            assert_eq!(args.get(2).map(String::as_str), Some("python3"));
-        } else {
-            // Platform without unshare: honest false, command unchanged.
-            assert_eq!(cmd, "python3");
+    fn strict_preflights_net_ns_and_never_wraps_an_unproven_wrapper() {
+        let (cmd, args, wrapper_available, state) =
+            Isolation::Strict.apply_to_command("python3", &["-c".into()]);
+        match state {
+            VerifiedState::Verified => {
+                // The probe actually created a net namespace, so we wrapped.
+                assert!(wrapper_available);
+                assert_eq!(cmd, "unshare");
+                assert_eq!(args.first().map(String::as_str), Some("--net"));
+                assert_eq!(args.get(2).map(String::as_str), Some("python3"));
+            }
+            VerifiedState::Failed => {
+                // unshare present but the net-ns could not be created
+                // (e.g. operation not permitted). We must NOT wrap — a broken
+                // wrapper would just abort the child — and must say so.
+                assert!(wrapper_available);
+                assert_eq!(cmd, "python3");
+                assert!(!args.contains(&String::from("unshare")));
+            }
+            VerifiedState::NotApplied => {
+                // No unshare on this host: honest, command unchanged.
+                assert!(!wrapper_available);
+                assert_eq!(cmd, "python3");
+            }
+            VerifiedState::Unverified => {
+                // Unverified is not produced by the preflight path.
+                panic!("preflight should never be Unverified")
+            }
         }
+    }
+
+    #[test]
+    fn local_never_wraps() {
+        let (cmd, args, wrapper_available, state) =
+            Isolation::Local.apply_to_command("sh", &[]);
+        assert_eq!(cmd, "sh");
+        assert!(args.is_empty());
+        assert!(!wrapper_available);
+        assert_eq!(state, VerifiedState::NotApplied);
     }
 }
