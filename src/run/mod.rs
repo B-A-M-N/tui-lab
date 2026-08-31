@@ -155,6 +155,9 @@ pub struct RunContext {
     /// them into the durable root even when they were stopped while
     /// ephemeral). Keyed by suggested file name.
     held_recordings: Vec<(String, String)>,
+    /// Wave F item 57: screen captures held while the run is ephemeral
+    /// (name, bytes, format).
+    held_captures: Vec<(String, Vec<u8>, String)>,
     /// Focus-transition ledger: (unix_ms, session, from, to) recorded from
     /// semantic analysis of every observation. The run's focus graph.
     focus_transitions: Vec<(u64, String, Option<String>, Option<String>)>,
@@ -200,8 +203,27 @@ pub struct RunContext {
     /// Conformance baselines for `compare` (Wave E item 47): label → the
     /// report captured under that label.
     contract_baselines: HashMap<String, crate::design::ContractReport>,
+    /// Wave F item 64: native coverage ledger. Entries accumulate from
+    /// NativeSemanticProtocol `coverage` events: target → (hits, sessions).
+    /// This is interaction-correlated coverage: "did my last act exercise
+    /// new app code" is answerable by diffing before/after a step.
+    pub coverage_ledger: std::collections::BTreeMap<String, CoverageEntry>,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
+}
+
+/// One native coverage entry (Wave F item 64): an app-declared coverage
+/// target (file:line, widget id, function name) plus its hit statistics.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoverageEntry {
+    /// Total hits declared by the app.
+    pub hits: u64,
+    /// Sessions that reported this target.
+    pub sessions: Vec<String>,
+    /// Unix-millis of the first report.
+    pub first_seen: u64,
+    /// Unix-millis of the last report.
+    pub last_seen: u64,
 }
 
 impl RunContext {
@@ -220,6 +242,7 @@ impl RunContext {
             saved_scenarios: HashMap::new(),
             scenario_names: HashMap::new(),
             held_recordings: Vec::new(),
+            held_captures: Vec::new(),
             focus_transitions: Vec::new(),
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
@@ -234,6 +257,7 @@ impl RunContext {
             contract: None,
             contract_path: None,
             contract_baselines: HashMap::new(),
+            coverage_ledger: std::collections::BTreeMap::new(),
             closed: false,
         }
     }
@@ -657,6 +681,52 @@ impl RunContext {
         self.held_recordings.push((file_name, ndjson));
     }
 
+    /// Wave F item 57: retain a screen capture (SVG/PNG bytes) in run
+    /// memory while ephemeral; `flush` writes it under `captures/`.
+    pub fn hold_capture(&mut self, file_name: String, body: Vec<u8>, format: &str) {
+        self.held_captures.push((file_name, body, format.to_string()));
+    }
+
+    /// Wave F item 64: fold one native coverage event into the ledger.
+    /// Target strings are app-declared (`src/main.rs:42`, `#save.activate`);
+    /// the ledger only counts and correlates, never interprets.
+    pub fn record_coverage_event(&mut self, session: &str, target: &str) {
+        if target.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let entry = self
+            .coverage_ledger
+            .entry(target.to_string())
+            .or_insert_with(|| CoverageEntry {
+                hits: 0,
+                sessions: Vec::new(),
+                first_seen: now,
+                last_seen: now,
+            });
+        entry.hits += 1;
+        entry.last_seen = now;
+        if !entry.sessions.iter().any(|s| s == session) {
+            entry.sessions.push(session.to_string());
+        }
+    }
+
+    /// Wave F item 64: collect coverage events from a session's native
+    /// channel into the ledger. Returns how many events were folded in.
+    pub fn collect_native_coverage(&mut self, session: &str, channel: &crate::semantic::native::NativeChannel) -> usize {
+        let events: Vec<(u64, String, String)> = channel
+            .events
+            .iter()
+            .filter(|(_, event, _)| event == "coverage")
+            .cloned()
+            .collect();
+        let n = events.len();
+        for (_, _, target) in events {
+            self.record_coverage_event(session, &target);
+        }
+        n
+    }
+
     /// Recordings held in memory (name + event count preview).
     pub fn held_recordings(&self) -> Vec<serde_json::Value> {
         self.held_recordings
@@ -951,12 +1021,37 @@ impl RunContext {
             }
         }
         self.held_recordings = still_held;
+        // Wave F item 57: screen captures held while ephemeral.
+        let cap_dir = dir.join("captures");
+        std::fs::create_dir_all(&cap_dir)?;
+        let mut still_held_caps = Vec::new();
+        for (name, body, format) in std::mem::take(&mut self.held_captures) {
+            match std::fs::write(cap_dir.join(&name), &body) {
+                Ok(()) => {
+                    self.register_artifact(
+                        crate::run::ArtifactKind::Capture,
+                        Some(std::path::PathBuf::from("captures").join(&name)),
+                        Some(body.len() as u64),
+                        None,
+                        format!("screen capture ({format} format)"),
+                    );
+                }
+                Err(_) => still_held_caps.push((name, body, format)),
+            }
+        }
+        self.held_captures = still_held_caps;
         // Findings.
         let fdir = dir.join("findings");
         std::fs::create_dir_all(&fdir)?;
         let ftmp = dir.join("findings.json.tmp");
         std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.findings)?)?;
         std::fs::rename(&ftmp, dir.join("findings.json"))?;
+        // Wave F item 64: the native coverage ledger.
+        if !self.coverage_ledger.is_empty() {
+            let ctmp = dir.join("coverage.json.tmp");
+            std::fs::write(&ctmp, serde_json::to_vec_pretty(&self.coverage_ledger)?)?;
+            std::fs::rename(&ctmp, dir.join("coverage.json"))?;
+        }
         Ok(())
     }
 

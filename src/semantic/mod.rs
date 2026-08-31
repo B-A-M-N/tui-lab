@@ -10,6 +10,7 @@ pub mod confidence;
 pub mod controls;
 pub mod focus;
 pub mod focus_graph;
+pub mod native;
 pub mod node;
 pub mod recognizers;
 pub mod regions;

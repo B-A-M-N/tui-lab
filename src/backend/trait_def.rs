@@ -5,8 +5,8 @@
 //! screen actually stayed quiet.
 
 use super::{
-    BackendResult, Capabilities, Input, InputModes, ObserveResult, TerminalEventState, WaitCond,
-    WaitOutcome,
+    BackendResult, Capabilities, CommandState, Input, InputModes, ObserveResult, SearchHit,
+    TerminalEventState, WaitCond, WaitOutcome,
 };
 use crate::screen::{ProcessState, ScreenState};
 use std::time::Duration;
@@ -98,6 +98,32 @@ pub trait TerminalBackend: Send {
     /// Current snapshot (alias for `state`, kept for API clarity).
     fn snapshot(&mut self) -> BackendResult<ScreenState> {
         self.state()
+    }
+
+    /// Wave F item 53: true scrollback — lines the application scrolled off
+    /// the top of the viewport, oldest first. Backends that cannot retain
+    /// history return an empty vec (and `Capabilities.scrollback` stays
+    /// `false`); backends that can MUST return the real rows, never a
+    /// truncated ring silently.
+    fn scrollback_lines(&mut self) -> BackendResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Wave F item 53: search viewport + scrollback for a case-insensitive
+    /// substring. Returns every hit with its region and (for viewport hits)
+    /// cell coordinates so a caller can click it. Default searches the
+    /// viewport only — correct but incomplete; scrollback-capable backends
+    /// override to cover history too.
+    fn search(&mut self, query: &str) -> BackendResult<Vec<SearchHit>> {
+        let screen = self.state()?;
+        Ok(crate::backend::search_screen(&screen, query))
+    }
+
+    /// Wave F item 54: the shell-integration phase of the foreground command
+    /// (OSC 133). `None` when the application emits no shell integration —
+    /// callers must treat command waits as honestly unsatisfiable then.
+    fn command_state(&mut self) -> Option<CommandState> {
+        None
     }
 
     /// Whether a recording session is active (asciinema cast export, etc.).

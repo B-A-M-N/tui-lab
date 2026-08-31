@@ -140,6 +140,14 @@ pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backen
             quiet_for: idle_quiet,
             after_output_seq: None,
         }),
+        // Wave F item 54: shell-integration command waits (OSC 133).
+        "command_done" => Some(WaitCond::CommandDone {
+            after_command_seq: None,
+        }),
+        "command_output" => p.text.clone().map(|t| WaitCond::CommandOutput {
+            text: t,
+            after_command_seq: None,
+        }),
         _ => None,
     }
 }

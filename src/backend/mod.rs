@@ -12,9 +12,12 @@
 use crate::screen::ScreenState;
 use std::time::Duration;
 
+pub mod line_cli;
+pub mod line_types;
 pub mod portable_pty;
 pub mod trait_def;
 
+pub use line_cli::LineCliBackend;
 pub use portable_pty::PortablePtyBackend;
 pub use trait_def::TerminalBackend;
 
@@ -90,6 +93,66 @@ pub enum BackendError {
 
 pub type BackendResult<T> = Result<T, BackendError>;
 
+/// Wave F item 54: the shell-integration phase of the current command,
+/// derived from OSC 133 escape sequences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommandState {
+    /// 1-based counter of command starts seen (OSC 133;C). 0 when none yet.
+    pub command_seq: u64,
+    /// True between 133;C and the matching 133;D.
+    pub running: bool,
+    /// Exit status carried by the last 133;D;exit (None when not reported).
+    pub last_exit: Option<i32>,
+    /// Phase label: "prompt" | "output" | "done" (mirrors OSC 133;A/B/D).
+    pub phase: &'static str,
+}
+
+/// One search hit (Wave F item 53): where the query matched.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SearchHit {
+    /// "viewport" or "scrollback".
+    pub region: String,
+    /// 0-based row. Viewport rows are screen rows; scrollback rows index the
+    /// scrollback buffer (0 = oldest retained line).
+    pub row: u32,
+    /// Byte offset of the match within the row text.
+    pub start: u32,
+    /// Length of the match in bytes.
+    pub len: u32,
+    /// The full row text (context; renderers may trim).
+    pub line: String,
+}
+
+/// Search viewport + scrollback rows for a case-insensitive substring.
+/// Shared by backends so hit semantics stay identical across engines.
+pub fn search_screen(screen: &ScreenState, query: &str) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    if query.is_empty() {
+        return hits;
+    }
+    let q = query.to_lowercase();
+    let scan = |rows: &[String], region: &str, row_base: u32, hits: &mut Vec<SearchHit>| {
+        for (y, row) in rows.iter().enumerate() {
+            let lower = row.to_lowercase();
+            let mut from = 0;
+            while let Some(rel) = lower[from..].find(&q) {
+                let start = from + rel;
+                hits.push(SearchHit {
+                    region: region.to_string(),
+                    row: row_base + y as u32,
+                    start: start as u32,
+                    len: q.len() as u32,
+                    line: row.clone(),
+                });
+                from = start + q.len();
+            }
+        }
+    };
+    scan(&screen.viewport_text, "viewport", 0, &mut hits);
+    scan(&screen.scrollback, "scrollback", 0, &mut hits);
+    hits
+}
+
 /// Terminal input-mode state, derived from the parsed terminal state.
 ///
 /// Input encoding depends on this state. For example, paste bytes are only
@@ -103,6 +166,11 @@ pub struct InputModes {
     pub mouse_mode: MouseMode,
     pub mouse_encoding: MouseEncoding,
     pub cursor_visible: bool,
+    /// Kitty keyboard protocol flags currently pushed by the application
+    /// (Wave F item 52). `0` when the protocol is not active. When nonzero,
+    /// keys that the legacy encodings cannot express (Super-modified keys,
+    /// F-keys above F12) encode as CSI-u instead of being rejected.
+    pub kitty_flags: u8,
 }
 
 impl Default for InputModes {
@@ -113,6 +181,7 @@ impl Default for InputModes {
             mouse_mode: MouseMode::None,
             mouse_encoding: MouseEncoding::Default,
             cursor_visible: true,
+            kitty_flags: 0,
         }
     }
 }
@@ -329,6 +398,11 @@ pub struct TerminalEventState {
     pub title_seq: u64,
     pub last_output_at: u64,
     pub last_screen_change_at: u64,
+    /// Wave F item 54: shell command edge counter (OSC 133). Starts at 1
+    /// when the first `133;C` (command start) is observed; the anchored
+    /// CommandDone/CommandOutput waits compare against it.
+    #[serde(default)]
+    pub command_seq: u64,
 }
 
 /// Wait conditions (spec section 13 `tui_wait`). All conditions are now real:
@@ -358,6 +432,23 @@ pub enum WaitCond {
     Idle {
         quiet_for: Duration,
         after_output_seq: Option<u64>,
+    },
+    /// Wave F item 54: the shell's currently-running command (OSC 133;C seen,
+    /// no OSC 133;D yet) finishes. Anchored on the command-start sequence
+    /// number so "command #N finished" is expressible even after several
+    /// commands have run. `Some(seq)` requires a command-finish edge with
+    /// `command_seq > seq`; `None` accepts the next finish edge.
+    CommandDone {
+        after_command_seq: Option<u64>,
+    },
+    /// Wave F item 54: the named text appeared in the *output of the command
+    /// that started after* the given baseline — the output is checked against
+    /// the shell-scroll captured between `after_command_seq` and the next
+    /// command boundary, not the whole screen history, so a token printed by
+    /// an earlier command cannot satisfy this wait.
+    CommandOutput {
+        text: String,
+        after_command_seq: Option<u64>,
     },
 }
 
@@ -391,6 +482,16 @@ impl WaitCond {
                     quiet_for: Duration::from_millis(40),
                     after_screen_seq: Some(baseline.screen_seq),
                 };
+            }
+            WaitCond::CommandDone {
+                after_command_seq, ..
+            }
+            | WaitCond::CommandOutput {
+                after_command_seq, ..
+            } => {
+                if after_command_seq.is_none() {
+                    *after_command_seq = Some(baseline.command_seq);
+                }
             }
             _ => {}
         }

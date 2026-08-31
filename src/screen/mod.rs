@@ -1,5 +1,6 @@
 //! Screen module: cell model, state extraction, diffing, normalization.
 
+pub mod capture;
 pub mod cell;
 pub mod cell_string;
 pub mod diff;

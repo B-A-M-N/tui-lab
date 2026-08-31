@@ -178,10 +178,12 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
     }
 }
 
-fn native_adapter_exists(_fw: &str) -> bool {
-    // Native adapters are implemented as src/framework/<fw>.rs modules.
-    // Until those modules exist, this returns false.
-    false
+fn native_adapter_exists(fw: &str) -> bool {
+    // Wave F items 58–63: the NativeSemanticProtocol side channel is the
+    // native-adapter path — a cooperative app declares its real tree and
+    // the harness merges it over inference. Adapter snippets ship for
+    // these frameworks (`tui_framework action=adapter_snippet`).
+    matches!(fw, "ratatui" | "textual")
 }
 
 fn collect_json_dep_keys(pkg: &serde_json::Value) -> Vec<String> {

@@ -82,6 +82,13 @@ pub struct TuiObserveParams {
     /// their own position in the event stream.
     #[serde(default)]
     pub consumer: Option<String>,
+    /// mode=search: the query string (Wave F item 53). `text` is accepted as
+    /// an alias.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Alias for `query` (mode=search).
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// Schema wrapper for [`TuiActRequest`]: re-roots the enum's natural `oneOf`
