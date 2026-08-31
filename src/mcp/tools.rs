@@ -189,12 +189,12 @@ impl Default for TuiLabServer {
     }
 }
 
-#[tool_router(router = tool_router)]
+#[tool_router(router = tool_router, vis = "pub(crate)")]
 impl TuiLabServer {
     /// Session lifecycle: start / restart / stop / list / status.
     #[tool(
         name = "tui_session",
-        description = "Manage TUI sessions: start, restart, stop, list, status."
+        description = "Manage TUI sessions: start, restart, stop, list, status, plus the human control lease (lease/release)."
     )]
     pub async fn tui_session(
         &self,
@@ -430,7 +430,7 @@ impl TuiLabServer {
     /// Observe the screen: summary / screen / cells / region / semantic / diff / scrollback / history.
     #[tool(
         name = "tui_observe",
-        description = "Observe terminal state. Modes: summary, screen, cells, semantic, tree, nodes, diff, scrollback, search (query in 'text'), command_state."
+        description = "Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state."
     )]
     pub async fn tui_observe(
         &self,
@@ -797,7 +797,7 @@ impl TuiLabServer {
     /// Wait for a state condition without fixed sleeps.
     #[tool(
         name = "tui_wait",
-        description = "Block until a condition holds: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output (OSC 133 shell integration)."
+        description = "Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges."
     )]
     pub async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
@@ -938,7 +938,7 @@ impl TuiLabServer {
     /// Checkpoints: save / compare / list / delete (spec section 13).
     #[tool(
         name = "tui_checkpoint",
-        description = "Save and compare named UI state checkpoints."
+        description = "Save and compare named UI state checkpoints (durable under persistent runs)."
     )]
     pub async fn tui_checkpoint(
         &self,
@@ -1030,7 +1030,7 @@ impl TuiLabServer {
     /// Scenarios: record discovered workflows (spec section 13 / 4.4).
     #[tool(
         name = "tui_scenario",
-        description = "Record, save, list, and export workflows as regression scenarios."
+        description = "Record, save, list, export, and replay interaction scenarios (session+generation scoped)."
     )]
     pub async fn tui_scenario(
         &self,
@@ -1282,7 +1282,7 @@ impl TuiLabServer {
     /// provides raster capture; here we expose the asciinema `.cast` writer.
     #[tool(
         name = "tui_record",
-        description = "Produce terminal recordings (asciinema .cast). Other formats are delegated to the backend."
+        description = "Capture terminal output: asciicast .cast lifecycle (start/stop) plus one-shot SVG/PNG screen captures."
     )]
     pub async fn tui_record(&self, p: Parameters<TuiRecordParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
@@ -2139,7 +2139,7 @@ impl TuiLabServer {
     /// does not kill sessions unless `kill_sessions` is set.
     #[tool(
         name = "tui_run",
-        description = "Run lifecycle: status, persist (ephemeral→durable, same run identity), close. Nothing is written to disk until you persist."
+        description = "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, and context (this registry as JSON)."
     )]
     pub async fn tui_run(&self, p: Parameters<TuiRunParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
@@ -2383,7 +2383,7 @@ impl TuiLabServer {
     /// policy (item 48) and arms contract-guided exploration (item 49).
     #[tool(
         name = "tui_contract",
-        description = "Design contracts: load, validate, check conformance (PASS/FAIL/WARN against the running app), and compare runs."
+        description = "Design contracts: load, validate, conformance status, and baseline compare (regressions become findings)."
     )]
     pub async fn tui_contract(
         &self,
