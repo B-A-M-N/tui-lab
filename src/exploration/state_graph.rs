@@ -29,7 +29,12 @@ fn identity_hash(kind: &str, parts: &[&str]) -> String {
         hasher.update(&(p.len() as u64).to_le_bytes());
         hasher.update(p.as_bytes());
     }
-    format!("{}:{}:{}", IDENTITY_SCHEMA, kind, hasher.finalize().to_hex())
+    format!(
+        "{}:{}:{}",
+        IDENTITY_SCHEMA,
+        kind,
+        hasher.finalize().to_hex()
+    )
 }
 
 /// Identity for a UI state node.
@@ -234,7 +239,10 @@ impl StateGraph {
     /// Deprecated (re-review P0 fix 3): keys on the bare structure hash,
     /// which collapses interaction-distinct states. New code must use
     /// [`Self::record_state_identity`].
-    #[deprecated(since = "0.1.0", note = "keys collapse interaction state; use record_state_identity")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "keys collapse interaction state; use record_state_identity"
+    )]
     pub fn record_state(
         &mut self,
         structure_hash: &str,
@@ -309,7 +317,10 @@ impl StateGraph {
     /// Deprecated (re-review P0 fix 3): keys on bare structure hashes and
     /// loses interaction state. New code must use
     /// [`Self::record_transition_identity`].
-    #[deprecated(since = "0.1.0", note = "loses interaction state; use record_transition_identity")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "loses interaction state; use record_transition_identity"
+    )]
     pub fn record_transition(&mut self, from_hash: &str, to_hash: &str, action_name: &str) {
         let from = StateId::from_structure_hash(from_hash);
         let to = StateId::from_structure_hash(to_hash);
@@ -744,9 +755,10 @@ mod tests {
                     selected: true,
                     checked: false,
                     shortcut: None,
-                    confidence: crate::semantic::confidence::Confidence::inferred(0.9, &[
-                        "test-fixture",
-                    ]),
+                    confidence: crate::semantic::confidence::Confidence::inferred(
+                        0.9,
+                        &["test-fixture"],
+                    ),
                     evidence: vec![],
                     source: "inferred".to_string(),
                 });

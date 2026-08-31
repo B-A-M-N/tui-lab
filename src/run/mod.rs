@@ -305,10 +305,7 @@ impl RunContext {
     }
 
     /// The launch spec recorded for one session.
-    pub fn launch_spec(
-        &self,
-        session_id: &str,
-    ) -> Option<&crate::session::state::LaunchSpec> {
+    pub fn launch_spec(&self, session_id: &str) -> Option<&crate::session::state::LaunchSpec> {
         self.session_specs.get(session_id)
     }
 
@@ -345,11 +342,7 @@ impl RunContext {
 
     /// Record the loaded contract (replaces any previous one — the newest
     /// contract wins, matching the tool's load semantics).
-    pub fn set_contract(
-        &mut self,
-        contract: crate::design::ProjectContract,
-        path: String,
-    ) {
+    pub fn set_contract(&mut self, contract: crate::design::ProjectContract, path: String) {
         self.contract = Some(contract);
         self.contract_path = Some(path);
         self.write_manifest().ok();
@@ -364,9 +357,7 @@ impl RunContext {
     /// report. `status` writes "baseline" (the first trusted state);
     /// `compare` writes the label it was given so later comparisons have
     /// history.
-    pub fn contract_baselines(
-        &self,
-    ) -> &HashMap<String, crate::design::ContractReport> {
+    pub fn contract_baselines(&self) -> &HashMap<String, crate::design::ContractReport> {
         &self.contract_baselines
     }
 
@@ -393,7 +384,8 @@ impl RunContext {
         label: &str,
         report: &crate::design::ContractReport,
     ) {
-        self.contract_baselines.insert(label.to_string(), report.clone());
+        self.contract_baselines
+            .insert(label.to_string(), report.clone());
     }
 
     /// Start recording a scenario bound to one session generation. Returns
@@ -708,7 +700,8 @@ impl RunContext {
     /// Wave F item 57: retain a screen capture (SVG/PNG bytes) in run
     /// memory while ephemeral; `flush` writes it under `captures/`.
     pub fn hold_capture(&mut self, file_name: String, body: Vec<u8>, format: &str) {
-        self.held_captures.push((file_name, body, format.to_string()));
+        self.held_captures
+            .push((file_name, body, format.to_string()));
     }
 
     /// Wave F item 64: fold one native coverage event into the ledger.
@@ -737,7 +730,11 @@ impl RunContext {
 
     /// Wave F item 64: collect coverage events from a session's native
     /// channel into the ledger. Returns how many events were folded in.
-    pub fn collect_native_coverage(&mut self, session: &str, channel: &crate::semantic::native::NativeChannel) -> usize {
+    pub fn collect_native_coverage(
+        &mut self,
+        session: &str,
+        channel: &crate::semantic::native::NativeChannel,
+    ) -> usize {
         let events: Vec<(u64, String, String)> = channel
             .events
             .iter()
@@ -912,8 +909,7 @@ impl RunContext {
 
     /// The launch spec cwd of the primary session, if attached.
     pub fn primary_session_cwd(&self) -> Option<&str> {
-        self.primary_launch_spec()
-            .and_then(|s| s.cwd.as_deref())
+        self.primary_launch_spec().and_then(|s| s.cwd.as_deref())
     }
 
     /// Status snapshot for `tui_run status` (goal spec shape).
@@ -1150,10 +1146,7 @@ impl RunContext {
 
     /// Assign the next citable frame id (Wave B item 11) and stamp the
     /// frame with run provenance. Returns the id (`frame:N`).
-    pub fn register_frame(
-        &mut self,
-        frame: &mut crate::backend::CanonicalFrame,
-    ) -> u64 {
+    pub fn register_frame(&mut self, frame: &mut crate::backend::CanonicalFrame) -> u64 {
         self.next_frame_id += 1;
         let id = self.next_frame_id;
         frame.assign_frame_id(id);
@@ -1163,11 +1156,7 @@ impl RunContext {
 
     /// Hold one session's drained terminal events for persistence (Wave B
     /// item 14). Sessions own the live queue; the run keeps the export.
-    pub fn hold_events(
-        &mut self,
-        session: &str,
-        events: Vec<crate::events::TerminalEvent>,
-    ) {
+    pub fn hold_events(&mut self, session: &str, events: Vec<crate::events::TerminalEvent>) {
         if events.is_empty() {
             return;
         }
@@ -1385,7 +1374,8 @@ mod tests {
     #[test]
     fn frames_get_citable_ids() {
         let mut run = RunContext::ephemeral();
-        let mut f = crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 3, 9);
+        let mut f =
+            crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 3, 9);
         let id = run.register_frame(&mut f);
         assert_eq!(id, 1);
         assert_eq!(f.frame_id, Some(1));
@@ -1443,7 +1433,10 @@ mod tests {
         let mut s = crate::session::state::Session::new("ev-sess".into(), "python3".into());
         s.start_with_spec(crate::session::state::LaunchSpec {
             command: "python3".into(),
-            args: vec!["-c".into(), "print('ev'); import time; time.sleep(10)".into()],
+            args: vec![
+                "-c".into(),
+                "print('ev'); import time; time.sleep(10)".into(),
+            ],
             cwd: None,
             env: vec![],
             cols: 80,
@@ -1458,16 +1451,17 @@ mod tests {
         let drained = s.drain_events();
         assert!(!drained.is_empty(), "observe must emit events");
         assert!(
-            drained
-                .iter()
-                .any(|e| e.kind.name() == "process_started"),
+            drained.iter().any(|e| e.kind.name() == "process_started"),
             "first observation emits ProcessStarted"
         );
 
         run.hold_events("ev-sess", drained);
         run.flush().expect("flush");
         let log = std::fs::read_to_string(
-            run.run_dir().expect("dir").join("events").join("ev-sess.jsonl"),
+            run.run_dir()
+                .expect("dir")
+                .join("events")
+                .join("ev-sess.jsonl"),
         )
         .expect("event log");
         assert!(log.contains("\"type\":\"process_started\""), "{log}");
@@ -1486,7 +1480,10 @@ mod tests {
         assert!(run.run_dir().is_some());
         assert!(run.run_dir().unwrap().join("run.json").exists());
 
-        run.set_launch_spec("primary-sess", crate::session::state::LaunchSpec::new("python3", 80, 24));
+        run.set_launch_spec(
+            "primary-sess",
+            crate::session::state::LaunchSpec::new("python3", 80, 24),
+        );
 
         let scenario = crate::scenario::model::Scenario::new("roundtrip")
             .act(serde_json::json!({"action": "key", "key": "enter"}))

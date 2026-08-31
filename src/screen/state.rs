@@ -223,8 +223,6 @@ mod tests {
         assert!(cs.display_width() >= 3);
     }
 
-
-
     /// Item 22: pure-ASCII rows are byte-identical to the old assembly
     /// (including its full-width space padding of blank cells).
     #[test]

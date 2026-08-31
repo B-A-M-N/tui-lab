@@ -85,7 +85,11 @@ pub fn build_tree_from_parts(
     // detect_controls) or the root.
     for c in controls {
         let n = control_to_node(c, focus, affordances, screen);
-        match c.region_id.as_deref().and_then(|rid| region_nodes.get_mut(rid)) {
+        match c
+            .region_id
+            .as_deref()
+            .and_then(|rid| region_nodes.get_mut(rid))
+        {
             Some(rn) => rn.children.push(n),
             None => root.children.push(n),
         }
@@ -115,7 +119,11 @@ fn hyperlink_to_node(link: &crate::screen::cell::Hyperlink) -> SemanticNode {
     let (x1, y1) = link.end.unwrap_or(link.start);
     // Span width: same-row links are common; multi-row spans take the first
     // row's extent (a hyperlink node is a pointer, not a text container).
-    let width = if y1 == y0 { x1.saturating_sub(x0).max(1) } else { 1 };
+    let width = if y1 == y0 {
+        x1.saturating_sub(x0).max(1)
+    } else {
+        1
+    };
     SemanticNode {
         id: format!("link/{}/{}", link.id.clone().unwrap_or_default(), x0),
         role: Role::Hyperlink,
@@ -275,20 +283,14 @@ fn infer_read_only(c: &Control, screen: &ScreenState) -> crate::semantic::node::
 }
 
 /// Field cursor position, relative to the field's bounds.
-fn field_cursor(
-    c: &Control,
-    screen: &ScreenState,
-) -> Option<(u16, u16)> {
+fn field_cursor(c: &Control, screen: &ScreenState) -> Option<(u16, u16)> {
     if !screen.cursor.visible {
         return None;
     }
     let inside = screen.cursor.x >= c.bounds.x
         && screen.cursor.x < c.bounds.x + c.bounds.width.max(1)
         && screen.cursor.y == c.bounds.y;
-    inside.then_some((
-        screen.cursor.x - c.bounds.x,
-        screen.cursor.y - c.bounds.y,
-    ))
+    inside.then_some((screen.cursor.x - c.bounds.x, screen.cursor.y - c.bounds.y))
 }
 
 /// Attach a node to the smallest region containing its midpoint, else root.
@@ -397,7 +399,11 @@ fn assign_layers(root: &SemanticNode, layers: &mut HashMap<String, Layer>) {
             Role::Toast | Role::Alert | Role::CommandPalette | Role::Dropdown | Role::Overlay => {
                 Layer::Overlay
             }
-            Role::Toolbar | Role::Footer | Role::Status | Role::StatusLayer | Role::KeyHint
+            Role::Toolbar
+            | Role::Footer
+            | Role::Status
+            | Role::StatusLayer
+            | Role::KeyHint
             | Role::HelpOverlay => Layer::Status,
             _ => {
                 // A titled bordered box that is not chrome reads as a modal
@@ -447,10 +453,7 @@ fn is_hint_bar(n: &SemanticNode) -> bool {
         return false;
     }
     // Heuristic: several short tokens, half of them 1-2 chars (keys).
-    let keyish = words
-        .iter()
-        .filter(|w| w.chars().count() <= 3)
-        .count();
+    let keyish = words.iter().filter(|w| w.chars().count() <= 3).count();
     keyish * 2 >= words.len()
 }
 
@@ -460,11 +463,7 @@ fn is_hint_bar(n: &SemanticNode) -> bool {
 ///
 /// A thumb at the top of its track means no content above; at the bottom,
 /// no content below. Track length 0 → no claims.
-pub fn scroll_edges_from_thumb(
-    thumb_offset: u16,
-    thumb_len: u16,
-    track_len: u16,
-) -> ScrollEdges {
+pub fn scroll_edges_from_thumb(thumb_offset: u16, thumb_len: u16, track_len: u16) -> ScrollEdges {
     let mut e = ScrollEdges {
         up: false,
         down: false,
@@ -595,15 +594,11 @@ mod tests {
     /// Item 27: a footer hint bar is Status layer, not Background.
     #[test]
     fn hint_bar_is_status_layer() {
-        let s = screen(
-            vec!["body content here", "q quit  ^X exit  [F1] Help"],
-            40,
-        );
+        let s = screen(vec!["body content here", "q quit  ^X exit  [F1] Help"], 40);
         let tree = build_tree(&s);
         let status = tree.layer_nodes(Layer::Status);
         assert!(!status.is_empty(), "layers: {:?}", tree.layers);
     }
-
 
     /// Item 29, end to end: an OSC8 link in ScreenState becomes a Hyperlink
     /// node in the tree, value = URI (observation only). Item 28: a control
@@ -618,7 +613,15 @@ mod tests {
             .map(|x| Cell {
                 x,
                 y: 0,
-                text: if x < 8 { s.viewport_text[0].chars().nth(x as usize).map(|c| c.to_string()).unwrap_or_default() } else { String::new() },
+                text: if x < 8 {
+                    s.viewport_text[0]
+                        .chars()
+                        .nth(x as usize)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
                 fg: crate::screen::Color::unknown(),
                 bg: crate::screen::Color::unknown(),
                 bold: false,

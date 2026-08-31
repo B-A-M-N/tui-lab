@@ -191,10 +191,7 @@ fn parse_inner(trimmed: &str, original: &str) -> Result<Oracle, OracleError> {
     if name.is_empty() {
         return Err(malformed("missing predicate name before '('"));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(malformed("predicate name must be [a-z0-9_]"));
     }
     let name = name.to_ascii_lowercase();
@@ -393,15 +390,9 @@ pub fn eval_static(expr: &str, screen: &ScreenState, sem: &SemanticScreen) -> Or
                 .map(|a| a == want || a.eq_ignore_ascii_case(&want))
                 .unwrap_or(false);
             if hit {
-                OracleOutcome::passed(
-                    expr,
-                    format!("focus is on '{want}'"),
-                )
+                OracleOutcome::passed(expr, format!("focus is on '{want}'"))
             } else {
-                OracleOutcome::failed(
-                    expr,
-                    format!("focus is on {actual:?}, expected '{want}'"),
-                )
+                OracleOutcome::failed(expr, format!("focus is on {actual:?}, expected '{want}'"))
             }
         }
         "visible" | "control_exists" => {
@@ -417,7 +408,10 @@ pub fn eval_static(expr: &str, screen: &ScreenState, sem: &SemanticScreen) -> Or
             match c {
                 Some(c) => OracleOutcome::passed(
                     expr,
-                    format!("control '{}' visible (id {}, kind {:?})", c.label, c.id, c.kind),
+                    format!(
+                        "control '{}' visible (id {}, kind {:?})",
+                        c.label, c.id, c.kind
+                    ),
                 ),
                 None => OracleOutcome::failed(
                     expr,
@@ -586,9 +580,11 @@ pub fn eval_static(expr: &str, screen: &ScreenState, sem: &SemanticScreen) -> Or
                 Err(o) => return o,
             };
             let expected = oracle.args.get(1).and_then(|a| a.as_bool()).unwrap_or(true);
-            match sem.controls.iter().find(|c| {
-                c.id == want || c.label.eq_ignore_ascii_case(&want)
-            }) {
+            match sem
+                .controls
+                .iter()
+                .find(|c| c.id == want || c.label.eq_ignore_ascii_case(&want))
+            {
                 Some(c) => {
                     if c.enabled == expected {
                         OracleOutcome::passed(
@@ -598,7 +594,10 @@ pub fn eval_static(expr: &str, screen: &ScreenState, sem: &SemanticScreen) -> Or
                     } else {
                         OracleOutcome::failed(
                             expr,
-                            format!("control '{}' enabled={}, expected {expected}", c.id, c.enabled),
+                            format!(
+                                "control '{}' enabled={}, expected {expected}",
+                                c.id, c.enabled
+                            ),
                         )
                     }
                 }
@@ -606,15 +605,20 @@ pub fn eval_static(expr: &str, screen: &ScreenState, sem: &SemanticScreen) -> Or
             }
         }
         "focus_visible" => {
-            let want = oracle.args.first().and_then(|a| a.as_bool()).unwrap_or(true);
-            let has_focus = sem.focus.control.is_some()
-                || screen.cells.iter().any(|c| c.reverse);
+            let want = oracle
+                .args
+                .first()
+                .and_then(|a| a.as_bool())
+                .unwrap_or(true);
+            let has_focus = sem.focus.control.is_some() || screen.cells.iter().any(|c| c.reverse);
             if has_focus == want {
                 OracleOutcome::passed(
                     expr,
-                    format!("focus visibility = {want} (focused control {:?}, reverse cells {})",
+                    format!(
+                        "focus visibility = {want} (focused control {:?}, reverse cells {})",
                         sem.focus.control,
-                        screen.cells.iter().filter(|c| c.reverse).count()),
+                        screen.cells.iter().filter(|c| c.reverse).count()
+                    ),
                 )
             } else {
                 OracleOutcome::failed(
@@ -631,11 +635,17 @@ pub fn eval_static(expr: &str, screen: &ScreenState, sem: &SemanticScreen) -> Or
                 return bad_args("expected two numeric arguments: viewport_at_least(cols, rows)");
             };
             if screen.cols >= w && screen.rows >= h {
-                OracleOutcome::passed(expr, format!("viewport {}x{} >= {w}x{h}", screen.cols, screen.rows))
+                OracleOutcome::passed(
+                    expr,
+                    format!("viewport {}x{} >= {w}x{h}", screen.cols, screen.rows),
+                )
             } else {
                 OracleOutcome::failed(
                     expr,
-                    format!("viewport {}x{} < required {w}x{h}", screen.cols, screen.rows),
+                    format!(
+                        "viewport {}x{} < required {w}x{h}",
+                        screen.cols, screen.rows
+                    ),
                 )
             }
         }
@@ -738,11 +748,19 @@ fn eval_active_with(
     };
     match oracle.name.as_str() {
         "escape_closes_modal" => {
-            let expects = oracle.args.first().and_then(|a| a.as_bool()).unwrap_or(true);
+            let expects = oracle
+                .args
+                .first()
+                .and_then(|a| a.as_bool())
+                .unwrap_or(true);
             check("escape_closes_modal", answers.escape_closes_modal, expects)
         }
         "reverse_tab_is_inverse" => {
-            let expects = oracle.args.first().and_then(|a| a.as_bool()).unwrap_or(true);
+            let expects = oracle
+                .args
+                .first()
+                .and_then(|a| a.as_bool())
+                .unwrap_or(true);
             check(
                 "reverse_tab_is_inverse",
                 answers.reverse_tab_is_inverse,
@@ -759,11 +777,19 @@ fn eval_active_with(
             )
         }
         "tab_traps_focus" => {
-            let expects = oracle.args.first().and_then(|a| a.as_bool()).unwrap_or(false);
+            let expects = oracle
+                .args
+                .first()
+                .and_then(|a| a.as_bool())
+                .unwrap_or(false);
             check("tab_traps_focus", answers.tab_traps_focus, expects)
         }
         "resize_no_clipping" => {
-            let expects = oracle.args.first().and_then(|a| a.as_bool()).unwrap_or(true);
+            let expects = oracle
+                .args
+                .first()
+                .and_then(|a| a.as_bool())
+                .unwrap_or(true);
             check("resize_no_clipping", answers.resize_no_clipping, expects)
         }
         _ => None,
@@ -778,7 +804,11 @@ mod tests {
         ScreenState {
             cols: 40,
             rows: rows.len() as u16,
-            cursor: crate::screen::CursorState { x: 0, y: 0, visible: true },
+            cursor: crate::screen::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
             title: None,
             cells: Vec::new(),
             viewport_text: rows.into_iter().map(String::from).collect(),
@@ -857,8 +887,7 @@ mod tests {
 
     #[test]
     fn no_clipping_detects_overflow() {
-        let mut s = screen(vec!["┌─too long──────────┐",
-            "└───────────────────┘"]);
+        let mut s = screen(vec!["┌─too long──────────┐", "└───────────────────┘"]);
         s.cols = 10; // rows are longer than cols → overflow
         let sem = crate::semantic::analyze(&s);
         let out = eval_static("no_clipping()", &s, &sem);
@@ -872,7 +901,10 @@ mod tests {
         let sem = crate::semantic::analyze(&s);
         let out = eval_static("frobnicates_the_ui()", &s, &sem);
         assert!(!out.passed);
-        assert!(out.parse_error.unwrap().contains("unknown oracle predicate"));
+        assert!(out
+            .parse_error
+            .unwrap()
+            .contains("unknown oracle predicate"));
     }
 
     #[test]

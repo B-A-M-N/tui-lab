@@ -55,7 +55,15 @@ pub fn run(
     max_actions: u32,
     max_risk: ActionRisk,
 ) -> anyhow::Result<SemanticExploreReport> {
-    run_with_contract(session, graph, focus_graph, budget, max_actions, max_risk, None)
+    run_with_contract(
+        session,
+        graph,
+        focus_graph,
+        budget,
+        max_actions,
+        max_risk,
+        None,
+    )
 }
 
 /// Contract-armed variant (Wave E item 49): the loaded project contract
@@ -148,7 +156,12 @@ pub fn run_with_contract(
             sem.focus.control_id.as_deref(),
             after_sem.focus.control_id.as_deref(),
         ) {
-            focus_graph.transition(f, t, after_sem.focus.control.as_deref(), candidate_name(&action));
+            focus_graph.transition(
+                f,
+                t,
+                after_sem.focus.control.as_deref(),
+                candidate_name(&action),
+            );
         }
 
         let changed = identity.id() != after_identity.id();
@@ -224,7 +237,11 @@ fn build_action(
                 candidate.control_id.clone(),
                 reason_text,
             ),
-            Err(_) => (None, candidate.control_id.clone(), format!("unparseable key '{key}'")),
+            Err(_) => (
+                None,
+                candidate.control_id.clone(),
+                format!("unparseable key '{key}'"),
+            ),
         }
     } else {
         (None, candidate.control_id.clone(), reason_text)
@@ -256,7 +273,10 @@ mod tests {
             control_id: Some("button/nope".into()),
         };
         let (action, target, motive) = build_action(&candidate, &sem);
-        assert!(action.is_none(), "unresolvable target must not fabricate an action");
+        assert!(
+            action.is_none(),
+            "unresolvable target must not fabricate an action"
+        );
         assert_eq!(target.as_deref(), Some("button/nope"));
         assert!(motive.contains("no control matches"), "{motive}");
     }

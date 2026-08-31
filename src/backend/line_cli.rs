@@ -182,16 +182,18 @@ impl LineCliBackend {
         let mut p = Parser::new(self.rows, self.cols, 0);
         for (y, line) in viewport.iter().enumerate() {
             let truncated: String = line.chars().take(self.cols as usize).collect();
-            p.process(format!("{}{}", truncated, if y + 1 < viewport.len() { "\r\n" } else { "" }).as_bytes());
+            p.process(
+                format!(
+                    "{}{}",
+                    truncated,
+                    if y + 1 < viewport.len() { "\r\n" } else { "" }
+                )
+                .as_bytes(),
+            );
         }
         self.parser = p;
         let process = self.process();
-        let mut state = crate::screen::from_vt(
-            self.parser.screen(),
-            process,
-            None,
-            Vec::new(),
-        );
+        let mut state = crate::screen::from_vt(self.parser.screen(), process, None, Vec::new());
         state.scrollback = self.lines[..start].to_vec();
         state
     }
@@ -399,8 +401,7 @@ impl TerminalBackend for LineCliBackend {
             Input::Raw(b) => {
                 self.write_input(&b)?;
             }
-            Input::Mouse(_)
-            | Input::MouseClick { .. } => {
+            Input::Mouse(_) | Input::MouseClick { .. } => {
                 return Err(BackendError::Unsupported(
                     "mouse is meaningless on a line CLI backend (no terminal grid reports input)"
                         .into(),
@@ -470,7 +471,10 @@ impl TerminalBackend for LineCliBackend {
                     !screen.viewport_text.iter().any(|r| r.contains(t.as_str())),
                     WaitReason::TextAbsent,
                 ),
-                WaitCond::ScreenChange => (self.screen_seq > baseline_screen_seq, WaitReason::ScreenChange),
+                WaitCond::ScreenChange => (
+                    self.screen_seq > baseline_screen_seq,
+                    WaitReason::ScreenChange,
+                ),
                 WaitCond::ScreenStable {
                     quiet_for,
                     after_screen_seq,

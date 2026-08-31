@@ -229,10 +229,7 @@ impl Default for ProjectContract {
             escape_closes_modal: true,
             reverse_tab_required: true,
             destructive_require_confirmation: true,
-            volatile_patterns: vec![
-                r"\bCPU \d+%".to_string(),
-                r"\b\d\d:\d\d:\d\d\b".to_string(),
-            ],
+            volatile_patterns: vec![r"\bCPU \d+%".to_string(), r"\b\d\d:\d\d:\d\d\b".to_string()],
             components: Vec::new(),
             interactions: Vec::new(),
             layout: Vec::new(),

@@ -94,20 +94,26 @@ impl FocusGraph {
         via: &str,
         label: Option<&str>,
     ) -> FocusEdge {
-        let node = self.nodes.entry(from.to_string()).or_insert_with(|| FocusNode {
-            control_id: from.to_string(),
-            label: None,
-            visit_count: 0,
-        });
+        let node = self
+            .nodes
+            .entry(from.to_string())
+            .or_insert_with(|| FocusNode {
+                control_id: from.to_string(),
+                label: None,
+                visit_count: 0,
+            });
         node.visit_count += 1;
         if node.label.is_none() {
             node.label = label.map(str::to_string);
         }
-        let tnode = self.nodes.entry(to.to_string()).or_insert_with(|| FocusNode {
-            control_id: to.to_string(),
-            label: label.map(str::to_string),
-            visit_count: 0,
-        });
+        let tnode = self
+            .nodes
+            .entry(to.to_string())
+            .or_insert_with(|| FocusNode {
+                control_id: to.to_string(),
+                label: label.map(str::to_string),
+                visit_count: 0,
+            });
         tnode.visit_count += 1;
 
         if let Some(e) = self
@@ -214,8 +220,7 @@ impl FocusGraph {
 
     /// Serializable summary for MCP responses.
     pub fn summary(&self) -> serde_json::Value {
-        let tab_edges: Vec<&FocusEdge> =
-            self.edges.iter().filter(|e| e.via == "tab").collect();
+        let tab_edges: Vec<&FocusEdge> = self.edges.iter().filter(|e| e.via == "tab").collect();
         serde_json::json!({
             "nodes": self.nodes.len(),
             "edges": self.edges.len(),
@@ -262,14 +267,24 @@ mod tests {
     #[test]
     fn edges_key_on_ids_not_labels() {
         let mut g = FocusGraph::new();
-        g.transition("dialog/one/button/save", "dialog/two/button/save", Some("Save"), "tab");
+        g.transition(
+            "dialog/one/button/save",
+            "dialog/two/button/save",
+            Some("Save"),
+            "tab",
+        );
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].from, "dialog/one/button/save");
         assert_eq!(g.edges[0].to, "dialog/two/button/save");
         assert_eq!(g.nodes.len(), 2, "same-label controls are distinct nodes");
         // Same holder again: no edge.
         assert!(g
-            .transition("dialog/two/button/save", "dialog/two/button/save", None, "tab")
+            .transition(
+                "dialog/two/button/save",
+                "dialog/two/button/save",
+                None,
+                "tab"
+            )
             .is_none());
         assert_eq!(g.edges.len(), 1);
     }
@@ -296,7 +311,11 @@ mod tests {
         }
         let cyc = g.tab_cycle().expect("cycle");
         assert_eq!(cyc.len(), 3);
-        assert!(cyc.contains(&"a".to_string()) && cyc.contains(&"b".to_string()) && cyc.contains(&"c".to_string()));
+        assert!(
+            cyc.contains(&"a".to_string())
+                && cyc.contains(&"b".to_string())
+                && cyc.contains(&"c".to_string())
+        );
     }
 
     #[test]

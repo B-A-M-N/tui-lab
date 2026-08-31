@@ -791,7 +791,9 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
     // buttons and links whose click might mutate or destroy state are
     // listed, not clicked, unless the screen marks them unambiguous. Here
     // we click only controls whose label does not match destructive verbs.
-    let destructive = ["delete", "remove", "quit", "kill", "reset", "format", "erase"];
+    let destructive = [
+        "delete", "remove", "quit", "kill", "reset", "format", "erase",
+    ];
     let clickable: Vec<&semantic::Control> = sem
         .controls
         .iter()
@@ -799,8 +801,12 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             if !c.enabled || c.bounds.width == 0 || c.bounds.height == 0 {
                 return false;
             }
-            matches!(c.kind, semantic::ControlKind::Button | semantic::ControlKind::Tab | semantic::ControlKind::MenuItem)
-                || c.focusable
+            matches!(
+                c.kind,
+                semantic::ControlKind::Button
+                    | semantic::ControlKind::Tab
+                    | semantic::ControlKind::MenuItem
+            ) || c.focusable
         })
         .filter(|c| {
             let label = c.label.to_lowercase();
@@ -984,9 +990,15 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
     // samples means the app never goes quiet — an anti-pattern for waits.
     let slow_observe = obs_p95 >= 500;
     const SETTLE_CEILING: u64 = 1000;
-    let settle_saturated = settle_ms.iter().filter(|&&m| m >= SETTLE_CEILING).count() * 2 >= settle_ms.len();
+    let settle_saturated =
+        settle_ms.iter().filter(|&&m| m >= SETTLE_CEILING).count() * 2 >= settle_ms.len();
     findings.push(Finding {
-        id: if slow_observe { "PERF-OBSERVE-SLOW" } else { "PERF-OK" }.into(),
+        id: if slow_observe {
+            "PERF-OBSERVE-SLOW"
+        } else {
+            "PERF-OK"
+        }
+        .into(),
         severity: if slow_observe { "warn" } else { "info" }.into(),
         category: "performance".into(),
         summary: format!(
@@ -1054,8 +1066,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         }
     };
     let sem = semantic::analyze(&screen);
-    let disabled: Vec<&semantic::Control> =
-        sem.controls.iter().filter(|c| !c.enabled).collect();
+    let disabled: Vec<&semantic::Control> = sem.controls.iter().filter(|c| !c.enabled).collect();
     let empty_like: Vec<&semantic::Control> = sem
         .controls
         .iter()
@@ -1070,7 +1081,11 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             summary: format!(
                 "{} disabled control(s) on this screen: {}",
                 disabled.len(),
-                disabled.iter().map(|c| c.label.clone()).collect::<Vec<_>>().join(", ")
+                disabled
+                    .iter()
+                    .map(|c| c.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             evidence: vec![ev_other(
                 "disabled_controls",
@@ -1380,7 +1395,16 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         }
     };
     let caps = session.capabilities();
-    let styled_cells = screen.cells.iter().filter(|c| c.fg.rgb.is_some() || c.fg.palette.is_some() || c.bg.rgb.is_some() || c.bg.palette.is_some()).count();
+    let styled_cells = screen
+        .cells
+        .iter()
+        .filter(|c| {
+            c.fg.rgb.is_some()
+                || c.fg.palette.is_some()
+                || c.bg.rgb.is_some()
+                || c.bg.palette.is_some()
+        })
+        .count();
     findings.push(Finding {
         id: "COLOR-INVENTORY".into(),
         severity: "info".into(),

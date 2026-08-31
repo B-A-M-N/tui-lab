@@ -185,7 +185,10 @@ fn detect_native_adapter_false_without_adapter() {
     let dir = TempDir::new().unwrap();
     let mut files = HashMap::new();
     // A framework we detect but have no adapter snippet for.
-    files.insert("package.json", "{\n  \"dependencies\": {\"ink\": \"^5.0.0\"}\n}\n");
+    files.insert(
+        "package.json",
+        "{\n  \"dependencies\": {\"ink\": \"^5.0.0\"}\n}\n",
+    );
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());

@@ -199,9 +199,7 @@ impl Session {
     }
 
     /// Wave G item 77: what the current generation actually launched with.
-    pub fn isolation_evidence(
-        &self,
-    ) -> Option<&crate::session::isolation::IsolationEvidence> {
+    pub fn isolation_evidence(&self) -> Option<&crate::session::isolation::IsolationEvidence> {
         self.isolation_evidence.as_ref()
     }
 
@@ -450,8 +448,10 @@ impl Session {
         let effective_env = isolation.effective_env(&spec.env);
         let (command, args, network_isolated) =
             isolation.apply_to_command(&spec.command, &spec.args);
-        self.backend
-            .set_clear_env(!matches!(isolation, crate::session::isolation::Isolation::Local));
+        self.backend.set_clear_env(!matches!(
+            isolation,
+            crate::session::isolation::Isolation::Local
+        ));
         // Re-attach any active recording hook (the backend was just replaced
         // internally on restart).
         self.backend.set_recording_hook(self.recording_slot.clone());
@@ -603,8 +603,7 @@ impl Session {
 
     /// Append to the session's event queue.
     fn push_event(&mut self, kind: crate::events::TerminalEventKind) {
-        self.events
-            .push(&self.id, self.generation, kind);
+        self.events.push(&self.id, self.generation, kind);
     }
 
     /// Read events after `cursor` WITHOUT moving it (per-consumer cursors,
@@ -707,7 +706,10 @@ impl Session {
     }
 
     /// Wave F item 53: search viewport + scrollback.
-    pub fn backend_search(&mut self, query: &str) -> anyhow::Result<Vec<crate::backend::SearchHit>> {
+    pub fn backend_search(
+        &mut self,
+        query: &str,
+    ) -> anyhow::Result<Vec<crate::backend::SearchHit>> {
         Ok(self.backend.search(query)?)
     }
 

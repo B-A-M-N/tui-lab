@@ -186,11 +186,7 @@ impl vt100::Callbacks for BackendCallbacks {
         // `CSI ? u`          query → `CSI ? flags u` response
         if c == 'u' {
             if i1 == Some(b'>') {
-                let flags = params
-                    .first()
-                    .and_then(|p| p.first())
-                    .copied()
-                    .unwrap_or(0);
+                let flags = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
                 self.kitty_flags = flags.min(u8::MAX as u16) as u8;
                 self.kitty_seen = true;
                 return;
@@ -209,16 +205,8 @@ impl vt100::Callbacks for BackendCallbacks {
                 return;
             }
             if i1 == Some(b'=') {
-                let flags = params
-                    .first()
-                    .and_then(|p| p.first())
-                    .copied()
-                    .unwrap_or(0);
-                let mode = params
-                    .get(1)
-                    .and_then(|p| p.first())
-                    .copied()
-                    .unwrap_or(1);
+                let flags = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+                let mode = params.get(1).and_then(|p| p.first()).copied().unwrap_or(1);
                 match mode {
                     1 => self.kitty_flags = flags.min(u8::MAX as u16) as u8,
                     2 => self.kitty_flags |= flags.min(u8::MAX as u16) as u8,
@@ -349,9 +337,7 @@ impl PortablePtyBackend {
             child_pid: None,
             last_output_instant: now,
             last_screen_change_instant: now,
-            normalization_policy: std::sync::Arc::new(
-                crate::screen::NormalizationPolicy::default(),
-            ),
+            normalization_policy: std::sync::Arc::new(crate::screen::NormalizationPolicy::default()),
             scrollback_cache: Vec::new(),
             scrollback_seen: false,
         }
@@ -1055,11 +1041,15 @@ impl TerminalBackend for PortablePtyBackend {
                         Some(seq) => cb.command_seq > *seq,
                         None => cb.command_seq > 0,
                     };
-                    let in_window = cb.command_seq.saturating_sub(1) == after_command_seq.unwrap_or(0)
+                    let in_window = cb.command_seq.saturating_sub(1)
+                        == after_command_seq.unwrap_or(0)
                         || cb.command_seq == after_command_seq.unwrap_or(0).max(1);
                     let found = anchored_ok
                         && in_window
-                        && (screen.viewport_text.iter().any(|r| r.contains(text.as_str()))
+                        && (screen
+                            .viewport_text
+                            .iter()
+                            .any(|r| r.contains(text.as_str()))
                             || screen.scrollback.iter().any(|r| r.contains(text.as_str())));
                     (found, WaitReason::Text)
                 }
@@ -1435,7 +1425,7 @@ fn encode_key_kitty(kev: &KeyEvent) -> Option<Vec<u8>> {
         Enter => 13,
         Tab => 9,
         Backspace => 127,
-        Up => 0xE000,   // kitty functional: 57344 + n
+        Up => 0xE000, // kitty functional: 57344 + n
         Down => 0xE000 + 1,
         Left => 0xE000 + 2,
         Right => 0xE000 + 3,

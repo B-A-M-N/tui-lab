@@ -129,8 +129,22 @@ pub fn detect_widgets(screen: &ScreenState, regions: &[Region]) -> Vec<Widget> {
 fn is_borderish(c: char) -> bool {
     matches!(
         c,
-        '─' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '╔' | '╗' | '╚' | '╝'
-            | '║' | '═'
+        '─' | '│'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '╔'
+            | '╗'
+            | '╚'
+            | '╝'
+            | '║'
+            | '═'
     )
 }
 
@@ -168,8 +182,8 @@ fn header_columns(line: &str) -> Vec<(u16, String)> {
             i += 1;
         }
         let label: String = chars[start..i].iter().collect();
-        let sep_ok = i >= chars.len()
-            || chars[i..].iter().take(2).filter(|&&c| c == ' ').count() >= 2;
+        let sep_ok =
+            i >= chars.len() || chars[i..].iter().take(2).filter(|&&c| c == ' ').count() >= 2;
         if sep_ok {
             out.push((start as u16, label));
         } else if let Some(last) = out.last_mut() {
@@ -258,9 +272,7 @@ fn detect_table(screen: &ScreenState) -> Option<Widget> {
             let _ = rbx;
             let starts: Vec<u16> = cols
                 .iter()
-                .map(|(hx, _)| {
-                    word_start_at(rline, *hx).unwrap_or(u16::MAX)
-                })
+                .map(|(hx, _)| word_start_at(rline, *hx).unwrap_or(u16::MAX))
                 .collect();
             let aligned = starts.iter().filter(|&&s| s != u16::MAX).count();
             if aligned * 2 < xs.len() {
@@ -286,7 +298,13 @@ fn detect_table(screen: &ScreenState) -> Option<Widget> {
         return Some(Widget {
             id: format!(
                 "table/{}",
-                slug(&cols.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>().join("-"))
+                slug(
+                    &cols
+                        .iter()
+                        .map(|(_, l)| l.clone())
+                        .collect::<Vec<_>>()
+                        .join("-")
+                )
             ),
             kind: WidgetKind::Table,
             bounds: Bounds {
@@ -621,7 +639,10 @@ fn detect_selects(screen: &ScreenState) -> Vec<Widget> {
         if t.ends_with('▾') || t.ends_with('▸') || t.ends_with('▼') || t.ends_with('►') {
             if let Some(colon) = t.find(": ") {
                 let label = t[..colon].trim().to_string();
-                let value = t[colon + 2..].trim_end_matches(['▾', '▸', '▼', '►']).trim().to_string();
+                let value = t[colon + 2..]
+                    .trim_end_matches(['▾', '▸', '▼', '►'])
+                    .trim()
+                    .to_string();
                 if !label.is_empty() && !value.is_empty() {
                     out.push(Widget {
                         id: format!("select/{}", slug(&label)),
@@ -814,7 +835,9 @@ fn detect_splits(screen: &ScreenState) -> Vec<Widget> {
             if t.is_empty() {
                 continue;
             }
-            let divider = t.chars().all(|c| matches!(c, '─' | '├' | '┤' | '┬' | '┴' | '┼' | '═'))
+            let divider = t
+                .chars()
+                .all(|c| matches!(c, '─' | '├' | '┤' | '┬' | '┴' | '┼' | '═'))
                 && t.chars().count() as u32 * 4 >= screen.cols as u32 * 3;
             if divider {
                 out.push(Widget {
@@ -906,9 +929,7 @@ fn detect_help_overlays(screen: &ScreenState) -> Vec<Widget> {
         let width = display_width(t);
         for (by, bottom) in screen.viewport_text.iter().enumerate().skip(y + 2) {
             let bt = bottom.trim();
-            if (bt.starts_with('└') || bt.starts_with('╚'))
-                && display_width(bt) == width
-            {
+            if (bt.starts_with('└') || bt.starts_with('╚')) && display_width(bt) == width {
                 out.push(Widget {
                     id: format!("help/overlay/@{}", y),
                     kind: WidgetKind::HelpOverlay,
@@ -932,7 +953,9 @@ fn detect_help_overlays(screen: &ScreenState) -> Vec<Widget> {
 fn detect_key_hint_bar(screen: &ScreenState) -> Option<Widget> {
     let edge_rows = [0usize, screen.viewport_text.len().saturating_sub(1)];
     for y in edge_rows {
-        let Some(line) = screen.viewport_text.get(y) else { continue };
+        let Some(line) = screen.viewport_text.get(y) else {
+            continue;
+        };
         let t = line.trim();
         if t.is_empty() {
             continue;
@@ -1088,12 +1111,8 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                     affordances: Vec::new(),
                     confidence: w.confidence.clone(),
                 };
-                for (ci, ((x, hl), cell)) in w
-                    .detail
-                    .columns
-                    .iter()
-                    .zip(row.cells.iter())
-                    .enumerate()
+                for (ci, ((x, hl), cell)) in
+                    w.detail.columns.iter().zip(row.cells.iter()).enumerate()
                 {
                     let cw = crate::screen::display_width(hl)
                         .max(crate::screen::display_width(cell))
@@ -1122,12 +1141,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
         WidgetKind::Tree | WidgetKind::List | WidgetKind::Menu => {
             for (i, item) in w.detail.items.iter().enumerate() {
                 root.children.push(SemanticNode {
-                    id: format!(
-                        "{}/item/{}/{}",
-                        w.id,
-                        i,
-                        slug(&item.label)
-                    ),
+                    id: format!("{}/item/{}/{}", w.id, i, slug(&item.label)),
                     role: match &w.kind {
                         WidgetKind::Tree => Role::TreeItem,
                         WidgetKind::List => Role::ListItem,
@@ -1165,7 +1179,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                         x: 0,
                         y: item.y,
                         width: crate::screen::display_width(&item.label).max(1),
-                        height:  layer_height(screen),
+                        height: layer_height(screen),
                     },
                     label: Some(item.label.clone()),
                     value: None,
@@ -1253,15 +1267,14 @@ mod tests {
 
     #[test]
     fn tree_items_with_depth() {
-        let s = screen(
-            vec!["root", "├─ src", "│  └─ main.rs", "└─ tests"],
-            40,
-        );
+        let s = screen(vec!["root", "├─ src", "│  └─ main.rs", "└─ tests"], 40);
         let w = detect_tree(&s).expect("tree");
         assert!(w.detail.items.len() >= 3);
         let n = widget_to_node(&w, &s);
         let roles: Vec<_> = n.children.iter().map(|c| c.role.clone()).collect();
-        assert!(roles.iter().all(|r| *r == crate::semantic::node::Role::TreeItem));
+        assert!(roles
+            .iter()
+            .all(|r| *r == crate::semantic::node::Role::TreeItem));
         // Depth from glyph position / 2.
         let depths: Vec<u32> = n.children.iter().filter_map(|c| c.state.depth).collect();
         assert!(depths.contains(&0), "depths: {depths:?}");
@@ -1290,18 +1303,12 @@ mod tests {
         assert!(edges.at_end());
     }
 
-
-
-
-
-
     #[test]
     fn ellipsis_row_means_more_below() {
         let s = screen(vec!["item one", "item two", "…"], 20);
         let ws = detect_scroll_regions(&s);
         assert!(
-            ws.iter()
-                .any(|w| w.detail.scroll.is_some_and(|e| e.down)),
+            ws.iter().any(|w| w.detail.scroll.is_some_and(|e| e.down)),
             "ellipsis row must report can_scroll_down: {ws:?}"
         );
     }
@@ -1338,15 +1345,15 @@ mod tests {
         let rows = vec!["left   │   right"; 6];
         let s = screen(rows, 15);
         let ws = detect_splits(&s);
-        assert!(
-            ws.iter().any(|w| w.kind == WidgetKind::SplitPane),
-            "{ws:?}"
-        );
+        assert!(ws.iter().any(|w| w.kind == WidgetKind::SplitPane), "{ws:?}");
     }
 
     #[test]
     fn toast_and_alert_detected() {
-        let s = screen(vec!["body", "Settings saved", "error: host unreachable"], 40);
+        let s = screen(
+            vec!["body", "Settings saved", "error: host unreachable"],
+            40,
+        );
         let ws = detect_toasts(&s);
         assert!(ws.iter().any(|w| w.kind == WidgetKind::Toast));
         assert!(ws.iter().any(|w| w.kind == WidgetKind::Alert));
@@ -1358,7 +1365,6 @@ mod tests {
         let w = detect_menu(&s).expect("menu");
         assert_eq!(w.detail.items.len(), 4);
     }
-
 
     #[test]
     fn all_families_surface_in_the_tree() {
@@ -1392,7 +1398,10 @@ mod tests {
     #[test]
     fn prose_yields_no_widgets() {
         let s = screen(
-            vec!["Hello and welcome to the application.", "Second line of body copy."],
+            vec![
+                "Hello and welcome to the application.",
+                "Second line of body copy.",
+            ],
             50,
         );
         let ws = detect_widgets(&s, &[]);

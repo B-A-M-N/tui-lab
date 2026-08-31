@@ -12,7 +12,7 @@
 //! screen actually settled (re-review items 8/9).
 
 use crate::backend::{
-    CaptureOutcome, CanonicalFrame, Input, TerminalEventState, WaitCond, WaitOutcome,
+    CanonicalFrame, CaptureOutcome, Input, TerminalEventState, WaitCond, WaitOutcome,
 };
 use crate::screen::diff::Transition;
 use crate::screen::ScreenState;
@@ -548,7 +548,13 @@ pub fn execute_act_with_visibility(
             SettleStatus::TimedOut
         };
         let seq = outcome.screen_seq;
-        (settle, outcome.elapsed_ms, outcome.state, Some(seq), Some(capture))
+        (
+            settle,
+            outcome.elapsed_ms,
+            outcome.state,
+            Some(seq),
+            Some(capture),
+        )
     };
 
     let transition = crate::screen::diff(&before_frame.state, &after_state);

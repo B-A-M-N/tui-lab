@@ -56,21 +56,13 @@ pub enum TerminalEventKind {
     /// Rendered appearance changed (style/attribute level).
     VisualChanged,
     /// Cursor position or visibility changed.
-    CursorMoved {
-        x: u16,
-        y: u16,
-    },
+    CursorMoved { x: u16, y: u16 },
     /// The terminal bell rang.
     Bell,
     /// The terminal title changed.
-    TitleChanged {
-        title: String,
-    },
+    TitleChanged { title: String },
     /// The viewport was resized.
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
+    Resize { cols: u16, rows: u16 },
     /// A semantic focus change was inferred (from observation analysis).
     FocusChanged {
         from: Option<String>,
@@ -285,7 +277,10 @@ mod tests {
             q.push("s", 1, TerminalEventKind::Output { byte_len: i });
         }
         assert_eq!(q.total(), EVENT_RING_CAPACITY as u64 + 10);
-        assert_eq!(q.retained(), EVENT_RING_CAPACITY - EVENT_RING_CAPACITY / 2 + 10);
+        assert_eq!(
+            q.retained(),
+            EVENT_RING_CAPACITY - EVENT_RING_CAPACITY / 2 + 10
+        );
         assert!(q.evicted() > 0, "eviction must be counted");
         // A far-behind consumer learns about the gap.
         let batch = q.since(1);

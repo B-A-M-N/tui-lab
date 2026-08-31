@@ -30,8 +30,7 @@ pub fn err(cat: ErrorCategory, msg: impl Into<String>) -> CallToolResult {
 
 /// Wrap an already-rendered envelope JSON string into a CallToolResult.
 fn from_envelope_json(json: &str, is_error: bool) -> CallToolResult {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .unwrap_or(serde_json::Value::Null);
+    let value: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
     let mut r = CallToolResult::structured(value);
     r.content = vec![rmcp::model::ContentBlock::text(json)];
     r.is_error = Some(is_error);
@@ -55,6 +54,25 @@ pub fn err_continued(cat: ErrorCategory, detail: String) -> CallToolResult {
         data: Some(serde_json::json!({ "passed": false })),
     };
     from_envelope_json(&env.to_json(), false)
+}
+
+/// Lease guard (Wave G item 76): inside a driving job (act/explore/audit/
+/// replay), refuse with `control_leased` when a human holds the session's
+/// control lease. Runs on the session's own actor thread, so the check and
+/// the input it gates are serialized through the same mailbox — a lease
+/// taken after this check cannot interleave before the input lands.
+pub fn lease_refused(sess: &mut crate::session::state::Session) -> Option<CallToolResult> {
+    sess.driving_blocked().map(|lease| {
+        err(
+            ErrorCategory::ControlLeased,
+            format!(
+                "session '{}' is leased by '{}' for another {} ms — machine driving (act/explore/audit/replay) refuses while the lease is live; observe and status stay allowed",
+                sess.id,
+                lease.holder,
+                lease.remaining_ms()
+            ),
+        )
+    })
 }
 
 /// Uniform `invalid_request` for an unrecognized selector value: names what

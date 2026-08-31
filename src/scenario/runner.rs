@@ -123,35 +123,29 @@ impl ScenarioRunner {
                             // "oracle", "text": "modal_open()"}), evaluated
                             // through the same language contracts and audits
                             // use.
-                            let is_oracle = step
-                                .params
-                                .get("assertion")
-                                .and_then(|a| a.as_str())
+                            let is_oracle = step.params.get("assertion").and_then(|a| a.as_str())
                                 == Some("oracle");
                             if is_oracle {
-                                let expr = step
-                                    .params
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
-                                    .or_else(|| {
-                                        step.params.get("reference").and_then(|t| t.as_str())
-                                    });
+                                let expr =
+                                    step.params.get("text").and_then(|t| t.as_str()).or_else(
+                                        || step.params.get("reference").and_then(|t| t.as_str()),
+                                    );
                                 match expr {
                                     Some(expr) => {
                                         let sem = crate::semantic::analyze(&screen);
                                         let outcome =
                                             crate::design::eval_static(expr, &screen, &sem);
                                         if outcome.parse_error.is_some() {
-                                            (
-                                                false,
-                                                format!("invalid oracle: {}", outcome.detail),
-                                            )
+                                            (false, format!("invalid oracle: {}", outcome.detail))
                                         } else if outcome.passed {
                                             (true, format!("oracle '{expr}': {}", outcome.detail))
                                         } else {
                                             (
                                                 false,
-                                                format!("oracle '{expr}' failed: {}", outcome.detail),
+                                                format!(
+                                                    "oracle '{expr}' failed: {}",
+                                                    outcome.detail
+                                                ),
                                             )
                                         }
                                     }

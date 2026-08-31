@@ -83,7 +83,10 @@ impl Isolation {
                 out.push(("HOME".to_string(), home.to_string_lossy().to_string()));
                 out.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
                 // Minimal PATH so `sh -c 'ls'` still resolves system tools.
-                out.push(("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string()));
+                out.push((
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin:/bin".to_string(),
+                ));
                 out
             }
         }
@@ -136,7 +139,10 @@ impl IsolationEvidence {
         let env_policy = match profile {
             Isolation::Local => format!("inherited ({} vars)", env_keys.len()),
             Isolation::Clean | Isolation::Strict => {
-                format!("minimal + scratch HOME/TMPDIR (kept: {})", env_keys.join(","))
+                format!(
+                    "minimal + scratch HOME/TMPDIR (kept: {})",
+                    env_keys.join(",")
+                )
             }
         };
         IsolationEvidence {
@@ -182,7 +188,8 @@ mod tests {
             .expect("HOME set");
         assert!(home.contains("tui-lab-"), "scratch HOME: {home}");
         assert!(
-            eff.iter().any(|(k, v)| k == "TERM" && v == "xterm-256color"),
+            eff.iter()
+                .any(|(k, v)| k == "TERM" && v == "xterm-256color"),
             "TERM is kept"
         );
         assert!(eff.iter().any(|(k, _)| k == "PATH"));

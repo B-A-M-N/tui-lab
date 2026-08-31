@@ -63,7 +63,9 @@ impl LeaseState {
         let lease = ControlLease {
             holder: holder.to_string(),
             taken_at_ms: ControlLease::now_ms(),
-            ttl_ms: ttl_ms.max(1000).min(Duration::from_secs(3600).as_millis() as u64),
+            ttl_ms: ttl_ms
+                .max(1000)
+                .min(Duration::from_secs(3600).as_millis() as u64),
         };
         self.lease = Some(lease.clone());
         Ok(lease)

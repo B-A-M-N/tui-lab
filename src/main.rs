@@ -295,7 +295,7 @@ fn probe_screen() -> tui_lab::screen::ScreenState {
         cells: Vec::new(),
         viewport_text: vec!["a".to_string(), String::new(), String::new()],
         scrollback: Vec::new(),
-            hyperlinks: Vec::new(),
+        hyperlinks: Vec::new(),
         raw_hash: "r".into(),
         visual_hash: "v".into(),
         structure_hash: "s".into(),

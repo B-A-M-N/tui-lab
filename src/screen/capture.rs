@@ -79,8 +79,16 @@ pub fn to_svg(screen: &ScreenState) -> String {
                 } else {
                     fg_rgb(&cell)
                 }),
-                if cell.bold { " font-weight=\"bold\"" } else { "" },
-                if cell.italic { " font-style=\"italic\"" } else { "" },
+                if cell.bold {
+                    " font-weight=\"bold\""
+                } else {
+                    ""
+                },
+                if cell.italic {
+                    " font-style=\"italic\""
+                } else {
+                    ""
+                },
                 if cell.underline {
                     format!(" text-decoration=\"underline\"")
                 } else {
@@ -158,7 +166,14 @@ pub fn to_png(screen: &ScreenState) -> Vec<u8> {
                 fg,
             );
         }
-        draw_glyph(&mut img, w, cell.x as usize * CW, cell.y as usize * CH, &cell.text, fg);
+        draw_glyph(
+            &mut img,
+            w,
+            cell.x as usize * CW,
+            cell.y as usize * CH,
+            &cell.text,
+            fg,
+        );
     }
     // Cursor outline.
     if screen.cursor.visible && screen.cursor.y < screen.rows && screen.cursor.x < screen.cols {
@@ -244,8 +259,12 @@ fn css(c: (u8, u8, u8)) -> String {
 }
 
 fn same_style(a: &Cell, b: &Cell) -> bool {
-    a.fg == b.fg && a.bg == b.bg && a.bold == b.bold && a.italic == b.italic
-        && a.underline == b.underline && a.reverse == b.reverse
+    a.fg == b.fg
+        && a.bg == b.bg
+        && a.bold == b.bold
+        && a.italic == b.italic
+        && a.underline == b.underline
+        && a.reverse == b.reverse
 }
 
 fn cell_at(screen: &ScreenState, x: usize, y: usize) -> Option<&Cell> {
@@ -294,14 +313,7 @@ fn draw_rect_outline(
 }
 
 /// 5x7 bitmap font for printable ASCII; other glyphs → solid block.
-fn draw_glyph(
-    img: &mut [u8],
-    w: usize,
-    ox: usize,
-    oy: usize,
-    text: &str,
-    c: (u8, u8, u8),
-) {
+fn draw_glyph(img: &mut [u8], w: usize, ox: usize, oy: usize, text: &str, c: (u8, u8, u8)) {
     let ch = text.chars().next().unwrap_or(' ');
     if (ch as u32) < 32 || (ch as u32) > 126 {
         draw_rect(img, w, ox + 1, oy + 3, 6, 10, c);
@@ -399,7 +411,11 @@ fn crc32(data: &[u8]) -> u32 {
     for (n, entry) in table.iter_mut().enumerate() {
         let mut c = n as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         *entry = c;
     }
