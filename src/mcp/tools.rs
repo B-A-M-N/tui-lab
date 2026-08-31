@@ -41,6 +41,99 @@ impl TuiLabServer {
         }
     }
 
+    /// Resolve a `tui://` resource URI to its text content (Wave G item
+    /// 72). Unknown schemes/ids are honest `resource_not_found` errors that
+    /// name what WAS accepted, so a stale id can be self-corrected.
+    async fn resolve_resource(&self, uri: &str) -> Result<String, rmcp::model::ErrorData> {
+        use crate::semantic;
+        let not_found = |msg: String| rmcp::model::ErrorData::resource_not_found(msg, None);
+        if uri == "tui://findings" {
+            let run = self.run.lock().unwrap();
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "run": run.id,
+                "findings": run.findings(),
+                "count": run.findings().len(),
+            }))
+            .unwrap_or_default());
+        }
+        if let Some(rest) = uri.strip_prefix("tui://runs/") {
+            let rest = rest.trim_end_matches('/');
+            if rest.is_empty() {
+                return Err(not_found("empty run id".to_string()));
+            }
+            let run = self.run.lock().unwrap();
+            if rest != run.id {
+                let known = run.id.clone();
+                return Err(not_found(format!(
+                    "no run '{rest}' in this server (this server's run is '{known}')"
+                )));
+            }
+            let sessions = self.sessions.list();
+            return Ok(run
+                .status(
+                    sessions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                )
+                .to_string());
+        }
+        // tui://sessions/<id>/semantic | tui://sessions/<id>/screen
+        if let Some(rest) = uri.strip_prefix("tui://sessions/") {
+            let (sid, view) = match rest.split_once('/') {
+                Some((sid, view)) => (sid, view.trim_end_matches('/')),
+                None => (rest, ""),
+            };
+            let semantic_view = match view {
+                "semantic" => true,
+                "screen" => false,
+                other => {
+                    return Err(not_found(format!(
+                        "unknown session resource view '{other}' (expected 'semantic' or 'screen')"
+                    )))
+                }
+            };
+            let selector = sid.to_string();
+            let in_job = selector.clone();
+            let snapshot = self
+                .sessions
+                .with_session(Some(&selector), move |s| {
+                    let selector = in_job;
+                    let screen = s.observe(40).ok()?;
+                    if semantic_view {
+                        let sem = semantic::analyze(&screen);
+                        Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
+                    } else {
+                        Some(serde_json::to_string_pretty(&serde_json::json!({
+                            "session": selector,
+                            "cols": screen.cols,
+                            "rows": screen.rows,
+                            "title": screen.title,
+                            "cursor": screen.cursor,
+                            "viewport_text": screen.viewport_text,
+                            "structure_hash": screen.structure_hash,
+                            "visual_hash": screen.visual_hash,
+                            "process": screen.process,
+                        }))
+                        .unwrap_or_default())
+                    }
+                })
+                .await;
+            return match snapshot {
+                Ok(Some(text)) => Ok(text),
+                Ok(None) => Err(not_found(format!(
+                    "session '{sid}' could not be observed (stopped or exited)"
+                ))),
+                Err(e) => Err(not_found(e.to_string())),
+            };
+        }
+        Err(not_found(format!(
+            "unknown resource URI '{uri}' (templates: tui://runs/{{run_id}}, \
+             tui://sessions/{{session_id}}/semantic, tui://sessions/{{session_id}}/screen, \
+             tui://findings)"
+        )))
+    }
+
     /// Run a closure against one session inside its actor, mapping actor
     /// failures to the envelope error channel. The closure runs to
     /// completion on the session's own thread.
@@ -2389,5 +2482,70 @@ fn diff_contract_reports(
 }
 
 // Generate `call_tool`/`list_tools`/`get_info` from the tool router above.
+// The resource methods below live on the same impl — the macro skips any
+// method that is already hand-written (has_method detection), so resources
+// need no second type or wrapper trait.
 #[rmcp::tool_handler]
-impl ServerHandler for TuiLabServer {}
+impl ServerHandler for TuiLabServer {
+    // ── MCP resources (Wave G item 72) ─────────────────────────────────
+    // The live surface the agent can subscribe to instead of polling:
+    // current run manifest, per-session semantic/screen snapshots, and the
+    // findings ledger. Everything is read-through (no caching): a read
+    // reflects the session state at read time, and unknown ids are honest
+    // `resource_not_found` errors, never empty placeholders.
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData> {
+        use rmcp::model::{ListResourcesResult, Resource};
+        let run_id = self.run.lock().unwrap().id.clone();
+        let items = vec![
+            Resource::new(
+                "tui://findings",
+                "findings",
+            )
+            .with_description("Findings accumulated this run (audits, contracts, exploration)."),
+            Resource::new(format!("tui://runs/{run_id}"), format!("run-{run_id}"))
+                .with_description("This run's status and manifest."),
+        ];
+        Ok(ListResourcesResult::with_all_items(items))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, rmcp::model::ErrorData> {
+        use rmcp::model::{ListResourceTemplatesResult, ResourceTemplate};
+        let templates = vec![
+            ResourceTemplate::new("tui://runs/{run_id}", "run")
+                .with_description("Run status + manifest for the named run id."),
+            ResourceTemplate::new(
+                "tui://sessions/{session_id}/semantic",
+                "session-semantic",
+            )
+            .with_description(
+                "Live semantic screen: regions, controls, focus, affordances.",
+            ),
+            ResourceTemplate::new("tui://sessions/{session_id}/screen", "session-screen")
+                .with_description("Live screen text + geometry."),
+        ];
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::model::ErrorData> {
+        use rmcp::model::{ReadResourceResult, ResourceContents};
+        let uri = request.uri.clone();
+        let contents = self.resolve_resource(&uri).await?;
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            contents, uri,
+        )])
+        .into())
+    }
+}
