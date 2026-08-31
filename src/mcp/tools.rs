@@ -15,24 +15,48 @@ use crate::mcp::helpers::{build_wait, err, err_continued, err_invalid_selector, 
 use crate::mcp::params::*;
 use crate::screen::diff;
 use crate::semantic;
-use crate::session::SessionManager;
+use crate::session::SessionPool;
 use rmcp::handler::server::wrapper::Parameters;
 
-/// Shared MCP state: the session manager plus the run context (composition
-/// root for checkpoints, scenarios, recordings, findings, exploration graph —
-/// audit item: "Run/Artifact Model"). Serialized by Hermes (no parallel calls).
+/// Shared MCP state: the session pool (Wave G item 73 — per-session actors;
+/// no global blocking lock) plus the run context (composition root for
+/// checkpoints, scenarios, recordings, findings, exploration graph — audit
+/// item: "Run/Artifact Model").
+///
+/// Lock discipline: the run Mutex is short-lock and never held across an
+/// actor `.await`. Handlers ship one closure per session operation; the
+/// closure may lock the run ON THE ACTOR THREAD (a sync thread, so a std
+/// lock there blocks nothing async).
 #[derive(Clone)]
 pub struct TuiLabServer {
-    manager: Arc<std::sync::Mutex<SessionManager>>,
+    sessions: Arc<SessionPool>,
     run: Arc<std::sync::Mutex<crate::run::RunContext>>,
 }
 
 impl TuiLabServer {
     pub fn new() -> Self {
         TuiLabServer {
-            manager: Arc::new(std::sync::Mutex::new(SessionManager::new())),
+            sessions: Arc::new(SessionPool::new()),
             run: Arc::new(std::sync::Mutex::new(crate::run::RunContext::ephemeral())),
         }
+    }
+
+    /// Run a closure against one session inside its actor, mapping actor
+    /// failures to the envelope error channel. The closure runs to
+    /// completion on the session's own thread.
+    async fn with_sess<R, F>(
+        &self,
+        id: Option<&str>,
+        job: F,
+    ) -> Result<R, rmcp::model::CallToolResult>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::session::Session) -> R + Send + 'static,
+    {
+        self.sessions
+            .with_session(id, job)
+            .await
+            .map_err(|e| err(e.category(), e.to_string()))
     }
 }
 
@@ -52,7 +76,6 @@ impl TuiLabServer {
     pub async fn tui_session(&self, p: Parameters<TuiSessionParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         use crate::mcp::params::SessionAction as A;
-        let mut mgr = self.manager.lock().unwrap();
         let Some(action) = p.action.known() else {
             return err(
                 ErrorCategory::InvalidRequest,
@@ -119,144 +142,156 @@ impl TuiLabServer {
                 }
                 let env: Vec<(String, String)> = p.env.unwrap_or_default().into_iter().collect();
                 let isolation_name = isolation.name().to_string();
-                match mgr.start(
-                    &command,
-                    &p.args.unwrap_or_default(),
-                    p.cwd.as_deref(),
-                    &env,
-                    cols,
-                    rows,
-                    &backend,
-                    &isolation_name,
-                ) {
-                    Ok(id) => {
-                        let sess = mgr.get_mut(&id).expect("just started");
-                        let caps = sess.capabilities();
-                        let launch = sess.launch().cloned();
-                        let version = sess.backend_version();
-                        let kind = sess.backend_kind.clone();
-                        let generation = sess.generation;
-                        let iso_evidence = sess.isolation_evidence().cloned();
-                        // Attach the launch spec to the run, per session
-                        // (audit re-review item 1 + P0 fix 6: the run owns
-                        // session/launch correlation for *all* sessions, so
-                        // relaunches, restarts, and multi-session replay
-                        // share one identity).
-                        if let Some(spec) = launch.clone() {
-                            self.run.lock().unwrap().set_launch_spec(&id, spec);
-                        }
-                        let run_id = self.run.lock().unwrap().id.clone();
-                        ok(json!({
-                            "session": id,
-                            "generation": generation,
-                            "run": run_id,
-                            "backend": { "name": kind, "version": version },
-                            "capabilities": caps,
-                            "launch": launch,
-                            "isolation": iso_evidence,
-                        }))
-                    }
-                    Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+                let args = p.args.unwrap_or_default();
+                // Launch inside the pool; the actor owns the session from
+                // birth (Wave G item 73).
+                let started = self.sessions.start(
+                    &command, &args, p.cwd.as_deref(), &env, cols, rows, &backend, &isolation_name,
+                );
+                let id = match started.await {
+                    Ok(id) => id,
+                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                };
+                // Read back the launch facts inside the actor (the session
+                // never crosses the boundary — only this summary does).
+                let facts = self
+                    .with_sess(Some(&id), |s| {
+                        let caps = s.capabilities();
+                        let launch = s.launch().cloned();
+                        let version = s.backend_version();
+                        let kind = s.backend_kind.clone();
+                        let generation = s.generation;
+                        let iso_evidence = s.isolation_evidence().cloned();
+                        (caps, launch, version, kind, generation, iso_evidence)
+                    })
+                    .await;
+                let (caps, launch, version, kind, generation, iso_evidence) = match facts {
+                    Ok(f) => f,
+                    Err(e) => return e,
+                };
+                // Attach the launch spec to the run, per session (audit
+                // re-review item 1 + P0 fix 6: the run owns session/launch
+                // correlation for *all* sessions, so relaunches, restarts,
+                // and multi-session replay share one identity). Short lock,
+                // after the actor reply — never across an await.
+                if let Some(spec) = launch.clone() {
+                    self.run.lock().unwrap().set_launch_spec(&id, spec);
                 }
+                let run_id = self.run.lock().unwrap().id.clone();
+                ok(json!({
+                    "session": id,
+                    "generation": generation,
+                    "run": run_id,
+                    "backend": { "name": kind, "version": version },
+                    "capabilities": caps,
+                    "launch": launch,
+                    "isolation": iso_evidence,
+                }))
             }
             A::Restart => {
-                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                let id = match p.id.clone().or_else(|| self.sessions.active_id()) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session to restart"),
                 };
                 // Restart the SAME logical session: same id, next generation,
                 // reusing the stored LaunchSpec (spec section 13).
-                match mgr.restart(&id) {
+                match self.sessions.restart(&id).await {
                     Ok((new_id, generation)) => {
-                        let sess = mgr.get_mut(&new_id).expect("just restarted");
-                        let caps = sess.capabilities();
-                        ok(json!({
-                            "session": new_id,
-                            "generation": generation,
-                            "restarted_from": id,
-                            "capabilities": caps,
-                        }))
+                        let caps = self
+                            .with_sess(Some(&new_id), |s| s.capabilities())
+                            .await;
+                        match caps {
+                            Ok(caps) => ok(json!({
+                                "session": new_id,
+                                "generation": generation,
+                                "restarted_from": id,
+                                "capabilities": caps,
+                            })),
+                            Err(e) => return e,
+                        }
                     }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
             A::Stop => {
-                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                let id = match p.id.clone().or_else(|| self.sessions.active_id()) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session"),
                 };
-                match mgr.stop(&id) {
+                match self.sessions.stop(&id).await {
                     Ok(()) => ok(json!({ "stopped": id })),
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
-            A::List => ok(json!({ "sessions": mgr.list() })),
+            A::List => ok(json!({ "sessions": self.sessions.list() })),
             // Wave G item 76: take the human control lease.
             A::Lease => {
-                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                let id = match p.id.clone().or_else(|| self.sessions.active_id()) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session"),
                 };
                 let holder = p.holder.clone().unwrap_or_else(|| "human".into());
                 let ttl = p.ttl_ms.unwrap_or(300_000);
-                let sess = match mgr.get_mut(&id) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-                };
-                match sess.acquire_lease(&holder, ttl) {
-                    Ok(lease) => ok(json!({
-                        "session": id,
-                        "leased": true,
-                        "holder": lease.holder,
-                        "ttl_ms": lease.ttl_ms,
-                        "note": "machine-driving tools (act/explore/audit/replay) refuse this session while the lease is valid; observe stays allowed",
-                    })),
-                    Err(existing) => ok(json!({
-                        "session": id,
-                        "leased": false,
-                        "holder": existing.holder,
-                        "remaining_ms": existing.remaining_ms(),
-                        "note": "a live lease is already held; release it or wait for expiry",
-                    })),
-                }
+                let selector = id.clone();
+                self.with_sess(Some(&selector), move |s| {
+                    match s.acquire_lease(&holder, ttl) {
+                        Ok(lease) => ok(json!({
+                            "session": id.clone(),
+                            "leased": true,
+                            "holder": lease.holder,
+                            "ttl_ms": lease.ttl_ms,
+                            "note": "machine-driving tools (act/explore/audit/replay) refuse this session while the lease is valid; observe stays allowed",
+                        })),
+                        Err(existing) => ok(json!({
+                            "session": id,
+                            "leased": false,
+                            "holder": existing.holder,
+                            "remaining_ms": existing.remaining_ms(),
+                            "note": "a live lease is already held; release it or wait for expiry",
+                        })),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| e)
             }
             A::Release => {
-                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                let id = match p.id.clone().or_else(|| self.sessions.active_id()) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session"),
                 };
-                let sess = match mgr.get_mut(&id) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-                };
-                let released = sess.release_lease();
-                ok(json!({ "session": id, "released": released }))
+                let selector = id.clone();
+                self.with_sess(Some(&selector), move |s| {
+                    let released = s.release_lease();
+                    ok(json!({ "session": id.clone(), "released": released }))
+                })
+                .await
+                .unwrap_or_else(|e| e)
             }
             A::Status => {
-                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                let id = match p.id.clone().or_else(|| self.sessions.active_id()) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session"),
                 };
-                match mgr.resolve_mut(Some(&id)) {
-                    Ok(s) => {
-                        let caps = s.capabilities();
-                        let lease = s.active_lease();
-                        let iso = s.isolation_evidence().cloned();
-                        ok(json!({
-                            "session": id,
-                            "command": s.command,
-                            "backend": s.backend_kind,
-                            "capabilities": caps,
-                            "process": s.process(),
-                            "lease": lease.map(|l| json!({
-                                "holder": l.holder,
-                                "remaining_ms": l.remaining_ms(),
-                            })),
-                            "isolation": iso,
-                        }))
-                    }
-                    Err(e) => err(ErrorCategory::NoSession, e.to_string()),
-                }
+                let selector = id.clone();
+                self.with_sess(Some(&selector), move |s| {
+                    let caps = s.capabilities();
+                    let lease = s.active_lease();
+                    let iso = s.isolation_evidence().cloned();
+                    ok(json!({
+                        "session": id.clone(),
+                        "command": s.command,
+                        "backend": s.backend_kind,
+                        "capabilities": caps,
+                        "process": s.process(),
+                        "lease": lease.map(|l| json!({
+                            "holder": l.holder,
+                            "remaining_ms": l.remaining_ms(),
+                        })),
+                        "isolation": iso,
+                    }))
+                })
+                .await
+                .unwrap_or_else(|e| e)
             }
         }
     }
@@ -268,17 +303,6 @@ impl TuiLabServer {
     )]
     async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
-        let screen = match sess.observe(p.idle_ms.unwrap_or(80)) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-        };
-        self.run.lock().unwrap().bump_event();
-
         use crate::mcp::params::ObserveMode as OM;
         let mode = p
             .mode
@@ -298,6 +322,18 @@ impl TuiLabServer {
                 ),
             );
         }
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            let screen = match sess.observe(p.idle_ms.unwrap_or(80)) {
+                Ok(s) => s,
+                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+            };
+            run.lock().unwrap().bump_event();
+
+            if mode.known().is_none() {
+                unreachable!("validated above");
+            }
         match mode.known().copied().unwrap() {
             OM::Summary => {
                 // Compact summary for agent consumption (spec 36). Avoids
@@ -320,7 +356,7 @@ impl TuiLabServer {
                         .previous()
                         .map(|p| semantic::analyze(p).focus)
                         .unwrap_or_default();
-                    let mut run = self.run.lock().unwrap();
+                    let mut run = run.lock().unwrap();
                     run.record_focus_observation(
                         &sess.id,
                         prev.control.clone(),
@@ -503,6 +539,9 @@ impl TuiLabServer {
                 "run/session event history is not implemented; the current frame identity is available via mode=summary (structure_hash)",
             ),
         }
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Drive input: key / keys / type / paste / mouse_* / resize / signal / raw.
@@ -513,11 +552,6 @@ impl TuiLabServer {
     )]
     pub async fn tui_act(&self, p: Parameters<TuiActRequest>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
         // The typed action (Wave-2 item 10): built once from the request,
         // executed, and stored on the transaction for lossless replay.
         let action = match crate::execution::CanonicalAction::from_request(&p) {
@@ -535,79 +569,91 @@ impl TuiLabServer {
             crate::execution::InputVisibility::Normal
         };
         // The one canonical executor (re-review item 4): anchored settle wait
-        // (item 8) + honest settle reporting (item 9).
+        // (item 8) + honest settle reporting (item 9). The whole
+        // act + ledger sequence runs inside the session's actor; run locks
+        // happen on the actor thread and never span an await.
         let quiet = p.wait_ms().unwrap_or(150);
-        let tx = match crate::execution::execute_act_with_visibility(
-            sess,
-            &action,
-            quiet,
-            quiet.saturating_add(1000),
-            p.no_wait(),
-            visibility,
-        ) {
-            Ok(t) => t,
-            Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-        };
-        // Scenario recording in progress? Append this act (audit: scenarios
-        // capture real tool traffic; sensitive payloads are not recorded —
-        // and for a sensitive step the *params* are stripped to a redacted
-        // placeholder so replay still works shape-wise without the secret).
-        // Scoped to the resolved session generation (re-review item 5): a
-        // recording for session A never absorbs session B's traffic.
-        let frame_refs = {
-            let (sid, gen) = (sess.id.clone(), sess.generation);
-            let mut run = self.run.lock().unwrap();
-            // Citable frame identities (Wave B item 11): both frames get
-            // per-run ids and full provenance.
-            let b = run.register_frame(&mut {
-                let mut f = tx.before_frame.clone();
-                f.session_id = Some(sid.clone());
-                f.generation = Some(gen);
-                f
-            });
-            let a = run.register_frame(&mut {
-                let mut f = tx.after_frame.clone();
-                f.session_id = Some(sid.clone());
-                f.generation = Some(gen);
-                f
-            });
-            // Run ledger (Wave-2 item 15): the reconstructable transaction
-            // record, not just a counter. The ledger projects the action
-            // through the visibility policy — sensitive payloads are stored
-            // as Redacted(kind, byte_len), never verbatim.
-            run.record_interaction(&sid, &tx);
-            // Scenario capture (see block comment above): sensitive steps
-            // are recorded as redacted placeholders, never with the payload.
-            if sensitive {
-                run.record_scenario_act(
-                    &sid,
-                    gen,
-                    json!({
-                        "kind": tx.name(),
-                        "sensitive": true,
-                        "redacted": true,
-                        "payload_bytes": tx.canonical().payload_len(),
-                    }),
-                );
-            } else {
-                run.record_scenario_act(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
-            }
-            serde_json::json!({ "before": format!("frame:{b}"), "after": format!("frame:{a}") })
-        };
-        ok(json!({
-            "action": tx.name(),
-            "settled": tx.settled(),
-            "settle_status": tx.settle,
-            "settle_reason": tx.settle_reason(),
-            "elapsed_ms": tx.elapsed_ms,
-            "frames": frame_refs,
-            "warnings": if tx.settled() { Vec::<String>::new() } else if tx.settle == crate::execution::SettleStatus::Skipped {
-                vec!["settlement was not tested (no_wait=true); reported honestly as skipped".to_string()]
-            } else {
-                vec!["screen did not reach the requested stability within the settle budget".to_string()]
-            },
-            "transition": tx.transition,
-        }))
+        let selector = p.id().map(str::to_string);
+        let run = self.run.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            let tx = match crate::execution::execute_act_with_visibility(
+                sess,
+                &action,
+                quiet,
+                quiet.saturating_add(1000),
+                p.no_wait(),
+                visibility,
+            ) {
+                Ok(t) => t,
+                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+            };
+            // Scenario recording in progress? Append this act (audit: scenarios
+            // capture real tool traffic; sensitive payloads are not recorded —
+            // and for a sensitive step the *params* are stripped to a redacted
+            // placeholder so replay still works shape-wise without the secret).
+            // Scoped to the resolved session generation (re-review item 5): a
+            // recording for session A never absorbs session B's traffic.
+            let frame_refs = {
+                let (sid, gen) = (sess.id.clone(), sess.generation);
+                let mut run = run.lock().unwrap();
+                // Citable frame identities (Wave B item 11): both frames get
+                // per-run ids and full provenance.
+                let b = run.register_frame(&mut {
+                    let mut f = tx.before_frame.clone();
+                    f.session_id = Some(sid.clone());
+                    f.generation = Some(gen);
+                    f
+                });
+                let a = run.register_frame(&mut {
+                    let mut f = tx.after_frame.clone();
+                    f.session_id = Some(sid.clone());
+                    f.generation = Some(gen);
+                    f
+                });
+                // Run ledger (Wave-2 item 15): the reconstructable transaction
+                // record, not just a counter. The ledger projects the action
+                // through the visibility policy — sensitive payloads are stored
+                // as Redacted(kind, byte_len), never verbatim.
+                run.record_interaction(&sid, &tx);
+                // Scenario capture (see block comment above): sensitive steps
+                // are recorded as redacted placeholders, never with the payload.
+                if sensitive {
+                    run.record_scenario_act(
+                        &sid,
+                        gen,
+                        json!({
+                            "kind": tx.name(),
+                            "sensitive": true,
+                            "redacted": true,
+                            "payload_bytes": tx.canonical().payload_len(),
+                        }),
+                    );
+                } else {
+                    run.record_scenario_act(
+                        &sid,
+                        gen,
+                        serde_json::to_value(&p).unwrap_or_default(),
+                    );
+                }
+                serde_json::json!({ "before": format!("frame:{b}"), "after": format!("frame:{a}") })
+            };
+            ok(json!({
+                "action": tx.name(),
+                "settled": tx.settled(),
+                "settle_status": tx.settle,
+                "settle_reason": tx.settle_reason(),
+                "elapsed_ms": tx.elapsed_ms,
+                "frames": frame_refs,
+                "warnings": if tx.settled() { Vec::<String>::new() } else if tx.settle == crate::execution::SettleStatus::Skipped {
+                    vec!["settlement was not tested (no_wait=true); reported honestly as skipped".to_string()]
+                } else {
+                    vec!["screen did not reach the requested stability within the settle budget".to_string()]
+                },
+                "transition": tx.transition,
+            }))
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Wait for a state condition without fixed sleeps.
@@ -617,48 +663,50 @@ impl TuiLabServer {
     )]
     async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
         let cond = match build_wait(&p) {
             Some(c) => c,
             None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),
         };
-        // Go through the canonical wait executor (re-review P0).
-        match crate::execution::execute_wait(sess, cond, p.budget_ms.unwrap_or(5000)) {
-            Ok(out) => {
-                // Scoped to the resolved session generation (item 5).
-                {
-                    let (sid, gen) = (sess.id.clone(), sess.generation);
-                    let mut run = self.run.lock().unwrap();
-                    run.record_event(&sid, "wait");
-                    run.record_scenario_wait(
-                        &sid,
-                        gen,
-                        serde_json::to_value(&p).unwrap_or_default(),
-                    );
-                }
-                ok(json!({
-                    "met": out.met,
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        // Go through the canonical wait executor (re-review P0), inside the
+        // session actor.
+        self.with_sess(selector.as_deref(), move |sess| {
+            match crate::execution::execute_wait(sess, cond, p.budget_ms.unwrap_or(5000)) {
+                Ok(out) => {
+                    // Scoped to the resolved session generation (item 5).
+                    {
+                        let (sid, gen) = (sess.id.clone(), sess.generation);
+                        let mut run = run.lock().unwrap();
+                        run.record_event(&sid, "wait");
+                        run.record_scenario_wait(
+                            &sid,
+                            gen,
+                            serde_json::to_value(&p).unwrap_or_default(),
+                        );
+                    }
+                    ok(json!({
+                        "met": out.met,
                     "timeout": !out.met,
                     "reason": format!("{:?}", out.reason),
                     "elapsed_ms": out.elapsed_ms,
                     "screen_seq": out.screen_seq,
                     "output_seq": out.output_seq,
-                    "state": {
-                        "structure_hash": out.state.structure_hash,
-                        "visual_hash": out.state.visual_hash,
-                        "process": {
-                            "running": out.state.process.running,
-                            "exit_code": out.state.process.exit_code,
+                        "state": {
+                            "structure_hash": out.state.structure_hash,
+                            "visual_hash": out.state.visual_hash,
+                            "process": {
+                                "running": out.state.process.running,
+                                "exit_code": out.state.process.exit_code,
+                            },
                         },
-                    },
-                }))
+                    }))
+                }
+                Err(e) => err(ErrorCategory::BackendError, e.to_string()),
             }
-            Err(e) => err(ErrorCategory::BackendError, e.to_string()),
-        }
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Assertions against screen/state.
@@ -668,75 +716,85 @@ impl TuiLabServer {
     )]
     async fn tui_assert(&self, p: Parameters<TuiAssertParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
-        let screen = match sess.observe(40) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-        };
         // Wave E: `assertion: "oracle"` evaluates a declarative oracle
         // expression (shared language with contracts and audits). Any other
         // assertion name goes through the canonical assert executor.
         use crate::mcp::params::AssertAssertion as AA;
         let is_oracle = matches!(p.assertion.known(), Some(AA::Oracle));
-        if is_oracle {
-            let Some(expr) = p.text.as_deref().or(p.reference.as_deref()) else {
-                return err(
-                    ErrorCategory::InvalidRequest,
-                    "oracle assertion requires the expression in 'text' (e.g. text: \"modal_open()\")",
-                );
-            };
-            let sem = semantic::analyze(&screen);
-            let outcome = crate::design::eval_static(expr, &screen, &sem);
-            {
-                // Scoped to the resolved session generation (item 5).
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = self.run.lock().unwrap();
-                run.record_scenario_assert(
-                    &sid,
-                    gen,
-                    serde_json::json!({ "assertion": "oracle", "text": expr }),
-                );
-            }
-            if outcome.passed {
-                ok(json!({
-                    "passed": true,
-                    "assertion": "oracle",
-                    "expression": expr,
-                    "detail": outcome.detail,
-                    "flavor": outcome.flavor,
-                }))
-            } else if outcome.parse_error.is_some() {
-                // A malformed expression is a caller error, not a UI failure.
-                err(ErrorCategory::InvalidRequest, outcome.detail)
-            } else {
-                err_continued(
-                    ErrorCategory::AssertionFailed,
-                    format!("oracle '{}' failed: {}", expr, outcome.detail),
-                )
-            }
-        } else {
-            // Go through the canonical assert executor (re-review P0).
-            let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
-            {
-                // Scoped to the resolved session generation (item 5).
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = self.run.lock().unwrap();
-                run.record_scenario_assert(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
-            }
-            if passed {
-                ok(json!({ "passed": true, "assertion": p.assertion_name() }))
-            } else if let Some(ErrorCategory::InvalidRequest) = invalid {
-                // Unknown assertion name (or missing required param): a caller error,
-                // NOT a UI failure (spec section 37).
-                err(ErrorCategory::InvalidRequest, detail)
-            } else {
-                err_continued(ErrorCategory::AssertionFailed, detail)
-            }
+        if is_oracle && p.text.is_none() && p.reference.is_none() {
+            return err(
+                ErrorCategory::InvalidRequest,
+                "oracle assertion requires the expression in 'text' (e.g. text: \"modal_open()\")",
+            );
         }
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            let screen = match sess.observe(40) {
+                Ok(s) => s,
+                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+            };
+            if is_oracle {
+                let expr = p
+                    .text
+                    .clone()
+                    .or_else(|| p.reference.clone())
+                    .expect("validated above");
+                let sem = semantic::analyze(&screen);
+                let outcome = crate::design::eval_static(&expr, &screen, &sem);
+                {
+                    // Scoped to the resolved session generation (item 5).
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
+                    let mut run = run.lock().unwrap();
+                    run.record_scenario_assert(
+                        &sid,
+                        gen,
+                        serde_json::json!({ "assertion": "oracle", "text": expr }),
+                    );
+                }
+                if outcome.passed {
+                    ok(json!({
+                        "passed": true,
+                        "assertion": "oracle",
+                        "expression": expr,
+                        "detail": outcome.detail,
+                        "flavor": outcome.flavor,
+                    }))
+                } else if outcome.parse_error.is_some() {
+                    // A malformed expression is a caller error, not a UI failure.
+                    err(ErrorCategory::InvalidRequest, outcome.detail)
+                } else {
+                    err_continued(
+                        ErrorCategory::AssertionFailed,
+                        format!("oracle '{}' failed: {}", expr, outcome.detail),
+                    )
+                }
+            } else {
+                // Go through the canonical assert executor (re-review P0).
+                let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
+                {
+                    // Scoped to the resolved session generation (item 5).
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
+                    let mut run = run.lock().unwrap();
+                    run.record_scenario_assert(
+                        &sid,
+                        gen,
+                        serde_json::to_value(&p).unwrap_or_default(),
+                    );
+                }
+                if passed {
+                    ok(json!({ "passed": true, "assertion": p.assertion_name() }))
+                } else if let Some(ErrorCategory::InvalidRequest) = invalid {
+                    // Unknown assertion name (or missing required param): a caller error,
+                    // NOT a UI failure (spec section 37).
+                    err(ErrorCategory::InvalidRequest, detail)
+                } else {
+                    err_continued(ErrorCategory::AssertionFailed, detail)
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Checkpoints: save / compare / list / delete (spec section 13).
@@ -746,82 +804,82 @@ impl TuiLabServer {
     )]
     async fn tui_checkpoint(&self, p: Parameters<TuiCheckpointParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        // Resolve session first (all actions except a bare list still need a
-        // live session; list is per-session scoped, defaulting to active).
-        let mut mgr = self.manager.lock().unwrap();
-        let session_id = match mgr.resolve(p.id.as_deref()) {
-            Ok(s) => s.id.clone(),
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
-        let mut run = self.run.lock().unwrap();
         use crate::mcp::params::CheckpointAction as CA;
         let Some(ckpt_action) = p.action.known().copied() else {
             return err_invalid_selector("checkpoint action", &p.action, <CA as crate::mcp::params::EnumVariants>::VARIANTS);
         };
-        match ckpt_action {
-            CA::List => ok(json!({ "checkpoints": run.checkpoints.list(&session_id) })),
-            CA::Save => {
-                let (generation, screen, sem) = {
-                    let sess = match mgr.get_mut(&session_id) {
+        let run = self.run.clone();
+        // The actor closure owns the session side (observe) and does the
+        // checkpoint work against the run under a short lock.
+        self.with_sess(p.id.as_deref(), move |sess| {
+            let session_id = sess.id.clone();
+            let generation = sess.generation;
+            match ckpt_action {
+                CA::List => {
+                    let run = run.lock().unwrap();
+                    ok(json!({ "checkpoints": run.checkpoints.list(&session_id) }))
+                }
+                CA::Save => {
+                    let screen = match sess.observe(40) {
                         Ok(s) => s,
-                        Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                        Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                    };
+                    let sem = semantic::analyze(&screen);
+                    let mut run = run.lock().unwrap();
+                    let name = run.checkpoints.save(
+                        &session_id,
+                        generation,
+                        p.name.clone(),
+                        &screen,
+                        Some(&sem),
+                    );
+                    ok(json!({
+                        "name": name,
+                        "structure_hash": screen.structure_hash,
+                        "visual_hash": screen.visual_hash,
+                        "focus": sem.focus.control,
+                        "controls": sem.controls.len(),
+                    }))
+                }
+                CA::Compare => {
+                    let name = match &p.name {
+                        Some(n) => n.clone(),
+                        None => {
+                            return err(ErrorCategory::InvalidRequest, "compare requires 'name'")
+                        }
                     };
                     let screen = match sess.observe(40) {
                         Ok(s) => s,
                         Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                     };
                     let sem = semantic::analyze(&screen);
-                    (sess.generation, screen, sem)
-                };
-                let name = run.checkpoints.save(
-                    &session_id,
-                    generation,
-                    p.name.clone(),
-                    &screen,
-                    Some(&sem),
-                );
-                ok(json!({
-                    "name": name,
-                    "structure_hash": screen.structure_hash,
-                    "visual_hash": screen.visual_hash,
-                    "focus": sem.focus.control,
-                    "controls": sem.controls.len(),
-                }))
-            }
-            CA::Compare => {
-                let name = match &p.name {
-                    Some(n) => n.clone(),
-                    None => return err(ErrorCategory::InvalidRequest, "compare requires 'name'"),
-                };
-                let sess = match mgr.get_mut(&session_id) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-                };
-                let screen = match sess.observe(40) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-                };
-                let sem = semantic::analyze(&screen);
-                match run
-                    .checkpoints
-                    .compare(&session_id, &name, &screen, Some(&sem))
-                {
-                    Ok(json_out) => crate::mcp::helpers::ok_from_json(&json_out),
-                    Err(ErrorCategory::InvalidRequest) => {
-                        err(ErrorCategory::InvalidRequest, "no such checkpoint")
+                    let run = run.lock().unwrap();
+                    match run
+                        .checkpoints
+                        .compare(&session_id, &name, &screen, Some(&sem))
+                    {
+                        Ok(json_out) => crate::mcp::helpers::ok_from_json(&json_out),
+                        Err(ErrorCategory::InvalidRequest) => {
+                            err(ErrorCategory::InvalidRequest, "no such checkpoint")
+                        }
+                        Err(c) => err(c, "checkpoint comparison failed"),
                     }
-                    Err(c) => err(c, "checkpoint comparison failed"),
+                }
+                CA::Delete => {
+                    let name = match &p.name {
+                        Some(n) => n.clone(),
+                        None => {
+                            return err(ErrorCategory::InvalidRequest, "delete requires 'name'")
+                        }
+                    };
+                    let mut run = run.lock().unwrap();
+                    let removed = run.checkpoints.delete(&session_id, &name);
+                    ok(json!({ "name": name, "deleted": removed }))
                 }
             }
-            CA::Delete => {
-                let name = match &p.name {
-                    Some(n) => n.clone(),
-                    None => return err(ErrorCategory::InvalidRequest, "delete requires 'name'"),
-                };
-                let removed = run.checkpoints.delete(&session_id, &name);
-                ok(json!({ "name": name, "deleted": removed }))
-            }
-        }
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Scenarios: record discovered workflows (spec section 13 / 4.4).
@@ -831,7 +889,6 @@ impl TuiLabServer {
     )]
     pub async fn tui_scenario(&self, p: Parameters<TuiScenarioParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut run = self.run.lock().unwrap();
         use crate::mcp::params::ScenarioAction as SA;
         let Some(sc_action) = (match &p.action {
             crate::mcp::params::Known::Known(a) => Some(*a),
@@ -850,6 +907,7 @@ impl TuiLabServer {
         };
         match sc_action {
             SA::List => {
+                let run = self.run.lock().unwrap();
                 let recorded = run.active_recordings();
                 let saved = run.list_saved_scenarios().unwrap_or_default();
                 ok(json!({ "recordings_in_progress": recorded, "scenarios": saved }))
@@ -860,29 +918,30 @@ impl TuiLabServer {
             // (re-review item 5). The returned id — not the name — is the
             // identity for record_stop.
             SA::RecordStart => {
-                let mut mgr = self.manager.lock().unwrap();
-                let sess = match mgr.resolve_mut(p.id.as_deref()) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-                };
                 let name = p.name.clone().unwrap_or_else(|| "scenario".into());
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                drop(mgr);
-                let rec_id = run.begin_scenario_recording(&name, &sid, gen);
-                ok(json!({
-                    "recording_id": rec_id.as_str(),
-                    "name": name,
-                    "session": sid,
-                    "generation": gen,
-                    "started": true,
-                }))
+                let selector = p.id.clone();
+                let run = self.run.clone();
+                let started = self
+                    .with_sess(selector.as_deref(), move |sess| {
+                        let (sid, gen) = (sess.id.clone(), sess.generation);
+                        let rec_id = run.lock().unwrap().begin_scenario_recording(&name, &sid, gen);
+                        ok(json!({
+                            "recording_id": rec_id.as_str(),
+                            "name": name,
+                            "session": sid,
+                            "generation": gen,
+                            "started": true,
+                        }))
+                    })
+                    .await;
+                started.unwrap_or_else(|e| e)
             }
             // Finish + persist. Accepts `recording_id` (preferred identity)
             // or falls back to the oldest active recording with `name`.
             SA::RecordStop => {
                 let rec_id = match (&p.recording_id, &p.name) {
                     (Some(id), _) => id.clone(),
-                    (None, Some(name)) => match run.find_recording_by_name(name) {
+                    (None, Some(name)) => match self.run.lock().unwrap().find_recording_by_name(name) {
                         Some(id) => id,
                         None => {
                             return err(
@@ -898,6 +957,7 @@ impl TuiLabServer {
                         )
                     }
                 };
+                let mut run = self.run.lock().unwrap();
                 match run.finish_scenario_recording(&rec_id) {
                     Some(scenario) => {
                         let path: Option<String> = run
@@ -974,7 +1034,10 @@ impl TuiLabServer {
                 let scenario = recorder.build();
                 let count = scenario.step_count();
                 let scenario_id = scenario.id.clone();
-                let path: Option<String> = run
+                let path: Option<String> = self
+                    .run
+                    .lock()
+                    .unwrap()
                     .save_scenario(scenario.clone())
                     .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
                 ok(
@@ -986,6 +1049,7 @@ impl TuiLabServer {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "export requires name"),
                 };
+                let run = self.run.lock().unwrap();
                 match run.load_scenario(&name) {
                     Ok(scenario) => ok(
                         json!({ "name": name, "scenario": serde_json::to_value(&scenario).unwrap_or_default() }),
@@ -1004,53 +1068,54 @@ impl TuiLabServer {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "run requires 'name'"),
                 };
-                let scenario = match run.load_scenario(&name) {
-                    Ok(sc) => sc,
-                    Err(e) => {
-                        return err(
-                            ErrorCategory::InvalidRequest,
-                            format!("no such scenario: {}", e),
-                        )
+                let scenario = {
+                    let run = self.run.lock().unwrap();
+                    match run.load_scenario(&name) {
+                        Ok(sc) => sc,
+                        Err(e) => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                format!("no such scenario: {}", e),
+                            )
+                        }
                     }
                 };
-                drop(run);
-                let mut mgr = self.manager.lock().unwrap();
-                let sess = match mgr.resolve_mut(p.id.as_deref()) {
-                    Ok(s) => s,
-                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-                };
-                let report = crate::scenario::runner::ScenarioRunner::run(&scenario, sess);
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                drop(mgr);
-                self.run
-                    .lock()
-                    .unwrap()
-                    .record_event(&sid, &format!("scenario_run:{}", scenario.name));
-                if report.steps_failed == 0 {
-                    ok(json!({
-                        "name": report.scenario_name,
-                        "session": sid,
-                        "generation": gen,
-                        "passed": true,
-                        "steps_total": report.steps_total,
-                        "steps_passed": report.steps_passed,
-                        "steps_failed": 0,
-                        "step_results": report.step_results,
-                    }))
-                } else {
-                    // Real regression: envelope stays success (transport ok),
-                    // payload reports the failure honestly.
-                    ok(json!({
-                        "name": report.scenario_name,
-                        "session": sid,
-                        "generation": gen,
-                        "passed": false,
-                        "steps_total": report.steps_total,
-                        "steps_passed": report.steps_passed,
-                        "steps_failed": report.steps_failed,
-                        "step_results": report.step_results,
-                    }))
-                }
+                let selector = p.id.clone();
+                let run = self.run.clone();
+                self.with_sess(selector.as_deref(), move |sess| {
+                    let report = crate::scenario::runner::ScenarioRunner::run(&scenario, sess);
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
+                    run.lock()
+                        .unwrap()
+                        .record_event(&sid, &format!("scenario_run:{}", scenario.name));
+                    if report.steps_failed == 0 {
+                        ok(json!({
+                            "name": report.scenario_name,
+                            "session": sid,
+                            "generation": gen,
+                            "passed": true,
+                            "steps_total": report.steps_total,
+                            "steps_passed": report.steps_passed,
+                            "steps_failed": 0,
+                            "step_results": report.step_results,
+                        }))
+                    } else {
+                        // Real regression: envelope stays success (transport ok),
+                        // payload reports the failure honestly.
+                        ok(json!({
+                            "name": report.scenario_name,
+                            "session": sid,
+                            "generation": gen,
+                            "passed": false,
+                            "steps_total": report.steps_total,
+                            "steps_passed": report.steps_passed,
+                            "steps_failed": report.steps_failed,
+                            "step_results": report.step_results,
+                        }))
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| e)
             }
         }
     }
@@ -1063,11 +1128,6 @@ impl TuiLabServer {
     )]
     pub async fn tui_record(&self, p: Parameters<TuiRecordParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
         use crate::mcp::params::RecordFormat as RF;
         let fmt = p
             .format
@@ -1087,7 +1147,10 @@ impl TuiLabServer {
         }) else {
             unreachable!()
         };
-        match rfmt {
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            match rfmt {
             // Attach the raw PTY hook (audit item 24): every byte the reader
             // thread sees from now on is captured with timing.
             RF::Start => {
@@ -1131,7 +1194,7 @@ impl TuiLabServer {
                 // in memory") — the content is also returned inline.
                 let size = body.len() as u64;
                 let (path, artifact) = {
-                    let mut run = self.run.lock().unwrap();
+                    let mut run = run.lock().unwrap();
                     match run.run_dir().cloned() {
                         Some(dir) => {
                             let rec_dir = dir.join("recordings");
@@ -1220,12 +1283,8 @@ impl TuiLabServer {
                 );
                 let size = body.len() as u64;
                 let (path, artifact) = {
-                    let mut run = self.run.lock().unwrap();
-                    let kind = if is_svg {
-                        crate::run::ArtifactKind::Capture
-                    } else {
-                        crate::run::ArtifactKind::Capture
-                    };
+                    let mut run = run.lock().unwrap();
+                    let kind = crate::run::ArtifactKind::Capture;
                     match run.run_dir().cloned() {
                         Some(dir) => {
                             let cap_dir = dir.join("captures");
@@ -1288,7 +1347,10 @@ impl TuiLabServer {
                     },
                 }))
             }
-        }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Wave D item 38: when an exploration report recorded a crash exit,
@@ -1429,11 +1491,6 @@ impl TuiLabServer {
     )]
     async fn tui_explore(&self, p: Parameters<TuiExploreParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
         use crate::mcp::params::ExploreMode as EM;
         let mode_sel = p.mode.clone();
         let Some(emode) = (match &mode_sel {
@@ -1451,6 +1508,33 @@ impl TuiLabServer {
         }) else {
             unreachable!()
         };
+        // StateGraph needs no session at all; every other mode drives the
+        // session through its actor with run locks taken on the actor thread.
+        if emode == EM::StateGraph {
+            let run = self.run.lock().unwrap();
+            return ok(json!({
+                "states": run.state_graph.state_count(),
+                "transitions": run.state_graph.transition_count(),
+                "dead_ends": run.state_graph
+                    .find_dead_ends()
+                    .into_iter()
+                    .map(|n| n.structure_hash.clone())
+                    .collect::<Vec<String>>(),
+                "edges": run.state_graph.edge_list(),
+                "visit_counts": run.state_graph.visit_counts(),
+                "budget_exhausted": run.state_graph.budget_exhausted(),
+                // The ID-keyed focus graph (Wave D item 36): Tab order
+                // and reverse-traversal proof, accumulated across every
+                // observe and audit in this run.
+                "focus_graph": run.focus_graph.summary(),
+            }));
+        }
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        let explore = p.clone();
+        let server = self.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            let p = explore;
         match emode {
             EM::GuidedCandidates => {
                 // Novel action candidates for Hermes to choose (spec 4.3),
@@ -1467,7 +1551,7 @@ impl TuiLabServer {
                     crate::exploration::state_graph::StateIdentity::with_semantic(&screen, &sem);
                 let current = identity.id();
                 let candidate_list = {
-                    let run = self.run.lock().unwrap();
+                    let run = run.lock().unwrap();
                     let action_history: Vec<String> = run
                         .transactions()
                         .iter()
@@ -1507,7 +1591,7 @@ impl TuiLabServer {
                 // from the run's ExplorationBudget, with an optional action
                 // override; the report names the real completion reason.
                 let budget = {
-                    let run = self.run.lock().unwrap();
+                    let run = run.lock().unwrap();
                     crate::exploration::random::Budget {
                         max_actions: p.actions.unwrap_or(run.state_graph.budget().max_actions),
                         ..crate::exploration::random::Budget::from_graph_budget(
@@ -1522,7 +1606,7 @@ impl TuiLabServer {
                         // ordered ExplorationStep records (before → after via
                         // the real action), not from post-hoc hash lists.
                         let graph_summary = {
-                            let mut run = self.run.lock().unwrap();
+                            let mut run = run.lock().unwrap();
                             crate::exploration::random::record_steps(
                                 &mut run.state_graph,
                                 &report.steps,
@@ -1535,7 +1619,7 @@ impl TuiLabServer {
                         };
                         // Persist the graph when the run is persistent.
                         let graph_path = {
-                            let run = self.run.lock().unwrap();
+                            let run = run.lock().unwrap();
                             match run.run_dir() {
                                 Some(dir) => {
                                     let path = dir.join("state_graph.json");
@@ -1555,7 +1639,7 @@ impl TuiLabServer {
                         // minimization pipeline — clean restart, delta-debug
                         // replay, saved Scenario, Finding with
                         // reproduction=scenario_id.
-                        let repro = self.minimize_crash_finding(sess, seed, &report);
+                        let repro = server.minimize_crash_finding(sess, seed, &report);
                         ok(json!({
                             "seed": seed,
                             "report": report,
@@ -1579,7 +1663,7 @@ impl TuiLabServer {
                     .and_then(crate::intent::ActionRisk::parse)
                     .unwrap_or(crate::intent::ActionRisk::Mutating);
                 let (graph_budget, run_graph_summary, contract) = {
-                    let run = self.run.lock().unwrap();
+                    let run = run.lock().unwrap();
                     (
                         run.state_graph.budget().clone(),
                         (run.state_graph.state_count(), run.state_graph.transition_count()),
@@ -1607,7 +1691,7 @@ impl TuiLabServer {
                 };
                 // Merge what actually happened into the run's graphs.
                 {
-                    let mut run = self.run.lock().unwrap();
+                    let mut run = run.lock().unwrap();
                     run.state_graph.merge(&local_graph);
                     run.focus_graph.merge(&focus_graph);
                 }
@@ -1622,26 +1706,11 @@ impl TuiLabServer {
                     },
                 }))
             }
-            EM::StateGraph => {
-                let run = self.run.lock().unwrap();
-                ok(json!({
-                    "states": run.state_graph.state_count(),
-                    "transitions": run.state_graph.transition_count(),
-                    "dead_ends": run.state_graph
-                        .find_dead_ends()
-                        .into_iter()
-                        .map(|n| n.structure_hash.clone())
-                        .collect::<Vec<String>>(),
-                    "edges": run.state_graph.edge_list(),
-                    "visit_counts": run.state_graph.visit_counts(),
-                    "budget_exhausted": run.state_graph.budget_exhausted(),
-                    // The ID-keyed focus graph (Wave D item 36): Tab order
-                    // and reverse-traversal proof, accumulated across every
-                    // observe and audit in this run.
-                    "focus_graph": run.focus_graph.summary(),
-                }))
-            }
+            EM::StateGraph => unreachable!("handled above the actor boundary"),
         }
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// UX audits: keyboard / focus / layout / resize / navigation / discoverability / states / errors / mouse / color / performance / full (spec section 14-21).
@@ -1651,11 +1720,6 @@ impl TuiLabServer {
     )]
     async fn tui_audit(&self, p: Parameters<TuiAuditParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = match mgr.resolve_mut(p.id.as_deref()) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
-        };
         use crate::mcp::params::AuditProfile as AP;
         let profile_sel = p
             .profile
@@ -1684,40 +1748,44 @@ impl TuiLabServer {
         // and no profile is weaker than its members. The MCP layer only
         // surfaces the resulting mode. Item 49: the loaded contract rides
         // along for profile=contract.
-        let report = {
-            let contract = self.run.lock().unwrap().contract().cloned();
-            match crate::audit::orchestrator::run_profile_with_contract(
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            let contract = run.lock().unwrap().contract().cloned();
+            let report = match crate::audit::orchestrator::run_profile_with_contract(
                 sess,
                 &profile,
                 contract.as_ref(),
             ) {
                 Ok(r) => r,
                 Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
-            }
-        };
+            };
 
-        // Findings accumulate in the run context (composition root) so a
-        // later audit/coverage query can see prior evidence. Driven focus
-        // edges merge into the run's persistent ID-keyed FocusGraph (Wave D
-        // item 36), so multiple audits accumulate traversal proof.
-        let focus_summary = {
-            let mut run = self.run.lock().unwrap();
-            run.focus_graph.merge(&report.focus_graph);
-            run.extend_findings(report.findings.clone());
-            json!({
-                "nodes": run.focus_graph.nodes.len(),
-                "edges": run.focus_graph.edges.len(),
-                "tab_cycle": run.focus_graph.tab_cycle(),
-                "reverse_tab_gaps": run.focus_graph.reverse_tab_gaps(),
-            })
-        };
-        ok(json!({
-            "profile": profile_wire,
-            "mode": report.mode,
-            "finding_count": report.findings.len(),
-            "findings": report.findings,
-            "focus_graph": focus_summary,
-        }))
+            // Findings accumulate in the run context (composition root) so a
+            // later audit/coverage query can see prior evidence. Driven focus
+            // edges merge into the run's persistent ID-keyed FocusGraph (Wave D
+            // item 36), so multiple audits accumulate traversal proof.
+            let focus_summary = {
+                let mut run = run.lock().unwrap();
+                run.focus_graph.merge(&report.focus_graph);
+                run.extend_findings(report.findings.clone());
+                json!({
+                    "nodes": run.focus_graph.nodes.len(),
+                    "edges": run.focus_graph.edges.len(),
+                    "tab_cycle": run.focus_graph.tab_cycle(),
+                    "reverse_tab_gaps": run.focus_graph.reverse_tab_gaps(),
+                })
+            };
+            ok(json!({
+                "profile": profile_wire,
+                "mode": report.mode,
+                "finding_count": report.findings.len(),
+                "findings": report.findings,
+                "focus_graph": focus_summary,
+            }))
+        })
+        .await
+        .unwrap_or_else(|e| e)
     }
 
     /// Coverage (spec section 5; Wave F item 64). Two providers, merged:
@@ -1853,7 +1921,7 @@ impl TuiLabServer {
         };
         match run_action {
             RA::Status => {
-                let sessions = self.manager.lock().unwrap().list();
+                let sessions = self.sessions.list();
                 ok(self.run.lock().unwrap().status(
                     sessions
                         .into_iter()
@@ -1900,30 +1968,33 @@ impl TuiLabServer {
                 }
             }
             RA::Close => {
-                let mut run = self.run.lock().unwrap();
                 // Drain terminal-event queues into the run (Wave B item 14)
                 // before the flush so the event logs land in the artifacts.
-                // The id list is bound FIRST: a `for sid in lock().list()`
-                // would keep the manager guard alive for the whole loop and
-                // re-locking it below self-deadlocks (std Mutex is not
-                // reentrant) — the exact hang this replaces.
-                let session_ids = self.manager.lock().unwrap().list();
-                for sid in session_ids {
-                    if let Ok(sess) = self.manager.lock().unwrap().resolve_mut(Some(&sid)) {
-                        run.hold_events(&sid, sess.drain_events());
+                // Wave G item 73: each drain is one actor call — no guard is
+                // held across the loop, so there is no re-entrancy dance and
+                // no close-path deadlock to avoid.
+                for sid in self.sessions.list() {
+                    if let Ok(events) = self.sessions.drain_events(&sid).await {
+                        self.run.lock().unwrap().hold_events(&sid, events);
                     }
                 }
-                let already = run.is_closed();
-                let sessions = self.manager.lock().unwrap().list();
-                let summary = run.status(
-                    sessions
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                );
-                let kill = p.kill_sessions.unwrap_or(false);
-                let result = run.close();
-                drop(run);
+                let already;
+                let summary;
+                let kill;
+                let result;
+                {
+                    let mut run = self.run.lock().unwrap();
+                    already = run.is_closed();
+                    let sessions = self.sessions.list();
+                    summary = run.status(
+                        sessions
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                    kill = p.kill_sessions.unwrap_or(false);
+                    result = run.close();
+                }
                 if let Err(e) = result {
                     return err(
                         ErrorCategory::InternalError,
@@ -1932,15 +2003,7 @@ impl TuiLabServer {
                 }
                 // Sessions survive close unless explicitly requested.
                 let stopped: Vec<String> = if kill {
-                    let mut mgr = self.manager.lock().unwrap();
-                    let ids: Vec<String> = mgr.list();
-                    let mut stopped = Vec::new();
-                    for id in ids {
-                        if mgr.stop(&id).is_ok() {
-                            stopped.push(id);
-                        }
-                    }
-                    stopped
+                    self.sessions.stop_all().await
                 } else {
                     Vec::new()
                 };
@@ -2009,16 +2072,21 @@ impl TuiLabServer {
                         )
                     }
                 };
-                let applied: Vec<String> = {
-                    let mut mgr = self.manager.lock().unwrap();
-                    let ids = mgr.list();
-                    for sid in &ids {
-                        if let Ok(sess) = mgr.get_mut(sid) {
-                            sess.set_normalization_policy(policy.clone());
-                        }
+                // Apply to EVERY live session (item 48 semantics): one actor
+                // job per session, none blocking another.
+                let mut applied: Vec<String> = Vec::new();
+                for sid in self.sessions.list() {
+                    let policy_for_session = policy.clone();
+                    if let Ok(id) = self
+                        .with_sess(Some(&sid), move |sess| {
+                            sess.set_normalization_policy(policy_for_session.clone());
+                            sess.id.clone()
+                        })
+                        .await
+                    {
+                        applied.push(id);
                     }
-                    ids
-                };
+                }
                 let summary = {
                     let mut run = self.run.lock().unwrap();
                     run.set_contract(contract.clone(), path.clone());
@@ -2085,7 +2153,8 @@ impl TuiLabServer {
                         }
                     }
                 };
-                self.check_contract_against(p.id.as_deref(), &contract)
+                self.check_contract_against(p.id.as_deref(), contract)
+                    .await
             }
             // ── compare: run conformance now, diff against the baseline ──
             CT::Compare => {
@@ -2101,9 +2170,11 @@ impl TuiLabServer {
                         }
                     }
                 };
-                let current = match self.check_contract_inner(p.id.as_deref(), &contract) {
-                    Ok(r) => r,
-                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                let current =
+                    match self.check_contract_inner(p.id.as_deref(), contract.clone()).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => return err(ErrorCategory::BackendError, e.to_string()),
+                    Err(e) => return e,
                 };
                 let label = p.label.clone().unwrap_or_else(|| "current".into());
                 let mut run = self.run.lock().unwrap();
@@ -2190,19 +2261,26 @@ impl TuiLabServer {
         }
     }
 
-    /// Lock-and-resolve wrapper around [`Self::check_contract_inner`].
-    fn check_contract_against(
+    /// Actor-backed conformance check with run-ledger recording.
+    async fn check_contract_against(
         &self,
         id: Option<&str>,
-        contract: &crate::design::ProjectContract,
+        contract: crate::design::ProjectContract,
     ) -> rmcp::model::CallToolResult {
-        match self.check_contract_inner(id, contract) {
-            Ok(report) => {
+        let selector = id.map(str::to_string);
+        let run = self.run.clone();
+        match self
+            .with_sess(selector.as_deref(), move |sess| {
+                crate::design::check_contract(sess, &contract)
+            })
+            .await
+        {
+            Ok(Ok(report)) => {
                 // Findings feed the run ledger (item 49).
                 let findings = report.findings();
                 let summary = report.summary();
                 let results = report.results.clone();
-                let mut run = self.run.lock().unwrap();
+                let mut run = run.lock().unwrap();
                 run.extend_findings(findings);
                 run.record_contract_baseline("baseline", &report);
                 ok(json!({
@@ -2211,18 +2289,26 @@ impl TuiLabServer {
                     "results": results,
                 }))
             }
-            Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+            Ok(Err(e)) => err(ErrorCategory::BackendError, e.to_string()),
+            Err(e) => e,
         }
     }
 
-    fn check_contract_inner(
+    async fn check_contract_inner(
         &self,
         id: Option<&str>,
-        contract: &crate::design::ProjectContract,
-    ) -> anyhow::Result<crate::design::ContractReport> {
-        let mut mgr = self.manager.lock().unwrap();
-        let sess = mgr.resolve_mut(id)?;
-        crate::design::check_contract(sess, contract)
+        contract: crate::design::ProjectContract,
+    ) -> Result<anyhow::Result<crate::design::ContractReport>, rmcp::model::CallToolResult> {
+        let selector = id.map(str::to_string);
+        match self
+            .with_sess(selector.as_deref(), move |sess| {
+                crate::design::check_contract(sess, &contract)
+            })
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => Err(e),
+        }
     }
 }
 

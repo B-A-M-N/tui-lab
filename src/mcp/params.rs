@@ -272,7 +272,7 @@ impl AuditProfile {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiSessionParams {
     pub action: Known<SessionAction>,
     #[serde(default)]
@@ -339,7 +339,7 @@ impl From<IsolationParam> for crate::session::isolation::Isolation {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiObserveParams {
     #[serde(default)]
     pub mode: Option<Known<ObserveMode>>,
@@ -386,7 +386,7 @@ impl TuiActRequestSchema {
 /// identical; `doc(hidden)` so it never appears in the public API story.
 #[doc(hidden)]
 #[allow(dead_code)]
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum TuiActRequestVariants {
     Key {
@@ -532,7 +532,7 @@ pub enum TuiActRequestVariants {
 /// (MCP spec); serde's internally-tagged enum alone generates a bare `oneOf`
 /// there, which panicked the tool router on every stdio `tools/list` /
 /// `tools/call`.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 #[schemars(schema_with = "TuiActRequestSchema::wrapped")]
 pub enum TuiActRequest {
@@ -771,7 +771,7 @@ impl TuiActRequest {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiWaitParams {
     pub condition: Known<WaitCondition>,
     #[serde(default)]
@@ -787,7 +787,7 @@ pub struct TuiWaitParams {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiAssertParams {
     pub assertion: Known<AssertAssertion>,
     #[serde(default)]
@@ -823,7 +823,7 @@ impl TuiAssertParams {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiCheckpointParams {
     pub action: Known<CheckpointAction>,
     #[serde(default)]
@@ -832,7 +832,7 @@ pub struct TuiCheckpointParams {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiScenarioParams {
     pub action: Known<ScenarioAction>,
     #[serde(default)]
@@ -848,7 +848,7 @@ pub struct TuiScenarioParams {
     pub steps: Option<Vec<serde_json::Value>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiRecordParams {
     #[serde(default)]
     pub format: Option<Known<RecordFormat>>,
@@ -858,7 +858,7 @@ pub struct TuiRecordParams {
 
 /// Run lifecycle (goal spec): status / persist / close / context. Ephemeral
 /// by default; `persist` promotes the SAME run to durable storage.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiRunParams {
     pub action: Known<RunAction>,
     /// persist: explicit artifact root. When omitted, resolved from the
@@ -871,7 +871,7 @@ pub struct TuiRunParams {
     pub kill_sessions: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiExploreParams {
     pub mode: Known<ExploreMode>,
     #[serde(default)]
@@ -890,7 +890,7 @@ pub struct TuiExploreParams {
     pub max_risk: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiAuditParams {
     #[serde(default)]
     pub profile: Option<Known<AuditProfile>>,
@@ -904,7 +904,7 @@ pub struct TuiAuditParams {
     pub compare_to: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiCoverageParams {
     #[serde(default)]
     pub action: Option<Known<CoverageAction>>,
@@ -914,7 +914,7 @@ pub struct TuiCoverageParams {
     pub format: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiFrameworkParams {
     pub action: Known<FrameworkAction>,
     #[serde(default)]
@@ -925,7 +925,7 @@ pub struct TuiFrameworkParams {
 
 /// Wave E items 45–47: contract loading, validation, conformance status,
 /// and comparison against a saved baseline.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiContractParams {
     /// load | validate | status | compare
     pub action: Known<ContractAction>,
