@@ -41,6 +41,10 @@ struct BackendCallbacks {
     title: Option<String>,
     audible_bells: u64,
     title_seq: u64,
+    /// OSC8 hyperlink currently open (`id=…` params + URI), if any.
+    open_link: Option<crate::screen::cell::Hyperlink>,
+    /// Links completed so far, in completion order.
+    links: Vec<crate::screen::cell::Hyperlink>,
 }
 
 impl vt100::Callbacks for BackendCallbacks {
@@ -52,6 +56,41 @@ impl vt100::Callbacks for BackendCallbacks {
         let s = String::from_utf8_lossy(title).into_owned();
         self.title = Some(s);
         self.title_seq += 1;
+    }
+
+    /// OSC8 hyperlinks (Wave C item 29): `\e]8;params;uri\e\\ … \e]8;;\e\\`.
+    /// The vt grid does not carry link state, so we record the span by
+    /// *cursor position at open/close time* — the same coordinates the grid
+    /// uses. Observation only: we never fetch the URI.
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first().copied() != Some(b"8".as_slice()) {
+            return;
+        }
+        let (y, x) = screen.cursor_position();
+        // OSC8 with empty URI closes the current link.
+        let uri_at_2: Option<&[u8]> = params.get(2).map(|p| p.as_ref());
+        match uri_at_2 {
+            Some(uri) if !uri.is_empty() => {
+                let link_params = String::from_utf8_lossy(params.get(1).copied().unwrap_or(b""));
+                let id = link_params
+                    .split(';')
+                    .find_map(|kv| kv.strip_prefix("id="))
+                    .map(|s| s.to_string());
+                self.open_link = Some(crate::screen::cell::Hyperlink {
+                    id,
+                    uri: String::from_utf8_lossy(uri).into_owned(),
+                    start: (x, y),
+                    end: None,
+                });
+            }
+            _ => {
+                // Close: finish the span at the current cursor.
+                if let Some(mut link) = self.open_link.take() {
+                    link.end = Some((x, y));
+                    self.links.push(link);
+                }
+            }
+        }
     }
 }
 
@@ -389,7 +428,20 @@ impl TerminalBackend for PortablePtyBackend {
         }
         let title = self.parser.callbacks().title.clone();
         let process = self.process();
-        Ok(crate::screen::from_vt(self.parser.screen(), process, title))
+        let links: Vec<crate::screen::cell::Hyperlink> = self
+            .parser
+            .callbacks()
+            .links
+            .iter()
+            .cloned()
+            .chain(self.parser.callbacks().open_link.clone())
+            .collect();
+        Ok(crate::screen::from_vt(
+            self.parser.screen(),
+            process,
+            title,
+            links,
+        ))
     }
 
     fn send_input(&mut self, input: Input) -> BackendResult<()> {
@@ -579,7 +631,17 @@ impl TerminalBackend for PortablePtyBackend {
 
             let process = self.process();
             let title = self.parser.callbacks().title.clone();
-            let screen = crate::screen::from_vt(self.parser.screen(), process, title);
+            let mut links: Vec<crate::screen::cell::Hyperlink> =
+                self.parser.callbacks().links.clone();
+            if let Some(open) = &self.parser.callbacks().open_link {
+                links.push(open.clone());
+            }
+            let screen = crate::screen::from_vt(
+                self.parser.screen(),
+                process,
+                title,
+                links,
+            );
 
             let (met, reason) = match &cond {
                 WaitCond::Text(t) => (
@@ -1486,5 +1548,35 @@ mod key_encode_tests {
             &modes,
         );
         assert!(matches!(out, Err(BackendError::Unsupported(_))));
+    }
+}
+
+#[cfg(test)]
+mod osc8_tests {
+    use super::*;
+
+    #[test]
+    fn osc8_hyperlink_captured_in_screen_state() {
+        let mut b = PortablePtyBackend::new(40, 5);
+        let fixture = std::env::temp_dir().join("osc8_fixture.py");
+        std::fs::write(&fixture, include_str!("/tmp/osc8_fixture.py")).unwrap();
+        b.start(
+            "python3",
+            &[fixture.to_string_lossy().to_string()],
+            None,
+            &[],
+            40,
+            5,
+        )
+        .expect("start");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let st = b.state().expect("state");
+        b.stop().ok();
+        let links = &st.hyperlinks;
+        assert!(
+            links.iter().any(|l| l.uri.contains("example.com/docs")),
+            "OSC8 link must be captured: {:?}",
+            links
+        );
     }
 }

@@ -295,6 +295,7 @@ mod tests {
             cells: Vec::new(),
             viewport_text: vec!["hi".to_string(), "".to_string(), "".to_string()],
             scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
             raw_hash: "r1".into(),
             visual_hash: "v1".into(),
             structure_hash: "s1".into(),

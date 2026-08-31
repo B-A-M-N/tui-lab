@@ -43,6 +43,12 @@ attributes, cursor, title), not screenshots.
    (button/field/checkbox/...), and the focused control, each with a
    `confidence` and `source: "inferred"`. Treat inference as a hypothesis, not
    ground truth.
+   For structure-aware work prefer `mode=nodes`: the Wave-C semantic node
+   tree expresses everything as one tree (screen → dialog → table → rows →
+   cells), tags modal vs overlay vs status layers, reports scroll edges
+   ("can_scroll_down: true" instead of blind PageDown), OSC8 hyperlinks,
+   and disabled/read-only state with provenance (`source: "dim-style"` vs
+   `"default"` assumption).
 4. Explore: `tui_act` + `tui_wait` to walk a workflow. After each action read
    the transition. Use `tui_explore mode=guided_candidates` to get ranked
    next actions (Hermes reasons; the tool does NOT embed another LLM).
@@ -60,8 +66,8 @@ attributes, cursor, title), not screenshots.
 ## Tools (12)
 
 - `tui_session` — start / restart / stop / list / status.
-- `tui_observe` — summary | screen | cells | region | semantic | diff |
-  scrollback | history.
+- `tui_observe` — summary | screen | cells | region | semantic | tree |
+  nodes | diff | scrollback | history.
 - `tui_act` — key / keys / type / paste / mouse_click / mouse_move / mouse_drag
   / mouse_scroll / resize / signal / raw. Auto-waits + captures transition.
 - `tui_wait` — text / text_absent / screen_change / screen_stable /

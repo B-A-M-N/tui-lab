@@ -71,6 +71,24 @@ pub struct ProcessState {
     pub pid: Option<u32>,
 }
 
+/// An OSC8 hyperlink observed on screen (Wave C item 29).
+///
+/// Spans are recorded in cell coordinates at open/close time (the vt grid
+/// itself does not carry link state). Observation only — the URI is recorded,
+/// never fetched.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Hyperlink {
+    /// The `id=` parameter from the OSC8 params, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub uri: String,
+    /// `(x, y)` where the link text starts.
+    pub start: (u16, u16),
+    /// `(x, y)` where it ends (exclusive); `None` when still open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<(u16, u16)>,
+}
+
 /// Full screen snapshot.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScreenState {
@@ -87,6 +105,9 @@ pub struct ScreenState {
     /// Scrollback lines (most recent last).
     #[serde(default)]
     pub scrollback: Vec<String>,
+    /// OSC8 hyperlinks observed on this screen (item 29).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hyperlinks: Vec<Hyperlink>,
     pub raw_hash: String,
     pub visual_hash: String,
     pub structure_hash: String,
@@ -108,6 +129,7 @@ impl ScreenState {
             cells: Vec::new(),
             viewport_text: Vec::new(),
             scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
             raw_hash: String::new(),
             visual_hash: String::new(),
             structure_hash: String::new(),

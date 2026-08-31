@@ -9,10 +9,13 @@ pub mod components;
 pub mod confidence;
 pub mod controls;
 pub mod focus;
+pub mod node;
 pub mod recognizers;
 pub mod regions;
 pub mod relationships;
 pub mod state_tree;
+pub mod tree_builder;
+pub mod widgets;
 
 pub use affordance::{infer_affordances, Affordance, Invocation, Visibility};
 
@@ -23,9 +26,14 @@ pub use components::{
 pub use confidence::Confidence;
 pub use controls::{Control, ControlKind};
 pub use focus::FocusInfo;
+pub use node::{
+    EnabledState, Layer, NodeState, ReadOnlyState, Role, ScrollEdges, SemanticNode, SemanticTree,
+};
 pub use regions::{ClippingState, Region, RegionKind};
 pub use relationships::{Relationship, RelationshipEngine, SemanticRelation};
 pub use state_tree::{build_state_tree, ControlEntry, StateNode, TerminalStateTree};
+pub use tree_builder::build_tree;
+pub use widgets::{detect_widgets, Widget, WidgetKind};
 
 use crate::screen::ScreenState;
 

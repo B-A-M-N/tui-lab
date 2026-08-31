@@ -192,7 +192,7 @@ impl TuiLabServer {
     /// Observe the screen: summary / screen / cells / region / semantic / diff / scrollback / history.
     #[tool(
         name = "tui_observe",
-        description = "Observe terminal state. Modes: summary, screen, cells, semantic, diff, scrollback."
+        description = "Observe terminal state. Modes: summary, screen, cells, semantic, tree, nodes, diff, scrollback."
     )]
     async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> String {
         let p = p.0;
@@ -269,6 +269,18 @@ impl TuiLabServer {
                     &sem.components,
                 );
                 ok(json!({ "tree": tree, "rendered": tree.render() }))
+            }
+            // Wave C (items 16-30): the general SemanticNode tree — one node
+            // type for regions, controls, widget internals (table rows/cells,
+            // tree items, scroll edges), hyperlinks, and help hints, with
+            // modal layering and provenance-tracked enabled state.
+            "nodes" => {
+                let tree = semantic::build_tree(&screen);
+                ok(json!({
+                    "tree": tree,
+                    "rendered": tree.render(),
+                    "layers": tree.layers,
+                }))
             }
             "diff" => {
                 // ONE diff path (re-review item 7): observe() above stashed

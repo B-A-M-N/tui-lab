@@ -15,6 +15,7 @@
 use vt100::Screen as VtScreen;
 
 use super::cell::{Cell, Color, CursorState, ProcessState, ScreenState};
+use super::cell_string::display_width;
 
 fn cell_color(c: vt100::Color) -> Color {
     match c {
@@ -30,7 +31,12 @@ fn cell_color(c: vt100::Color) -> Color {
     }
 }
 
-pub fn from_vt(screen: &VtScreen, process: ProcessState, title: Option<String>) -> ScreenState {
+pub fn from_vt(
+    screen: &VtScreen,
+    process: ProcessState,
+    title: Option<String>,
+    hyperlinks: Vec<super::cell::Hyperlink>,
+) -> ScreenState {
     let rows = screen.size().0;
     let cols = screen.size().1;
     let mut cells = Vec::with_capacity((rows * cols) as usize);
@@ -104,7 +110,14 @@ pub fn from_vt(screen: &VtScreen, process: ProcessState, title: Option<String>) 
             cells[row_start..].iter().map(|c| (c.x, c.text.as_str())),
             cols,
         );
-        viewport_text.push(line.as_str().to_string());
+        // Rows render at grid width: trailing blank cells pad to `cols` so
+        // consumers can index by column and diff rows of equal length.
+        let mut rendered = line.render();
+        let w = display_width(&rendered);
+        if w < cols {
+            rendered.push_str(&" ".repeat((cols - w) as usize));
+        }
+        viewport_text.push(rendered);
     }
 
     // Structure hash: normalize per-row (item 19). We build the structure
@@ -133,6 +146,7 @@ pub fn from_vt(screen: &VtScreen, process: ProcessState, title: Option<String>) 
         cells,
         viewport_text,
         scrollback: Vec::new(),
+        hyperlinks,
         raw_hash: format!("raw:v1:{}", hex(raw.finalize().as_bytes())),
         visual_hash: format!("visual:v1:{}", hex(visual.finalize().as_bytes())),
         structure_hash: format!("structure:v1:{}", hex(structure.finalize().as_bytes())),
@@ -169,17 +183,28 @@ mod tests {
         let mut p = vt100::Parser::new(4, 10, 0);
         // 界 (width 2) at col 0, A lands at col 2; continuation cell empty.
         p.process("界A".as_bytes());
-        let state = from_vt(p.screen(), process_state(), None);
+        let state = from_vt(p.screen(), process_state(), None, Vec::new());
         let row = &state.viewport_text[0];
         assert_eq!(row.chars().next(), Some('界'));
         assert_eq!(row.chars().nth(1), Some(' '), "continuation column padded");
         assert_eq!(row.chars().nth(2), Some('A'));
 
-        // Same row via the CellString view: char_at agrees with the grid.
-        let cs = crate::screen::CellString::aligned(row.clone());
-        assert_eq!(cs.char_at(2), Some('A'));
+        // Same row via the CellString view. The rendered row's char index
+        // still equals the column (filler space after 界), but aligned()
+        // re-measures widths: the filler at char 1 becomes a *slot* at col 2,
+        // pushing "A" to col 3 in slot space. Column addressing must be
+        // rebuilt from the vt cells, not the padded render — which is exactly
+        // why byte_to_cell exists: it maps the render's offsets to columns.
+        let cs = crate::screen::CellString::from_cells(
+            state.cells[..10].iter().map(|c| (c.x, c.text.as_str())),
+            state.cols,
+        );
+        assert_eq!(cs.char_at(2), Some("A"), "grid cell 2 is A");
+        assert_eq!(cs.glyph_at(1).map(|s| s.text.as_str()), Some("界"));
         assert!(cs.display_width() >= 3);
     }
+
+
 
     /// Item 22: pure-ASCII rows are byte-identical to the old assembly
     /// (including its full-width space padding of blank cells).
@@ -187,7 +212,7 @@ mod tests {
     fn from_vt_ascii_rows_unchanged() {
         let mut p = vt100::Parser::new(4, 20, 0);
         p.process(b"[ OK ] Host: db");
-        let state = from_vt(p.screen(), process_state(), None);
+        let state = from_vt(p.screen(), process_state(), None, Vec::new());
         assert!(state.viewport_text[0].starts_with("[ OK ] Host: db"));
         assert_eq!(state.viewport_text[0].len(), 20, "padded to grid width");
     }

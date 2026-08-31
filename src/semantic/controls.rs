@@ -1025,6 +1025,7 @@ mod tests {
             cells: Vec::new(),
             viewport_text: rows,
             scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
             raw_hash: String::new(),
             visual_hash: String::new(),
             structure_hash: String::new(),

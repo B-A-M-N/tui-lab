@@ -253,6 +253,32 @@ fn stdio_e2e_full_lifecycle() {
         "tree carries bounds: {obs_tree}"
     );
 
+    // --- observe mode=nodes: the Wave-C SemanticNode tree ---
+    let obs_nodes = mcp.tool(
+        "tui_observe",
+        serde_json::json!({ "mode": "nodes", "id": session }),
+    );
+    assert_eq!(obs_nodes["category"], "success", "nodes mode: {obs_nodes}");
+    let nrendered = obs_nodes["data"]["rendered"].as_str().unwrap_or_default();
+    assert!(
+        nrendered.contains("screen"),
+        "node tree render must include the root: {obs_nodes}"
+    );
+    assert!(
+        obs_nodes["data"]["tree"]["root"]["children"].is_array()
+            || obs_nodes["data"]["tree"]["root"]
+                .get("children")
+                .is_none(),
+        // A blank screen legitimately yields no children (the field is
+        // skip_serializing_if empty) — the shape contract is the root node
+        // itself plus layer tags.
+        "node tree root is well-formed: {obs_nodes}"
+    );
+    assert!(
+        obs_nodes["data"]["layers"].is_object(),
+        "node tree carries layer tags: {obs_nodes}"
+    );
+
     // --- act: type text + enter ---
     let act = mcp.tool(
         "tui_act",

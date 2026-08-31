@@ -75,6 +75,16 @@ screen-level components (tables, trees, scrollbars) attached — the
 machine-readable shape to compare against an intended design. `rendered`
 is an indented text view for logs.
 
+`nodes` returns the Wave-C semantic node tree: one node type
+(`{id, role, parent, children, bounds, label, value, state, affordances,
+confidence}`) for everything on screen — regions, controls, table
+header/rows/cells, tree items, scroll regions (with `can_scroll_up/down`,
+`at_start/at_end`), text areas, selects, menus, command palettes, split
+panes, toasts, OSC8 hyperlinks, help overlays, and key-hint bars. Top-level
+subtrees carry layer tags (`modal` / `overlay` / `status` / `background`),
+and `state.enabled` carries provenance (`source: "dim-style"` vs `"default"`
+assumption) — disabled is inferred from evidence, never silently assumed.
+
 The `semantic` payload includes the Wave-4 semantic surfaces: `affordances`
 (actionable capabilities with their visible cues), `components` (detected
 tables/trees/scrollbars), and `relationships` (normalized spatial relations
@@ -191,7 +201,7 @@ integrated until the real MCP path can exercise it.
 | Mouse | working (SGR/X10/UTF-8 byte-conformance-tested: press/release/move/drag/wheel) |
 | Resize | working (single-record, backend-owned) |
 | State waits | working (causality-anchored) |
-| Semantic model | v2 (border graph) |
+| Semantic model | v3 (border graph + SemanticNode tree, modal layering, widget families, provenance-tracked enabled, OSC8 hyperlinks) |
 | MCP surface | working (12 tools, stdio E2E-proven) |
 | Run lifecycle | working (ephemeral default, explicit persist/close) |
 | Checkpoints | working (durable under persistent runs) |

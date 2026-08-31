@@ -136,7 +136,7 @@ pub fn infer_affordances(screen: &ScreenState, controls: &[Control]) -> Vec<Affo
 ///   * `[F1] Help`         — bracketed function key
 ///   * `ctrl+s save`       — explicit modifier
 ///   * `<tab> next`        — angle-bracketed key
-fn extract_hint_pairs(line: &str) -> Vec<(String, String)> {
+pub(crate) fn extract_hint_pairs(line: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let trimmed = line.trim();
 
@@ -291,6 +291,7 @@ mod tests {
             cells: Vec::new(),
             viewport_text: rows.into_iter().map(String::from).collect(),
             scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
             raw_hash: String::new(),
             visual_hash: String::new(),
             structure_hash: String::new(),
