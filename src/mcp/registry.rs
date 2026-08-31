@@ -28,12 +28,12 @@ pub struct ToolCapability {
 pub const TOOLS: &[ToolCapability] = &[
     ToolCapability {
         name: "tui_session",
-        summary: "Manage TUI sessions: start, restart, stop, list, status, lease (human control), release.",
+        summary: "Manage TUI sessions: start, restart, stop, list, status, plus the human control lease (lease/release).",
         selector: Some(("action", <crate::mcp::params::SessionAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
         name: "tui_observe",
-        summary: "Observe terminal state (summary, screen text, cells, semantic surfaces, tree, nodes, diff, change cursor, scrollback, search, command state).",
+        summary: "Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state.",
         selector: Some(("mode", <crate::mcp::params::ObserveMode as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -68,12 +68,12 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_explore",
-        summary: "Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph.",
+        summary: "Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph. Driving: blocked while a human lease is live.",
         selector: Some(("mode", <crate::mcp::params::ExploreMode as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
         name: "tui_audit",
-        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs (FIXED/REGRESSED/NEW).",
+        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Active profiles drive the app: blocked while a human lease is live.",
         selector: Some(("profile", <crate::mcp::params::AuditProfile as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -88,13 +88,43 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_run",
-        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, and context (this registry as JSON).",
+        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, and context (this registry as JSON).",
         selector: Some(("action", <crate::mcp::params::RunAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
         name: "tui_contract",
         summary: "Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).",
         selector: Some(("action", <crate::mcp::params::ContractAction as EnumVariants>::VARIANTS)),
+    },
+];
+
+/// One declared resource surface (templates + the fixed findings feed).
+pub struct ResourceCapability {
+    /// URI, with `{placeholders}` for templates.
+    pub uri: &'static str,
+    pub description: &'static str,
+}
+
+/// Every `tui://` resource, in stable order. The live `tui://runs/<id>`
+/// entry (this server's own run) is dynamic and not listed here; these are
+/// the shapes a client can enumerate without connecting.
+pub const RESOURCES: &[ResourceCapability] = &[
+    ResourceCapability {
+        uri: "tui://runs/{run_id}",
+        description:
+            "Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).",
+    },
+    ResourceCapability {
+        uri: "tui://sessions/{session_id}/semantic",
+        description: "Live semantic screen: regions, controls, focus, affordances, components.",
+    },
+    ResourceCapability {
+        uri: "tui://sessions/{session_id}/screen",
+        description: "Live screen text + geometry.",
+    },
+    ResourceCapability {
+        uri: "tui://findings",
+        description: "Findings accumulated this run (audits, contracts, exploration).",
     },
 ];
 
@@ -109,12 +139,10 @@ pub fn to_json() -> serde_json::Value {
                 "values": values,
             })),
         })).collect::<Vec<_>>(),
-        "resources": [
-            { "uri_template": "tui://runs/{run_id}", "description": "run status + manifest" },
-            { "uri_template": "tui://sessions/{session_id}/semantic", "description": "live semantic screen (regions, controls, focus, affordances, components)" },
-            { "uri_template": "tui://sessions/{session_id}/screen", "description": "live screen text + geometry" },
-            { "uri_template": "tui://findings", "description": "findings accumulated this run" },
-        ],
+        "resources": RESOURCES.iter().map(|r| json!({
+            "uri_template": r.uri,
+            "description": r.description,
+        })).collect::<Vec<_>>(),
         "count": TOOLS.len(),
     })
 }
@@ -130,6 +158,18 @@ pub fn skill_tool_section() -> String {
         if let Some((field, values)) = t.selector {
             out.push_str(&format!("  - {}: {}\n", field, values.join(", ")));
         }
+    }
+    out
+}
+
+/// Render the SKILL.md resource section from the same RESOURCES table the
+/// server advertises — one declaration, three consumers (list_resource_
+/// templates stays hand-written where it needs rmcp types; the registry
+/// JSON and the skill doc both read this).
+pub fn skill_resource_section() -> String {
+    let mut out = String::from("## Resources (tui://)\n\n");
+    for r in RESOURCES {
+        out.push_str(&format!("- `{}` — {}\n", r.uri, r.description));
     }
     out
 }
@@ -170,6 +210,45 @@ mod tests {
         let section = skill_tool_section();
         for t in TOOLS {
             assert!(section.contains(t.name), "skill section misses {}", t.name);
+        }
+    }
+
+    #[test]
+    fn registry_names_match_the_rmcp_router() {
+        // Item 69's pin: the registry cannot drift from what tools/list
+        // actually serves. The router is built from the same #[tool] fns
+        // the dispatch macro uses, so equality here means the registry and
+        // the wire surface are the same set.
+        let router = crate::mcp::TuiLabServer::tool_router();
+        let mut served: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let mut declared: Vec<String> = TOOLS.iter().map(|t| t.name.to_string()).collect();
+        served.sort();
+        declared.sort();
+        assert_eq!(declared, served, "registry TOOLS != router tools/list set");
+    }
+
+    #[test]
+    fn skill_doc_ships_the_generated_sections() {
+        // The compiled-in skill document must be regenerated from the
+        // registry, not hand-edited: its Tools and Resources sections are
+        // byte-equal to what the generators produce right now. A failure
+        // here means the registry changed without rerunning
+        // `cargo run -- skill` (or editing SKILL.md by hand).
+        let doc = include_str!("../../SKILL.md");
+        assert!(
+            doc.contains(&skill_tool_section()),
+            "SKILL.md's Tools section drifted from the registry — regenerate: cargo run -- skill"
+        );
+        assert!(
+            doc.contains(&skill_resource_section()),
+            "SKILL.md's Resources section drifted from the registry — regenerate: cargo run -- skill"
+        );
+        for r in RESOURCES {
+            assert!(doc.contains(r.uri), "SKILL.md misses resource {}", r.uri);
         }
     }
 }

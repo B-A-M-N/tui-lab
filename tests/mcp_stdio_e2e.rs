@@ -180,14 +180,30 @@ fn stdio_e2e_full_lifecycle() {
     );
     mcp.notify("notifications/initialized");
 
-    // --- tools/list: the 12-tool surface ---
+    // --- tools/list: exactly the registry's 14-tool surface (item 69's
+    // pin, held over the wire) ---
     let tools = mcp.request("tools/list", serde_json::json!({}));
-    let names: Vec<String> = tools["result"]["tools"]
+    let mut names: Vec<String> = tools["result"]["tools"]
         .as_array()
         .expect("tools array")
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
+    names.sort();
+    let registry = mcp.tool("tui_run", serde_json::json!({ "action": "context" }));
+    let mut declared: Vec<String> = registry["data"]["registry"]["tools"]
+        .as_array()
+        .expect("registry tools")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    declared.sort();
+    assert_eq!(names, declared, "tools/list == capability registry");
+    assert_eq!(
+        names.len(),
+        14,
+        "registry count matches the wire: {names:?}"
+    );
     for expected in [
         "tui_session",
         "tui_observe",
@@ -201,6 +217,8 @@ fn stdio_e2e_full_lifecycle() {
         "tui_audit",
         "tui_coverage",
         "tui_framework",
+        "tui_run",
+        "tui_contract",
     ] {
         assert!(
             names.contains(&expected.to_string()),

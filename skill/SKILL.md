@@ -75,38 +75,42 @@ attributes, cursor, title), not screenshots.
 10. Run broader `tui_explore mode=random seed=...` (deterministic) and
    `tui_coverage` if available. Stop when acceptance gates pass.
 
-## Tools (13)
+## Tools
 
-- `tui_session` — start / restart / stop / list / status.
-- `tui_observe` — summary | screen | cells | region | semantic | tree |
-  nodes | diff | scrollback | history.
-- `tui_act` — key / keys / type / paste / mouse_click / mouse_move / mouse_drag
-  / mouse_scroll / resize / signal / raw. Auto-waits + captures transition.
-- `tui_wait` — text / text_absent / screen_change / screen_stable /
-  process_exit / title / bell / command_complete.
-- `tui_assert` — text / text_absent / position / region / foreground /
-  background / style / cursor / focus / dimensions / snapshot / structure /
-  exit_code / title / not_clipped / oracle (declarative expression shared
-  with contracts, e.g. `text: "modal_open()"`).
-- `tui_checkpoint` — save / compare / list / delete (screen + semantic + focus
-  + process + coverage state).
-- `tui_scenario` — start_recording / stop_recording / save / load / run /
-  compare / export (turns workflows into deterministic regression tests;
-  oracle assert steps replay through the contract oracle language).
-- `tui_record` — cast / svg_sequence / apng / gif / mp4.
-- `tui_explore` — random / guided_candidates / semantic / state_graph
-  (a loaded contract feeds declared-but-unexercised keys as candidates).
-- `tui_audit` — keyboard | focus | layout | resize | navigation |
-  discoverability | contract | states | errors | mouse | color | performance
-  | full.
-- `tui_contract` — load / validate / status / compare: YAML design contracts
-  (viewports, components, interactions, layout, oracles) checked against the
-  running app; PASS/FAIL/WARN per check; compare names regressions and fixes.
-  Loading also installs `volatile_patterns` into the normalization policy.
-- `tui_coverage` — detect / start / collect / summary / delta / uncovered /
-  stop (backed by optional `tuicov` executable; reports "unavailable" if absent).
-- `tui_framework` — detect / capabilities / inspect_native / generate_tests /
-  run_native_tests.
+- `tui_session` — Manage TUI sessions: start, restart, stop, list, status, plus the human control lease (lease/release).
+  - action: start, restart, stop, list, status, lease, release
+- `tui_observe` — Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state.
+  - mode: summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history
+- `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema).
+- `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
+  - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output
+- `tui_assert` — Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
+  - assertion: text, text_absent, position, focus, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, focused_not, oracle
+- `tui_checkpoint` — Save and compare named UI state checkpoints (durable under persistent runs).
+  - action: save, compare, list, delete
+- `tui_scenario` — Record, save, list, export, and replay interaction scenarios (session+generation scoped).
+  - action: list, record_start, record_stop, save, export, run
+- `tui_record` — Capture terminal output: asciicast .cast lifecycle (start/stop) plus one-shot SVG/PNG screen captures.
+  - format: start, stop, cast, svg, png
+- `tui_explore` — Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph. Driving: blocked while a human lease is live.
+  - mode: random, guided_candidates, semantic, state_graph
+- `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Active profiles drive the app: blocked while a human lease is live.
+  - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors
+- `tui_coverage` — Coverage: native NSP coverage-event ledger plus the optional tuicov executable (honest Unsupported when absent).
+  - action: detect, summary, collect, delta, uncovered, ledger, start, stop
+- `tui_framework` — Framework detection, capability probes, and NativeSemanticProtocol adapter snippets (Ratatui/Textual/Python).
+  - action: detect, capabilities, adapter_snippet
+- `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, and context (this registry as JSON).
+  - action: status, persist, close, context, list, resume
+- `tui_contract` — Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).
+  - action: load, validate, status, compare
+
+## Resources (tui://)
+
+- `tui://runs/{run_id}` — Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).
+- `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
+- `tui://sessions/{session_id}/screen` — Live screen text + geometry.
+- `tui://findings` — Findings accumulated this run (audits, contracts, exploration).
 
 ## Key facts
 
@@ -144,6 +148,8 @@ mcp_servers:
         - tui_audit
         - tui_coverage
         - tui_framework
+        - tui_run
+        - tui_contract
     sampling:
       enabled: false
 ```
