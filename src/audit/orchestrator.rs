@@ -37,8 +37,8 @@ pub enum AuditProfile {
     Clipping,
     /// Focus hints from one frame (static).
     Discoverability,
-    /// Placeholder classes: parsed and reported honestly as not yet
-    /// implemented rather than rejected, so callers can probe availability.
+    /// Tab-order / reverse-traversal proof over the ID-keyed focus graph
+    /// (active — Wave D item 37; previously a static placeholder).
     Navigation,
     Color,
     Performance,
@@ -82,6 +82,7 @@ impl AuditProfile {
                 | AuditProfile::Resize
                 | AuditProfile::Layout
                 | AuditProfile::Clipping
+                | AuditProfile::Navigation
         )
     }
 
@@ -98,6 +99,10 @@ pub struct ProfileReport {
     /// (static + active, i.e. `full`).
     pub mode: &'static str,
     pub findings: Vec<Finding>,
+    /// Focus edges recorded by this run's drivers (Wave D item 36). Callers
+    /// merge it into the run's persistent graph; static profiles leave it
+    /// empty.
+    pub focus_graph: crate::semantic::focus_graph::FocusGraph,
 }
 
 /// Run one audit profile against a session (re-review P0 fix 2). The engine
@@ -139,12 +144,16 @@ pub fn run_profile(
             profile,
             mode,
             findings,
+            focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
         });
     }
 
     // `full` = static composite + every active driver (P0 fix 2). Ordering
     // matters for evidence readability: static analysis first (it does not
-    // mutate), then drivers that change state.
+    // mutate), then drivers that change state. The focus graph is per-call
+    // here: the caller (MCP layer) merges it into the run's graph.
+    let mut graph = crate::semantic::focus_graph::FocusGraph::new();
+
     let mut findings = Vec::new();
     if profile.wants_static_composite() {
         let screen = observe_or_err(session)?;
@@ -154,18 +163,21 @@ pub fn run_profile(
 
     let active_findings = match profile {
         AuditProfile::Full => {
-            let mut fs = crate::audit::driver::keyboard_audit(session, 20);
+            let mut fs = crate::audit::driver::keyboard_audit(session, 20, &mut graph);
             fs.extend(crate::audit::driver::focus_audit(session));
             fs.extend(crate::audit::driver::resize_audit(session));
             fs.extend(crate::audit::driver::clipping_audit(session));
             fs
         }
-        AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20),
+        AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
         AuditProfile::Focus => crate::audit::driver::focus_audit(session),
         AuditProfile::Resize | AuditProfile::Layout => {
             crate::audit::driver::resize_audit(session)
         }
         AuditProfile::Clipping => crate::audit::driver::clipping_audit(session),
+        AuditProfile::Navigation => {
+            crate::audit::driver::navigation_audit(session, 20, &mut graph)
+        }
         _ => unreachable!("non-active profiles returned above"),
     };
     findings.extend(active_findings);
@@ -179,6 +191,7 @@ pub fn run_profile(
         profile,
         mode,
         findings,
+        focus_graph: graph,
     })
 }
 
@@ -204,6 +217,7 @@ fn orchestration_error(profile: &str, summary: String) -> Finding {
         )
         .with_detail(json!({"profile": profile}))],
         confidence: 1.0,
+        reproduction: None,
     }
 }
 

@@ -4,7 +4,7 @@
 use crate::screen::ScreenState;
 use crate::semantic::controls::{Control, ControlKind};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FocusInfo {
     /// Label of the control believed to hold focus, if any.
     pub control: Option<String>,

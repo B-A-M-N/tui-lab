@@ -142,9 +142,10 @@ byte boundary — escape sequences, timing, and intermediate frames preserved;
 input bytes recorded only when requested.
 
 ### tui_explore
-Seeded random exploration and candidate generation.
+Seeded random exploration, candidate generation, and screen-reading
+exploration.
 
-**Modes:** `random`, `guided_candidates`, `state_graph`
+**Modes:** `random`, `guided_candidates`, `semantic`, `state_graph`
 
 The explorer records an ordered step per action while it happens (seq, action,
 before/after state identity, settle outcome, novelty) and feeds the run's state
@@ -155,13 +156,29 @@ depth, unique states) is checked each iteration and the report names the real
 `depth_budget`, `unique_state_budget`, `clean_exit`, `failure`, `cancelled`).
 Relaunches go through session restart so generation increments.
 
+`guided_candidates` is evidential: every suggested action cites where its
+novelty claim comes from — the state graph (`"tab" has never been executed
+from this state`), the design contract (`declared but never exercised`), an
+on-screen affordance, or interaction coverage (`control has never held
+focus`). `max_risk` (`safe` < `mutating` < `destructive` <
+`external_side_effect`) filters candidates above the allowance entirely — a
+`safe` explorer is never offered "activate Delete Database". `semantic` mode
+loops: read the screen, execute the top evidential candidate through the
+canonical executor, record the transition, repeat — deterministic for a given
+app state, unlike the seeded random fuzz.
+
 ### tui_audit
 Run deterministic UX audits and return evidence-backed findings.
 
 **Profiles:** `full`, `focus`, `keyboard`, `clipping`, `resize`, `navigation`, `discoverability`
 
-Active profiles (`keyboard`, `focus`, `resize`, `clipping`, `layout`) drive the
-app through the session and observe real transitions.
+Active profiles (`keyboard`, `focus`, `resize`, `clipping`, `layout`,
+`navigation`) drive the app through the session and observe real transitions.
+`navigation` is the traversal-proof audit: it drives Tab forward and Shift+Tab
+back, records every transition into the ID-keyed focus graph, and reports the
+proven Tab order, the wrap-around cycle, and — edge for edge — whether
+Shift+Tab truly reverses Tab (missing inverses are named by control ID, not
+shrugged at).
 
 ### tui_coverage
 Native coverage via optional tuicov executable. Reports "unavailable" honestly

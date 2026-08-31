@@ -594,6 +594,12 @@ pub struct TuiExploreParams {
     pub id: Option<String>,
     #[serde(default)]
     pub recording_path: Option<String>,
+    /// guided_candidates: highest risk class the caller accepts
+    /// (`safe` < `mutating` < `destructive` < `external_side_effect`).
+    /// Candidates above the allowance are filtered, never merely flagged
+    /// (Wave D item 33).
+    #[serde(default)]
+    pub max_risk: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
