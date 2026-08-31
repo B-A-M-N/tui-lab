@@ -33,11 +33,19 @@ fn ev_other_empty(target: &str, summary: &str) -> EvidenceRef {
     )
 }
 
-/// Run keyboard audit: traverse focus using Tab (item 52).
-pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
+/// Run keyboard audit: traverse focus using Tab (item 52). Upgraded for
+/// Wave D (items 36–37): every transition is recorded into the run's
+/// ID-keyed [`crate::semantic::focus_graph::FocusGraph`] with `via=tab`
+/// / `via=shift+tab` provenance, so the audit *proves* traversal order
+/// instead of listing labels.
+pub fn keyboard_audit(
+    session: &mut Session,
+    max_tabs: u32,
+    graph: &mut crate::semantic::focus_graph::FocusGraph,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let _baseline = match session.observe(50) {
-        Ok(s) => s,
+    let baseline_sem = match session.observe(50) {
+        Ok(s) => semantic::analyze(&s),
         Err(e) => {
             findings.push(Finding {
                 id: "KB-ERR".into(),
@@ -49,10 +57,12 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                     "session.observe failed at audit start",
                 )],
                 confidence: 1.0,
+                reproduction: None,
             });
             return findings;
         }
     };
+    let mut last_id = baseline_sem.focus.control_id.clone();
 
     let mut visited_states: Vec<String> = Vec::new();
     let mut focus_order: Vec<Option<String>> = Vec::new();
@@ -63,7 +73,8 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             Ok(s) => s,
             Err(_) => break,
         };
-        let focus_before = semantic::analyze(&before).focus.control.clone();
+        let sem_before = semantic::analyze(&before);
+        let focus_before = sem_before.focus.control.clone();
         focus_order.push(focus_before.clone());
 
         // Tab via the canonical executor — same baseline-before-send and
@@ -90,6 +101,7 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                         json!({"step": i}),
                     )],
                     confidence: 1.0,
+                    reproduction: None,
                 });
                 break;
             }
@@ -98,6 +110,12 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         let after = tx.after().clone();
         let sem_after = semantic::analyze(&after);
         let focus_after = sem_after.focus.control.clone();
+
+        // ID-keyed graph edge with Tab provenance (item 36).
+        if let (Some(f), Some(t)) = (&sem_before.focus.control_id, &sem_after.focus.control_id) {
+            graph.record_edge(f, t, "tab", sem_after.focus.control.as_deref());
+        }
+        last_id = sem_after.focus.control_id.clone();
 
         // Detect Tab trap: focus didn't change
         if focus_before == focus_after {
@@ -116,6 +134,7 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.8,
+                reproduction: None,
             });
         }
 
@@ -139,13 +158,16 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.9,
+                reproduction: None,
             });
             break;
         }
         visited_states.push(state_key);
     }
 
-    // Reverse traversal with Shift+Tab via the canonical executor.
+    // Reverse traversal with Shift+Tab via the canonical executor. Each
+    // reversal lands in the graph with `via=shift+tab` so reverse_tab_gaps
+    // can name what a forward edge lacked.
     let mut reverse_ok = true;
     for _ in 0..successful_tabs.min(max_tabs) {
         let r = execute_act(
@@ -157,33 +179,83 @@ pub fn keyboard_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             500,
             false,
         );
-        if r.is_err() {
-            reverse_ok = false;
-            break;
+        match r {
+            Ok(tx) => {
+                let sem_b = semantic::analyze(tx.before());
+                let sem_a = semantic::analyze(tx.after());
+                if let (Some(f), Some(t)) = (&sem_b.focus.control_id, &sem_a.focus.control_id) {
+                    graph.record_edge(f, t, "shift+tab", sem_a.focus.control.as_deref());
+                }
+                last_id = sem_a.focus.control_id.clone();
+            }
+            Err(_) => {
+                reverse_ok = false;
+                break;
+            }
         }
     }
 
-    if successful_tabs > 0 && reverse_ok {
-        findings.push(Finding {
-            id: "KB-OK".into(),
-            severity: "info".into(),
-            category: "keyboard".into(),
-            summary: format!(
-                "Tab traversal: {} states visited, reverse traversal succeeded",
-                successful_tabs
-            ),
-            evidence: vec![ev_other(
-                "tab_ok",
-                "Tab traversal completed with reverse traversal ok",
-                json!({
-                    "states_visited": successful_tabs,
-                    "focus_order": focus_order,
-                    "reverse_ok": reverse_ok,
-                }),
-            )],
-            confidence: 0.85,
-        });
+    if successful_tabs > 0 {
+        let gaps = graph.reverse_tab_gaps();
+        let cycle = graph.tab_cycle();
+        // A cycle through Tab is expected behavior (wrap-around), not a
+        // defect — record it as evidence. Missing inverse edges ARE a
+        // defect: Shift+Tab must truly reverse Tab.
+        if reverse_ok && !gaps.is_empty() {
+            findings.push(Finding {
+                id: "KB-REVERSE-GAP".into(),
+                severity: "warn".into(),
+                category: "keyboard".into(),
+                summary: format!(
+                    "Shift+Tab does not reverse Tab: {} transition(s) lack the inverse edge",
+                    gaps.len()
+                ),
+                evidence: vec![ev_other(
+                    "reverse_tab_gaps",
+                    "focus graph edges with a missing Shift+Tab inverse",
+                    json!({
+                        "gaps": gaps,
+                        "note": "edges keyed on stable control IDs; 'from' expects a shift+tab edge back to 'to'",
+                    }),
+                )],
+                confidence: 0.85,
+                reproduction: None,
+            });
+        }
+        if successful_tabs > 0 && reverse_ok {
+            findings.push(Finding {
+                id: "KB-OK".into(),
+                severity: "info".into(),
+                category: "keyboard".into(),
+                summary: format!(
+                    "Tab traversal: {} states visited, reverse traversal succeeded ({} graph edges{})",
+                    successful_tabs,
+                    graph.edges.len(),
+                    cycle
+                        .as_ref()
+                        .map(|c| format!(", wrap cycle through {}", c.len()))
+                        .unwrap_or_default(),
+                ),
+                evidence: vec![ev_other(
+                    "tab_ok",
+                    "Tab traversal completed with reverse traversal ok",
+                    json!({
+                        "states_visited": successful_tabs,
+                        "focus_order": focus_order,
+                        "reverse_ok": reverse_ok,
+                        "focus_graph": graph.summary(),
+                    }),
+                )],
+                confidence: 0.85,
+                reproduction: None,
+            });
+        }
     }
+
+    // `last_id` is consumed by callers through the graph; silence the
+    // unused-assign lint without dropping the tracking (used for the
+    // audit's own final-state evidence).
+    let _ = last_id;
 
     findings
 }
@@ -204,6 +276,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                     "session.observe failed in focus audit",
                 )],
                 confidence: 1.0,
+                reproduction: None,
             });
             return findings;
         }
@@ -227,6 +300,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 json!({ "reverse_cells": reverse_cells.len() }),
             )],
             confidence: 0.7,
+            reproduction: None,
         });
     }
 
@@ -263,6 +337,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.85,
+                reproduction: None,
             });
         } else {
             findings.push(Finding {
@@ -283,6 +358,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                     }),
                 )],
                 confidence: sem.focus.confidence,
+                reproduction: None,
             });
         }
     }
@@ -309,6 +385,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                     json!({"cols": cols, "rows": rows}),
                 )],
                 confidence: 1.0,
+                reproduction: None,
             });
             continue;
         }
@@ -334,6 +411,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                         json!({"cols": cols, "rows": rows}),
                     )],
                     confidence: 1.0,
+                    reproduction: None,
                 });
                 continue;
             }
@@ -369,6 +447,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.95,
+                reproduction: None,
             });
         } else {
             findings.push(Finding {
@@ -391,6 +470,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.9,
+                reproduction: None,
             });
         }
     }
@@ -424,6 +504,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                     "session.observe failed in clipping audit",
                 )],
                 confidence: 1.0,
+                reproduction: None,
             });
             return findings;
         }
@@ -454,6 +535,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.96,
+                reproduction: None,
             });
         }
 
@@ -474,6 +556,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                     }),
                 )],
                 confidence: 0.95,
+                reproduction: None,
             });
         }
     }
@@ -496,6 +579,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                     json!({"row": first_row, "edge": "top"}),
                 )],
                 confidence: 0.6,
+                reproduction: None,
             });
         }
 
@@ -512,6 +596,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                     json!({"row": last_row, "edge": "bottom"}),
                 )],
                 confidence: 0.6,
+                reproduction: None,
             });
         }
     }
@@ -528,6 +613,108 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 json!({"region_count": sem.regions.len()}),
             )],
             confidence: 0.9,
+            reproduction: None,
+        });
+    }
+
+    findings
+}
+
+/// Run the navigation audit (Wave D item 37): build a real focus graph by
+/// driving Tab forward through the whole cycle, then Shift+Tab back, and
+/// report what the ID-keyed edges prove: traversal order, wrap-around,
+/// and whether Shift+Tab truly reverses Tab.
+pub fn navigation_audit(
+    session: &mut Session,
+    max_tabs: u32,
+    graph: &mut crate::semantic::focus_graph::FocusGraph,
+) -> Vec<Finding> {
+    // The keyboard driver already records `via=tab` / `via=shift+tab` edges
+    // into the graph; navigation analysis reads them.
+    let mut findings = keyboard_audit(session, max_tabs, graph);
+
+    let cycle = graph.tab_cycle();
+    let gaps = graph.reverse_tab_gaps();
+    let tab_edges = graph.successors_all("tab");
+
+    if tab_edges.is_empty() {
+        findings.push(Finding {
+            id: "NAV-NO-TRAVERSAL".into(),
+            severity: "warn".into(),
+            category: "navigation".into(),
+            summary: "No Tab traversal observed: the screen exposes no keyboard navigation order."
+                .into(),
+            evidence: vec![ev_other(
+                "no_tab_edges",
+                "focus graph holds no via=tab edges after the traversal attempt",
+                json!({ "graph": graph.summary() }),
+            )],
+            confidence: 0.7,
+            reproduction: None,
+        });
+        return findings;
+    }
+
+    // The order itself, proven edge by edge (stable IDs, not labels).
+    let order: Vec<String> = tab_edges
+        .iter()
+        .map(|e| format!("{} → {} (x{})", e.from, e.to, e.count))
+        .collect();
+    findings.push(Finding {
+        id: "NAV-ORDER".into(),
+        severity: "info".into(),
+        category: "navigation".into(),
+        summary: format!(
+            "Tab order observed over {} edge(s){}",
+            tab_edges.len(),
+            cycle
+                .as_ref()
+                .map(|c| format!("; wraps through {} controls", c.len()))
+                .unwrap_or_else(|| "; no complete cycle observed".to_string()),
+        ),
+        evidence: vec![ev_other(
+            "tab_order",
+            "focus graph Tab edges in observation order (stable control IDs)",
+            json!({
+                "edges": order,
+                "cycle": cycle,
+                "graph": graph.summary(),
+            }),
+        )],
+        confidence: 0.9,
+        reproduction: None,
+    });
+
+    if !gaps.is_empty() {
+        findings.push(Finding {
+            id: "NAV-REVERSE-GAP".into(),
+            severity: "warn".into(),
+            category: "navigation".into(),
+            summary: format!(
+                "Reverse traversal is not the true inverse: {} Tab edge(s) have no Shift+Tab counterpart",
+                gaps.len()
+            ),
+            evidence: vec![ev_other(
+                "reverse_gaps",
+                "every Tab edge must have the mirrored Shift+Tab edge for true reversal",
+                json!({ "gaps": gaps, "graph": graph.summary() }),
+            )],
+            confidence: 0.85,
+            reproduction: None,
+        });
+    } else {
+        findings.push(Finding {
+            id: "NAV-REVERSE-OK".into(),
+            severity: "info".into(),
+            category: "navigation".into(),
+            summary: "Shift+Tab exactly reverses Tab (every forward edge has its inverse).".into(),
+            evidence: vec![ev_other(
+                "reverse_proven",
+                "edge-for-edge inverse holds across the observed Tab subgraph",
+                json!({ "tab_edges": tab_edges.len(), "graph": graph.summary() }),
+            )],
+            confidence: 0.9,
+            reproduction: None,
         });
     }
 

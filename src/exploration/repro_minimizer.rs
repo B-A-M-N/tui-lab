@@ -34,16 +34,19 @@ pub struct ReproResult {
 }
 
 /// Minimizer: finds the smallest subsequence of actions that reproduces a failure.
+///
+/// The test callback is [`FnMut`] (Wave D item 38): a live reproduction test
+/// drives a session — it mutates. Pure functions still satisfy `FnMut`.
 pub struct ReproMinimizer<F>
 where
-    F: Fn(&[ReproAction]) -> ReproResult,
+    F: FnMut(&[ReproAction]) -> ReproResult,
 {
     test_fn: F,
 }
 
 impl<F> ReproMinimizer<F>
 where
-    F: Fn(&[ReproAction]) -> ReproResult,
+    F: FnMut(&[ReproAction]) -> ReproResult,
 {
     /// Create a new minimizer with a test function.
     pub fn new(test_fn: F) -> Self {
@@ -51,7 +54,7 @@ where
     }
 
     /// Minimize the action sequence using delta debugging.
-    pub fn minimize(&self, actions: &[ReproAction]) -> Vec<ReproAction> {
+    pub fn minimize(&mut self, actions: &[ReproAction]) -> Vec<ReproAction> {
         if actions.is_empty() {
             return Vec::new();
         }
@@ -191,7 +194,7 @@ mod tests {
             }
         };
 
-        let minimizer = ReproMinimizer::new(test_fn);
+        let mut minimizer = ReproMinimizer::new(test_fn);
         let actions = make_actions(10);
         let minimal = minimizer.minimize(&actions);
 
@@ -208,7 +211,7 @@ mod tests {
             failure_type: None,
         };
 
-        let minimizer = ReproMinimizer::new(test_fn);
+        let mut minimizer = ReproMinimizer::new(test_fn);
         let actions = make_actions(5);
         let minimal = minimizer.minimize(&actions);
 
@@ -227,7 +230,7 @@ mod tests {
             }
         };
 
-        let minimizer = ReproMinimizer::new(test_fn);
+        let mut minimizer = ReproMinimizer::new(test_fn);
         let actions = make_actions(10);
         let minimal = minimizer.minimize(&actions);
 
@@ -243,7 +246,7 @@ mod tests {
             failure_type: None,
         };
 
-        let minimizer = ReproMinimizer::new(test_fn);
+        let mut minimizer = ReproMinimizer::new(test_fn);
         let minimal = minimizer.minimize(&[]);
 
         assert!(minimal.is_empty());
@@ -257,7 +260,7 @@ mod tests {
             failure_type: None,
         };
 
-        let minimizer = ReproMinimizer::new(test_fn);
+        let mut minimizer = ReproMinimizer::new(test_fn);
         let actions = vec![
             ReproAction {
                 index: 0,

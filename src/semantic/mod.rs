@@ -9,6 +9,7 @@ pub mod components;
 pub mod confidence;
 pub mod controls;
 pub mod focus;
+pub mod focus_graph;
 pub mod node;
 pub mod recognizers;
 pub mod regions;
@@ -26,6 +27,7 @@ pub use components::{
 pub use confidence::Confidence;
 pub use controls::{Control, ControlKind};
 pub use focus::FocusInfo;
+pub use focus_graph::{FocusEdge, FocusGraph, FocusNode, TransitionSource};
 pub use node::{
     EnabledState, Layer, NodeState, ReadOnlyState, Role, ScrollEdges, SemanticNode, SemanticTree,
 };

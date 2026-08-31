@@ -131,6 +131,11 @@ pub struct Finding {
     /// well-formed finding; empty evidence is treated as a bug.
     pub evidence: Vec<EvidenceRef>,
     pub confidence: f32,
+    /// Reproducible form (Wave D item 38): the scenario ID of a minimized,
+    /// replayable reproduction saved into the run. `None` for findings that
+    /// are not reproductions (most static findings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reproduction: Option<String>,
 }
 
 impl Finding {
@@ -152,6 +157,7 @@ impl Finding {
             summary: s.clone(),
             evidence: vec![EvidenceRef::screen(hash, s)],
             confidence,
+            reproduction: None,
         }
     }
 }
@@ -183,6 +189,7 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
                 "static navigation graph not derivable from a single frame",
             )],
             confidence: 1.0,
+            reproduction: None,
         });
     }
     if want("color") || want("performance") || want("mouse") || want("states") || want("errors") {
@@ -202,6 +209,7 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
                     "profile": profile_name,
                 }))],
             confidence: 1.0,
+            reproduction: None,
         });
     }
     out
@@ -223,6 +231,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
                     "cursor": screen.cursor,
                 }))],
             confidence: 0.7,
+            reproduction: None,
         });
     } else if sem.focus.control.is_some() {
         let ctrl = sem.focus.control.clone().unwrap_or_default();
@@ -241,6 +250,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
                 })),
             ],
             confidence: sem.focus.confidence,
+            reproduction: None,
         });
     }
     out
@@ -264,6 +274,7 @@ fn static_clipping_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                     })),
                 ],
                 confidence: 0.96,
+                reproduction: None,
             });
         }
     }
@@ -299,6 +310,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                     "note": "some TUIs hide hints intentionally; confirm against design contract",
                 }))],
             confidence: 0.5,
+            reproduction: None,
         });
         return out;
     }
@@ -329,6 +341,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
             }),
         )],
         confidence: 0.85,
+        reproduction: None,
     });
 
     // Hidden-keybinding heuristic: prose words that commonly announce
@@ -357,6 +370,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                     ),
                 ],
                 confidence: 0.6,
+                reproduction: None,
             });
         }
     }
@@ -389,6 +403,7 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
                 ),
             ],
             confidence: 0.85,
+            reproduction: None,
         });
     }
     out

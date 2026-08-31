@@ -158,6 +158,12 @@ pub struct RunContext {
     /// Focus-transition ledger: (unix_ms, session, from, to) recorded from
     /// semantic analysis of every observation. The run's focus graph.
     focus_transitions: Vec<(u64, String, Option<String>, Option<String>)>,
+    /// The real FocusGraph (Wave D items 36–37): focus transitions as edges
+    /// keyed on stable control IDs with the input that produced them, so Tab
+    /// order and Shift+Tab reversal are provable, not suggested. Recorded
+    /// from the same observations as `focus_transitions` (labels) plus the
+    /// audit drivers (driven edges).
+    pub focus_graph: crate::semantic::focus_graph::FocusGraph,
     /// Exploration state graph (owned here so audits/exploration share it).
     pub state_graph: StateGraph,
     /// Findings emitted during this run (audit results).
@@ -207,6 +213,7 @@ impl RunContext {
             scenario_names: HashMap::new(),
             held_recordings: Vec::new(),
             focus_transitions: Vec::new(),
+            focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
             findings: Vec::new(),
             transactions: Vec::new(),
@@ -629,6 +636,36 @@ impl RunContext {
         &self.focus_transitions
     }
 
+    /// Record one focus transition into BOTH focus ledgers (Wave D item
+    /// 36): the legacy label list for display continuity, and the
+    /// control-ID [`crate::semantic::focus_graph::FocusGraph`] for proof.
+    /// `via` names the input that produced the transition; the graph only
+    /// joins transitions whose ends carry stable control IDs — label-only
+    /// observations stay in the legacy ledger.
+    pub fn record_focus_observation(
+        &mut self,
+        session_id: &str,
+        from_label: Option<String>,
+        to_label: Option<String>,
+        from_id: Option<&str>,
+        to_id: Option<&str>,
+        via: &str,
+    ) {
+        // Legacy label ledger (unchanged shape, skips no-op transitions).
+        if from_label != to_label {
+            self.focus_transitions.push((
+                now_ms(),
+                session_id.to_string(),
+                from_label.clone(),
+                to_label.clone(),
+            ));
+        }
+        // ID-keyed graph.
+        if let (Some(f), Some(t)) = (from_id, to_id) {
+            self.focus_graph.transition(f, t, to_label.as_deref(), via);
+        }
+    }
+
     /// Whether the run is marked closed (`tui_run close`).
     pub fn is_closed(&self) -> bool {
         self.closed
@@ -801,10 +838,13 @@ impl RunContext {
         let tmp = dir.join("state_graph.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&graph)?)?;
         std::fs::rename(&tmp, dir.join("state_graph.json"))?;
-        // Focus graph.
+        // Focus graph (legacy label ledger + the ID-keyed FocusGraph).
         let ftmp = dir.join("focus_graph.json.tmp");
         std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.focus_transitions)?)?;
         std::fs::rename(&ftmp, dir.join("focus_graph.json"))?;
+        let gtmp = dir.join("focus_graph_ids.json.tmp");
+        std::fs::write(&gtmp, serde_json::to_vec_pretty(&self.focus_graph)?)?;
+        std::fs::rename(&gtmp, dir.join("focus_graph_ids.json"))?;
         // Transaction ledger (Wave-2 item 15 + Wave B item 14): NDJSON,
         // APPENDED incrementally — every record whose seq exceeds
         // `ledger_flushed_upto` is appended now, so a crash loses at most
@@ -993,6 +1033,7 @@ impl RunContext {
             "findings": self.findings.len(),
             "held_recordings": self.held_recordings.len(),
             "focus_transitions": self.focus_transitions.len(),
+            "focus_graph_edges": self.focus_graph.edges.len(),
             "state_graph_states": self.state_graph.state_count(),
             "state_graph_transitions": self.state_graph.transition_count(),
             "frames": self.next_frame_id,

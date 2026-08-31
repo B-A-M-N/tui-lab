@@ -13,6 +13,11 @@ pub enum ErrorCategory {
     AssertionFailed,
     InvalidRequest,
     NoSession,
+    /// A semantic action target failed to resolve: `ambiguous_target`,
+    /// `target_not_found`, or a verb/kind mismatch (Wave D item 31). The
+    /// agent can self-correct from the message (matches/candidates are
+    /// attached) — this is not a malformed request, it is a refinement loop.
+    TargetError,
     BackendError,
     InternalError,
     Unsupported,
@@ -25,6 +30,7 @@ impl ErrorCategory {
             ErrorCategory::AssertionFailed => "assertion_failed",
             ErrorCategory::InvalidRequest => "invalid_request",
             ErrorCategory::NoSession => "no_session",
+            ErrorCategory::TargetError => "target_error",
             ErrorCategory::BackendError => "backend_error",
             ErrorCategory::InternalError => "internal_error",
             ErrorCategory::Unsupported => "unsupported",

@@ -20,7 +20,8 @@ fn test_keyboard_audit_detects_states() {
         .expect("start");
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::keyboard_audit(sess, 3);
+    let mut graph = tui_lab::semantic::focus_graph::FocusGraph::new();
+    let findings = tui_lab::audit::keyboard_audit(sess, 3, &mut graph);
 
     assert!(
         !findings.is_empty(),
@@ -136,7 +137,8 @@ fn test_keyboard_audit_empty_session() {
         .wait(tui_lab::backend::WaitCond::ProcessExit, 2000);
 
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::keyboard_audit(sess, 2);
+    let mut graph = tui_lab::semantic::focus_graph::FocusGraph::new();
+    let findings = tui_lab::audit::keyboard_audit(sess, 2, &mut graph);
 
     assert!(!findings.is_empty());
 }

@@ -111,6 +111,19 @@ impl StateIdentity {
         }
     }
 
+    /// Identity whose graph key is exactly `structure_hash` (no interaction
+    /// layer). `content` carries the hash verbatim so `id()` — which falls
+    /// back to content when interaction is absent — resolves to it. This is
+    /// how callers key edges by a hash they already hold (Wave D item 34
+    /// candidate lookups, legacy graph consumers).
+    pub fn from_structure_content(structure_hash: &str) -> Self {
+        StateIdentity {
+            content: structure_hash.to_string(),
+            visual: structure_hash.to_string(),
+            interaction: None,
+        }
+    }
+
     /// Identity including the interaction layer from semantic analysis.
     ///
     /// The interaction digest is fed a canonical input set (P0 fix 4):
@@ -354,6 +367,39 @@ impl StateGraph {
     pub fn outgoing(&self, structure_hash: &str) -> Vec<&StateTransition> {
         let id = StateId::from_structure_hash(structure_hash);
         self.edges.iter().filter(|e| e.from == id).collect()
+    }
+
+    /// Outgoing edges from an identity-keyed state (Wave D item 34): guided
+    /// candidates reason about the *current* state's history, which is
+    /// identity-keyed (interaction layer included), not hash-keyed.
+    pub fn outgoing_identity(&self, id: &StateId) -> Vec<&StateTransition> {
+        self.edges.iter().filter(|e| &e.from == id).collect()
+    }
+
+    /// Node lookup by identity key.
+    pub fn node_by_identity(&self, id: &StateId) -> Option<&StateNode> {
+        self.nodes.get(id)
+    }
+
+    /// Has this identity-keyed state been visited?
+    pub fn has_identity(&self, id: &StateId) -> bool {
+        self.nodes.contains_key(id)
+    }
+
+    /// How many times `action_name` was taken OUT of the state `id`
+    /// (0 = never tried from here — the evidential basis for novelty).
+    pub fn action_taken_from(&self, id: &StateId, action_name: &str) -> u32 {
+        self.edges
+            .iter()
+            .filter(|e| &e.from == id && e.action_name == action_name)
+            .map(|e| e.count)
+            .sum()
+    }
+
+    /// Transitions that led INTO `id`, with the actions that caused them —
+    /// "how did I get here / how do I get back" evidence.
+    pub fn incoming_identity(&self, id: &StateId) -> Vec<&StateTransition> {
+        self.edges.iter().filter(|e| &e.to == id).collect()
     }
 
     /// Get all incoming edges to a state.

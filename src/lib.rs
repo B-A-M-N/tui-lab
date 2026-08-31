@@ -12,6 +12,7 @@ pub mod events;
 pub mod execution;
 pub mod exploration;
 pub mod framework;
+pub mod intent;
 pub mod mcp;
 pub mod recording;
 pub mod run;

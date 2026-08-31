@@ -220,15 +220,23 @@ impl TuiLabServer {
                     .count();
                 let focused = sem.focus.control.clone();
                 // Run focus graph: ledger this observation's focus against
-                // the previous observation's (per session).
+                // the previous observation's (per session). Both ledgers get
+                // fed (Wave D item 36): the legacy label list and the
+                // ID-keyed FocusGraph, the latter only when both frames
+                // resolved stable control IDs.
                 {
-                    let prev_focus = sess
+                    let prev = sess
                         .previous()
-                        .map(|p| semantic::analyze(p).focus.control);
-                    self.run.lock().unwrap().record_focus_transition(
+                        .map(|p| semantic::analyze(p).focus)
+                        .unwrap_or_default();
+                    let mut run = self.run.lock().unwrap();
+                    run.record_focus_observation(
                         &sess.id,
-                        prev_focus.unwrap_or(None),
+                        prev.control.clone(),
                         focused.clone(),
+                        prev.control_id.as_deref(),
+                        sem.focus.control_id.as_deref(),
+                        "unknown",
                     );
                 }
                 ok(json!({
@@ -968,6 +976,137 @@ impl TuiLabServer {
         }
     }
 
+    /// Wave D item 38: when an exploration report recorded a crash exit,
+    /// run the full minimization pipeline — clean restart, delta-debug
+    /// replay, saved Scenario — and emit a Finding with
+    /// `reproduction = scenario_id` into the run. Returns the pipeline
+    /// record for the tool response (`null` when nothing crashed).
+    fn minimize_crash_finding(
+        &self,
+        sess: &mut crate::session::state::Session,
+        seed: u64,
+        report: &crate::exploration::random::ExploreReport,
+    ) -> serde_json::Value {
+        use crate::exploration::repro::FailureKind;
+
+        // Only a failure-classified exit is a reproduction candidate; clean
+        // exits and signal-free deaths get no pipeline (and no fabricated
+        // finding).
+        let crash_exit = report.exits.iter().find(|e| {
+            matches!(
+                e.classification,
+                crate::exploration::random::ExitClassification::Error
+                    | crate::exploration::random::ExitClassification::Signal
+            )
+        });
+        let Some(exit) = crash_exit else {
+            return serde_json::Value::Null;
+        };
+        let expected = match exit.classification {
+            crate::exploration::random::ExitClassification::Signal => FailureKind::Crash,
+            _ => FailureKind::Crash,
+        };
+
+        // Steps up to and including the crashing action.
+        let upto = exit.action_index as usize;
+        let trace: Vec<crate::exploration::random::ExplorationStep> = report
+            .steps
+            .iter()
+            .filter(|s| s.seq as usize <= upto)
+            .cloned()
+            .collect();
+
+        let name = format!("seed{seed}-act{}", exit.action_index);
+        let pipeline = crate::exploration::repro::minimize_crash(sess, &trace, expected, &name);
+
+        if !pipeline.reproduced {
+            // Honest outcome: the trace did not reproduce on a clean
+            // restart. Report the attempt; emit no reproduction finding.
+            let mut run = self.run.lock().unwrap();
+            run.extend_findings(vec![crate::audit::Finding {
+                id: format!("EXPLORE-CRASH-{}", exit.action_index),
+                severity: "warn".into(),
+                category: "exploration".into(),
+                summary: format!(
+                    "Exploration crash at action {} ({}): original trace ({} steps) did not reproduce on a clean restart — not minimized, no scenario fabricated",
+                    exit.action_index,
+                    exit.action_name,
+                    pipeline.original_len,
+                ),
+                evidence: vec![crate::audit::EvidenceRef::point(
+                    crate::audit::EvidenceKind::Other,
+                    format!("crash_at_{}", exit.action_index),
+                    "process died during seeded exploration",
+                )
+                .with_detail(json!({
+                    "seed": seed,
+                    "action_index": exit.action_index,
+                    "action_name": exit.action_name,
+                    "exit_code": exit.exit_code,
+                    "exit_signal": exit.exit_signal,
+                    "attempts": pipeline.attempts,
+                }))],
+                confidence: 0.9,
+                reproduction: None,
+            }]);
+            return json!({
+                "reproduced": false,
+                "attempts": pipeline.attempts,
+                "note": "trace did not reproduce on a clean restart; no scenario fabricated",
+            });
+        }
+
+        // Save the minimized scenario into the run and attach its ID to the
+        // finding (item 38, the last mile). The pipeline hands back the
+        // fully-built Scenario — no lossy rebuild.
+        let scenario = match pipeline.scenario.clone() {
+            Some(s) => s,
+            None => return json!({ "reproduced": false, "attempts": pipeline.attempts }),
+        };
+        let scenario_id = scenario.id.clone();
+        let saved = {
+            let mut run = self.run.lock().unwrap();
+            run.save_scenario(scenario);
+            run.extend_findings(vec![crate::audit::Finding {
+                id: format!("EXPLORE-CRASH-{}", exit.action_index),
+                severity: "error".into(),
+                category: "exploration".into(),
+                summary: format!(
+                    "Exploration crash at action {} ({}): minimized to {} step(s), saved as scenario {}",
+                    exit.action_index,
+                    exit.action_name,
+                    pipeline.minimized_len,
+                    scenario_id,
+                ),
+                evidence: vec![crate::audit::EvidenceRef::point(
+                    crate::audit::EvidenceKind::Other,
+                    format!("repro_{}", scenario_id),
+                    "minimized reproduction saved as a replayable scenario",
+                )
+                .with_detail(json!({
+                    "seed": seed,
+                    "action_index": exit.action_index,
+                    "action_name": exit.action_name,
+                    "original_len": pipeline.original_len,
+                    "minimized_len": pipeline.minimized_len,
+                    "minimized_steps": pipeline.steps,
+                    "attempts": pipeline.attempts,
+                }))],
+                confidence: 1.0,
+                reproduction: Some(scenario_id.clone()),
+            }]);
+            scenario_id.clone()
+        };
+        json!({
+            "reproduced": true,
+            "scenario_id": saved,
+            "original_len": pipeline.original_len,
+            "minimized_len": pipeline.minimized_len,
+            "minimized_steps": pipeline.steps,
+            "attempts": pipeline.attempts,
+        })
+    }
+
     /// Exploration: random / guided_candidates / coverage_guided / replay (spec section 4/25).
     #[tool(
         name = "tui_explore",
@@ -982,14 +1121,45 @@ impl TuiLabServer {
         };
         match p.mode.as_str() {
             "guided_candidates" => {
-                // return novel action candidates for Hermes to choose (spec 4.3)
+                // Novel action candidates for Hermes to choose (spec 4.3),
+                // Wave D item 34: every reason is evidential. The candidate
+                // context carries the run's state graph, the current state's
+                // layered identity, the actions actually executed this run,
+                // the coverage set, and the risk allowance.
                 let screen = match sess.observe(40) {
                     Ok(s) => s,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
                 let sem = semantic::analyze(&screen);
-                let candidates = crate::exploration::candidates::suggest(&screen, &sem);
-                ok(json!({ "novel_actions": candidates }))
+                let identity =
+                    crate::exploration::state_graph::StateIdentity::with_semantic(&screen, &sem);
+                let current = identity.id();
+                let candidate_list = {
+                    let run = self.run.lock().unwrap();
+                    let action_history: Vec<String> = run
+                        .transactions()
+                        .iter()
+                        .map(|t| t.action.clone())
+                        .collect();
+                    let coverage: Vec<String> = run.focus_graph.nodes.keys().cloned().collect();
+                    let ctx = crate::exploration::candidates::CandidateContext {
+                        state_graph: &run.state_graph,
+                        current,
+                        action_history: &action_history,
+                        coverage: &coverage,
+                        contract: None,
+                        allowed_risk: p
+                            .max_risk
+                            .as_deref()
+                            .and_then(crate::intent::ActionRisk::parse)
+                            .unwrap_or(crate::intent::ActionRisk::Mutating),
+                    };
+                    crate::exploration::candidates::suggest(&screen, &sem, &ctx)
+                };
+                ok(json!({
+                    "novel_actions": candidate_list,
+                    "state": identity.id().as_str(),
+                }))
             }
             "random" => {
                 let seed = p.seed.unwrap_or(4242);
@@ -1045,15 +1215,74 @@ impl TuiLabServer {
                                 None => None,
                             }
                         };
+                        // Wave D item 38: a crash exit gets the full
+                        // minimization pipeline — clean restart, delta-debug
+                        // replay, saved Scenario, Finding with
+                        // reproduction=scenario_id.
+                        let repro = self.minimize_crash_finding(sess, seed, &report);
                         ok(json!({
                             "seed": seed,
                             "report": report,
                             "state_graph": graph_summary,
                             "state_graph_path": graph_path,
+                            "reproduction": repro,
                         }))
                     }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
+            }
+            "semantic" => {
+                // Wave D item 35: screen-reading exploration. Picks the
+                // top evidential candidate each round (affordances, untried
+                // keys from the graph, unreached controls) and executes it
+                // through the canonical executor. Focus edges land in the
+                // run's ID-keyed FocusGraph with the acting key as via.
+                let max_risk = p
+                    .max_risk
+                    .as_deref()
+                    .and_then(crate::intent::ActionRisk::parse)
+                    .unwrap_or(crate::intent::ActionRisk::Mutating);
+                let (graph_budget, run_graph_summary) = {
+                    let run = self.run.lock().unwrap();
+                    (
+                        run.state_graph.budget().clone(),
+                        (run.state_graph.state_count(), run.state_graph.transition_count()),
+                    )
+                };
+                let max_actions = p.actions.unwrap_or(20);
+                // Local graphs during the loop (session I/O must not hold
+                // the run lock); merged into the run after.
+                let mut local_graph = crate::exploration::state_graph::StateGraph::new(
+                    graph_budget.clone(),
+                );
+                let mut focus_graph = crate::semantic::focus_graph::FocusGraph::new();
+                let report = match crate::exploration::semantic::run(
+                    sess,
+                    &mut local_graph,
+                    &mut focus_graph,
+                    &graph_budget,
+                    max_actions,
+                    max_risk,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                };
+                // Merge what actually happened into the run's graphs.
+                {
+                    let mut run = self.run.lock().unwrap();
+                    run.state_graph.merge(&local_graph);
+                    run.focus_graph.merge(&focus_graph);
+                }
+                ok(json!({
+                    "mode": "semantic",
+                    "max_risk": max_risk.name(),
+                    "report": report,
+                    "focus_graph": focus_graph.summary(),
+                    "run_graph_before": {
+                        "states": run_graph_summary.0,
+                        "transitions": run_graph_summary.1,
+                    },
+                }))
             }
             "state_graph" => {
                 let run = self.run.lock().unwrap();
@@ -1068,6 +1297,10 @@ impl TuiLabServer {
                     "edges": run.state_graph.edge_list(),
                     "visit_counts": run.state_graph.visit_counts(),
                     "budget_exhausted": run.state_graph.budget_exhausted(),
+                    // The ID-keyed focus graph (Wave D item 36): Tab order
+                    // and reverse-traversal proof, accumulated across every
+                    // observe and audit in this run.
+                    "focus_graph": run.focus_graph.summary(),
                 }))
             }
             other => err(
@@ -1102,16 +1335,26 @@ impl TuiLabServer {
             };
 
         // Findings accumulate in the run context (composition root) so a
-        // later audit/coverage query can see prior evidence.
-        {
+        // later audit/coverage query can see prior evidence. Driven focus
+        // edges merge into the run's persistent ID-keyed FocusGraph (Wave D
+        // item 36), so multiple audits accumulate traversal proof.
+        let focus_summary = {
             let mut run = self.run.lock().unwrap();
+            run.focus_graph.merge(&report.focus_graph);
             run.extend_findings(report.findings.clone());
-        }
+            json!({
+                "nodes": run.focus_graph.nodes.len(),
+                "edges": run.focus_graph.edges.len(),
+                "tab_cycle": run.focus_graph.tab_cycle(),
+                "reverse_tab_gaps": run.focus_graph.reverse_tab_gaps(),
+            })
+        };
         ok(json!({
             "profile": profile,
             "mode": report.mode,
             "finding_count": report.findings.len(),
             "findings": report.findings,
+            "focus_graph": focus_summary,
         }))
     }
 

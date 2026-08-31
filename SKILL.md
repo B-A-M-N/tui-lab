@@ -12,8 +12,8 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_checkpoint` — save/restore screen snapshots
 - `tui_scenario` — record/replay interaction sequences
 - `tui_record` — capture terminal sessions as asciinema
-- `tui_explore` — seeded random exploration
-- `tui_audit` — run UX audits
+- `tui_explore` — seeded random exploration, evidential candidate generation, screen-reading semantic exploration
+- `tui_audit` — run UX audits (keyboard/focus/clipping/resize drive the live app; navigation proves Tab order + Shift+Tab reversal via the ID-keyed focus graph)
 - `tui_coverage` — collect coverage data
 - `tui_framework` — native framework inspection
 
