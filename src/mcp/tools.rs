@@ -11,7 +11,7 @@ use rmcp::tool_router;
 use rmcp::ServerHandler;
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{build_wait, err, err_continued, ok};
+use crate::mcp::helpers::{build_wait, err, err_continued, err_invalid_selector, ok};
 use crate::mcp::params::*;
 use crate::screen::diff;
 use crate::semantic;
@@ -49,11 +49,25 @@ impl TuiLabServer {
         name = "tui_session",
         description = "Manage TUI sessions: start, restart, stop, list, status."
     )]
-    pub async fn tui_session(&self, p: Parameters<TuiSessionParams>) -> String {
+    pub async fn tui_session(&self, p: Parameters<TuiSessionParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
+        use crate::mcp::params::SessionAction as A;
         let mut mgr = self.manager.lock().unwrap();
-        match p.action.as_str() {
-            "start" => {
+        let Some(action) = p.action.known() else {
+            return err(
+                ErrorCategory::InvalidRequest,
+                format!(
+                    "unknown session action '{}' (expected one of: {})",
+                    match &p.action {
+                        crate::mcp::params::Known::Other(s) => s.clone(),
+                        _ => String::new(),
+                    },
+                    <A as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                ),
+            );
+        };
+        match action {
+            A::Start => {
                 let cols = p.cols.unwrap_or(80);
                 let rows = p.rows.unwrap_or(24);
                 let command = match &p.command {
@@ -65,7 +79,26 @@ impl TuiLabServer {
                 // Wave F items 50–51: `cli` selects the line CLI engine for
                 // non-screen targets (git/npm/pytest-style output).
                 let backend = p.backend.clone().unwrap_or_else(|| "auto".into());
-                let isolation = p.isolation.clone().unwrap_or_else(|| "local".into());
+                // Wave G item 77: typed isolation profile; the enum converts
+                // into the engine-level Isolation.
+                let isolation_param = p
+                    .isolation
+                    .clone()
+                    .unwrap_or(crate::mcp::params::Known::Known(
+                        crate::mcp::params::IsolationParam::Local,
+                    ));
+                let isolation: crate::session::isolation::Isolation = match &isolation_param {
+                    crate::mcp::params::Known::Known(ip) => (*ip).into(),
+                    crate::mcp::params::Known::Other(other) => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                                "unknown isolation profile '{}' (supported: local, clean, strict)",
+                                other
+                            ),
+                        )
+                    }
+                };
                 match backend.as_str() {
                     "auto" | "portable_vt100" | "cli" | "line_cli" => {}
                     "tui_test" => {
@@ -84,20 +117,8 @@ impl TuiLabServer {
                         )
                     }
                 }
-                match isolation.as_str() {
-                    "local" => {}
-                    "docker" => return err(
-                        ErrorCategory::Unsupported,
-                        "isolation 'docker' is not wired in this build; only 'local' is supported",
-                    ),
-                    other => {
-                        return err(
-                            ErrorCategory::InvalidRequest,
-                            format!("unknown isolation '{}' (supported: local)", other),
-                        )
-                    }
-                }
                 let env: Vec<(String, String)> = p.env.unwrap_or_default().into_iter().collect();
+                let isolation_name = isolation.name().to_string();
                 match mgr.start(
                     &command,
                     &p.args.unwrap_or_default(),
@@ -106,7 +127,7 @@ impl TuiLabServer {
                     cols,
                     rows,
                     &backend,
-                    &isolation,
+                    &isolation_name,
                 ) {
                     Ok(id) => {
                         let sess = mgr.get_mut(&id).expect("just started");
@@ -115,6 +136,7 @@ impl TuiLabServer {
                         let version = sess.backend_version();
                         let kind = sess.backend_kind.clone();
                         let generation = sess.generation;
+                        let iso_evidence = sess.isolation_evidence().cloned();
                         // Attach the launch spec to the run, per session
                         // (audit re-review item 1 + P0 fix 6: the run owns
                         // session/launch correlation for *all* sessions, so
@@ -131,12 +153,13 @@ impl TuiLabServer {
                             "backend": { "name": kind, "version": version },
                             "capabilities": caps,
                             "launch": launch,
+                            "isolation": iso_evidence,
                         }))
                     }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
-            "restart" => {
+            A::Restart => {
                 let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session to restart"),
@@ -157,7 +180,7 @@ impl TuiLabServer {
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
-            "stop" => {
+            A::Stop => {
                 let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session"),
@@ -167,8 +190,49 @@ impl TuiLabServer {
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
-            "list" => ok(json!({ "sessions": mgr.list() })),
-            "status" => {
+            A::List => ok(json!({ "sessions": mgr.list() })),
+            // Wave G item 76: take the human control lease.
+            A::Lease => {
+                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                    Some(i) => i,
+                    None => return err(ErrorCategory::NoSession, "no session"),
+                };
+                let holder = p.holder.clone().unwrap_or_else(|| "human".into());
+                let ttl = p.ttl_ms.unwrap_or(300_000);
+                let sess = match mgr.get_mut(&id) {
+                    Ok(s) => s,
+                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                };
+                match sess.acquire_lease(&holder, ttl) {
+                    Ok(lease) => ok(json!({
+                        "session": id,
+                        "leased": true,
+                        "holder": lease.holder,
+                        "ttl_ms": lease.ttl_ms,
+                        "note": "machine-driving tools (act/explore/audit/replay) refuse this session while the lease is valid; observe stays allowed",
+                    })),
+                    Err(existing) => ok(json!({
+                        "session": id,
+                        "leased": false,
+                        "holder": existing.holder,
+                        "remaining_ms": existing.remaining_ms(),
+                        "note": "a live lease is already held; release it or wait for expiry",
+                    })),
+                }
+            }
+            A::Release => {
+                let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
+                    Some(i) => i,
+                    None => return err(ErrorCategory::NoSession, "no session"),
+                };
+                let sess = match mgr.get_mut(&id) {
+                    Ok(s) => s,
+                    Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
+                };
+                let released = sess.release_lease();
+                ok(json!({ "session": id, "released": released }))
+            }
+            A::Status => {
                 let id = match p.id.clone().or_else(|| mgr.active_id().map(str::to_string)) {
                     Some(i) => i,
                     None => return err(ErrorCategory::NoSession, "no session"),
@@ -176,21 +240,24 @@ impl TuiLabServer {
                 match mgr.resolve_mut(Some(&id)) {
                     Ok(s) => {
                         let caps = s.capabilities();
+                        let lease = s.active_lease();
+                        let iso = s.isolation_evidence().cloned();
                         ok(json!({
                             "session": id,
                             "command": s.command,
                             "backend": s.backend_kind,
                             "capabilities": caps,
                             "process": s.process(),
+                            "lease": lease.map(|l| json!({
+                                "holder": l.holder,
+                                "remaining_ms": l.remaining_ms(),
+                            })),
+                            "isolation": iso,
                         }))
                     }
                     Err(e) => err(ErrorCategory::NoSession, e.to_string()),
                 }
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown action '{}'", other),
-            ),
         }
     }
 
@@ -199,7 +266,7 @@ impl TuiLabServer {
         name = "tui_observe",
         description = "Observe terminal state. Modes: summary, screen, cells, semantic, tree, nodes, diff, scrollback, search (query in 'text'), command_state."
     )]
-    async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> String {
+    async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
@@ -212,8 +279,27 @@ impl TuiLabServer {
         };
         self.run.lock().unwrap().bump_event();
 
-        match p.mode.as_deref().unwrap_or("summary") {
-            "summary" => {
+        use crate::mcp::params::ObserveMode as OM;
+        let mode = p
+            .mode
+            .clone()
+            .unwrap_or(crate::mcp::params::Known::Known(OM::Summary));
+        if mode.known().is_none() {
+            let bad = match &mode {
+                crate::mcp::params::Known::Other(o) => o.clone(),
+                _ => String::new(),
+            };
+            return err(
+                ErrorCategory::InvalidRequest,
+                format!(
+                    "unknown observe mode '{}' (expected one of: {})",
+                    bad,
+                    <OM as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                ),
+            );
+        }
+        match mode.known().copied().unwrap() {
+            OM::Summary => {
                 // Compact summary for agent consumption (spec 36). Avoids
                 // returning the full viewport text (which could be 160x50).
                 // Use mode=screen for full text.
@@ -278,9 +364,9 @@ impl TuiLabServer {
                     },
                 }))
             }
-            "screen" => ok(json!({ "viewport_text": screen.viewport_text })),
-            "cells" => ok(json!({ "cells": screen.cells })),
-            "semantic" => {
+            OM::Screen => ok(json!({ "viewport_text": screen.viewport_text })),
+            OM::Cells => ok(json!({ "cells": screen.cells })),
+            OM::Semantic => {
                 let sem = semantic::analyze(&screen);
                 ok(json!({ "semantic": sem }))
             }
@@ -288,7 +374,7 @@ impl TuiLabServer {
             // per containment, controls inside their regions, focus and
             // screen-level components attached. This is the shape to compare
             // against an intended design without re-deriving containment.
-            "tree" => {
+            OM::Tree => {
                 let sem = semantic::analyze(&screen);
                 let tree = semantic::build_state_tree(
                     screen.cols,
@@ -307,7 +393,7 @@ impl TuiLabServer {
             // Wave F (items 58–63): when the app cooperates via the native
             // side channel, its real tree is merged over inference and the
             // merge report names what matched.
-            "nodes" => {
+            OM::Nodes => {
                 let mut tree = semantic::build_tree(&screen);
                 let native_report = sess.overlay_native(&mut tree);
                 ok(json!({
@@ -325,7 +411,7 @@ impl TuiLabServer {
                     },
                 }))
             }
-            "diff" => {
+            OM::Diff => {
                 // ONE diff path (re-review item 7): observe() above stashed
                 // the prior frame in `previous`, so this is a real
                 // previous→current comparison through the canonical
@@ -351,7 +437,7 @@ impl TuiLabServer {
             // Incremental read (Wave B item 13): return only what changed
             // since the named consumer's cursor, with dirty rows — far more
             // token-efficient than full-screen rereads for monitoring.
-            "changes" => {
+            OM::Changes => {
                 let consumer = p.consumer.clone().unwrap_or_else(|| "hermes".to_string());
                 let batch = sess.events_for_consumer(&consumer);
                 ok(json!({
@@ -370,7 +456,7 @@ impl TuiLabServer {
             // Wave F item 53: real scrollback (viewport + history). A backend
             // that cannot retain history still answers — honestly, with the
             // capability state named.
-            "scrollback" => {
+            OM::Scrollback => {
                 let lines = sess
                     .backend_scrollback()
                     .map_err(|e| err(ErrorCategory::BackendError, e.to_string()))
@@ -386,7 +472,7 @@ impl TuiLabServer {
                 }))
             }
             // Wave F item 53: search viewport + scrollback.
-            "search" => {
+            OM::Search => {
                 let Some(query) = p.text.clone().or(p.query.clone()) else {
                     return err(
                         ErrorCategory::InvalidRequest,
@@ -403,7 +489,7 @@ impl TuiLabServer {
                 }
             }
             // Wave F item 54: OSC 133 shell-integration state.
-            "command_state" => {
+            OM::CommandState => {
                 match sess.backend_command_state() {
                     Some(cs) => ok(json!({ "command_state": cs })),
                     None => ok(json!({
@@ -412,13 +498,9 @@ impl TuiLabServer {
                     })),
                 }
             }
-            "history" => err(
+            OM::History => err(
                 ErrorCategory::Unsupported,
                 "run/session event history is not implemented; the current frame identity is available via mode=summary (structure_hash)",
-            ),
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown mode '{}'", other),
             ),
         }
     }
@@ -429,7 +511,7 @@ impl TuiLabServer {
         name = "tui_act",
         description = "Drive input. Returns a screen transition after the action. Actions: key, keys, type, paste, raw, mouse_click, mouse_press, mouse_release, mouse_move, mouse_drag, mouse_scroll, resize, signal."
     )]
-    pub async fn tui_act(&self, p: Parameters<TuiActRequest>) -> String {
+    pub async fn tui_act(&self, p: Parameters<TuiActRequest>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id()) {
@@ -533,7 +615,7 @@ impl TuiLabServer {
         name = "tui_wait",
         description = "Block until a condition holds: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output (OSC 133 shell integration)."
     )]
-    async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> String {
+    async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
@@ -584,7 +666,7 @@ impl TuiLabServer {
         name = "tui_assert",
         description = "Assert UI facts: text, text_absent, position, focus, not_clipped, dimensions, exit_code."
     )]
-    async fn tui_assert(&self, p: Parameters<TuiAssertParams>) -> String {
+    async fn tui_assert(&self, p: Parameters<TuiAssertParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
@@ -598,7 +680,9 @@ impl TuiLabServer {
         // Wave E: `assertion: "oracle"` evaluates a declarative oracle
         // expression (shared language with contracts and audits). Any other
         // assertion name goes through the canonical assert executor.
-        if p.assertion == "oracle" {
+        use crate::mcp::params::AssertAssertion as AA;
+        let is_oracle = matches!(p.assertion.known(), Some(AA::Oracle));
+        if is_oracle {
             let Some(expr) = p.text.as_deref().or(p.reference.as_deref()) else {
                 return err(
                     ErrorCategory::InvalidRequest,
@@ -644,7 +728,7 @@ impl TuiLabServer {
                 run.record_scenario_assert(&sid, gen, serde_json::to_value(&p).unwrap_or_default());
             }
             if passed {
-                ok(json!({ "passed": true, "assertion": p.assertion }))
+                ok(json!({ "passed": true, "assertion": p.assertion_name() }))
             } else if let Some(ErrorCategory::InvalidRequest) = invalid {
                 // Unknown assertion name (or missing required param): a caller error,
                 // NOT a UI failure (spec section 37).
@@ -660,7 +744,7 @@ impl TuiLabServer {
         name = "tui_checkpoint",
         description = "Save and compare named UI state checkpoints."
     )]
-    async fn tui_checkpoint(&self, p: Parameters<TuiCheckpointParams>) -> String {
+    async fn tui_checkpoint(&self, p: Parameters<TuiCheckpointParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         // Resolve session first (all actions except a bare list still need a
         // live session; list is per-session scoped, defaulting to active).
@@ -670,9 +754,13 @@ impl TuiLabServer {
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
         let mut run = self.run.lock().unwrap();
-        match p.action.as_str() {
-            "list" => ok(json!({ "checkpoints": run.checkpoints.list(&session_id) })),
-            "save" => {
+        use crate::mcp::params::CheckpointAction as CA;
+        let Some(ckpt_action) = p.action.known().copied() else {
+            return err_invalid_selector("checkpoint action", &p.action, <CA as crate::mcp::params::EnumVariants>::VARIANTS);
+        };
+        match ckpt_action {
+            CA::List => ok(json!({ "checkpoints": run.checkpoints.list(&session_id) })),
+            CA::Save => {
                 let (generation, screen, sem) = {
                     let sess = match mgr.get_mut(&session_id) {
                         Ok(s) => s,
@@ -700,7 +788,7 @@ impl TuiLabServer {
                     "controls": sem.controls.len(),
                 }))
             }
-            "compare" => {
+            CA::Compare => {
                 let name = match &p.name {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "compare requires 'name'"),
@@ -718,14 +806,14 @@ impl TuiLabServer {
                     .checkpoints
                     .compare(&session_id, &name, &screen, Some(&sem))
                 {
-                    Ok(json_out) => json_out,
+                    Ok(json_out) => crate::mcp::helpers::ok_from_json(&json_out),
                     Err(ErrorCategory::InvalidRequest) => {
                         err(ErrorCategory::InvalidRequest, "no such checkpoint")
                     }
                     Err(c) => err(c, "checkpoint comparison failed"),
                 }
             }
-            "delete" => {
+            CA::Delete => {
                 let name = match &p.name {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "delete requires 'name'"),
@@ -733,10 +821,6 @@ impl TuiLabServer {
                 let removed = run.checkpoints.delete(&session_id, &name);
                 ok(json!({ "name": name, "deleted": removed }))
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown action '{}'", other),
-            ),
         }
     }
 
@@ -745,11 +829,27 @@ impl TuiLabServer {
         name = "tui_scenario",
         description = "Record, save, list, and export workflows as regression scenarios."
     )]
-    pub async fn tui_scenario(&self, p: Parameters<TuiScenarioParams>) -> String {
+    pub async fn tui_scenario(&self, p: Parameters<TuiScenarioParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut run = self.run.lock().unwrap();
-        match p.action.as_str() {
-            "list" => {
+        use crate::mcp::params::ScenarioAction as SA;
+        let Some(sc_action) = (match &p.action {
+            crate::mcp::params::Known::Known(a) => Some(*a),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown scenario action '{}' (expected one of: {})",
+                        o,
+                        <SA as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                    ),
+                );
+            }
+        }) else {
+            unreachable!()
+        };
+        match sc_action {
+            SA::List => {
                 let recorded = run.active_recordings();
                 let saved = run.list_saved_scenarios().unwrap_or_default();
                 ok(json!({ "recordings_in_progress": recorded, "scenarios": saved }))
@@ -759,7 +859,7 @@ impl TuiLabServer {
             // that session generation append steps; other sessions never do
             // (re-review item 5). The returned id — not the name — is the
             // identity for record_stop.
-            "record_start" => {
+            SA::RecordStart => {
                 let mut mgr = self.manager.lock().unwrap();
                 let sess = match mgr.resolve_mut(p.id.as_deref()) {
                     Ok(s) => s,
@@ -779,7 +879,7 @@ impl TuiLabServer {
             }
             // Finish + persist. Accepts `recording_id` (preferred identity)
             // or falls back to the oldest active recording with `name`.
-            "record_stop" => {
+            SA::RecordStop => {
                 let rec_id = match (&p.recording_id, &p.name) {
                     (Some(id), _) => id.clone(),
                     (None, Some(name)) => match run.find_recording_by_name(name) {
@@ -820,7 +920,7 @@ impl TuiLabServer {
             }
             // explicit save of hand-authored steps (validated through the
             // Scenario model rather than stored as opaque JSON)
-            "save" => {
+            SA::Save => {
                 let name = p.name.clone().unwrap_or_else(|| "scenario".into());
                 let steps = p.steps.clone().unwrap_or_default();
                 let mut recorder = crate::scenario::recorder::ScenarioRecorder::new(name.clone());
@@ -881,7 +981,7 @@ impl TuiLabServer {
                     json!({ "scenario_id": scenario_id, "name": name, "steps": count, "saved_to": path }),
                 )
             }
-            "export" => {
+            SA::Export => {
                 let name = match &p.name {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "export requires name"),
@@ -899,7 +999,7 @@ impl TuiLabServer {
             // Replay a saved scenario against a session through the one
             // canonical executor — the regression path: record once, run
             // again later, get a real pass/fail per step.
-            "run" => {
+            SA::Run => {
                 let name = match &p.name {
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "run requires 'name'"),
@@ -952,10 +1052,6 @@ impl TuiLabServer {
                     }))
                 }
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown action '{}'", other),
-            ),
         }
     }
 
@@ -965,17 +1061,36 @@ impl TuiLabServer {
         name = "tui_record",
         description = "Produce terminal recordings (asciinema .cast). Other formats are delegated to the backend."
     )]
-    pub async fn tui_record(&self, p: Parameters<TuiRecordParams>) -> String {
+    pub async fn tui_record(&self, p: Parameters<TuiRecordParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        match p.format.as_deref().unwrap_or("start") {
+        use crate::mcp::params::RecordFormat as RF;
+        let fmt = p
+            .format
+            .clone()
+            .unwrap_or(crate::mcp::params::Known::Known(RF::Start));
+        let Some(rfmt) = (match &fmt {
+            crate::mcp::params::Known::Known(f) => Some(*f),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::Unsupported,
+                    format!(
+                        "recording format '{}' is not implemented by the current backend; available: start/stop (.cast lifecycle), svg, png (one-shot captures)",
+                        o
+                    ),
+                );
+            }
+        }) else {
+            unreachable!()
+        };
+        match rfmt {
             // Attach the raw PTY hook (audit item 24): every byte the reader
             // thread sees from now on is captured with timing.
-            "start" => {
+            RF::Start => {
                 sess.enable_recording(false);
                 ok(json!({
                     "recording": "started",
@@ -984,7 +1099,7 @@ impl TuiLabServer {
                 }))
             }
             // Detach + write the .cast into the run's recordings dir.
-            "stop" => {
+            RF::Stop => {
                 // stop_recording() detaches the hook and hands back the sink
                 // (disable_recording() would drop it before retrieval).
                 let rec = match sess.stop_recording() {
@@ -1075,7 +1190,7 @@ impl TuiLabServer {
                     "inline_events": path.is_none().then_some(ndjson),
                 }))
             }
-            "cast" => err(
+            RF::Cast => err(
                 ErrorCategory::InvalidRequest,
                 "format='cast' is not a lifecycle action; use format=start then format=stop (produces asciinema v3 .cast)",
             ),
@@ -1083,12 +1198,12 @@ impl TuiLabServer {
             // SVG is the faithful render (styled runs + cursor); PNG is the
             // raster fallback (ASCII glyphs + block degradation for other
             // scripts — honest about that in the response).
-            "svg" | "png" => {
+            fmt @ (RF::Svg | RF::Png) => {
                 let screen = match sess.observe(40) {
                     Ok(s) => s,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
-                let is_svg = p.format.as_deref() == Some("svg");
+                let is_svg = fmt == RF::Svg;
                 let (body, ext) = if is_svg {
                     (crate::screen::capture::to_svg(&screen).into_bytes(), "svg")
                 } else {
@@ -1173,13 +1288,6 @@ impl TuiLabServer {
                     },
                 }))
             }
-            other => err(
-                ErrorCategory::Unsupported,
-                format!(
-                    "recording format '{}' is not implemented by the current backend; available: start/stop (.cast lifecycle), svg, png (one-shot captures)",
-                    other
-                ),
-            ),
         }
     }
 
@@ -1319,15 +1427,32 @@ impl TuiLabServer {
         name = "tui_explore",
         description = "Seeded random exploration, candidate generation, or replay. Returns evidence, not another reasoning loop."
     )]
-    async fn tui_explore(&self, p: Parameters<TuiExploreParams>) -> String {
+    async fn tui_explore(&self, p: Parameters<TuiExploreParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        match p.mode.as_str() {
-            "guided_candidates" => {
+        use crate::mcp::params::ExploreMode as EM;
+        let mode_sel = p.mode.clone();
+        let Some(emode) = (match &mode_sel {
+            crate::mcp::params::Known::Known(m) => Some(*m),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown explore mode '{}' (expected one of: {})",
+                        o,
+                        <EM as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                    ),
+                );
+            }
+        }) else {
+            unreachable!()
+        };
+        match emode {
+            EM::GuidedCandidates => {
                 // Novel action candidates for Hermes to choose (spec 4.3),
                 // Wave D item 34: every reason is evidential. The candidate
                 // context carries the run's state graph, the current state's
@@ -1372,7 +1497,7 @@ impl TuiLabServer {
                     "state": identity.id().as_str(),
                 }))
             }
-            "random" => {
+            EM::Random => {
                 let seed = p.seed.unwrap_or(4242);
                 let recording_path = p.recording_path.as_deref().map(std::path::Path::new);
                 if recording_path.is_some() {
@@ -1442,7 +1567,7 @@ impl TuiLabServer {
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
-            "semantic" => {
+            EM::Semantic => {
                 // Wave D item 35: screen-reading exploration. Picks the
                 // top evidential candidate each round (affordances, untried
                 // keys from the graph, unreached controls) and executes it
@@ -1497,7 +1622,7 @@ impl TuiLabServer {
                     },
                 }))
             }
-            "state_graph" => {
+            EM::StateGraph => {
                 let run = self.run.lock().unwrap();
                 ok(json!({
                     "states": run.state_graph.state_count(),
@@ -1516,10 +1641,6 @@ impl TuiLabServer {
                     "focus_graph": run.focus_graph.summary(),
                 }))
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown mode '{}'", other),
-            ),
         }
     }
 
@@ -1528,14 +1649,35 @@ impl TuiLabServer {
         name = "tui_audit",
         description = "Run deterministic UX audits and return evidence-backed findings."
     )]
-    async fn tui_audit(&self, p: Parameters<TuiAuditParams>) -> String {
+    async fn tui_audit(&self, p: Parameters<TuiAuditParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let mut mgr = self.manager.lock().unwrap();
         let sess = match mgr.resolve_mut(p.id.as_deref()) {
             Ok(s) => s,
             Err(e) => return err(ErrorCategory::NoSession, e.to_string()),
         };
-        let profile = p.profile.as_deref().unwrap_or("full").to_string();
+        use crate::mcp::params::AuditProfile as AP;
+        let profile_sel = p
+            .profile
+            .clone()
+            .unwrap_or(crate::mcp::params::Known::Known(AP::Full));
+        let profile = match &profile_sel {
+            crate::mcp::params::Known::Known(ap) => ap.engine_name().to_string(),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown audit profile '{}' (expected one of: {})",
+                        o,
+                        <AP as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                    ),
+                );
+            }
+        };
+        let profile_wire = match &profile_sel {
+            crate::mcp::params::Known::Known(ap) => ap.as_str().to_string(),
+            _ => profile.clone(),
+        };
 
         // The audit ENGINE owns the static-vs-active decision (re-review
         // P0 fix 2): `full` is the composite (static + every active driver),
@@ -1570,7 +1712,7 @@ impl TuiLabServer {
             })
         };
         ok(json!({
-            "profile": profile,
+            "profile": profile_wire,
             "mode": report.mode,
             "finding_count": report.findings.len(),
             "findings": report.findings,
@@ -1585,13 +1727,17 @@ impl TuiLabServer {
         name = "tui_coverage",
         description = "Native coverage: run ledger (native events) plus optional tuicov executable. Actions: detect, summary, collect, delta, uncovered."
     )]
-    async fn tui_coverage(&self, p: Parameters<TuiCoverageParams>) -> String {
+    async fn tui_coverage(&self, p: Parameters<TuiCoverageParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        let action = p.action.clone().unwrap_or_else(|| "summary".into());
+        use crate::mcp::params::CoverageAction as CV;
+        let action = p
+            .action
+            .clone()
+            .unwrap_or(crate::mcp::params::Known::Known(CV::Summary));
         // The run-ledger views are answered here (session-scoped); the
         // rest delegates to the provider module.
-        match action.as_str() {
-            "ledger" => {
+        match action.known() {
+            Some(CV::Ledger) => {
                 let run = self.run.lock().unwrap();
                 let entries: Vec<serde_json::Value> = run
                     .coverage_ledger
@@ -1611,7 +1757,7 @@ impl TuiLabServer {
                 }))
             }
             _ => match crate::coverage::tuicov::handle(&p) {
-                Ok(s) => s,
+                Ok(s) => crate::mcp::helpers::ok_from_json(&s),
                 Err(e) => err(ErrorCategory::BackendError, e.to_string()),
             },
         }
@@ -1625,16 +1771,32 @@ impl TuiLabServer {
         name = "tui_framework",
         description = "Detect the TUI framework, run native probes, and fetch NativeSemanticProtocol adapter snippets (action=adapter_snippet)."
     )]
-    async fn tui_framework(&self, p: Parameters<TuiFrameworkParams>) -> String {
+    async fn tui_framework(&self, p: Parameters<TuiFrameworkParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let cwd = p.cwd.clone().unwrap_or_else(|| ".".into());
         let det = crate::framework::detect::detect(&cwd);
-        match p.action.as_str() {
-            "detect" => ok(json!({ "framework": det })),
-            "capabilities" => ok(
+        use crate::mcp::params::FrameworkAction as FA;
+        let Some(fw_action) = (match &p.action {
+            crate::mcp::params::Known::Known(a) => Some(*a),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown framework action '{}' (expected one of: {})",
+                        o,
+                        <FA as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                    ),
+                );
+            }
+        }) else {
+            unreachable!()
+        };
+        match fw_action {
+            FA::Detect => ok(json!({ "framework": det })),
+            FA::Capabilities => ok(
                 json!({ "framework": det, "note": "native probes invoke project-local tooling" }),
             ),
-            "adapter_snippet" => {
+            FA::AdapterSnippet => {
                 let fw = p
                     .source
                     .clone()
@@ -1657,10 +1819,6 @@ impl TuiLabServer {
                     ),
                 }
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown action '{}' (detect|capabilities|adapter_snippet)", other),
-            ),
         }
     }
 
@@ -1675,10 +1833,26 @@ impl TuiLabServer {
         name = "tui_run",
         description = "Run lifecycle: status, persist (ephemeral→durable, same run identity), close. Nothing is written to disk until you persist."
     )]
-    pub async fn tui_run(&self, p: Parameters<TuiRunParams>) -> String {
+    pub async fn tui_run(&self, p: Parameters<TuiRunParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        match p.action.as_str() {
-            "status" => {
+        use crate::mcp::params::RunAction as RA;
+        let Some(run_action) = (match &p.action {
+            crate::mcp::params::Known::Known(a) => Some(*a),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown run action '{}' (expected one of: {})",
+                        o,
+                        <RA as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                    ),
+                );
+            }
+        }) else {
+            unreachable!()
+        };
+        match run_action {
+            RA::Status => {
                 let sessions = self.manager.lock().unwrap().list();
                 ok(self.run.lock().unwrap().status(
                     sessions
@@ -1687,7 +1861,7 @@ impl TuiLabServer {
                         .collect(),
                 ))
             }
-            "persist" => {
+            RA::Persist => {
                 let mut run = self.run.lock().unwrap();
                 if run.run_dir().is_some() {
                     return ok(json!({
@@ -1725,7 +1899,7 @@ impl TuiLabServer {
                     Err(e) => err(ErrorCategory::InternalError, format!("persist failed: {e}")),
                 }
             }
-            "close" => {
+            RA::Close => {
                 let mut run = self.run.lock().unwrap();
                 // Drain terminal-event queues into the run (Wave B item 14)
                 // before the flush so the event logs land in the artifacts.
@@ -1777,10 +1951,11 @@ impl TuiLabServer {
                     "final": summary,
                 }))
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown run action '{}' (status|persist|close)", other),
-            ),
+            // Wave G item 68: the capability registry as JSON — the
+            // machine-readable answer to "what can this server do".
+            RA::Context => ok(json!({
+                "registry": crate::mcp::registry::to_json(),
+            })),
         }
     }
 
@@ -1793,11 +1968,27 @@ impl TuiLabServer {
         name = "tui_contract",
         description = "Design contracts: load, validate, check conformance (PASS/FAIL/WARN against the running app), and compare runs."
     )]
-    pub async fn tui_contract(&self, p: Parameters<TuiContractParams>) -> String {
+    pub async fn tui_contract(&self, p: Parameters<TuiContractParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
-        match p.action.as_str() {
+        use crate::mcp::params::ContractAction as CT;
+        let Some(ct_action) = (match &p.action {
+            crate::mcp::params::Known::Known(a) => Some(*a),
+            crate::mcp::params::Known::Other(o) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown contract action '{}' (expected one of: {})",
+                        o,
+                        <CT as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                    ),
+                );
+            }
+        }) else {
+            unreachable!()
+        };
+        match ct_action {
             // ── load: parse + validate + remember + apply policy ──
-            "load" => {
+            CT::Load => {
                 let Some(path) = p.path.clone() else {
                     return err(ErrorCategory::InvalidRequest, "load requires 'path'");
                 };
@@ -1846,7 +2037,7 @@ impl TuiLabServer {
                 ok(json!({ "loaded": true, "path": path, "contract": summary }))
             }
             // ── validate: document-only, no session needed ──
-            "validate" => {
+            CT::Validate => {
                 let Some(path) = p.path.clone() else {
                     return err(ErrorCategory::InvalidRequest, "validate requires 'path'");
                 };
@@ -1881,7 +2072,7 @@ impl TuiLabServer {
                 }
             }
             // ── status: full conformance check against the running app ──
-            "status" => {
+            CT::Status => {
                 let contract = {
                     let run = self.run.lock().unwrap();
                     match run.contract() {
@@ -1897,7 +2088,7 @@ impl TuiLabServer {
                 self.check_contract_against(p.id.as_deref(), &contract)
             }
             // ── compare: run conformance now, diff against the baseline ──
-            "compare" => {
+            CT::Compare => {
                 let contract = {
                     let run = self.run.lock().unwrap();
                     match run.contract() {
@@ -1996,10 +2187,6 @@ impl TuiLabServer {
                     }
                 }
             }
-            other => err(
-                ErrorCategory::InvalidRequest,
-                format!("unknown contract action '{}' (load|validate|status|compare)", other),
-            ),
         }
     }
 
@@ -2008,7 +2195,7 @@ impl TuiLabServer {
         &self,
         id: Option<&str>,
         contract: &crate::design::ProjectContract,
-    ) -> String {
+    ) -> rmcp::model::CallToolResult {
         match self.check_contract_inner(id, contract) {
             Ok(report) => {
                 // Findings feed the run ledger (item 49).

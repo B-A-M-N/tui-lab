@@ -95,6 +95,13 @@ pub trait TerminalBackend: Send {
     ) {
     }
 
+    /// Wave G item 77: when set, the next `start()` clears the inherited
+    /// environment before applying the caller-supplied pairs — the `clean`
+    /// and `strict` isolation profiles. The default ignores it (local
+    /// inheritance stays in effect), so backends without env control are
+    /// honest about it rather than silently inheriting.
+    fn set_clear_env(&mut self, _clear: bool) {}
+
     /// Current snapshot (alias for `state`, kept for API clarity).
     fn snapshot(&mut self) -> BackendResult<ScreenState> {
         self.state()

@@ -56,6 +56,9 @@ pub struct LineCliBackend {
     chunk_rx: Option<mpsc::Receiver<Vec<u8>>>,
     recording_slot: RecordingHookSlot,
     reader_recording_hook: Option<super::RecordingHookSlot>,
+    // Wave G item 77: clear the inherited env before applying pairs at the
+    // next start() (clean/strict isolation profiles).
+    clear_env_on_start: bool,
     // Event sequencing (same contract as PortablePtyBackend).
     output_seq: u64,
     screen_seq: u64,
@@ -90,6 +93,7 @@ impl LineCliBackend {
             chunk_rx: None,
             recording_slot: new_recording_hook_slot(),
             reader_recording_hook: None,
+            clear_env_on_start: false,
             output_seq: 0,
             screen_seq: 0,
             content_seq: 0,
@@ -249,6 +253,12 @@ impl TerminalBackend for LineCliBackend {
         }
         if let Some(c) = cwd {
             cmd.cwd(c);
+        }
+        // Isolation profile (Wave G item 77): clean/strict launches drop the
+        // inherited environment first so the child sees only the caller's
+        // pairs (plus TERM=dumb below).
+        if self.clear_env_on_start {
+            cmd.env_clear();
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -585,6 +595,12 @@ impl TerminalBackend for LineCliBackend {
 
     fn set_recording_hook(&mut self, hook: RecordingHookSlot) {
         self.recording_slot = hook;
+    }
+
+    /// Wave G item 77: clear the inherited environment before applying the
+    /// caller's pairs on the next `start()` (clean/strict isolation).
+    fn set_clear_env(&mut self, clear: bool) {
+        self.clear_env_on_start = clear;
     }
 
     fn recording(&self) -> bool {

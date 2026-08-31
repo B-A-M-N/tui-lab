@@ -293,6 +293,9 @@ pub struct PortablePtyBackend {
     recording_slot: RecordingHookSlot,
     // Hook clone carried into the reader thread at start().
     reader_recording_hook: Option<super::RecordingHookSlot>,
+    // Wave G item 77: clear the inherited env before applying pairs at the
+    // next start() (clean/strict isolation profiles).
+    clear_env_on_start: bool,
     // Event sequencing state (spec section 1).
     output_seq: u64,
     screen_seq: u64,
@@ -335,6 +338,7 @@ impl PortablePtyBackend {
             chunk_rx: None,
             recording_slot: new_recording_hook_slot(),
             reader_recording_hook: None,
+            clear_env_on_start: false,
             output_seq: 0,
             screen_seq: 0,
             content_seq: 0,
@@ -613,6 +617,12 @@ impl TerminalBackend for PortablePtyBackend {
         };
         if let Some(c) = cwd_arg {
             cmd.cwd(c);
+        }
+        // Isolation profile (Wave G item 77): clean/strict launches drop the
+        // inherited environment first so the child sees only the caller's
+        // pairs. Local keeps portable-pty's base-env inheritance.
+        if self.clear_env_on_start {
+            cmd.env_clear();
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -1170,6 +1180,12 @@ impl TerminalBackend for PortablePtyBackend {
     /// Stores the slot so the struct can forward on_input/on_resize events.
     fn set_recording_hook(&mut self, hook: super::RecordingHookSlot) {
         self.recording_slot = hook;
+    }
+
+    /// Wave G item 77: clear the inherited environment before applying the
+    /// caller's pairs on the next `start()` (clean/strict isolation).
+    fn set_clear_env(&mut self, clear: bool) {
+        self.clear_env_on_start = clear;
     }
 
     /// Observe current terminal state with optional idle-wait.

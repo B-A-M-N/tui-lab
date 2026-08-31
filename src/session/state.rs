@@ -103,6 +103,11 @@ pub struct Session {
     /// child's env; cooperative apps write their real semantic tree there
     /// and observation merges it over inference.
     native: crate::semantic::native::NativeChannel,
+    /// Wave G item 76: the human control lease, when one is held.
+    lease: crate::session::lease::LeaseState,
+    /// Wave G item 77: what the current generation's launch actually got
+    /// (profile, network isolation, env policy) — evidence, not a promise.
+    isolation_evidence: Option<crate::session::isolation::IsolationEvidence>,
 }
 
 /// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`].
@@ -162,7 +167,42 @@ impl Session {
             events: crate::events::TerminalEventQueue::new(),
             cursors: std::collections::HashMap::new(),
             native: crate::semantic::native::NativeChannel::default(),
+            lease: crate::session::lease::LeaseState::default(),
+            isolation_evidence: None,
         }
+    }
+
+    /// Wave G item 76: take the human control lease (holder + TTL). A live
+    /// lease refuses with the current holder's grant.
+    pub fn acquire_lease(
+        &mut self,
+        holder: &str,
+        ttl_ms: u64,
+    ) -> Result<crate::session::lease::ControlLease, crate::session::lease::ControlLease> {
+        self.lease.acquire(holder, ttl_ms)
+    }
+
+    /// Release the control lease. Returns whether one was live.
+    pub fn release_lease(&mut self) -> bool {
+        self.lease.release()
+    }
+
+    /// The active lease, if any.
+    pub fn active_lease(&mut self) -> Option<crate::session::lease::ControlLease> {
+        self.lease.active()
+    }
+
+    /// Wave G item 76: does the lease currently block machine driving?
+    /// Every driving path checks this before sending input.
+    pub fn driving_blocked(&mut self) -> Option<crate::session::lease::ControlLease> {
+        self.lease.active()
+    }
+
+    /// Wave G item 77: what the current generation actually launched with.
+    pub fn isolation_evidence(
+        &self,
+    ) -> Option<&crate::session::isolation::IsolationEvidence> {
+        self.isolation_evidence.as_ref()
     }
 
     /// Allocate the next monotonic anchor index for this session
@@ -400,6 +440,18 @@ impl Session {
                 "portable-pty+vt100".to_string()
             };
         }
+        // Wave G item 77: apply the isolation profile. The declared string
+        // is parsed here (invalid names fail loudly at launch, not silently
+        // downgrade); the effective env is profile-filtered, strict wraps
+        // the command in `unshare --net --` when the platform provides it,
+        // and the backend is told to drop inherited env for clean/strict.
+        let isolation = crate::session::isolation::Isolation::parse(&spec.isolation)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let effective_env = isolation.effective_env(&spec.env);
+        let (command, args, network_isolated) =
+            isolation.apply_to_command(&spec.command, &spec.args);
+        self.backend
+            .set_clear_env(!matches!(isolation, crate::session::isolation::Isolation::Local));
         // Re-attach any active recording hook (the backend was just replaced
         // internally on restart).
         self.backend.set_recording_hook(self.recording_slot.clone());
@@ -415,22 +467,31 @@ impl Session {
         } else {
             self.native.reset();
         }
-        let mut effective_env = spec.env.clone();
+        let mut effective_env = effective_env; // native channel pair may append
         if let Some(pair) = self.native.env_pair() {
             if !crate::semantic::native::env_has_channel(&effective_env) {
                 effective_env.push(pair);
             }
         }
         self.backend.start(
-            &spec.command,
-            &spec.args,
+            &command,
+            &args,
             spec.cwd.as_deref(),
             &effective_env,
             spec.cols,
             spec.rows,
         )?;
         self.caps_at_start = self.backend.capabilities();
-        self.command = spec.command.clone();
+        self.command = command.clone();
+        // Evidence of what actually launched (item 77) — kept per generation.
+        self.isolation_evidence = Some(crate::session::isolation::IsolationEvidence::for_profile(
+            isolation,
+            network_isolated,
+            &effective_env
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>(),
+        ));
         self.launch = Some(spec);
         // A new process generation invalidates prior frame tracking.
         self.previous = None;
