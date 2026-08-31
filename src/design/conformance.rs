@@ -747,7 +747,7 @@ fn check_behavior(
     // ── escape_closes_modal ──
     if contract.escape_closes_modal {
         let pre = session.observe(50).ok();
-        let modal_before = pre.as_ref().map(|s| modal_present(s)).unwrap_or(false);
+        let modal_before = pre.as_ref().map(modal_present).unwrap_or(false);
         if !modal_before {
             // Establish the precondition from the contract itself: an
             // interaction whose expect declares `modal_open()` IS the
