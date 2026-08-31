@@ -404,7 +404,7 @@ fn unwrap_err(raw: &CallToolResult, ctx: &str) -> serde_json::Value {
     let v = raw
         .structured_content
         .clone()
-        .expect(&format!("{ctx}: structured content"));
+        .unwrap_or_else(|| panic!("{ctx}: structured content"));
     assert!(
         raw.is_error.unwrap_or(false),
         "{ctx} should be a caller fault: {v}"

@@ -63,22 +63,48 @@ impl TuiLabServer {
             if rest.is_empty() {
                 return Err(not_found("empty run id".to_string()));
             }
-            let run = self.run.lock().unwrap();
-            if rest != run.id {
-                let known = run.id.clone();
-                return Err(not_found(format!(
-                    "no run '{rest}' in this server (this server's run is '{known}')"
-                )));
+            // The live run first (it carries live session state)…
+            {
+                let run = self.run.lock().unwrap();
+                if rest == run.id {
+                    let sessions = self.sessions.list();
+                    return Ok(run
+                        .status(
+                            sessions
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        )
+                        .to_string());
+                }
             }
-            let sessions = self.sessions.list();
-            return Ok(run
-                .status(
-                    sessions
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                )
-                .to_string());
+            // …then any persisted run on disk (Wave G item 75: the browser
+            // reads closed runs without resuming them). Search roots: the
+            // base configured for the live run (its primary session cwd or
+            // durable root's parent), so `tui://runs/<old-id>` resolves
+            // against where runs actually live for this workspace.
+            let mut bases = self.run.lock().unwrap().browser_bases();
+            // The server's own working directory is the workspace anchor:
+            // the canonical browser workflow is a restarted server sitting
+            // in the same repo where runs were persisted.
+            if let Ok(cwd) = std::env::current_dir() {
+                if !bases.contains(&cwd) {
+                    bases.push(cwd);
+                }
+            }
+            for base in bases {
+                if let Some(dir) = crate::run::RunContext::resolve_run_dir(&base, rest) {
+                    let restored = crate::run::RunContext::restore(&dir)
+                        .map_err(|e| not_found(format!("run '{rest}' unreadable: {e}")))?;
+                    let mut summary = restored.status(Vec::new());
+                    summary["live"] = serde_json::Value::Bool(false);
+                    return Ok(summary.to_string());
+                }
+            }
+            let live_id = self.run.lock().unwrap().id.clone();
+            return Err(not_found(format!(
+                "no run '{rest}' in this server or under its runs roots (this server's live run is '{live_id}'; use tui_run action=list to see persisted runs)"
+            )));
         }
         // tui://sessions/<id>/semantic | tui://sessions/<id>/screen
         if let Some(rest) = uri.strip_prefix("tui://sessions/") {

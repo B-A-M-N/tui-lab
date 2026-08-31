@@ -55,7 +55,7 @@ pub fn to_svg(screen: &ScreenState) -> String {
                 let Some(c) = cell_at(screen, x, y) else {
                     break;
                 };
-                if !same_style(&cell, c) {
+                if !same_style(cell, c) {
                     break;
                 }
                 run.push_str(&c.text);
@@ -68,16 +68,16 @@ pub fn to_svg(screen: &ScreenState) -> String {
                     "<rect x=\"{}\" y=\"{}\" width=\"{rw}\" height=\"{ch}\" fill=\"{}\"/>\n",
                     pad + start_x as f64 * cw,
                     pad + y as f64 * ch,
-                    css(fg_rgb(&cell))
+                    css(fg_rgb(cell))
                 ));
             }
             out.push_str(&format!(
                 "<text x=\"{fx}\" y=\"{fy}\" font-size=\"{}\" fill=\"{}\"{}{}{}>{}</text>\n",
                 ch * 0.85,
                 css(if cell.reverse {
-                    bg_rgb(&cell)
+                    bg_rgb(cell)
                 } else {
-                    fg_rgb(&cell)
+                    fg_rgb(cell)
                 }),
                 if cell.bold {
                     " font-weight=\"bold\""
@@ -90,7 +90,7 @@ pub fn to_svg(screen: &ScreenState) -> String {
                     ""
                 },
                 if cell.underline {
-                    format!(" text-decoration=\"underline\"")
+                    " text-decoration=\"underline\"".to_string()
                 } else {
                     String::new()
                 },
@@ -137,9 +137,9 @@ pub fn to_png(screen: &ScreenState) -> Vec<u8> {
             continue;
         }
         let (fg, bgc) = if cell.reverse {
-            (bg_rgb(&cell), fg_rgb(cell))
+            (bg_rgb(cell), fg_rgb(cell))
         } else {
-            (fg_rgb(cell), bg_rgb(&cell))
+            (fg_rgb(cell), bg_rgb(cell))
         };
         // Cell background.
         draw_rect(

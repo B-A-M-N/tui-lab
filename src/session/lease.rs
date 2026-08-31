@@ -125,12 +125,13 @@ mod tests {
 
     #[test]
     fn expired_lease_can_be_taken_and_reports_none() {
-        let mut st = LeaseState::default();
-        st.lease = Some(ControlLease {
-            holder: "ghost".into(),
-            taken_at_ms: ControlLease::now_ms() - 60_000,
-            ttl_ms: 1_000,
-        });
+        let mut st = LeaseState {
+            lease: Some(ControlLease {
+                holder: "ghost".into(),
+                taken_at_ms: ControlLease::now_ms() - 60_000,
+                ttl_ms: 1_000,
+            }),
+        };
         assert!(!st.blocks_driving(), "expired lease does not block");
         assert!(st.active().is_none());
         // And a new holder can take it without release.

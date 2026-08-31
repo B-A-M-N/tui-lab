@@ -1241,6 +1241,25 @@ impl RunContext {
         out
     }
 
+    /// Where a `tui://runs/<other-id>` browser read should look for other
+    /// persisted runs (Wave G item 75): this run's durable root's parent
+    /// (the runs dir) when persisted, then the primary session's cwd. A
+    /// durable root whose parent is already the runs dir yields it once.
+    pub fn browser_bases(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = &self.run_dir {
+            // Durable root is `<runs>/<id>` — the parent is the runs dir.
+            if let Some(parent) = dir.parent() {
+                out.push(parent.to_path_buf());
+            }
+        }
+        if let Some(cwd) = self.primary_session_cwd() {
+            out.push(PathBuf::from(cwd));
+        }
+        out.dedup();
+        out
+    }
+
     /// Status snapshot for `tui_run status` (goal spec shape).
     ///
     /// `sessions` comes from the caller: the run records the primary launch
@@ -1985,7 +2004,6 @@ mod tests {
     /// a held recording.
     fn persisted_fixture(base: &std::path::Path) -> (String, std::path::PathBuf) {
         let mut run = RunContext::ephemeral();
-        let run_id = run.id.clone();
         run.set_launch_spec(
             "sess-fix",
             crate::session::state::LaunchSpec::new("python3", 90, 26),

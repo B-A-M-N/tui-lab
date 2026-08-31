@@ -28,9 +28,14 @@ struct McpProc {
 
 impl McpProc {
     fn spawn() -> Self {
+        Self::spawn_in(std::path::Path::new("."))
+    }
+
+    fn spawn_in(dir: &std::path::Path) -> Self {
         let bin = env!("CARGO_BIN_EXE_hermes-tui-lab");
         let mut child = Command::new(bin)
             .arg("mcp")
+            .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1008,7 +1013,7 @@ fn resources_list_and_read_live_state() {
         .filter_map(|t| t["uriTemplate"].as_str().map(str::to_string))
         .collect();
     assert!(
-        tlist.contains(&format!("tui://sessions/{{session_id}}/semantic")),
+        tlist.contains(&"tui://sessions/{session_id}/semantic".to_string()),
         "semantic template declared: {tlist:?}"
     );
     assert!(
@@ -1078,6 +1083,123 @@ fn resources_list_and_read_live_state() {
         serde_json::json!({ "uri": format!("tui://sessions/{sid}-nope/screen") }),
     );
     assert_eq!(bad["error"]["code"], -32002, "unknown session: {bad}");
+
+    // --- Wave G items 74+75: persist this run, close it, then read the
+    // CLOSED run through tui://runs/<id> from a SECOND server (the browser
+    // reads disk; a fresh server's live run differs, so the read takes the
+    // on-disk path and marks live=false). ---
+    let browser_base =
+        std::env::temp_dir().join(format!("tui-lab-e2e-browser-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&browser_base);
+    std::fs::create_dir_all(&browser_base).expect("browser base");
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": sid }),
+    );
+    let start2 = mcp.tool(
+        "tui_session",
+        serde_json::json!({
+            "action": "start", "command": "python3",
+            "args": ["-c", "print('browser-ready'); input()"],
+            "cwd": browser_base.to_string_lossy(),
+        }),
+    );
+    assert_eq!(start2["category"], "success", "browser session: {start2}");
+    let run_closed = start2["data"]["run"].as_str().unwrap().to_string();
+    let sess_closed = start2["data"]["session"].as_str().unwrap().to_string();
+    let _ = mcp.tool(
+        "tui_act",
+        serde_json::json!({ "action": "key", "key": "tab", "id": sess_closed }),
+    );
+    let persist2 = mcp.tool(
+        "tui_run",
+        serde_json::json!({ "action": "persist", "root": browser_base.to_string_lossy() }),
+    );
+    assert_eq!(persist2["category"], "success", "persist2: {persist2}");
+    let close2 = mcp.tool(
+        "tui_run",
+        serde_json::json!({ "action": "close", "kill_sessions": true }),
+    );
+    assert_eq!(close2["category"], "success", "close2: {close2}");
+
+    // A FRESH server (different live run) reads the closed run from disk.
+    // Spawned inside browser_base: cwd is the workspace anchor that lets a
+    // restarted server find runs persisted there.
+    let mut mcp2 = McpProc::spawn_in(&browser_base);
+    let init2 = mcp2.request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "tui-lab-e2e-2", "version": "0" },
+        }),
+    );
+    assert!(init2["result"]["serverInfo"]["name"].is_string(), "init2");
+    mcp2.notify("notifications/initialized");
+    let closed_read = mcp2.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_closed}") }),
+    );
+    let ctext = closed_read["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    let cv: serde_json::Value =
+        serde_json::from_str(ctext).expect("closed-run resource payload is JSON");
+    assert_eq!(cv["run_id"], run_closed.as_str(), "{cv}");
+    assert_eq!(cv["closed"], true, "{cv}");
+    assert_eq!(
+        cv["live"], false,
+        "browser read marks the run not-live: {cv}"
+    );
+    assert!(
+        cv["counts"]["transactions"].as_u64().unwrap_or(0) >= 1,
+        "ledger count restored in the browser payload: {cv}"
+    );
+
+    // tui_run action=list from the second server sees it, with the count.
+    let list2 = mcp2.tool(
+        "tui_run",
+        serde_json::json!({ "action": "list", "root": browser_base.to_string_lossy() }),
+    );
+    assert_eq!(list2["category"], "success", "list2: {list2}");
+    let listed = list2["data"]["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some(run_closed.as_str()))
+        .expect("closed run listed")
+        .clone();
+    assert_eq!(listed["closed"], true, "{listed}");
+    assert!(
+        listed["ledger_transactions"].as_u64().unwrap_or(0) >= 1,
+        "ledger count listed: {listed}"
+    );
+
+    // Resume it in the second server; the resource read now takes the live
+    // branch (no browser marker).
+    let resume = mcp2.tool(
+        "tui_run",
+        serde_json::json!({
+            "action": "resume", "run_id": run_closed,
+            "root": browser_base.to_string_lossy(),
+        }),
+    );
+    assert_eq!(resume["category"], "success", "resume: {resume}");
+    let live_read = mcp2.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_closed}") }),
+    );
+    let ltext = live_read["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    let lv: serde_json::Value =
+        serde_json::from_str(ltext).expect("live-run resource payload is JSON");
+    assert!(
+        lv.get("live").is_none(),
+        "live run read does not carry the browser marker: {lv}"
+    );
+    assert_eq!(lv["run_id"], run_closed.as_str(), "{lv}");
+    let _ = std::fs::remove_dir_all(&browser_base);
 
     // unknown scheme → resource_not_found naming the accepted templates.
     let bad2 = mcp.request(
