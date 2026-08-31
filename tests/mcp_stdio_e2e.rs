@@ -969,6 +969,128 @@ fn stdio_e2e_full_lifecycle() {
 }
 
 
+/// Wave G item 72: MCP resources over the real stdio transport —
+/// resources/templates list, live semantic + screen reads against a real
+/// python3 child, and honest resource_not_found for unknown ids.
+#[test]
+fn resources_list_and_read_live_state() {
+    let mut mcp = McpProc::spawn();
+    let init = mcp.request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "tui-lab-e2e", "version": "0" },
+        }),
+    );
+    assert!(init["result"]["serverInfo"]["name"].is_string(), "init: {init}");
+    mcp.notify("notifications/initialized");
+
+    // A live session so the session resources resolve.
+    let start = mcp.tool(
+        "tui_session",
+        serde_json::json!({
+            "action": "start",
+            "command": "python3",
+            "args": ["-c", "print('res-ready'); input()"],
+            "cols": 80, "rows": 24,
+        }),
+    );
+    assert_eq!(start["category"], "success", "start: {start}");
+    let sid = start["data"]["session"].as_str().expect("sid").to_string();
+    let run_id = start["data"]["run"].as_str().expect("run id").to_string();
+
+    // resources/templates/list: the declared templates.
+    let templates = mcp.request("resources/templates/list", serde_json::json!({}));
+    let tlist: Vec<String> = templates["result"]["resourceTemplates"]
+        .as_array()
+        .expect("templates array")
+        .iter()
+        .filter_map(|t| t["uriTemplate"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        tlist.contains(&format!("tui://sessions/{{session_id}}/semantic")),
+        "semantic template declared: {tlist:?}"
+    );
+    assert!(
+        tlist.contains(&"tui://runs/{run_id}".to_string()),
+        "run template declared: {tlist:?}"
+    );
+
+    // resources/list: concrete resources include the findings ledger.
+    let list = mcp.request("resources/list", serde_json::json!({}));
+    let names: Vec<String> = list["result"]["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r["uri"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|u| u == "tui://findings"),
+        "findings resource listed: {names:?}"
+    );
+
+    // read the semantic view: valid JSON naming the on-screen marker.
+    let sem = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://sessions/{sid}/semantic") }),
+    );
+    assert!(
+        sem["result"]["contents"].is_array(),
+        "semantic read: {sem}"
+    );
+    let text = sem["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("controls"), "semantic payload: {text}");
+    assert!(
+        sem["result"]["contents"][0]["uri"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("/semantic"),
+        "content carries its uri: {sem}"
+    );
+
+    // read the screen view: viewport text carries the child's output.
+    let screen = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://sessions/{sid}/screen") }),
+    );
+    let stext = screen["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(stext.contains("res-ready"), "screen payload: {stext}");
+
+    // read the run manifest: id matches the session-start echo.
+    let run = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}") }),
+    );
+    let rtext = run["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(rtext.contains(&run_id), "run manifest: {rtext}");
+
+    // findings ledger reads (empty is fine; the envelope must be valid).
+    let find = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": "tui://findings" }),
+    );
+    let ftext = find["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(ftext.contains("\"findings\""), "findings payload: {ftext}");
+
+    // unknown session id → protocol-level resource_not_found (code -32002),
+    // NOT a success envelope with empty content.
+    let bad = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://sessions/{sid}-nope/screen") }),
+    );
+    assert_eq!(bad["error"]["code"], -32002, "unknown session: {bad}");
+
+    // unknown scheme → resource_not_found naming the accepted templates.
+    let bad2 = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": "tui://bogus/thing" }),
+    );
+    assert_eq!(bad2["error"]["code"], -32002, "bogus scheme: {bad2}");
+
+    mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sid }));
+}
+
 /// Watchdog proof (harness hardening): a server that never responds must
 /// produce a request() timeout failure, not an eternal hang. Uses a silent
 /// child (`sleep`) standing in for a deadlocked server.
