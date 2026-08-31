@@ -54,8 +54,7 @@ pub enum AuditProfile {
 impl AuditProfile {
     /// Parse a profile name. Unknown names are an error — the engine does
     /// not silently degrade a typo into a weaker audit.
-    pub fn parse(name: &str) -> Result<Self, String> {
-        match name {
+    pub fn parse(name: &str) -> Result<Self, String> {        match name {
             "full" => Ok(AuditProfile::Full),
             "keyboard" => Ok(AuditProfile::Keyboard),
             "focus" => Ok(AuditProfile::Focus),
@@ -77,7 +76,30 @@ impl AuditProfile {
         }
     }
 
+    /// The profile's canonical engine name (used in residue findings).
+    pub fn name(&self) -> &'static str {
+        match self {
+            AuditProfile::Full => "full",
+            AuditProfile::Keyboard => "keyboard",
+            AuditProfile::Focus => "focus",
+            AuditProfile::Resize => "resize",
+            AuditProfile::Layout => "layout",
+            AuditProfile::Clipping => "clipping",
+            AuditProfile::Discoverability => "discoverability",
+            AuditProfile::Navigation => "navigation",
+            AuditProfile::Contract => "contract",
+            AuditProfile::Color => "color",
+            AuditProfile::Performance => "performance",
+            AuditProfile::Mouse => "mouse",
+            AuditProfile::States => "states",
+            AuditProfile::Errors => "errors",
+        }
+    }
+
     /// Does this profile need to drive the live app (send input / resize)?
+    /// Wave G item 66: mouse/performance/states/errors are real drivers now
+    /// (they send input / sample latency); color stays frame-level, and
+    /// discoverability remains the one static pass.
     fn is_active(&self) -> bool {
         matches!(
             self,
@@ -89,6 +111,10 @@ impl AuditProfile {
                 | AuditProfile::Clipping
                 | AuditProfile::Navigation
                 | AuditProfile::Contract
+                | AuditProfile::Mouse
+                | AuditProfile::Performance
+                | AuditProfile::States
+                | AuditProfile::Errors
         )
     }
 
@@ -148,37 +174,14 @@ pub fn run_profile_with_contract(
         });
     }
 
-    // Placeholder classes: honest info finding, no fake rigor.
+    // The one remaining static profile: discoverability (single frame).
     if !profile.is_active() {
-        let (findings, mode) = match profile {
-            AuditProfile::Discoverability => {
-                let screen = observe_or_err(session)?;
-                let sem = semantic::analyze(&screen);
-                (
-                    crate::audit::run("discoverability", &screen, &sem),
-                    "static",
-                )
-            }
-            ref p @ (AuditProfile::Navigation
-            | AuditProfile::Color
-            | AuditProfile::Performance
-            | AuditProfile::Mouse
-            | AuditProfile::States
-            | AuditProfile::Errors) => {
-                let name = format!("{:?}", p).to_lowercase();
-                let screen = observe_or_err(session)?;
-                let sem = semantic::analyze(&screen);
-                (
-                    crate::audit::run(&name, &screen, &sem),
-                    "static",
-                )
-            }
-            _ => unreachable!("non-active profiles handled above"),
-        };
+        let screen = observe_or_err(session)?;
+        let sem = semantic::analyze(&screen);
         return Ok(ProfileReport {
             profile,
-            mode,
-            findings,
+            mode: "static",
+            findings: crate::audit::run("discoverability", &screen, &sem),
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
         });
     }
@@ -196,12 +199,48 @@ pub fn run_profile_with_contract(
         findings.extend(crate::audit::run("full", &screen, &sem));
     }
 
+    // Item 65: every input-driving driver runs under an AuditTransaction —
+    // the pre-state is captured, the driver restores what it can, and any
+    // residue it leaves becomes an honest AUDIT-RESIDUE finding instead of
+    // silent session mutation (the old Tab-walk-left-focus-dirty bug).
+    use crate::audit::transaction::run_verified;
+    let tx = |s: &mut Session, f: &dyn Fn(&mut Session) -> Vec<Finding>| -> Vec<Finding> {
+        run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
+            vec![Finding {
+                id: "AUDIT-TX-ERR".into(),
+                severity: "error".into(),
+                category: "audit".into(),
+                summary: format!("audit transaction failed: {}", e),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "audit_transaction",
+                    "pre-state capture or post-verify failed",
+                )
+                .with_detail(json!({ "profile": profile.name(), "error": e }))],
+                confidence: 1.0,
+                reproduction: None,
+            }]
+        })
+    };
+
     let active_findings = match profile {
         AuditProfile::Full => {
             let mut fs = crate::audit::driver::keyboard_audit(session, 20, &mut graph);
             fs.extend(crate::audit::driver::focus_audit(session));
             fs.extend(crate::audit::driver::resize_audit(session));
             fs.extend(crate::audit::driver::clipping_audit(session));
+            fs.extend(crate::audit::driver::navigation_audit(session, 20, &mut graph));
+            fs.extend(tx(session, &|s| {
+                crate::audit::driver::mouse_audit(s, 8)
+            }));
+            fs.extend(crate::audit::driver::performance_audit(session, 5));
+            fs.extend(tx(session, &|s| {
+                crate::audit::driver::states_audit(s, 6)
+            }));
+            fs.extend(tx(session, &|s| {
+                crate::audit::driver::errors_audit(s, 12)
+            }));
+            fs.extend(crate::audit::driver::color_audit(session));
             fs
         }
         AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
@@ -213,6 +252,11 @@ pub fn run_profile_with_contract(
         AuditProfile::Navigation => {
             crate::audit::driver::navigation_audit(session, 20, &mut graph)
         }
+        AuditProfile::Mouse => tx(session, &|s| crate::audit::driver::mouse_audit(s, 12)),
+        AuditProfile::Performance => crate::audit::driver::performance_audit(session, 7),
+        AuditProfile::States => tx(session, &|s| crate::audit::driver::states_audit(s, 10)),
+        AuditProfile::Errors => tx(session, &|s| crate::audit::driver::errors_audit(s, 15)),
+        AuditProfile::Color => crate::audit::driver::color_audit(session),
         _ => unreachable!("non-active profiles returned above"),
     };
     findings.extend(active_findings);

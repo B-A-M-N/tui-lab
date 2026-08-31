@@ -301,7 +301,7 @@ impl TuiLabServer {
         name = "tui_observe",
         description = "Observe terminal state. Modes: summary, screen, cells, semantic, tree, nodes, diff, scrollback, search (query in 'text'), command_state."
     )]
-    async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_observe(&self, p: Parameters<TuiObserveParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         use crate::mcp::params::ObserveMode as OM;
         let mode = p
@@ -661,7 +661,7 @@ impl TuiLabServer {
         name = "tui_wait",
         description = "Block until a condition holds: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output (OSC 133 shell integration)."
     )]
-    async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         let cond = match build_wait(&p) {
             Some(c) => c,
@@ -714,7 +714,7 @@ impl TuiLabServer {
         name = "tui_assert",
         description = "Assert UI facts: text, text_absent, position, focus, not_clipped, dimensions, exit_code."
     )]
-    async fn tui_assert(&self, p: Parameters<TuiAssertParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_assert(&self, p: Parameters<TuiAssertParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         // Wave E: `assertion: "oracle"` evaluates a declarative oracle
         // expression (shared language with contracts and audits). Any other
@@ -802,7 +802,7 @@ impl TuiLabServer {
         name = "tui_checkpoint",
         description = "Save and compare named UI state checkpoints."
     )]
-    async fn tui_checkpoint(&self, p: Parameters<TuiCheckpointParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_checkpoint(&self, p: Parameters<TuiCheckpointParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         use crate::mcp::params::CheckpointAction as CA;
         let Some(ckpt_action) = p.action.known().copied() else {
@@ -1489,7 +1489,7 @@ impl TuiLabServer {
         name = "tui_explore",
         description = "Seeded random exploration, candidate generation, or replay. Returns evidence, not another reasoning loop."
     )]
-    async fn tui_explore(&self, p: Parameters<TuiExploreParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_explore(&self, p: Parameters<TuiExploreParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         use crate::mcp::params::ExploreMode as EM;
         let mode_sel = p.mode.clone();
@@ -1718,7 +1718,7 @@ impl TuiLabServer {
         name = "tui_audit",
         description = "Run deterministic UX audits and return evidence-backed findings."
     )]
-    async fn tui_audit(&self, p: Parameters<TuiAuditParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_audit(&self, p: Parameters<TuiAuditParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
         use crate::mcp::params::AuditProfile as AP;
         let profile_sel = p
@@ -1750,6 +1750,8 @@ impl TuiLabServer {
         // along for profile=contract.
         let selector = p.id.clone();
         let run = self.run.clone();
+        let label = p.label.clone();
+        let compare_to = p.compare_to.clone();
         self.with_sess(selector.as_deref(), move |sess| {
             let contract = run.lock().unwrap().contract().cloned();
             let report = match crate::audit::orchestrator::run_profile_with_contract(
@@ -1765,10 +1767,43 @@ impl TuiLabServer {
             // later audit/coverage query can see prior evidence. Driven focus
             // edges merge into the run's persistent ID-keyed FocusGraph (Wave D
             // item 36), so multiple audits accumulate traversal proof.
+            // Wave G item 67: `label` stores this pass as a named baseline;
+            // `compare_to` diffs the fresh pass against a stored one —
+            // FIXED / NEW / PERSISTING per fingerprint, honestly reporting
+            // a missing baseline instead of fabricating an empty compare.
+            let mut compare_block = serde_json::Value::Null;
             let focus_summary = {
                 let mut run = run.lock().unwrap();
                 run.focus_graph.merge(&report.focus_graph);
                 run.extend_findings(report.findings.clone());
+                if let Some(cmp_label) = compare_to.as_deref() {
+                    match run.finding_baseline(cmp_label) {
+                        Some(baseline) => {
+                            let compared = crate::audit::compare::compare(baseline, &report.findings);
+                            compare_block = json!({
+                                "baseline": cmp_label,
+                                "available": true,
+                                "counts": crate::audit::compare::summary(&compared),
+                                "findings": compared,
+                            });
+                        }
+                        None => {
+                            let labels = run.finding_baseline_labels();
+                            compare_block = json!({
+                                "baseline": cmp_label,
+                                "available": false,
+                                "error": format!(
+                                    "no finding baseline labeled '{}' (stored: {})",
+                                    cmp_label,
+                                    if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
+                                ),
+                            });
+                        }
+                    }
+                }
+                if let Some(lbl) = label.as_deref() {
+                    run.record_finding_baseline(lbl, report.findings.clone());
+                }
                 json!({
                     "nodes": run.focus_graph.nodes.len(),
                     "edges": run.focus_graph.edges.len(),
@@ -1782,6 +1817,8 @@ impl TuiLabServer {
                 "finding_count": report.findings.len(),
                 "findings": report.findings,
                 "focus_graph": focus_summary,
+                "labeled_as": label,
+                "compare": compare_block,
             }))
         })
         .await

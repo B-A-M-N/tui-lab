@@ -203,6 +203,11 @@ pub struct RunContext {
     /// Conformance baselines for `compare` (Wave E item 47): label → the
     /// report captured under that label.
     contract_baselines: HashMap<String, crate::design::ContractReport>,
+    /// Wave G item 67: labeled audit-finding baselines for FIXED/REGRESSED/
+    /// NEW comparison. `tui_audit label=X` stores this pass's findings under
+    /// X; `tui_audit compare_to=X` diffs the fresh pass against the stored
+    /// one via finding fingerprints.
+    finding_baselines: HashMap<String, Vec<crate::audit::Finding>>,
     /// Wave F item 64: native coverage ledger. Entries accumulate from
     /// NativeSemanticProtocol `coverage` events: target → (hits, sessions).
     /// This is interaction-correlated coverage: "did my last act exercise
@@ -257,6 +262,7 @@ impl RunContext {
             contract: None,
             contract_path: None,
             contract_baselines: HashMap::new(),
+            finding_baselines: HashMap::new(),
             coverage_ledger: std::collections::BTreeMap::new(),
             closed: false,
         }
@@ -362,6 +368,24 @@ impl RunContext {
         &self,
     ) -> &HashMap<String, crate::design::ContractReport> {
         &self.contract_baselines
+    }
+
+    /// Store (or overwrite) a labeled audit-finding baseline (item 67).
+    pub fn record_finding_baseline(&mut self, label: &str, findings: Vec<crate::audit::Finding>) {
+        self.finding_baselines.insert(label.to_string(), findings);
+    }
+
+    /// Fetch a labeled audit-finding baseline.
+    pub fn finding_baseline(&self, label: &str) -> Option<&Vec<crate::audit::Finding>> {
+        self.finding_baselines.get(label)
+    }
+
+    /// Labels of all stored finding baselines (for honest "no such label"
+    /// errors that name what exists).
+    pub fn finding_baseline_labels(&self) -> Vec<String> {
+        let mut l: Vec<String> = self.finding_baselines.keys().cloned().collect();
+        l.sort();
+        l
     }
 
     pub fn record_contract_baseline(

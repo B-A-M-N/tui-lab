@@ -7,8 +7,10 @@ use crate::semantic::{Affordance, Control, ControlKind, Invocation, SemanticScre
 use serde_json::json;
 use std::path::PathBuf;
 
+pub mod compare;
 pub mod driver;
 pub mod orchestrator;
+pub mod transaction;
 pub use driver::*;
 
 /// What kind of artifact an [`EvidenceRef`] points at.
