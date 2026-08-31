@@ -386,6 +386,60 @@ impl TuiActRequestSchema {
     }
 }
 
+/// Agent-facing names for a [`CompletionPolicy`](crate::capture::CompletionPolicy)
+/// (review P0 rigidity #4). These map 1:1 onto the strategy/condition the act
+/// executor honors — so a `tui_act(completion: "may_be_silent")` never reports
+/// a false `settled=false` when the action genuinely changes nothing, and a
+/// `completion: "process_exit"` waits for the child to exit rather than for a
+/// screen settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiCompletionParam {
+    /// Action then screen settles at rest (the ordinary default).
+    StableScreen,
+    /// A visible change is enough; quiet is not required.
+    FirstChange,
+    /// Any observable terminal activity (output, cursor, bell, title).
+    AnyChange,
+    /// A named text appears (paired with the `wait_text` field).
+    TextAppears,
+    /// A named text disappears (paired with the `wait_text` field).
+    TextDisappears,
+    /// The child process exits.
+    ProcessExit,
+    /// The shell command finishes (OSC 133).
+    CommandDone,
+    /// The terminal bell rings.
+    Bell,
+    /// The semantic analysis output changes.
+    SemanticChange,
+    /// The action may legitimately produce no observable change; never a
+    /// false `settled=false` (copy to clipboard, an invisible toggle).
+    MayBeSilent,
+    /// Do not wait at all; act and return immediately.
+    NoWait,
+}
+
+impl TuiCompletionParam {
+    /// The runtime [`CompletionPolicy`] this request name stands for.
+    pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
+        use crate::capture::CompletionPolicy as P;
+        match self {
+            TuiCompletionParam::StableScreen => P::StableScreen,
+            TuiCompletionParam::FirstChange => P::FirstScreenChange,
+            TuiCompletionParam::AnyChange => P::AnyObservableChange,
+            TuiCompletionParam::TextAppears => P::TextAppears(String::new()),
+            TuiCompletionParam::TextDisappears => P::TextDisappears(String::new()),
+            TuiCompletionParam::ProcessExit => P::ProcessExit,
+            TuiCompletionParam::CommandDone => P::CommandDone,
+            TuiCompletionParam::Bell => P::Bell,
+            TuiCompletionParam::SemanticChange => P::SemanticChange,
+            TuiCompletionParam::MayBeSilent => P::MayBeSilent,
+            TuiCompletionParam::NoWait => P::NoWait,
+        }
+    }
+}
+
 /// Mirror of [`TuiActRequest`] for schema generation only. Keep field-for-field
 /// identical; `doc(hidden)` so it never appears in the public API story.
 #[doc(hidden)]
@@ -398,6 +452,8 @@ pub enum TuiActRequestVariants {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -406,6 +462,8 @@ pub enum TuiActRequestVariants {
         keys: Vec<String>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -418,6 +476,8 @@ pub enum TuiActRequestVariants {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -429,6 +489,8 @@ pub enum TuiActRequestVariants {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -437,6 +499,8 @@ pub enum TuiActRequestVariants {
         raw: Vec<u8>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -450,6 +514,8 @@ pub enum TuiActRequestVariants {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -461,6 +527,8 @@ pub enum TuiActRequestVariants {
         button: Option<MouseButtonParam>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -474,6 +542,8 @@ pub enum TuiActRequestVariants {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -483,6 +553,8 @@ pub enum TuiActRequestVariants {
         y: u16,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -496,6 +568,8 @@ pub enum TuiActRequestVariants {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -507,6 +581,8 @@ pub enum TuiActRequestVariants {
         direction: Option<ScrollDirectionParam>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -546,6 +622,8 @@ pub enum TuiActRequest {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -555,6 +633,8 @@ pub enum TuiActRequest {
         keys: Vec<String>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -570,6 +650,8 @@ pub enum TuiActRequest {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -582,6 +664,8 @@ pub enum TuiActRequest {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -591,6 +675,8 @@ pub enum TuiActRequest {
         raw: Vec<u8>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -605,6 +691,8 @@ pub enum TuiActRequest {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -617,6 +705,8 @@ pub enum TuiActRequest {
         button: Option<MouseButtonParam>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -631,6 +721,8 @@ pub enum TuiActRequest {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -641,6 +733,8 @@ pub enum TuiActRequest {
         y: u16,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -655,6 +749,8 @@ pub enum TuiActRequest {
         #[serde(default)]
         no_wait: Option<bool>,
         #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
@@ -667,6 +763,8 @@ pub enum TuiActRequest {
         direction: Option<ScrollDirectionParam>,
         #[serde(default)]
         no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
         #[serde(default)]
@@ -724,6 +822,30 @@ impl TuiActRequest {
             TuiActRequest::Resize { .. } => None,
             TuiActRequest::Signal { .. } => None,
         }
+    }
+
+    /// Optional [`CompletionPolicy`] override (review P0 rigidity #4). When an
+    /// agent declares a completion, the act executor honors it instead of
+    /// assuming "send ⇒ screen settles" — so a `MayBeSilent` completion never
+    /// reports a false `settled=false`. `Resize`/`Signal` have no settle
+    /// semantics and always resolve `None` (the default).
+    pub fn completion(&self) -> Option<crate::capture::CompletionPolicy> {
+        match self {
+            TuiActRequest::Key { completion, .. } => *completion,
+            TuiActRequest::Keys { completion, .. } => *completion,
+            TuiActRequest::Type { completion, .. } => *completion,
+            TuiActRequest::Paste { completion, .. } => *completion,
+            TuiActRequest::Raw { completion, .. } => *completion,
+            TuiActRequest::MouseClick { completion, .. } => *completion,
+            TuiActRequest::MousePress { completion, .. } => *completion,
+            TuiActRequest::MouseRelease { completion, .. } => *completion,
+            TuiActRequest::MouseMove { completion, .. } => *completion,
+            TuiActRequest::MouseDrag { completion, .. } => *completion,
+            TuiActRequest::MouseScroll { completion, .. } => *completion,
+            TuiActRequest::Resize { .. } => None,
+            TuiActRequest::Signal { .. } => None,
+        }
+        .map(|c| c.to_policy())
     }
 
     pub fn id(&self) -> Option<&str> {
@@ -916,6 +1038,18 @@ pub struct TuiAuditParams {
     pub label: Option<String>,
     #[serde(default)]
     pub compare_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TuiExplainParams {
+    /// The finding id to explain (as produced/listed by `tui_audit` /
+    /// `tui://findings`). Must reference a finding recorded in the current run.
+    pub finding_id: String,
+    /// Optional session id whose live terminal profile conditions the
+    /// explanation (a capability the profile marks unverified bears on whether
+    /// the finding is a real defect or an artifact of missing capability).
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]

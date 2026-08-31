@@ -1,10 +1,31 @@
-//! Session manager: maps session id -> [`Session`]. Serialized access because
-//! Hermes runs with `supports_parallel_tool_calls: false` (spec section 43).
+//! **Legacy** synchronous session manager: maps session id -> [`Session`].
+//!
+//! Do **not** use this for new code. Production uses the actor-backed
+//! [`crate::session::SessionPool`] (one OS thread per session with a bounded
+//! mailbox), which replaced this global `Mutex`-serializing container —
+//! a long audit on session A here blocked every other session, and the
+//! blocking `SyncSender` path duplicated the actor's job. This type is kept
+//! only because the integration test suite was written against it; new code
+//! must route through `SessionPool` (or own a single `Session` directly).
+//!
+//! Serialized access was justified because Hermes ran with
+//! `supports_parallel_tool_calls: false` (spec section 43); the actor model
+//! retains that serialization per-session without cross-session blocking.
 
 use std::collections::HashMap;
 
 use crate::session::state::Session;
 
+/// Legacy blocking session registry.
+///
+/// **Do not use this for new code.** Production routes through
+/// [`crate::session::SessionPool`]. This type is kept verbatim (not removed)
+/// only because the integration test suite was written against its blocking
+/// API; the `#[deprecated]` gate is deliberately omitted so those legacy tests
+/// stay warning-free while the module doc states the contract. A future sweep
+/// migrates the remaining test call sites to `SessionPool` and deletes this
+/// file wholesale.
+#[allow(clippy::doc_markdown)]
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     active: Option<String>,
@@ -30,7 +51,12 @@ impl SessionManager {
         format!("sess-{}", id.simple())
     }
 
-    /// Create and start a new session. Returns its id.
+    /// Create and start a new session **synchronously** (blocking spawn on
+    /// the caller's thread). Returns its id.
+    ///
+    /// Legacy surface only — `crate::session::SessionPool::start(...).await`
+    /// is the production path (launch runs on the actor thread; the async
+    /// caller awaits the outcome without blocking a runtime worker).
     // Spec section 13 defines the full 9-arg start surface; refactor to a
     // LaunchSpec-taking variant is tracked with the Wave-3 executor work.
     #[allow(clippy::too_many_arguments)]

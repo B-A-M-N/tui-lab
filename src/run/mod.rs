@@ -582,30 +582,6 @@ impl RunContext {
             crate::run::ArtifactKind::EventLog,
             "terminal event log (restored run)",
         );
-        scan_dir(
-            &mut run,
-            run_dir,
-            &mut n,
-            "recordings",
-            crate::run::ArtifactKind::Recording,
-            "pty recording (restored run)",
-        );
-        scan_dir(
-            &mut run,
-            run_dir,
-            &mut n,
-            "captures",
-            crate::run::ArtifactKind::Capture,
-            "screen capture (restored run)",
-        );
-        scan_dir(
-            &mut run,
-            run_dir,
-            &mut n,
-            "events",
-            crate::run::ArtifactKind::EventLog,
-            "terminal event log (restored run)",
-        );
 
         Ok(run)
     }
@@ -2079,6 +2055,24 @@ mod tests {
             "recording re-registered: {:?}",
             restored.artifacts()
         );
+        // No duplicated artifact refs from restore: the recording/capture/
+        // events scan runs once per subdir, so every on-disk file maps to
+        // exactly one ref keyed by (kind, relative path). A second scan pass
+        // registers every file twice.
+        let keys: Vec<(crate::run::ArtifactKind, Option<std::path::PathBuf>)> = restored
+            .artifacts()
+            .iter()
+            .map(|a| (a.kind.clone(), a.path.clone()))
+            .collect();
+        let mut seen: Vec<_> = Vec::new();
+        for k in &keys {
+            assert!(
+                !seen.contains(k),
+                "artifact duplicated across restore: {:?} (all refs: {keys:?})",
+                k
+            );
+            seen.push(k.clone());
+        }
     }
 
     #[test]

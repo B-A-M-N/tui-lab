@@ -120,6 +120,10 @@ pub enum ActionRisk {
     Destructive,
     /// Reaches outside the application (signals, paste from clipboard).
     ExternalSideEffect,
+    /// The risk cannot be proven from what is visible/known (an unknown TUI,
+    /// an unmapped key, an experiment). Not a downgrade of the others — an
+    /// honest "we don't know yet", deliberately distinct from `Safe`.
+    Unknown,
 }
 
 impl ActionRisk {
@@ -129,6 +133,7 @@ impl ActionRisk {
             ActionRisk::Mutating => "mutating",
             ActionRisk::Destructive => "destructive",
             ActionRisk::ExternalSideEffect => "external_side_effect",
+            ActionRisk::Unknown => "unknown",
         }
     }
 
@@ -139,8 +144,19 @@ impl ActionRisk {
             "mutating" => Some(ActionRisk::Mutating),
             "destructive" => Some(ActionRisk::Destructive),
             "external_side_effect" => Some(ActionRisk::ExternalSideEffect),
+            "unknown" => Some(ActionRisk::Unknown),
             _ => None,
         }
+    }
+
+    /// The driving-risk fence: an action whose risk is unknown must not be
+    /// assumed safe. Returns `true` when the risk implies a caller *should*
+    /// seek confirmation before driving it (destructive, external, or unknown).
+    pub fn needs_confirmation(&self) -> bool {
+        matches!(
+            self,
+            ActionRisk::Destructive | ActionRisk::ExternalSideEffect | ActionRisk::Unknown
+        )
     }
 }
 
@@ -795,5 +811,30 @@ mod tests {
                 .unwrap_or_else(|e| panic!("'{shown}' must parse: {e}"));
             assert_eq!(back, k, "round-trip failed for '{shown}'");
         }
+    }
+
+    /// `ActionRisk::Unknown` is a distinct epistemic state (audit "action risk
+    /// needs Unknown"): parsable, named, and — critically — it must NOT sort as
+    /// if it were `Safe`, and it must demand confirmation like an unsafe action.
+    #[test]
+    fn unknown_risk_is_distinct_and_demands_confirmation() {
+        // Serialization round-trip.
+        assert_eq!(ActionRisk::parse("unknown"), Some(ActionRisk::Unknown));
+        assert_eq!(ActionRisk::Unknown.name(), "unknown");
+        assert!(
+            ActionRisk::parse("safe").unwrap() != ActionRisk::Unknown,
+            "unknown is not a downgrade of safe"
+        );
+        // The exploration fence `risk <= Safe` must exclude Unknown (a frame
+        // with Unknown risk cannot silently pass a safe-only filter).
+        assert!(
+            !(ActionRisk::Unknown <= ActionRisk::Safe),
+            "unknown risk must not pass a safe-only filter"
+        );
+        // And it must be treated as needing confirmation, like destructive
+        // side effects, not waved through.
+        assert!(ActionRisk::Unknown.needs_confirmation());
+        assert!(ActionRisk::Destructive.needs_confirmation());
+        assert!(!ActionRisk::Safe.needs_confirmation());
     }
 }

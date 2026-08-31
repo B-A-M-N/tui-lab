@@ -1,16 +1,19 @@
-//! Line-oriented CLI backend (Wave F items 50–51).
+//! PTY line backend (Wave F items 50–51).
 //!
 //! A second engine behind the same [`TerminalBackend`] trait for targets
-//! that are *not* screens: `git`, `npm`, `pytest`, interactive prompts.
-//! The process runs on plain pipes (no PTY), so there is no cell grid —
-//! each completed output chunk becomes synthetic screen rows backed by a
-//! bounded line history (real scrollback, honestly the whole story), and
-//! every capability the pipe model cannot honor (mouse, resize, styles,
-//! kitty) reports `false`.
+//! that benefit from a PTY but are interpreted line-by-line: `git`, `npm`,
+//! `pytest`, interactive prompts. The process runs on a real PTY (so
+//! `isatty()` is true and most programs work unchanged) but is interpreted
+//! with line-oriented parsing over a synthetic screen backed by a bounded
+//! line history (real scrollback, honestly the whole story). TERM=dumb is
+//! set so applications that honor it produce plain output.
 //!
-//! What this buys over the PTY backend: no pty echo, no terminal-mode
-//! requirements on the child, faithful line scrollback, and exit codes
-//! surfaced immediately. What it does NOT buy: pixel-perfect TUI driving —
+//! This is NOT a pipe backend — for true pipe semantics (no PTY, `isatty()`
+//! false), use [`super::pipe::PipeBackend`].
+//!
+//! What this buys over the PTY screen backend: line scrollback, exit codes
+//! surfaced immediately, and TERM=dumb for applications that opt into
+//! non-TUI output. What it does NOT buy: pixel-perfect TUI driving —
 //! for that, use `portable_vt100`.
 //!
 //! The screen model maps 1:1: the last `rows` lines render as the viewport,
@@ -40,7 +43,7 @@ use crate::screen::{ProcessState, ScreenState};
 /// a partial history.
 const MAX_LINES: usize = 10_000;
 
-pub struct LineCliBackend {
+pub struct PtyLineBackend {
     cols: u16,
     rows: u16,
     /// Synthetic parser kept for screen construction parity: the real text
@@ -79,10 +82,10 @@ pub struct LineCliBackend {
     lines_evicted: u64,
 }
 
-impl LineCliBackend {
+impl PtyLineBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
         let now = Instant::now();
-        LineCliBackend {
+        PtyLineBackend {
             cols,
             rows,
             parser: Parser::new(rows, cols, 0),
@@ -115,9 +118,18 @@ impl LineCliBackend {
     /// `\r\n` is the pty's ONLCR rendering of a newline — the `\r` is
     /// ignored and the `\n` commits the line. A bare `\r` (progress-bar
     /// redraws) restarts the pending line, matching what a terminal shows.
+    ///
+    /// Sequencing contract (review item "live line"): an unterminated prompt
+    /// is rendered as the live viewport line in `synth_screen`, so ANY change
+    /// to pending content — appended text, or a bare-`\r` restart — is a
+    /// visible screen change and MUST advance `screen_seq`. Otherwise an
+    /// anchored `ScreenStable`/`ScreenChange` wait would sleep through output
+    /// that changed the on-screen prompt, which is exactly the interactive
+    /// case this backend exists for.
     fn ingest(&mut self, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes).into_owned();
-        let mut changed = false;
+        let mut changed = false; // a line committed to history
+        let mut pending_changed = false; // the live pending line mutated
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
             if ch == '\n' {
@@ -128,15 +140,19 @@ impl LineCliBackend {
                 // that follows commits the line normally. A bare '\r'
                 // restarts the pending line (progress-bar redraw).
                 if chars.peek() != Some(&'\n') {
-                    self.pending.clear();
+                    if !self.pending.is_empty() {
+                        self.pending.clear();
+                        pending_changed = true;
+                    }
                 }
             } else if ch == '\x07' {
                 self.bell_seq += 1;
             } else {
                 self.pending.push(ch);
+                pending_changed = true;
             }
         }
-        if changed || !self.pending.is_empty() {
+        if changed || pending_changed {
             self.content_seq += 1;
         }
         if self.lines.len() > MAX_LINES {
@@ -144,7 +160,7 @@ impl LineCliBackend {
             self.lines.drain(..drop);
             self.lines_evicted += drop as u64;
         }
-        if changed {
+        if changed || pending_changed {
             self.screen_seq += 1;
             self.last_screen_change_at_ms = crate::backend::line_types::now_ms();
             self.last_screen_change_instant = Instant::now();
@@ -175,18 +191,30 @@ impl LineCliBackend {
     /// lines are scrollback.
     fn synth_screen(&mut self) -> ScreenState {
         let rows = self.rows as usize;
-        let start = self.lines.len().saturating_sub(rows);
-        let viewport: Vec<String> = self.lines[start..].to_vec();
+        // `start` is the first index of the viewport into `self.lines`; all
+        // lines before it are scrollback. When a pending (unterminated) line
+        // exists it occupies the last viewport row, trimming one history row.
+        let viewport_rows = if self.pending.is_empty() {
+            rows
+        } else {
+            rows.saturating_sub(1)
+        };
+        let start = self.lines.len().saturating_sub(viewport_rows);
+        // Include unterminated pending line as the live current line.
+        let mut viewport_lines: Vec<String> = self.lines[start..].to_vec();
+        if !self.pending.is_empty() {
+            viewport_lines.push(self.pending.clone());
+        }
         // Rebuild the parser each time (CLI output is append-mostly; the
         // rebuild cost is trivial at these sizes).
         let mut p = Parser::new(self.rows, self.cols, 0);
-        for (y, line) in viewport.iter().enumerate() {
+        for (y, line) in viewport_lines.iter().enumerate() {
             let truncated: String = line.chars().take(self.cols as usize).collect();
             p.process(
                 format!(
                     "{}{}",
                     truncated,
-                    if y + 1 < viewport.len() { "\r\n" } else { "" }
+                    if y + 1 < viewport_lines.len() { "\r\n" } else { "" }
                 )
                 .as_bytes(),
             );
@@ -225,7 +253,7 @@ impl LineCliBackend {
     }
 }
 
-impl TerminalBackend for LineCliBackend {
+impl TerminalBackend for PtyLineBackend {
     fn start(
         &mut self,
         command: &str,
@@ -237,9 +265,12 @@ impl TerminalBackend for LineCliBackend {
     ) -> BackendResult<()> {
         self.cols = cols;
         self.rows = rows;
-        // NOTE: intentionally NOT a PTY — the child's stdout is a pipe, so
-        // anything requiring a terminal (curses, cursor addressing) cannot
-        // run here. That constraint is the point of this backend.
+        // This backend IS a real PTY (openpty below): the child sees a
+        // terminal, `isatty()` is true, so programs that require a terminal
+        // run unchanged. What makes it "line" rather than "screen" is that
+        // output is interpreted line-by-line against a bounded line history,
+        // with TERM=dumb set so applications that honor it produce plain
+        // text. For genuine pipe semantics (no PTY), use PipeBackend.
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -658,7 +689,7 @@ impl TerminalBackend for LineCliBackend {
     }
 }
 
-impl LineCliBackend {
+impl PtyLineBackend {
     fn recorder_is_some(&self) -> bool {
         false
     }
@@ -666,7 +697,7 @@ impl LineCliBackend {
 
 /// Observe: parity with the PTY backend — capture now, then settle on
 /// line-quiet.
-impl LineCliBackend {
+impl PtyLineBackend {
     pub fn observe(&mut self, idle: Duration) -> BackendResult<ObserveResult> {
         let initial = self.state()?;
         if idle == Duration::ZERO {

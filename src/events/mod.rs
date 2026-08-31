@@ -7,6 +7,11 @@
 //! replay, and incremental observation all want the same answer, so they all
 //! consume this one stream.
 //!
+//! It also hosts the unified multi-source [`bus::EventBus`] that converges
+//! terminal, shell-command (OSC 133), native, and coverage events onto one
+//! ordered timeline (review P0: "a unified event bus"); the queue below is
+//! the terminal half of that timeline.
+//!
 //! Design constraints:
 //! - **Bounded**: a ring of [`EVENT_RING_CAPACITY`] events; eviction is
 //!   declared with `first_seq` so a consumer that falls far behind learns
@@ -20,6 +25,10 @@
 /// Upper bound on retained events per session. Sized so a full exploration
 /// step burst fits comfortably; eviction is declared, not silent.
 pub const EVENT_RING_CAPACITY: usize = 4096;
+
+pub mod bus;
+
+pub use bus::{BusBatch, BusEvent, BusEventKind, BusSource, EventBus};
 
 /// One thing that happened on a terminal, in order.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

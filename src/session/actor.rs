@@ -27,7 +27,6 @@
 //! for the duration, and every other session stays live.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::sync::{Mutex, RwLock};
 
 use crate::session::state::{LaunchSpec, Session};
@@ -47,7 +46,12 @@ enum Mail {
 /// One session's actor: a cloneable sender plus a join handle.
 pub struct SessionActor {
     id: String,
-    tx: mpsc::SyncSender<Mail>,
+    /// Bounded async mailbox (review item 13): `tokio::sync::mpsc` so a full
+    /// mailbox applies *awaitable backpressure* on the caller instead of
+    /// blocking a runtime worker thread the way `std::sync::mpsc::SyncSender`
+    /// would. The actor thread is a plain OS thread and drains via
+    /// `blocking_recv()`; callers `send().await`.
+    tx: tokio::sync::mpsc::Sender<Mail>,
     /// Reader thread join handle, taken by `shutdown`.
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -66,7 +70,7 @@ impl SessionActor {
     /// Spawn an actor thread owning `session`. Returns the handle.
     pub fn spawn(session: Session) -> SessionActor {
         let id = session.id.clone();
-        let (tx, rx) = mpsc::sync_channel::<Mail>(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Mail>(64);
         let join = std::thread::Builder::new()
             .name(format!(
                 "tui-lab-sess-{}",
@@ -74,7 +78,10 @@ impl SessionActor {
             ))
             .spawn(move || {
                 let mut session = session;
-                for mail in rx {
+                // `blocking_recv` is the plain-thread drain for a tokio
+                // channel: it parks the OS thread (not a runtime worker) and
+                // returns None once every sender is dropped, ending the loop.
+                while let Some(mail) = rx.blocking_recv() {
                     match mail {
                         Mail::Job(job) => job(&mut session),
                         Mail::Shutdown => break,
@@ -109,15 +116,21 @@ impl SessionActor {
         let job: Job = Box::new(move |session: &mut Session| {
             let _ = rtx.send(job(session));
         });
+        // Async backpressure (review item 13): a full mailbox suspends THIS
+        // task until the actor drains, rather than blocking a runtime worker
+        // thread as std::sync::mpsc::SyncSender::send would.
         self.tx
             .send(Mail::Job(job))
+            .await
             .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
         rrx.await
             .map_err(|_| ActorError::ActorDropped(self.id.clone()))
     }
 
-    /// Try to send without awaiting (used on the actor thread itself and by
-    /// stop paths that must not block).
+    /// Try to send without awaiting: returns a oneshot receiver to await the
+    /// reply. Never blocks the caller. A full mailbox is an explicit
+    /// `ActorBusy` (the session is legitimately mid-job and will drain); use
+    /// `send(...).await` for blocking-aware backpressure instead.
     pub fn send_sync<R, F>(&self, job: F) -> Result<tokio::sync::oneshot::Receiver<R>, ActorError>
     where
         R: Send + 'static,
@@ -127,15 +140,23 @@ impl SessionActor {
         let job: Job = Box::new(move |session: &mut Session| {
             let _ = rtx.send(job(session));
         });
-        self.tx
-            .send(Mail::Job(job))
-            .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
-        Ok(rrx)
+        match self.tx.try_send(Mail::Job(job)) {
+            Ok(()) => Ok(rrx),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(ActorError::ActorBusy(
+                self.id.clone(),
+            )),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(ActorError::ActorGone(self.id.clone()))
+            }
+        }
     }
 
     /// Ask the actor to stop the session and exit. Idempotent per handle.
     pub fn shutdown(&self) {
-        let _ = self.tx.send(Mail::Shutdown);
+        // Non-blocking: this may be called from a context that cannot await.
+        // A failed try_send (full mailbox or closed) is fine — the actor
+        // drains and exits either way once the channel closes.
+        let _ = self.tx.try_send(Mail::Shutdown);
         if let Ok(mut j) = self.join.lock() {
             if let Some(handle) = j.take() {
                 let _ = handle.join();
@@ -151,6 +172,11 @@ pub enum ActorError {
     ActorGone(String),
     #[error("session actor '{0}' dropped its reply")]
     ActorDropped(String),
+    /// A non-blocking `send_sync` found the bounded mailbox full — the
+    /// session is mid-job. Retry with `send(...).await` (async backpressure)
+    /// or after the actor drains.
+    #[error("session actor '{0}' mailbox is full (busy); await or retry")]
+    ActorBusy(String),
 }
 
 impl ActorError {
@@ -181,9 +207,12 @@ impl SessionPool {
         }
     }
 
-    /// Create + start a session from a full spec; the actor owns it from
-    /// birth. Returns the session id (and the start outcome computed inside
-    /// the actor, so launch errors surface verbatim).
+    /// Create + start a session; the actor owns it from birth (review item 10).
+/// `Session::new` is cheap (pure struct construction) and runs on the async
+/// caller, but the actual launch — `start_with_spec`, which spawns the PTY
+/// and does the initial settle — executes as a job ON the actor thread. The
+/// async caller awaits that job's oneshot, so launch errors surface verbatim
+/// but the blocking process-start no longer holds up a runtime worker.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
@@ -197,7 +226,7 @@ impl SessionPool {
         isolation: &str,
     ) -> Result<String, anyhow::Error> {
         let id = format!("sess-{}", uuid::Uuid::new_v4().simple());
-        let mut s = Session::new(id.clone(), command.to_string());
+        let s = Session::new(id.clone(), command.to_string());
         let spec = LaunchSpec {
             command: command.to_string(),
             args: args.to_vec(),
@@ -208,11 +237,18 @@ impl SessionPool {
             backend: backend.to_string(),
             isolation: isolation.to_string(),
         };
-        s.start_with_spec(spec)?;
+        // Spawn the actor owning the un-started session, then hand it the
+        // launch as a job. `send` awaits the reply, so the caller gets the
+        // launch outcome while the blocking PTY start runs on the actor thread.
+        let actor = SessionActor::spawn(s);
+        actor
+            .send(move |s: &mut Session| s.start_with_spec(spec))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))??;
         self.directory
             .write()
             .expect("session directory")
-            .insert(id.clone(), SessionActor::spawn(s));
+            .insert(id.clone(), actor);
         *self.active.lock().expect("active pointer") = Some(id.clone());
         Ok(id)
     }
@@ -327,7 +363,10 @@ impl Drop for SessionPool {
     fn drop(&mut self) {
         if let Ok(d) = self.directory.read() {
             for actor in d.values() {
-                let _ = actor.tx.send(Mail::Shutdown);
+                // try_send: Drop cannot await. When it fails (full or closed)
+                // the mailbox will close once these Senders drop, and the
+                // actor's blocking_recv returns None, so it still exits.
+                let _ = actor.tx.try_send(Mail::Shutdown);
             }
         }
         // Do not join here: the pool can drop inside an async runtime where

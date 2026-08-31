@@ -136,6 +136,7 @@ fn contract_keys_action_sends_full_sequence() {
     let p = TuiActRequest::Keys {
         keys: vec!["tab".into(), "tab".into(), "enter".into()],
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -296,6 +297,7 @@ fn contract_ctrl_key_encodes_typed_representation() {
     let p = TuiActRequest::Key {
         key: "ctrl+c".into(),
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -554,6 +556,7 @@ fn contract_key_a_preserves_case() {
     let p = TuiActRequest::Key {
         key: "A".into(),
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -574,6 +577,7 @@ fn contract_key_shift_a_yields_uppercase() {
     let p = TuiActRequest::Key {
         key: "shift+a".into(),
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -594,6 +598,7 @@ fn contract_key_ctrl_c() {
     let p = TuiActRequest::Key {
         key: "ctrl+c".into(),
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -614,6 +619,7 @@ fn contract_key_bogus_modifier_errors() {
     let p = TuiActRequest::Key {
         key: "bogus+key".into(),
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -626,6 +632,7 @@ fn contract_key_f1_function() {
     let p = TuiActRequest::Key {
         key: "F1".into(),
         no_wait: None,
+        completion: None,
         wait_ms: None,
         id: None,
     };
@@ -924,4 +931,40 @@ fn contract_control_label_exists_helper() {
     assert!(control_label_exists(&screen, "Save"));
     assert!(control_label_exists(&screen, "save")); // case-insensitive
     assert!(!control_label_exists(&screen, "Missing"));
+}
+
+/// Review P0 rigidity #4: a `completion` field on a `TuiActRequest` must be
+/// honored as a declared completion, not silently dropped. An agent that says
+/// `completion: "may_be_silent"` (e.g. copy-to-clipboard) must get a policy
+/// whose strategy never reports a false `settled=false`; absence must default
+/// to the ordinary "screen settles" behaviour.
+#[test]
+fn tui_act_completion_field_resolves_to_policy() {
+    // Wire round-trip: `completion: "may_be_silent"` deserializes (the field is
+    // optional, serde(default)) and resolves to the declare-silent policy.
+    let raw = r#"{"action":"type","text":"x","no_wait":false,"completion":"may_be_silent"}"#;
+    let p: TuiActRequest = serde_json::from_str(raw).expect("deserialize completion request");
+    assert!(
+        matches!(
+            p.completion(),
+            Some(tui_lab::capture::CompletionPolicy::MayBeSilent)
+        ),
+        "may_be_silent completion must resolve to MayBeSilent"
+    );
+
+    // Absence defaults to the ordinary screen-settle behaviour.
+    let plain = r#"{"action":"key","key":"enter"}"#;
+    let p2: TuiActRequest = serde_json::from_str(plain).expect("deserialize plain request");
+    assert!(
+        p2.completion().is_none(),
+        "absent completion must resolve to the default (None => StableScreen downstream)"
+    );
+
+    // A named-text completion maps to the appearance policy it declares.
+    let appears = r#"{"action":"type","text":"ok","completion":"text_appears"}"#;
+    let p3: TuiActRequest = serde_json::from_str(appears).expect("deserialize text-appears request");
+    assert!(matches!(
+        p3.completion(),
+        Some(tui_lab::capture::CompletionPolicy::TextAppears(_))
+    ));
 }

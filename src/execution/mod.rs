@@ -14,6 +14,7 @@
 use crate::backend::{
     CanonicalFrame, CaptureOutcome, Input, TerminalEventState, WaitCond, WaitOutcome,
 };
+use crate::capture::CompletionPolicy;
 use crate::screen::diff::Transition;
 use crate::screen::ScreenState;
 use crate::session::state::Session;
@@ -458,6 +459,63 @@ impl InteractionTransaction {
 ///
 /// `quiet_ms` is the quiet interval that defines "settled" (default 150ms).
 /// `settle_budget_ms` bounds the wait (default quiet + 1000ms).
+/// RAII recording-window guard for a single act (Wave G review P1 18:
+/// "mutations through transactions").
+///
+/// An act's mutation window may suppress recording (sensitive visibility) and
+/// raise an observation anchor. Both must be released on *every* exit path —
+/// success, error, early return, panic — or the next call observes a leaked
+/// suppression and the session's recording stays blind. The guard owns that
+/// obligation: it is constructed with the recording state it must restore and
+/// its `Drop` guarantees restoration even when a later step (e.g. the settle
+/// wait) returns `Err`.
+struct ActTransactionGuard<'a> {
+    session: &'a mut Session,
+    /// Whether the constructor suppressed recording for this window.
+    suppressed: bool,
+}
+
+impl<'a> ActTransactionGuard<'a> {
+    fn begin(
+        session: &'a mut Session,
+        suppress: bool,
+    ) -> ActTransactionGuard<'a> {
+        if suppress {
+            session.suppress_recording();
+        }
+        ActTransactionGuard { session, suppressed: suppress }
+    }
+
+    /// Reborrow the session for the transaction body. The reborrow lives only
+    /// as long as the body's reads/writes; it is refreshed each call so `?`
+    /// returns inside the body do not hold it past the guard's lifetime.
+    fn sess(&mut self) -> &mut Session {
+        &mut *self.session
+    }
+
+    /// Success path: restore recording, then relinquish the session.
+    fn commit(mut self) {
+        self.restore();
+        // Swallow self so `Drop` doesn't double-restore.
+        std::mem::forget(self);
+    }
+
+    /// Error path: restore recording so a later `?` returns a clean session.
+    /// Idempotent with `Drop`, so callers may invoke it or not.
+    fn restore(&mut self) {
+        if self.suppressed {
+            self.suppressed = false;
+            self.session.resume_recording();
+        }
+    }
+}
+
+impl<'a> Drop for ActTransactionGuard<'a> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 pub fn execute_act(
     session: &mut Session,
     action: &CanonicalAction,
@@ -465,19 +523,21 @@ pub fn execute_act(
     settle_budget_ms: u64,
     no_wait: bool,
 ) -> Result<InteractionTransaction, anyhow::Error> {
-    execute_act_with_visibility(
+    execute_act_with_completion(
         session,
         action,
         quiet_ms,
         settle_budget_ms,
         no_wait,
         InputVisibility::Normal,
+        CompletionPolicy::StableScreen,
     )
 }
 
 /// [`execute_act`] with an explicit [`InputVisibility`] policy. Sensitive
 /// visibility routes the send through [`Session::send_unrecorded`] and marks
-/// the transaction so every downstream recorder redacts.
+/// the transaction so every downstream recorder redacts. The completion
+/// policy is the ordinary "action ⇒ stable screen" case.
 pub fn execute_act_with_visibility(
     session: &mut Session,
     action: &CanonicalAction,
@@ -485,6 +545,35 @@ pub fn execute_act_with_visibility(
     settle_budget_ms: u64,
     no_wait: bool,
     visibility: InputVisibility,
+) -> Result<InteractionTransaction, anyhow::Error> {
+    execute_act_with_completion(
+        session,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        visibility,
+        CompletionPolicy::StableScreen,
+    )
+}
+
+/// The canonical act executor with a declared [`CompletionPolicy`] (review
+/// P0: "the runtime still assumes action success usually means a stable
+/// screen change"). Every action that is *not* "send then screen settles" —
+/// copy-to-clipboard (silent), quit (process exit), "type until text
+/// appears", a bell-only notify — historically produced a false
+/// `settled=false` because the settle wait demanded screen quiet that never
+/// came. A `completion` policy tells the executor what "done" actually means
+/// for THIS action, so a silent/toggle/exit action is correctly reported as
+/// `Met` rather than a spurious timeout.
+pub fn execute_act_with_completion(
+    session: &mut Session,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+    visibility: InputVisibility,
+    completion: CompletionPolicy,
 ) -> Result<InteractionTransaction, anyhow::Error> {
     let before = match session.last().cloned() {
         Some(s) => s,
@@ -506,46 +595,58 @@ pub fn execute_act_with_visibility(
     // captures are gated on output because the tty line discipline echoes
     // typed bytes back — the echo IS the payload. The PTY still receives
     // everything; only the cast is blind during the window.
+    //
+    // `ActTransactionGuard` owns the window as the transaction boundary: the
+    // send and its settle wait run inside it, and whichever way the function
+    // exits — a successful `commit`, a send error, or a settle-wait `Err` —
+    // the guard restores recording. A failed mutation never leaves the session
+    // permanently blind (Wave G review P1 18).
     let sensitive_window = matches!(
         visibility,
         InputVisibility::Sensitive | InputVisibility::NeverPersist
     );
-    if sensitive_window {
-        session.suppress_recording();
-    }
-    let send_result = session.send(action.to_input());
+    let mut window = ActTransactionGuard::begin(session, sensitive_window);
+    let send_result = window.sess().send(action.to_input());
     let send_failed = send_result.is_err();
     if send_failed {
-        // Never leave the gates raised on an error path.
-        if sensitive_window {
-            session.resume_recording();
-        }
         send_result?;
     }
 
-    let (settle, elapsed_ms, after_state, after_screen_seq, capture) = if no_wait {
+    // A declared `NoWait` completion is equivalent to the transport's
+    // no_wait flag: act, capture a fresh frame, report settlement as Skipped
+    // (never a fake "settled").
+    let skip = no_wait || matches!(completion, CompletionPolicy::NoWait);
+    let (settle, elapsed_ms, after_state, after_screen_seq, capture) = if skip {
         // Even with no_wait, capture a fresh frame so callers always get
         // both before and after — but settlement was NOT tested. Reporting
         // `SettleStatus::Skipped` is the honest answer (re-review P1 fix 8).
-        let s = session.observe(quiet_ms)?;
+        let s = window.sess().observe(quiet_ms)?;
         (SettleStatus::Skipped, 0, s, None, None)
     } else {
         let budget = settle_budget_ms.max(quiet_ms.saturating_add(1000));
+        // Map the completion policy to what "done" means, then wait_after that
+        // (re-review P0 rigidity): a silent action must not demand screen
+        // quiet, a quit must not wait for stability, etc. The default
+        // `StableScreen` reproduces the historic screen-settle behavior.
+        let policy_cond = completion_wait_cond(&completion, quiet_ms);
         // Use the matching frame from wait_after (re-review P0). No second
         // observe() — the captured state IS the authoritative after.
-        let outcome = session.wait_after(
-            baseline,
-            WaitCond::ScreenStable {
-                quiet_for: std::time::Duration::from_millis(quiet_ms),
-                after_screen_seq: None, // wait_after fills the anchor
-            },
-            budget,
-        )?;
+        let outcome = window.sess().wait_after(baseline, policy_cond, budget)?;
         let capture = CaptureOutcome::from_wait(outcome.clone());
-        let settle = if outcome.met {
+        // `MayBeSilent` is special: the action may legitimately produce no
+        // observable change (clipboard copy, an invisible toggle). A timeout
+        // here is NOT a failure — the capture holds whatever the screen shows
+        // and we call it Met, never a false `settled=false`.
+        let timed_out = !outcome.met;
+        let settle = if matches!(completion, CompletionPolicy::MayBeSilent) {
+            // The outcome frame is authoritative regardless of whether a
+            // screen edge fired; report Met so downstream automation does not
+            // misread a silent-but-valid action as a bug.
             SettleStatus::Met
-        } else {
+        } else if timed_out {
             SettleStatus::TimedOut
+        } else {
+            SettleStatus::Met
         };
         let seq = outcome.screen_seq;
         (
@@ -563,14 +664,13 @@ pub fn execute_act_with_visibility(
         after_screen_seq.unwrap_or(0),
         capture.as_ref().map(|c| c.output_seq).unwrap_or(0),
     );
-    after_frame.session_id = Some(session.id.clone());
-    after_frame.generation = Some(session.generation);
+    after_frame.session_id = Some(window.sess().id.clone());
+    after_frame.generation = Some(window.sess().generation);
 
     // Sensitive window closed: the settled frame has been captured, so the
-    // application's own (masked) rendering is recorded again from here on.
-    if sensitive_window {
-        session.resume_recording();
-    }
+    // application's own (masked) rendering is recorded from here on. `commit`
+    // restores recording and relinquishes the session.
+    window.commit();
 
     Ok(InteractionTransaction {
         action: ActionEnvelope::new(action.clone(), visibility),
@@ -582,6 +682,55 @@ pub fn execute_act_with_visibility(
         capture,
         elapsed_ms,
     })
+}
+
+/// Map a [`CompletionPolicy`] to the backend wait that proves it. The
+/// `after_screen_seq` / `after_command_seq` anchors are left `None` so
+/// [`Session::wait_after`] fills them from the transaction baseline — that is
+/// what scopes "the reaction to MY action" versus "any prior activity".
+fn completion_wait_cond(completion: &CompletionPolicy, quiet_ms: u64) -> WaitCond {
+    let quiet = std::time::Duration::from_millis(quiet_ms);
+    match completion {
+        CompletionPolicy::StableScreen | CompletionPolicy::MayBeSilent => WaitCond::ScreenStable {
+            quiet_for: quiet,
+            after_screen_seq: None,
+        },
+        CompletionPolicy::FirstScreenChange | CompletionPolicy::AnyObservableChange => {
+            // First change edge after the anchor; no quiet required.
+            WaitCond::ScreenStable {
+                quiet_for: std::time::Duration::from_millis(0),
+                after_screen_seq: None,
+            }
+        }
+        CompletionPolicy::TextAppears(t) => WaitCond::Text(t.clone()),
+        CompletionPolicy::TextDisappears(t) => WaitCond::TextAbsent(t.clone()),
+        CompletionPolicy::ProcessExit => WaitCond::ProcessExit,
+        CompletionPolicy::CommandDone => WaitCond::CommandDone {
+            after_command_seq: None,
+        },
+        CompletionPolicy::Bell => WaitCond::Bell,
+        CompletionPolicy::SemanticChange => {
+            // The backend cannot wait on a semantic diff directly; treat a
+            // first screen change as the closest honest proxy, and the
+            // transaction's semantic `transition` carries the real diff.
+            WaitCond::ScreenStable {
+                quiet_for: std::time::Duration::from_millis(0),
+                after_screen_seq: None,
+            }
+        }
+        CompletionPolicy::Event(_) => WaitCond::ScreenStable {
+            quiet_for: std::time::Duration::from_millis(0),
+            after_screen_seq: None,
+        },
+        CompletionPolicy::NoWait => {
+            // Not reachable on the wait path (the caller skips it), but a
+            // sensible fallback: snapshot now.
+            WaitCond::ScreenStable {
+                quiet_for: std::time::Duration::from_millis(0),
+                after_screen_seq: None,
+            }
+        }
+    }
 }
 
 /// Execute one wait. Thin by design: the point is that every caller uses the
@@ -768,6 +917,133 @@ mod tests {
         );
     }
 
+    /// The mutual-exclusion between: a send failure in a sensitive act must
+    /// tear down the whole transaction — the guard restores recording even
+    /// though no `commit` was reached (Wave G review P1 18, error path).
+    #[test]
+    fn failed_sensitive_act_restores_recording_via_guard() {
+        let mut s = session();
+        s.enable_recording(true);
+        // Stop the child so the next `send` fails; sending to a dead PTY is
+        // the deterministic analogue of any mid-transaction failure.
+        s.stop().expect("stop child");
+
+        let err = execute_act_with_visibility(
+            &mut s,
+            &CanonicalAction::Type {
+                text: "should-not-matter".to_string(),
+            },
+            40,
+            1000,
+            false,
+            InputVisibility::Sensitive,
+        );
+        assert!(err.is_err(), "a send to a stopped child must fail");
+
+        // Recording must be restored on the error path — a leaked suppression
+        // would leave the session permanently blind.
+        assert!(
+            s.is_recording(),
+            "the transaction guard must restore recording on a failed send"
+        );
+    }
+
+    // ── CompletionPolicy wiring (review P0 rigidity) ──────────────────
+
+    /// A `ProcessExit` completion declares "the action's real success signal is
+    /// the child exiting", NOT a screen settle. `execute_act` must wait for the
+    /// exit and report `Met` — not a spurious stable-screen timeout.
+    #[test]
+    fn process_exit_completion_waits_for_exit_not_screen_settle() {
+        let mut s = Session::new("exec-exit".into(), "python3".into());
+        s.start_with_spec(crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "import sys,time; print('bye'); sys.stdout.flush(); time.sleep(0.2)".into(),
+            ],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        })
+        .expect("spawn");
+        // Wait for initial output so the process is visibly alive before the act.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let tx = execute_act_with_completion(
+            &mut s,
+            &CanonicalAction::Key {
+                key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('q')),
+            },
+            40,
+            2000,
+            false,
+            InputVisibility::Normal,
+            CompletionPolicy::ProcessExit,
+        )
+        .expect("act with process-exit completion");
+        // The child exits ~200ms after start; the completion proves the exit.
+        assert_eq!(
+            tx.settle,
+            SettleStatus::Met,
+            "process-exit completion must report Met, got {}",
+            tx.settle_reason()
+        );
+        assert!(
+            !tx.after().process.running,
+            "after a process-exit completion the child must be gone"
+        );
+        s.stop().ok();
+    }
+
+    /// A `MayBeSilent` completion MUST never produce a false `settled=false`:
+    /// the action may legitimately change nothing observable (clipboard copy,
+    /// an invisible toggle). The executor captures whatever the screen shows
+    /// and reports `Met` — the exact rigidity the review called out.
+    #[test]
+    fn may_be_silent_never_reports_false_timeout() {
+        let mut s = Session::new("exec-silent".into(), "python3".into());
+        s.start_with_spec(crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "import time; print('quiet'); time.sleep(3)".into(),
+            ],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        })
+        .expect("spawn");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let tx = execute_act_with_completion(
+            &mut s,
+            &CanonicalAction::Key {
+                key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('x')),
+            },
+            40,
+            300,
+            false,
+            InputVisibility::Normal,
+            CompletionPolicy::MayBeSilent,
+        )
+        .expect("act");
+        // Even if the typed char echoes, no *settle* was required; and if the
+        // screen stayed quiet the action is still a success. Either way Met.
+        assert_eq!(
+            tx.settle,
+            SettleStatus::Met,
+            "MayBeSilent must report Met, never a false timeout"
+        );
+        s.stop().ok();
+    }
+
     // ── CanonicalAction (Wave-2 item 10) ──────────────────────────────
 
     /// JSON round-trip preserves every payload byte: replay must execute
@@ -861,6 +1137,7 @@ mod tests {
             y: 4,
             button: None,
             no_wait: Some(true),
+            completion: None,
             wait_ms: Some(500),
             id: Some("s1".into()),
         };
@@ -877,6 +1154,7 @@ mod tests {
         let bad = TuiActRequest::Keys {
             keys: vec![],
             no_wait: None,
+            completion: None,
             wait_ms: None,
             id: None,
         };
@@ -888,6 +1166,7 @@ mod tests {
         let raw = TuiActRequest::Raw {
             raw: vec![],
             no_wait: None,
+            completion: None,
             wait_ms: None,
             id: None,
         };

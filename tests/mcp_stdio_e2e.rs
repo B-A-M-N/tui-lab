@@ -180,7 +180,7 @@ fn stdio_e2e_full_lifecycle() {
     );
     mcp.notify("notifications/initialized");
 
-    // --- tools/list: exactly the registry's 14-tool surface (item 69's
+    // --- tools/list: exactly the registry's 15-tool surface (item 69's
     // pin, held over the wire) ---
     let tools = mcp.request("tools/list", serde_json::json!({}));
     let mut names: Vec<String> = tools["result"]["tools"]
@@ -201,7 +201,7 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(names, declared, "tools/list == capability registry");
     assert_eq!(
         names.len(),
-        14,
+        15,
         "registry count matches the wire: {names:?}"
     );
     for expected in [
@@ -219,6 +219,7 @@ fn stdio_e2e_full_lifecycle() {
         "tui_framework",
         "tui_run",
         "tui_contract",
+        "tui_explain",
     ] {
         assert!(
             names.contains(&expected.to_string()),

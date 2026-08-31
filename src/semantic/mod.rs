@@ -5,21 +5,25 @@
 //! with confidence 1.0.
 
 pub mod affordance;
+pub mod cache;
 pub mod components;
 pub mod confidence;
 pub mod controls;
 pub mod focus;
 pub mod focus_graph;
+pub mod invoke_affordance;
 pub mod native;
 pub mod node;
 pub mod recognizers;
 pub mod regions;
 pub mod relationships;
+pub mod source_ref;
 pub mod state_tree;
 pub mod tree_builder;
 pub mod widgets;
 
 pub use affordance::{infer_affordances, Affordance, Invocation, Visibility};
+pub use cache::{CacheResult, SemanticCache, MAX_ENTRIES};
 
 pub use components::{
     detect_components, Component, ScrollbarComponent, ScrollbarOrientation, TableComponent,
