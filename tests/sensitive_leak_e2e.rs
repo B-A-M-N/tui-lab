@@ -44,14 +44,26 @@ fn params<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Parameters<T>
     Parameters(serde_json::from_value(v).expect("valid params"))
 }
 
-fn unwrap_ok(raw: &str, ctx: &str) -> serde_json::Value {
-    let v: serde_json::Value = serde_json::from_str(raw).expect("valid JSON envelope");
+fn unwrap_ok(raw: &rmcp::model::CallToolResult, ctx: &str) -> serde_json::Value {
+    // Wave G item 71: the envelope rides as structured_content (and as the
+    // same JSON in the text block).
+    let v = raw
+        .structured_content
+        .clone()
+        .or_else(|| raw.content.first().map(|c| {
+            let rmcp::model::ContentBlock::Text(t) = c else {
+                panic!("{}: non-text content block", ctx);
+            };
+            serde_json::from_str(&t.text).expect("valid JSON envelope")
+        }))
+        .expect("structured content");
+    assert!(!raw.is_error.unwrap_or(false), "{} failed: {}", ctx, v);
     assert_eq!(
         v.get("category").and_then(|c| c.as_str()),
         Some("success"),
         "{} failed: {}",
         ctx,
-        serde_json::to_string(&v).unwrap_or_default()
+        v
     );
     v.get("data").cloned().expect("data payload")
 }

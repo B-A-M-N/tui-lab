@@ -100,7 +100,17 @@ impl ScenarioRunner {
                                     Err(e) => (false, format!("wait failed: {e}")),
                                 }
                             }
-                            None => (false, format!("unknown wait condition '{}'", wp.condition)),
+                            None => (
+                                false,
+                                format!(
+                                    "unknown wait condition '{}' (expected one of: {})",
+                                    match &wp.condition {
+                                        crate::mcp::params::Known::Other(o) => o.clone(),
+                                        _ => String::new(),
+                                    },
+                                    <crate::mcp::params::WaitCondition as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                                ),
+                            ),
                         },
                         Err(e) => (false, format!("unparseable wait step: {e}")),
                     }

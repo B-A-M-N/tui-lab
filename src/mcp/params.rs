@@ -1,11 +1,106 @@
-//! Tool parameter structs (schemas) for the 12 MCP tools.
+//! Tool parameter structs (schemas) for the MCP tools.
 //!
 //! Item 30: tui_act uses a tagged enum (`TuiActRequest`) so Hermes gets a
 //! proper discriminated union schema instead of a flat struct with many
 //! optional fields that permits nonsensical combinations.
+//!
+//! Wave G item 70: every action/mode/condition/assertion/profile selector is
+//! a typed enum, not a `String` matched deep in a handler. Each enum pairs a
+//! closed variant list (which generates a real JSON Schema `enum`) with the
+//! [`Known::Other`] escape hatch: an *unknown* value still deserializes (so
+//! the handler can answer `invalid_request` with the full expected list
+//! through the normal envelope) instead of dying in the transport layer with
+//! a bare JSON-RPC deserialization error that carries no remediation.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// A selector value that is either one of the known variants or an
+/// unrecognized string. `Known` gives typed dispatch + closed schemas;
+/// `Other` keeps forward compatibility honest — new/typo'd values surface as
+/// envelope `invalid_request` naming every accepted value, never as a
+/// transport-level parse failure with no context.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum Known<T> {
+    Known(T),
+    Other(String),
+}
+
+impl<T> Known<T> {
+    /// The known variant, or `None` when the caller passed an unrecognized
+    /// value.
+    pub fn known(&self) -> Option<&T> {
+        match self {
+            Known::Known(t) => Some(t),
+            Known::Other(_) => None,
+        }
+    }
+}
+
+/// `From<&str>` for test/authoring ergonomics: a recognized wire name
+/// becomes `Known`, anything else becomes `Known::Other` (which the
+/// handlers surface as `invalid_request` naming the accepted set). The MCP
+/// transport path never uses this — serde's untagged derive handles the
+/// wire — but test constructors and scenario authors write `"text".into()`.
+impl<T: std::str::FromStr<Err = String>> From<&str> for Known<T> {
+    fn from(s: &str) -> Self {
+        match T::from_str(s) {
+            Ok(t) => Known::Known(t),
+            Err(_) => Known::Other(s.to_string()),
+        }
+    }
+}
+
+/// Trait for the closed selector enums: their variant names, for error
+/// messages and the capability registry. Hand-rolled (no strum dependency).
+pub trait EnumVariants {
+    const VARIANTS: &'static [&'static str];
+}
+
+macro_rules! selector_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident ; [ $( $variant:ident => $wire:literal ),+ $(,)? ]
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+        pub enum $name {
+            $(
+                #[serde(rename = $wire)]
+                $variant,
+            )+
+        }
+
+        impl EnumVariants for $name {
+            const VARIANTS: &'static [&'static str] = &[ $( $wire ),+ ];
+        }
+
+        impl $name {
+            /// Wire name of this variant (the exact historical string the
+            /// handler matched before the enum existed).
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $( $name::$variant => $wire, )+
+                }
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $( $wire => Ok($name::$variant), )+
+                    other => Err(format!(
+                        "unknown {} '{}' (expected one of: {})",
+                        stringify!($name), other,
+                        Self::VARIANTS.join(", ")
+                    )),
+                }
+            }
+        }
+    };
+}
 
 /// Typed mouse button (audit item 5/28): validated at the deserialization
 /// boundary so an invalid button is `invalid_request`, never silently coerced
@@ -46,9 +141,140 @@ impl From<ScrollDirectionParam> for crate::backend::ScrollDirection {
     }
 }
 
+// ── Wave G item 70: the closed selector vocabularies ─────────────────────
+// One enum per stringly selector. The wire names are the exact historical
+// strings the handlers matched before, so existing callers keep working.
+
+selector_enum!(
+    /// `tui_session` action.
+    SessionAction;
+    [
+        Start => "start", Restart => "restart", Stop => "stop", List => "list",
+        Status => "status", Lease => "lease", Release => "release",
+    ]
+);
+
+selector_enum!(
+    /// `tui_observe` mode.
+    ObserveMode;
+    [
+        Summary => "summary", Screen => "screen", Cells => "cells",
+        Semantic => "semantic", Tree => "tree", Nodes => "nodes",
+        Diff => "diff", Changes => "changes", Scrollback => "scrollback",
+        Search => "search", CommandState => "command_state", History => "history",
+    ]
+);
+
+selector_enum!(
+    /// `tui_wait` condition (the `build_wait` vocabulary).
+    WaitCondition;
+    [
+        Text => "text", TextAbsent => "text_absent", ScreenChange => "screen_change",
+        ScreenStable => "screen_stable", ProcessExit => "process_exit",
+        Title => "title", Bell => "bell", Idle => "idle",
+        CommandDone => "command_done", CommandOutput => "command_output",
+    ]
+);
+
+selector_enum!(
+    /// `tui_assert` assertion (includes `oracle`, the Wave E shared
+    /// language entry point).
+    AssertAssertion;
+    [
+        Text => "text", TextAbsent => "text_absent", Position => "position",
+        Focus => "focus", NotClipped => "not_clipped", Dimensions => "dimensions",
+        ExitCode => "exit_code", Region => "region", Snapshot => "snapshot",
+        Structure => "structure", ControlExists => "control_exists",
+        FocusedNot => "focused_not", Oracle => "oracle",
+    ]
+);
+
+selector_enum!(
+    /// `tui_checkpoint` action.
+    CheckpointAction;
+    [ Save => "save", Compare => "compare", List => "list", Delete => "delete" ]
+);
+
+selector_enum!(
+    /// `tui_scenario` action.
+    ScenarioAction;
+    [
+        List => "list", RecordStart => "record_start", RecordStop => "record_stop",
+        Save => "save", Export => "export", Run => "run",
+    ]
+);
+
+selector_enum!(
+    /// `tui_record` format / lifecycle selector.
+    RecordFormat;
+    [ Start => "start", Stop => "stop", Cast => "cast", Svg => "svg", Png => "png" ]
+);
+
+selector_enum!(
+    /// `tui_explore` mode.
+    ExploreMode;
+    [
+        Random => "random", GuidedCandidates => "guided_candidates",
+        Semantic => "semantic", StateGraph => "state_graph",
+    ]
+);
+
+selector_enum!(
+    /// `tui_audit` profile. `layout` is a documented alias of `resize`;
+    /// `contract` (Wave E) folds conformance into findings.
+    AuditProfile;
+    [
+        Full => "full", Keyboard => "keyboard", Focus => "focus", Resize => "resize",
+        Layout => "layout", Clipping => "clipping", Discoverability => "discoverability",
+        Navigation => "navigation", Contract => "contract", Color => "color",
+        Performance => "performance", Mouse => "mouse", States => "states",
+        Errors => "errors",
+    ]
+);
+
+selector_enum!(
+    /// `tui_coverage` action.
+    CoverageAction;
+    [
+        Detect => "detect", Summary => "summary", Collect => "collect",
+        Delta => "delta", Uncovered => "uncovered", Ledger => "ledger",
+        Start => "start", Stop => "stop",
+    ]
+);
+
+selector_enum!(
+    /// `tui_framework` action.
+    FrameworkAction;
+    [ Detect => "detect", Capabilities => "capabilities", AdapterSnippet => "adapter_snippet" ]
+);
+
+selector_enum!(
+    /// `tui_run` action.
+    RunAction;
+    [ Status => "status", Persist => "persist", Close => "close", Context => "context" ]
+);
+
+selector_enum!(
+    /// `tui_contract` action.
+    ContractAction;
+    [ Load => "load", Validate => "validate", Status => "status", Compare => "compare" ]
+);
+
+impl AuditProfile {
+    /// The engine-level name (what `crate::audit::orchestrator` accepts).
+    /// `layout` maps to `resize` at the engine, but the wire name is kept
+    /// for the response's `profile` echo.
+    pub fn engine_name(&self) -> &'static str {
+        match self {
+            AuditProfile::Layout => "resize",
+            other => other.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiSessionParams {
-    pub action: String,
+    pub action: Known<SessionAction>,
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
@@ -63,16 +289,60 @@ pub struct TuiSessionParams {
     pub rows: Option<u16>,
     #[serde(default)]
     pub backend: Option<String>,
+    /// Isolation profile (Wave G item 77): `local` | `clean` | `strict`.
+    /// Typed as Known<IsolationParam> so an unknown name still reaches the
+    /// envelope as invalid_request with the accepted list.
     #[serde(default)]
-    pub isolation: Option<String>,
+    pub isolation: Option<Known<IsolationParam>>,
     #[serde(default)]
     pub id: Option<String>,
+    /// lease: who takes control (free-form label).
+    #[serde(default)]
+    pub holder: Option<String>,
+    /// lease: time-to-live in milliseconds (default 300000 = 5 min).
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+}
+
+/// Isolation profile vocabulary (Wave G item 77).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub enum IsolationParam {
+    #[serde(rename = "local")]
+    Local,
+    #[serde(rename = "clean")]
+    Clean,
+    #[serde(rename = "strict")]
+    Strict,
+}
+
+impl EnumVariants for IsolationParam {
+    const VARIANTS: &'static [&'static str] = &["local", "clean", "strict"];
+}
+
+impl IsolationParam {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IsolationParam::Local => "local",
+            IsolationParam::Clean => "clean",
+            IsolationParam::Strict => "strict",
+        }
+    }
+}
+
+impl From<IsolationParam> for crate::session::isolation::Isolation {
+    fn from(p: IsolationParam) -> Self {
+        match p {
+            IsolationParam::Local => crate::session::isolation::Isolation::Local,
+            IsolationParam::Clean => crate::session::isolation::Isolation::Clean,
+            IsolationParam::Strict => crate::session::isolation::Isolation::Strict,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiObserveParams {
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<Known<ObserveMode>>,
     #[serde(default)]
     pub idle_ms: Option<u64>,
     #[serde(default)]
@@ -503,7 +773,7 @@ impl TuiActRequest {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiWaitParams {
-    pub condition: String,
+    pub condition: Known<WaitCondition>,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
@@ -519,7 +789,7 @@ pub struct TuiWaitParams {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiAssertParams {
-    pub assertion: String,
+    pub assertion: Known<AssertAssertion>,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
@@ -542,9 +812,20 @@ pub struct TuiAssertParams {
     pub id: Option<String>,
 }
 
+impl TuiAssertParams {
+    /// The assertion wire name, or the raw unknown string for the
+    /// `invalid_request` message.
+    pub fn assertion_name(&self) -> &str {
+        match &self.assertion {
+            Known::Known(a) => a.as_str(),
+            Known::Other(s) => s,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiCheckpointParams {
-    pub action: String,
+    pub action: Known<CheckpointAction>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -553,7 +834,7 @@ pub struct TuiCheckpointParams {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiScenarioParams {
-    pub action: String,
+    pub action: Known<ScenarioAction>,
     #[serde(default)]
     pub name: Option<String>,
     /// Target session (record_start resolves id + generation from it).
@@ -570,16 +851,16 @@ pub struct TuiScenarioParams {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiRecordParams {
     #[serde(default)]
-    pub format: Option<String>,
+    pub format: Option<Known<RecordFormat>>,
     #[serde(default)]
     pub id: Option<String>,
 }
 
-/// Run lifecycle (goal spec): status / persist / close. Ephemeral by default;
-/// `persist` promotes the SAME run to durable storage.
+/// Run lifecycle (goal spec): status / persist / close / context. Ephemeral
+/// by default; `persist` promotes the SAME run to durable storage.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiRunParams {
-    pub action: String,
+    pub action: Known<RunAction>,
     /// persist: explicit artifact root. When omitted, resolved from the
     /// primary session's `LaunchSpec.cwd` — never this process's cwd.
     #[serde(default)]
@@ -592,7 +873,7 @@ pub struct TuiRunParams {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiExploreParams {
-    pub mode: String,
+    pub mode: Known<ExploreMode>,
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
@@ -612,15 +893,21 @@ pub struct TuiExploreParams {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiAuditParams {
     #[serde(default)]
-    pub profile: Option<String>,
+    pub profile: Option<Known<AuditProfile>>,
     #[serde(default)]
     pub id: Option<String>,
+    /// Wave G item 67: record the result under this label, then diff against
+    /// the `compare_to` baseline (FIXED/REGRESSED/NEW per finding).
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub compare_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiCoverageParams {
     #[serde(default)]
-    pub action: Option<String>,
+    pub action: Option<Known<CoverageAction>>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -629,7 +916,7 @@ pub struct TuiCoverageParams {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiFrameworkParams {
-    pub action: String,
+    pub action: Known<FrameworkAction>,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -641,7 +928,7 @@ pub struct TuiFrameworkParams {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiContractParams {
     /// load | validate | status | compare
-    pub action: String,
+    pub action: Known<ContractAction>,
     /// Path to the contract document (YAML or JSON).
     #[serde(default)]
     pub path: Option<String>,

@@ -21,6 +21,10 @@ pub enum ErrorCategory {
     BackendError,
     InternalError,
     Unsupported,
+    /// A human holds the control lease on this session (Wave G item 76):
+    /// machine-driving tools refuse to act while the lease is valid. The
+    /// agent can retry after `ttl_ms` elapses or ask for the lease back.
+    ControlLeased,
 }
 
 impl ErrorCategory {
@@ -34,6 +38,7 @@ impl ErrorCategory {
             ErrorCategory::BackendError => "backend_error",
             ErrorCategory::InternalError => "internal_error",
             ErrorCategory::Unsupported => "unsupported",
+            ErrorCategory::ControlLeased => "control_leased",
         }
     }
 }

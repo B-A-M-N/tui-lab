@@ -169,13 +169,21 @@ fn contract_build_wait_screen_stable_has_quiet_interval() {
 
 #[test]
 fn contract_envelope_shapes() {
+    // Wave G item 71: ok/err return structured CallToolResults. The
+    // structured content IS the envelope; the text block carries the same
+    // JSON for text-only clients.
+    let ok_res = ok(serde_json::json!({ "x": 1 }));
+    assert_eq!(ok_res.is_error, Some(false));
     let ok_env: Envelope<serde_json::Value> =
-        serde_json::from_str(&ok(serde_json::json!({ "x": 1 }))).unwrap();
+        serde_json::from_value(ok_res.structured_content.clone().expect("structured")).unwrap();
     assert_eq!(ok_env.category, ErrorCategory::Success);
     assert!(ok_env.error.is_none());
+    assert_eq!(ok_env.data.expect("data")["x"], 1);
 
+    let err_res = err(ErrorCategory::Unsupported, "nope");
+    assert_eq!(err_res.is_error, Some(true));
     let err_env: Envelope<()> =
-        serde_json::from_str(&err(ErrorCategory::Unsupported, "nope")).unwrap();
+        serde_json::from_value(err_res.structured_content.clone().expect("structured")).unwrap();
     assert_eq!(err_env.category, ErrorCategory::Unsupported);
     assert_eq!(err_env.error.as_deref(), Some("nope"));
 }

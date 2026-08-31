@@ -3,32 +3,81 @@
 
 use crate::error::{Envelope, ErrorCategory};
 use crate::screen::ScreenState;
+use rmcp::model::CallToolResult;
 use std::time::Duration;
 
 use crate::backend::{KeyEvent, KeyModifiers};
 
-/// Render a success envelope.
-pub fn ok(data: serde_json::Value) -> String {
+/// Render a success envelope as a structured tool result (Wave G item 71):
+/// `structured_content` carries the envelope object; the same JSON rides in
+/// the text block for clients that only read text. Assertion-style
+/// `passed: false` stays a success at the transport level (see
+/// [`err_continued`]); genuine failures set `is_error` only when the
+/// category is a caller/transport fault, so agents can branch on the
+/// payload either way.
+pub fn ok(data: serde_json::Value) -> CallToolResult {
     let env = Envelope::ok(data);
-    env.to_json()
+    from_envelope_json(&env.to_json(), false)
 }
 
-/// Render a hard-failure envelope (category + message).
-pub fn err(cat: ErrorCategory, msg: impl Into<String>) -> String {
+/// Render a hard-failure envelope (category + message). `is_error: true` —
+/// this is a real fault (invalid request, backend error, …), not a UI
+/// verdict.
+pub fn err(cat: ErrorCategory, msg: impl Into<String>) -> CallToolResult {
     let env: Envelope<()> = Envelope::<()>::fail(cat, msg);
-    env.to_json()
+    from_envelope_json(&env.to_json(), true)
+}
+
+/// Wrap an already-rendered envelope JSON string into a CallToolResult.
+fn from_envelope_json(json: &str, is_error: bool) -> CallToolResult {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .unwrap_or(serde_json::Value::Null);
+    let mut r = CallToolResult::structured(value);
+    r.content = vec![rmcp::model::ContentBlock::text(json)];
+    r.is_error = Some(is_error);
+    r
+}
+
+/// Promote a legacy String envelope (rendered by a subsystem with its own
+/// [`Envelope`]) into the structured result shape. Used at the delegation
+/// boundaries (checkpoint compare, coverage provider).
+pub fn ok_from_json(json: &str) -> CallToolResult {
+    from_envelope_json(json, false)
 }
 
 /// Assertion failures are "success" at the transport level but carry
 /// `passed: false` so Hermes can branch on the payload rather than the error
 /// channel. We still tag category = assertion_failed for clarity.
-pub fn err_continued(cat: ErrorCategory, detail: String) -> String {
+pub fn err_continued(cat: ErrorCategory, detail: String) -> CallToolResult {
     let env = Envelope {
         category: cat,
         error: Some(detail),
         data: Some(serde_json::json!({ "passed": false })),
     };
-    env.to_json()
+    from_envelope_json(&env.to_json(), false)
+}
+
+/// Uniform `invalid_request` for an unrecognized selector value: names what
+/// was passed and every accepted variant (Wave G item 70 — the agent can
+/// self-correct from the message alone).
+pub fn err_invalid_selector(
+    what: &str,
+    got: &crate::mcp::params::Known<impl std::any::Any>,
+    variants: &[&'static str],
+) -> CallToolResult {
+    let shown = match got {
+        crate::mcp::params::Known::Other(s) => s.clone(),
+        _ => String::new(),
+    };
+    err(
+        ErrorCategory::InvalidRequest,
+        format!(
+            "unknown {} '{}' (expected one of: {})",
+            what,
+            shown,
+            variants.join(", ")
+        ),
+    )
 }
 
 /// Parse an ergonomic key string into a typed [`KeyEvent`] (spec section 6).
@@ -114,9 +163,12 @@ fn parse_key(s: &str) -> Result<KeyEvent, String> {
 /// Build a wait condition.
 ///
 /// Honours `quiet_ms` for `screen_stable` and `idle` conditions; defaults to
-/// 80 ms / 250 ms respectively when `quiet_ms` is `None`.
+/// 80 ms / 250 ms respectively when `quiet_ms` is `None`. Unknown condition
+/// strings (the `Known::Other` case) return `None` — the caller answers
+/// `invalid_request` naming the accepted set.
 pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backend::WaitCond> {
     use crate::backend::WaitCond;
+    use crate::mcp::params::WaitCondition as W;
     let quiet = p
         .quiet_ms
         .map(Duration::from_millis)
@@ -125,45 +177,59 @@ pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backen
         .quiet_ms
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(250));
-    match p.condition.as_str() {
-        "text" => p.text.clone().map(WaitCond::Text),
-        "text_absent" => p.text.clone().map(WaitCond::TextAbsent),
-        "screen_change" => Some(WaitCond::ScreenChange),
-        "screen_stable" => Some(WaitCond::ScreenStable {
+    let cond = p.condition.known()?;
+    Some(match cond {
+        W::Text => p.text.clone().map(WaitCond::Text)?,
+        W::TextAbsent => p.text.clone().map(WaitCond::TextAbsent)?,
+        W::ScreenChange => WaitCond::ScreenChange,
+        W::ScreenStable => WaitCond::ScreenStable {
             quiet_for: quiet,
             after_screen_seq: None,
-        }),
-        "process_exit" => Some(WaitCond::ProcessExit),
-        "title" => p.title.clone().map(WaitCond::Title),
-        "bell" => Some(WaitCond::Bell),
-        "idle" => Some(WaitCond::Idle {
+        },
+        W::ProcessExit => WaitCond::ProcessExit,
+        W::Title => p.title.clone().map(WaitCond::Title)?,
+        W::Bell => WaitCond::Bell,
+        W::Idle => WaitCond::Idle {
             quiet_for: idle_quiet,
             after_output_seq: None,
-        }),
+        },
         // Wave F item 54: shell-integration command waits (OSC 133).
-        "command_done" => Some(WaitCond::CommandDone {
+        W::CommandDone => WaitCond::CommandDone {
             after_command_seq: None,
-        }),
-        "command_output" => p.text.clone().map(|t| WaitCond::CommandOutput {
-            text: t,
+        },
+        W::CommandOutput => WaitCond::CommandOutput {
+            text: p.text.clone()?,
             after_command_seq: None,
-        }),
-        _ => None,
-    }
+        },
+    })
 }
 
 /// Run a single assertion against a screen. Returns `(passed, detail,
 /// invalid_request)`. The third element is `Some(InvalidRequest)` when the
-/// assertion *name* is unknown — that must surface as `invalid_request`, not
+/// assertion *name* is unknown (the `Known::Other` case) or a required
+/// parameter is missing — that must surface as `invalid_request`, not
 /// `assertion_failed`, so Hermes does not mistake a typo for a UI failure
 /// (spec section 37).
 pub fn run_assertion(
     p: &crate::mcp::params::TuiAssertParams,
     screen: &ScreenState,
 ) -> (bool, String, Option<ErrorCategory>) {
+    use crate::mcp::params::AssertAssertion as A;
     let joined = screen.viewport_text.join("\n");
-    match p.assertion.as_str() {
-        "text" => match &p.text {
+    let Some(a) = p.assertion.known() else {
+        return (
+            false,
+            format!(
+                "unknown assertion '{}' (expected one of: {})",
+                p.assertion_name(),
+                <crate::mcp::params::AssertAssertion as crate::mcp::params::EnumVariants>::VARIANTS
+                    .join(", ")
+            ),
+            Some(ErrorCategory::InvalidRequest),
+        );
+    };
+    match a {
+        A::Text => match &p.text {
             Some(t) => (
                 joined.contains(t.as_str()),
                 format!("expected text '{}'", t),
@@ -175,7 +241,7 @@ pub fn run_assertion(
                 Some(ErrorCategory::InvalidRequest),
             ),
         },
-        "text_absent" => match &p.text {
+        A::TextAbsent => match &p.text {
             Some(t) => (
                 !joined.contains(t.as_str()),
                 format!("expected absence of '{}'", t),
@@ -187,7 +253,7 @@ pub fn run_assertion(
                 Some(ErrorCategory::InvalidRequest),
             ),
         },
-        "focus" => match &p.subject {
+        A::Focus => match &p.subject {
             Some(s) => {
                 let sem = crate::semantic::analyze(screen);
                 let ok = sem.focus.control.as_deref() == Some(s.as_str());
@@ -203,7 +269,7 @@ pub fn run_assertion(
                 Some(ErrorCategory::InvalidRequest),
             ),
         },
-        "dimensions" => {
+        A::Dimensions => {
             let c = p.cols.unwrap_or(screen.cols);
             let r = p.rows.unwrap_or(screen.rows);
             let ok = screen.cols == c && screen.rows == r;
@@ -213,7 +279,7 @@ pub fn run_assertion(
                 None,
             )
         }
-        "exit_code" => {
+        A::ExitCode => {
             if screen.process.running {
                 (
                     false,
@@ -238,7 +304,7 @@ pub fn run_assertion(
                 }
             }
         }
-        "not_clipped" => {
+        A::NotClipped => {
             // heuristic: no region extends beyond terminal bounds (spec 17)
             let sem = crate::semantic::analyze(screen);
             let clipped = sem.regions.iter().any(|rg| {
@@ -255,7 +321,7 @@ pub fn run_assertion(
                 None,
             )
         }
-        "position" => {
+        A::Position => {
             // Assert that text appears at a specific row/column.
             match (&p.text, p.x, p.y) {
                 (Some(t), Some(x), Some(y)) => {
@@ -283,7 +349,7 @@ pub fn run_assertion(
                 ),
             }
         }
-        "region" => {
+        A::Region => {
             // Assert that a region with the given title exists.
             match &p.subject {
                 Some(title) => {
@@ -309,7 +375,7 @@ pub fn run_assertion(
                 ),
             }
         }
-        "snapshot" => {
+        A::Snapshot => {
             // Assert that the current structure_hash matches a reference.
             match &p.reference {
                 Some(expected_hash) => {
@@ -334,7 +400,7 @@ pub fn run_assertion(
                 ),
             }
         }
-        "structure" => {
+        A::Structure => {
             // Assert that the structure hash matches a reference (alias of snapshot).
             match &p.reference {
                 Some(expected_hash) => {
@@ -359,7 +425,7 @@ pub fn run_assertion(
                 ),
             }
         }
-        "control_exists" => {
+        A::ControlExists => {
             // Assert that a control with the given label exists (case-insensitive).
             match &p.subject {
                 Some(s) => {
@@ -391,7 +457,7 @@ pub fn run_assertion(
                 ),
             }
         }
-        "focused_not" => {
+        A::FocusedNot => {
             // Assert that focus is NOT on the named control (case-insensitive).
             match &p.subject {
                 Some(s) => {
@@ -418,9 +484,12 @@ pub fn run_assertion(
                 ),
             }
         }
-        other => (
+        // `oracle` is evaluated at the MCP layer against the shared Wave E
+        // language; if it lands here the dispatch drifted — say so honestly
+        // as invalid_request rather than guessing.
+        A::Oracle => (
             false,
-            format!("unknown assertion '{}'", other),
+            "assertion 'oracle' must be evaluated with a live session context; this path should not have been reached".into(),
             Some(ErrorCategory::InvalidRequest),
         ),
     }
