@@ -141,7 +141,7 @@ fn guided_candidates_cite_evidence_and_respect_risk() {
     // contract: CandidateContext gates what comes out.
     let screen = tui_lab::screen::ScreenState::new(80, 24);
     let sem = tui_lab::semantic::analyze(&screen);
-    let mut graph = tui_lab::exploration::state_graph::StateGraph::new(ExplorationBudget::default());
+    let graph = tui_lab::exploration::state_graph::StateGraph::new(ExplorationBudget::default());
     let current = tui_lab::exploration::state_graph::StateIdentity::with_semantic(&screen, &sem).id();
 
     let ctx = tui_lab::exploration::candidates::CandidateContext {

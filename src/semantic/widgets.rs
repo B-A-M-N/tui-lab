@@ -1335,10 +1335,7 @@ mod tests {
 
     #[test]
     fn split_pane_vertical_divider() {
-        let mut rows = Vec::new();
-        for _ in 0..6 {
-            rows.push("left   │   right");
-        }
+        let rows = vec!["left   │   right"; 6];
         let s = screen(rows, 15);
         let ws = detect_splits(&s);
         assert!(

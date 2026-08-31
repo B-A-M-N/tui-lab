@@ -55,6 +55,22 @@ pub fn run(
     max_actions: u32,
     max_risk: ActionRisk,
 ) -> anyhow::Result<SemanticExploreReport> {
+    run_with_contract(session, graph, focus_graph, budget, max_actions, max_risk, None)
+}
+
+/// Contract-armed variant (Wave E item 49): the loaded project contract
+/// feeds the candidate context, so declared-but-unexercised keys join the
+/// exploration queue with `contract` evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_contract(
+    session: &mut Session,
+    graph: &mut StateGraph,
+    focus_graph: &mut crate::semantic::focus_graph::FocusGraph,
+    budget: &ExplorationBudget,
+    max_actions: u32,
+    max_risk: ActionRisk,
+    contract: Option<&crate::design::ProjectContract>,
+) -> anyhow::Result<SemanticExploreReport> {
     let started = std::time::Instant::now();
     let mut steps: Vec<SemanticStep> = Vec::new();
     let mut identities: Vec<StateIdentity> = Vec::new();
@@ -92,7 +108,7 @@ pub fn run(
             current: current.clone(),
             action_history: &history,
             coverage: &coverage,
-            contract: None,
+            contract,
             allowed_risk: max_risk,
         };
         let candidates = crate::exploration::candidates::suggest(&screen, &sem, &ctx);

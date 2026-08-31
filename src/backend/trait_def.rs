@@ -85,6 +85,16 @@ pub trait TerminalBackend: Send {
     /// detaches. The default ignores it (backends without a byte boundary).
     fn set_recording_hook(&mut self, _hook: super::RecordingHookSlot) {}
 
+    /// Item 48: install the normalization policy used when computing
+    /// structure hashes. A contract's `volatile_patterns` are merged on top
+    /// of the built-in conservative classes. The default ignores it (the
+    /// built-in default stays in effect).
+    fn set_normalization_policy(
+        &mut self,
+        _policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
+    ) {
+    }
+
     /// Current snapshot (alias for `state`, kept for API clarity).
     fn snapshot(&mut self) -> BackendResult<ScreenState> {
         self.state()

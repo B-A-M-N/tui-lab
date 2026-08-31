@@ -35,6 +35,7 @@ uuid = "1"        # collision-resistant session ids (spec section 12)
 libc = "0.2"      # Unix process-group signal delivery (spec section 7)
 toml = "0.8"      # parse Cargo.toml manifests properly (spec section 64)
 clap = { version = "4", features = ["derive"] }  # CLI subcommands (spec section 77)
+serde_yaml = "0.9"
 
 # Optional framework probes invoke project-local tooling; not runtime deps.
 

@@ -260,7 +260,7 @@ mod tests {
             failure_type: None,
         };
 
-        let mut minimizer = ReproMinimizer::new(test_fn);
+        let minimizer = ReproMinimizer::new(test_fn);
         let actions = vec![
             ReproAction {
                 index: 0,

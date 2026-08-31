@@ -9,4 +9,5 @@ pub mod state;
 pub use cell::{Cell, Color, CursorState, ProcessState, ScreenState};
 pub use cell_string::{display_width, CellString};
 pub use diff::{diff, Transition};
-pub use state::from_vt;
+pub use normalize::{NormalizationPolicy, VolatileClass};
+pub use state::{from_vt, from_vt_with_policy};

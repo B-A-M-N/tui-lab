@@ -1,0 +1,54 @@
+# Wave E example contract: the modal-dialog fixture (fixtures/modal_tui.py).
+# Loads with: tui_contract action=load path=fixtures/modal_contract.yaml
+# Checked with: tui_contract action=status  /  tui_audit profile=contract
+schema:
+  name: modal-fixture
+  version: "1"
+
+launch:
+  command: python3
+  args: ["fixtures/modal_tui.py"]
+
+viewports:
+  - cols: 60
+    rows: 20
+  - cols: 80
+    rows: 24
+
+# The fixture's clock-free screen needs no extra volatile patterns; the
+# built-in conservative classes still apply (item 48).
+volatile_patterns: []
+
+# Behavioral properties — proven by driving the app, never assumed.
+escape_closes_modal: true
+reverse_tab_required: true
+
+components:
+  - name: connections-panel
+    role: panel
+    required: true
+    expect:
+      - "text_present(\"Connections\")"
+      - "text_present(\"n new\")"
+
+interactions:
+  - name: open-confirm-modal
+    keys: ["n"]
+    context: from the main list; the nested Confirm dialog must appear
+    expect:
+      - "modal_open()"
+      - "text_present(\"Add connection?\")"
+  - name: escape-dismisses-modal
+    keys: ["escape"]
+    context: modal must close on Escape (also proven behaviorally)
+    expect:
+      - "modal_open(false)"
+
+layout:
+  - name: narrow-survival
+    min_cols: 50
+    min_rows: 10
+
+oracles:
+  - id: quit-hint-visible
+    expr: "text_present(\"q quit\")"

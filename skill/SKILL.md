@@ -53,17 +53,29 @@ attributes, cursor, title), not screenshots.
    the transition. Use `tui_explore mode=guided_candidates` to get ranked
    next actions (Hermes reasons; the tool does NOT embed another LLM).
 5. `tui_audit profile=full` (or a specific profile: keyboard/focus/layout/
-   resize/navigation/discoverability/color/density) — returns evidence-backed
-   findings with IDs, severities, and reproduction scenarios.
+   resize/navigation/contract/discoverability/color/density) — returns
+   evidence-backed findings with IDs, severities, and reproduction scenarios.
 6. Edit the TUI source to fix findings.
 7. Rebuild, then `tui_scenario action=run` the exact failing scenario(s) to
    confirm the fix. `tui_audit` again and compare: FIXED / NEW / UNCHANGED.
 8. `tui_audit profile=resize` runs the default viewport matrix (60×20, 80×24,
    100×30, 120×40, 160×50) and flags clipping / unreachable controls.
-9. Run broader `tui_explore mode=random seed=...` (deterministic) and
+9. Contract-driven development: author a YAML contract describing what the
+   TUI is SUPPOSED to be (`tui_contract action=load path=app.contract.yaml`),
+   then `tui_contract action=status` for PASS/FAIL/WARN per check —
+   components present, interactions producing their declared oracles, layout
+   surviving declared viewports, Escape-closes-modal and Shift+Tab-reverses-
+   Tab proven by driving the app. `tui_contract action=compare` after a fix
+   names every regression and every fix. Oracle expressions
+   (`modal_open()`, `focused("#button/save")`, `no_clipping()`,
+   `escape_closes_modal()`, …) are shared by contracts, `tui_assert
+   assertion=oracle`, and scenario replay steps. Loading a contract also
+   installs its `volatile_patterns` into the structure-hash normalization
+   policy and feeds declared-but-unexercised keys into `tui_explore`.
+10. Run broader `tui_explore mode=random seed=...` (deterministic) and
    `tui_coverage` if available. Stop when acceptance gates pass.
 
-## Tools (12)
+## Tools (13)
 
 - `tui_session` — start / restart / stop / list / status.
 - `tui_observe` — summary | screen | cells | region | semantic | tree |
@@ -74,16 +86,23 @@ attributes, cursor, title), not screenshots.
   process_exit / title / bell / command_complete.
 - `tui_assert` — text / text_absent / position / region / foreground /
   background / style / cursor / focus / dimensions / snapshot / structure /
-  exit_code / title / not_clipped / inside / above / below / left_of /
-  right_of / aligned.
+  exit_code / title / not_clipped / oracle (declarative expression shared
+  with contracts, e.g. `text: "modal_open()"`).
 - `tui_checkpoint` — save / compare / list / delete (screen + semantic + focus
   + process + coverage state).
 - `tui_scenario` — start_recording / stop_recording / save / load / run /
-  compare / export (turns workflows into deterministic regression tests).
+  compare / export (turns workflows into deterministic regression tests;
+  oracle assert steps replay through the contract oracle language).
 - `tui_record` — cast / svg_sequence / apng / gif / mp4.
-- `tui_explore` — random / guided_candidates / coverage_guided / replay.
+- `tui_explore` — random / guided_candidates / semantic / state_graph
+  (a loaded contract feeds declared-but-unexercised keys as candidates).
 - `tui_audit` — keyboard | focus | layout | resize | navigation |
-  discoverability | states | errors | mouse | color | performance | full.
+  discoverability | contract | states | errors | mouse | color | performance
+  | full.
+- `tui_contract` — load / validate / status / compare: YAML design contracts
+  (viewports, components, interactions, layout, oracles) checked against the
+  running app; PASS/FAIL/WARN per check; compare names regressions and fixes.
+  Loading also installs `volatile_patterns` into the normalization policy.
 - `tui_coverage` — detect / start / collect / summary / delta / uncovered /
   stop (backed by optional `tuicov` executable; reports "unavailable" if absent).
 - `tui_framework` — detect / capabilities / inspect_native / generate_tests /
