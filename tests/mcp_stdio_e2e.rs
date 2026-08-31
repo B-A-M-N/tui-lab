@@ -37,9 +37,9 @@ impl McpProc {
             .spawn()
             .expect("spawn hermes-tui-lab mcp");
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = Arc::new(Mutex::new(SharedStdout(
-            BufReader::new(child.stdout.take().expect("stdout")),
-        )));
+        let stdout = Arc::new(Mutex::new(SharedStdout(BufReader::new(
+            child.stdout.take().expect("stdout"),
+        ))));
         McpProc {
             child,
             stdin,
@@ -68,10 +68,7 @@ impl McpProc {
         // test fails with a message instead of blocking the harness forever.
         let mut watchdog = Watchdog::start(Some(self.child.id()), deadline);
         loop {
-            assert!(
-                Instant::now() < deadline,
-                "timeout waiting for {method}"
-            );
+            assert!(Instant::now() < deadline, "timeout waiting for {method}");
             let mut line = String::new();
             let n = {
                 let mut out = self.stdout.lock().expect("stdout lock");
@@ -130,7 +127,9 @@ impl Watchdog {
                 std::thread::sleep(Duration::from_millis(100));
             }
             if !*flag.lock().unwrap() {
-                eprintln!("[e2e watchdog] no response before deadline; killing server {child_pid:?}");
+                eprintln!(
+                    "[e2e watchdog] no response before deadline; killing server {child_pid:?}"
+                );
                 if let Some(pid) = child_pid {
                     // SIGKILL the process group: the child PTY apps die too,
                     // so no stray python3 survives the failed test.
@@ -266,9 +265,7 @@ fn stdio_e2e_full_lifecycle() {
     );
     assert!(
         obs_nodes["data"]["tree"]["root"]["children"].is_array()
-            || obs_nodes["data"]["tree"]["root"]
-                .get("children")
-                .is_none(),
+            || obs_nodes["data"]["tree"]["root"].get("children").is_none(),
         // A blank screen legitimately yields no children (the field is
         // skip_serializing_if empty) — the shape contract is the root node
         // itself plus layer tags.
@@ -968,7 +965,6 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(stop["category"], "success", "stop failed: {stop}");
 }
 
-
 /// Wave G item 72: MCP resources over the real stdio transport —
 /// resources/templates list, live semantic + screen reads against a real
 /// python3 child, and honest resource_not_found for unknown ids.
@@ -983,7 +979,10 @@ fn resources_list_and_read_live_state() {
             "clientInfo": { "name": "tui-lab-e2e", "version": "0" },
         }),
     );
-    assert!(init["result"]["serverInfo"]["name"].is_string(), "init: {init}");
+    assert!(
+        init["result"]["serverInfo"]["name"].is_string(),
+        "init: {init}"
+    );
     mcp.notify("notifications/initialized");
 
     // A live session so the session resources resolve.
@@ -1035,10 +1034,7 @@ fn resources_list_and_read_live_state() {
         "resources/read",
         serde_json::json!({ "uri": format!("tui://sessions/{sid}/semantic") }),
     );
-    assert!(
-        sem["result"]["contents"].is_array(),
-        "semantic read: {sem}"
-    );
+    assert!(sem["result"]["contents"].is_array(), "semantic read: {sem}");
     let text = sem["result"]["contents"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("controls"), "semantic payload: {text}");
     assert!(
@@ -1054,7 +1050,9 @@ fn resources_list_and_read_live_state() {
         "resources/read",
         serde_json::json!({ "uri": format!("tui://sessions/{sid}/screen") }),
     );
-    let stext = screen["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    let stext = screen["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or("");
     assert!(stext.contains("res-ready"), "screen payload: {stext}");
 
     // read the run manifest: id matches the session-start echo.
@@ -1088,7 +1086,10 @@ fn resources_list_and_read_live_state() {
     );
     assert_eq!(bad2["error"]["code"], -32002, "bogus scheme: {bad2}");
 
-    mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": sid }));
+    mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": sid }),
+    );
 }
 
 /// Watchdog proof (harness hardening): a server that never responds must

@@ -54,10 +54,7 @@ fn line_cli_output_becomes_lines_with_scrollback() {
          \x20   time.sleep(0.02)\n\
          time.sleep(1)",
     );
-    let _ = b.wait(
-        WaitCond::Text("line-29".into()),
-        Duration::from_secs(10),
-    );
+    let _ = b.wait(WaitCond::Text("line-29".into()), Duration::from_secs(10));
     let st = b.state().expect("state");
     // 24-row viewport: line-6..line-29 visible; earlier lines scrollback.
     assert!(
@@ -129,7 +126,10 @@ fn kitty_flags_are_detected_and_super_unlocks() {
     );
     let _ = b.wait(WaitCond::Text("KITTY-ON".into()), Duration::from_secs(5));
     let caps: Capabilities = b.capabilities();
-    assert!(caps.kitty_keyboard, "kitty push must promote the capability");
+    assert!(
+        caps.kitty_keyboard,
+        "kitty push must promote the capability"
+    );
     // SUPER+q, rejected in legacy mode, encodes as CSI-u when active.
     let modes = b.input_modes();
     assert!(modes.kitty_flags > 0, "flags visible in input modes");
@@ -212,7 +212,10 @@ fn terminal_answers_dsr_cursor_position_query() {
          time.sleep(2)",
     );
     let out = b
-        .wait(WaitCond::Text("GOT-RESPONSE".into()), Duration::from_secs(8))
+        .wait(
+            WaitCond::Text("GOT-RESPONSE".into()),
+            Duration::from_secs(8),
+        )
         .expect("wait");
     assert!(
         out.met,
@@ -236,7 +239,10 @@ fn terminal_answers_da1_query() {
          time.sleep(2)",
     );
     let out = b
-        .wait(WaitCond::Text("DA1-ANSWERED".into()), Duration::from_secs(8))
+        .wait(
+            WaitCond::Text("DA1-ANSWERED".into()),
+            Duration::from_secs(8),
+        )
         .expect("wait");
     assert!(out.met, "DA1 answered");
     b.stop().ok();
@@ -284,7 +290,9 @@ fn native_channel_parses_app_frames() {
     assert_eq!(root.children[0].focused, Some(true));
     std::fs::remove_file(&path).ok();
     // The parse fn is also public contract.
-    assert!(parse_frame("{\"v\":1,\"type\":\"event\",\"event\":\"focus\",\"target\":\"#x\"}").is_ok());
+    assert!(
+        parse_frame("{\"v\":1,\"type\":\"event\",\"event\":\"focus\",\"target\":\"#x\"}").is_ok()
+    );
 }
 
 #[test]
@@ -308,11 +316,7 @@ fn session_injects_env_and_overlays_native_tree() {
     sess.start_with_spec(spec).expect("start");
     // The env var must have been injected into the channel (and NOT stored
     // in the launch spec — the injection is per-generation, transparent).
-    let path = sess
-        .native_channel()
-        .path
-        .clone()
-        .expect("channel created");
+    let path = sess.native_channel().path.clone().expect("channel created");
     assert!(path.exists(), "channel file exists");
 
     // Drive focus to the second button and give the app a moment to
@@ -335,7 +339,10 @@ fn session_injects_env_and_overlays_native_tree() {
     let report = sess.overlay_native(&mut tree);
     assert!(report.active(), "overlay engaged");
     assert!(
-        report.matched.iter().any(|id| id == "#save" || id == "#cancel"),
+        report
+            .matched
+            .iter()
+            .any(|id| id == "#save" || id == "#cancel"),
         "native ids matched into the tree: {:?}",
         report.matched
     );

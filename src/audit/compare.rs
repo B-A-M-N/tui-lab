@@ -46,8 +46,7 @@ pub struct ComparedFinding {
 /// - present in both → PERSISTING (carried so the caller sees the full set;
 ///   severity changes are surfaced in the summary)
 pub fn compare(baseline: &[Finding], current: &[Finding]) -> Vec<ComparedFinding> {
-    let base_keys: std::collections::HashSet<String> =
-        baseline.iter().map(fingerprint).collect();
+    let base_keys: std::collections::HashSet<String> = baseline.iter().map(fingerprint).collect();
     let cur_keys: std::collections::HashSet<String> = current.iter().map(fingerprint).collect();
 
     let mut out = Vec::new();
@@ -58,10 +57,7 @@ pub fn compare(baseline: &[Finding], current: &[Finding]) -> Vec<ComparedFinding
         } else {
             "new"
         };
-        let baseline_f = baseline
-            .iter()
-            .find(|b| fingerprint(b) == fp)
-            .cloned();
+        let baseline_f = baseline.iter().find(|b| fingerprint(b) == fp).cloned();
         out.push(ComparedFinding {
             fingerprint: fp,
             verdict,
@@ -153,7 +149,15 @@ mod tests {
             .iter()
             .filter(|c| c.verdict == "persisting")
             .count();
-        assert_eq!(news, 1, "region-b is new: {:?}", compared.iter().map(|c| (c.verdict, &c.fingerprint)).collect::<Vec<_>>());
+        assert_eq!(
+            news,
+            1,
+            "region-b is new: {:?}",
+            compared
+                .iter()
+                .map(|c| (c.verdict, &c.fingerprint))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(persisting, 1, "region-a persists");
     }
 

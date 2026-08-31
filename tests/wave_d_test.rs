@@ -66,7 +66,8 @@ fn crash_minimization_produces_replayable_reproduction() {
     // action — and the pipeline must have confirmed it reproduces.
     assert!(pipeline.reproduced, "pipeline: {:?}", pipeline);
     assert_eq!(
-        pipeline.minimized_len, 1,
+        pipeline.minimized_len,
+        1,
         "one key kills the crasher: {}",
         pipeline.steps.join(",")
     );
@@ -101,10 +102,7 @@ fn navigation_audit_proves_traversal() {
     let mut mgr = tui_lab::session::SessionManager::new();
     let id = start(
         &mut mgr,
-        &[
-            "-c".into(),
-            "print('nav audit'); input()".to_string(),
-        ],
+        &["-c".into(), "print('nav audit'); input()".to_string()],
     );
     let sess = mgr.resolve_mut(Some(&id)).expect("session");
     let mut graph = tui_lab::semantic::focus_graph::FocusGraph::new();
@@ -115,12 +113,14 @@ fn navigation_audit_proves_traversal() {
         "navigation audit must produce findings"
     );
     assert!(
-        findings.iter().all(|f| matches!(
-            f.category.as_str(),
-            "keyboard" | "navigation"
-        )),
+        findings
+            .iter()
+            .all(|f| matches!(f.category.as_str(), "keyboard" | "navigation")),
         "categories: {:?}",
-        findings.iter().map(|f| f.category.clone()).collect::<Vec<_>>()
+        findings
+            .iter()
+            .map(|f| f.category.clone())
+            .collect::<Vec<_>>()
     );
     // The audit drives Tab; with no focusable controls on a plain echo
     // screen the honest result is the no-traversal warning.
@@ -142,7 +142,8 @@ fn guided_candidates_cite_evidence_and_respect_risk() {
     let screen = tui_lab::screen::ScreenState::new(80, 24);
     let sem = tui_lab::semantic::analyze(&screen);
     let graph = tui_lab::exploration::state_graph::StateGraph::new(ExplorationBudget::default());
-    let current = tui_lab::exploration::state_graph::StateIdentity::with_semantic(&screen, &sem).id();
+    let current =
+        tui_lab::exploration::state_graph::StateIdentity::with_semantic(&screen, &sem).id();
 
     let ctx = tui_lab::exploration::candidates::CandidateContext {
         state_graph: &graph,
@@ -154,9 +155,12 @@ fn guided_candidates_cite_evidence_and_respect_risk() {
     };
     let out = tui_lab::exploration::candidates::suggest(&screen, &sem, &ctx);
     assert!(
-        out.iter().all(|c| c.risk <= tui_lab::intent::ActionRisk::Safe),
+        out.iter()
+            .all(|c| c.risk <= tui_lab::intent::ActionRisk::Safe),
         "safe gate must hold: {:?}",
-        out.iter().map(|c| (c.action.to_string(), c.risk)).collect::<Vec<_>>()
+        out.iter()
+            .map(|c| (c.action.to_string(), c.risk))
+            .collect::<Vec<_>>()
     );
     assert!(
         out.iter().all(|c| !c.reasons.is_empty()),

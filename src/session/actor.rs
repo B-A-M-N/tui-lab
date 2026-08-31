@@ -68,7 +68,10 @@ impl SessionActor {
         let id = session.id.clone();
         let (tx, rx) = mpsc::sync_channel::<Mail>(64);
         let join = std::thread::Builder::new()
-            .name(format!("tui-lab-sess-{}", &id[id.len().saturating_sub(8)..]))
+            .name(format!(
+                "tui-lab-sess-{}",
+                &id[id.len().saturating_sub(8)..]
+            ))
             .spawn(move || {
                 let mut session = session;
                 for mail in rx {
@@ -109,7 +112,8 @@ impl SessionActor {
         self.tx
             .send(Mail::Job(job))
             .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
-        rrx.await.map_err(|_| ActorError::ActorDropped(self.id.clone()))
+        rrx.await
+            .map_err(|_| ActorError::ActorDropped(self.id.clone()))
     }
 
     /// Try to send without awaiting (used on the actor thread itself and by
@@ -214,11 +218,7 @@ impl SessionPool {
     }
 
     /// Run a closure against a session (explicit id or the active one).
-    pub async fn with_session<R, F>(
-        &self,
-        id: Option<&str>,
-        job: F,
-    ) -> Result<R, ActorError>
+    pub async fn with_session<R, F>(&self, id: Option<&str>, job: F) -> Result<R, ActorError>
     where
         R: Send + 'static,
         F: FnOnce(&mut Session) -> R + Send + 'static,
@@ -347,11 +347,29 @@ mod tests {
     async fn sessions_do_not_block_each_other() {
         let pool = std::sync::Arc::new(SessionPool::new());
         let a = pool
-            .start("python3", &["-c".into(), "print('A'); input()".into()], None, &[], 80, 24, "auto", "local")
+            .start(
+                "python3",
+                &["-c".into(), "print('A'); input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
             .await
             .expect("start A");
         let b = pool
-            .start("python3", &["-c".into(), "print('B'); input()".into()], None, &[], 80, 24, "auto", "local")
+            .start(
+                "python3",
+                &["-c".into(), "print('B'); input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
             .await
             .expect("start B");
 
@@ -388,7 +406,16 @@ mod tests {
     async fn start_observe_stop_roundtrip() {
         let pool = SessionPool::new();
         let id = pool
-            .start("python3", &["-c".into(), "print('actor-ok'); input()".into()], None, &[], 80, 24, "auto", "local")
+            .start(
+                "python3",
+                &["-c".into(), "print('actor-ok'); input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
             .await
             .expect("start");
         let text = pool

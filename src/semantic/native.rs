@@ -119,8 +119,7 @@ pub struct NativeFrame {
 
 /// Parse+validate one NDJSON line.
 pub fn parse_frame(line: &str) -> Result<NativeFrame, String> {
-    let f: NativeFrame = serde_json::from_str(line)
-        .map_err(|e| format!("invalid frame: {e}"))?;
+    let f: NativeFrame = serde_json::from_str(line).map_err(|e| format!("invalid frame: {e}"))?;
     if f.v > PROTOCOL_VERSION {
         return Err(format!(
             "frame version {} newer than supported {}",
@@ -207,7 +206,9 @@ impl NativeChannel {
             }
             self.reader = Some(BufReader::new(f));
         }
-        let Some(reader) = self.reader.as_mut() else { return };
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
         loop {
             let mut line = String::new();
             let before_read = self.consumed_to;
@@ -292,12 +293,11 @@ impl NativeChannel {
             if let Some(n) = resolved {
                 // Enable provenance: app-declared enabled is native evidence.
                 if let Some(enabled) = node.enabled {
-                    n.state.enabled =
-                        crate::semantic::node::EnabledState {
-                            value: enabled,
-                            source: "native".to_string(),
-                            confidence: 1.0,
-                        };
+                    n.state.enabled = crate::semantic::node::EnabledState {
+                        value: enabled,
+                        source: "native".to_string(),
+                        confidence: 1.0,
+                    };
                 }
                 if let Some(label) = &node.label {
                     if n.label.is_none() {
@@ -422,7 +422,9 @@ fn find_by_suffix_key<'a>(
     if last == want {
         return Some(node);
     }
-    node.children.iter().find_map(|c| find_by_suffix_key(c, want))
+    node.children
+        .iter()
+        .find_map(|c| find_by_suffix_key(c, want))
 }
 
 fn find_by_suffix<'a>(
@@ -601,7 +603,14 @@ mod tests {
         assert_eq!(ch.frames_accepted, 0, "partial line must not parse");
         assert_eq!(ch.frames_invalid, 0);
         // Complete it.
-        std::fs::write(&path, format!("{}\n", r##"{"v":1,"type":"snapshot","root":{"id":"#r","role":"screen"}}"##)).expect("write full");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                r##"{"v":1,"type":"snapshot","root":{"id":"#r","role":"screen"}}"##
+            ),
+        )
+        .expect("write full");
         ch.poll();
         assert_eq!(ch.frames_accepted, 1);
         std::fs::remove_file(&path).ok();

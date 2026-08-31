@@ -25,9 +25,7 @@
 //! app bug.
 
 use super::oracle::{self, ActiveArgs, OracleOutcome};
-use super::schema::{
-    ComponentContract, InteractionContract, LayoutConstraint, ProjectContract,
-};
+use super::schema::{ComponentContract, InteractionContract, LayoutConstraint, ProjectContract};
 use crate::audit::{EvidenceKind, EvidenceRef, Finding};
 use crate::execution::{execute_act, CanonicalAction};
 use crate::semantic::{self, node::Role};
@@ -198,7 +196,10 @@ pub struct ObservedBehavior {
 }
 
 /// Run the full conformance check against a live session.
-pub fn check_contract(session: &mut Session, contract: &ProjectContract) -> anyhow::Result<ContractReport> {
+pub fn check_contract(
+    session: &mut Session,
+    contract: &ProjectContract,
+) -> anyhow::Result<ContractReport> {
     let mut results = Vec::new();
     let mut driven = 0u32;
 
@@ -395,9 +396,10 @@ fn check_one_component(
     });
 
     // 2) Region kinds (dialog / panel / toolbar / footer / list …).
-    let region_hit = sem.regions.iter().any(|r| {
-        format!("{:?}", r.kind).to_lowercase() == want
-    });
+    let region_hit = sem
+        .regions
+        .iter()
+        .any(|r| format!("{:?}", r.kind).to_lowercase() == want);
 
     // 3) Semantic node roles (menu, command_palette, …) — anywhere in the tree.
     let node_hit = role_matches(want, &tree.root);
@@ -624,8 +626,12 @@ fn check_layout(session: &mut Session, contract: &ProjectContract) -> Vec<CheckR
         let name = lc.name.clone().unwrap_or_else(|| {
             format!(
                 "layout {}x{}",
-                lc.min_cols.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                lc.min_rows.map(|r| r.to_string()).unwrap_or_else(|| "?".into())
+                lc.min_cols
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                lc.min_rows
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "?".into())
             )
         });
         if let (Some(cols), Some(rows)) = (lc.min_cols, lc.min_rows) {
@@ -649,7 +655,11 @@ fn check_layout(session: &mut Session, contract: &ProjectContract) -> Vec<CheckR
 
 fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> CheckResult {
     if let Err(e) = session.resize(cols, rows) {
-        return CheckResult::fail("layout", name, format!("resize to {cols}x{rows} failed: {e}"));
+        return CheckResult::fail(
+            "layout",
+            name,
+            format!("resize to {cols}x{rows} failed: {e}"),
+        );
     }
     let _ = session.wait(
         crate::backend::WaitCond::ScreenStable {
@@ -676,7 +686,11 @@ fn check_clipping_here(session: &mut Session, name: String, lc: &LayoutConstrain
         Err(e) => return CheckResult::fail("layout", name, format!("observe failed: {e}")),
     };
     if !lc.no_clipping {
-        return CheckResult::pass("layout", name, "clipping not required to be checked".to_string());
+        return CheckResult::pass(
+            "layout",
+            name,
+            "clipping not required to be checked".to_string(),
+        );
     }
     let sem = semantic::analyze(&screen);
     let clipped: Vec<String> = sem
@@ -700,7 +714,9 @@ fn check_clipping_here(session: &mut Session, name: String, lc: &LayoutConstrain
             name,
             format!(
                 "no clipping at {}x{} ({} regions)",
-                screen.cols, screen.rows, sem.regions.len()
+                screen.cols,
+                screen.rows,
+                sem.regions.len()
             ),
         )
     } else {
@@ -778,7 +794,10 @@ fn check_behavior(
                 ));
             }
             // Only escape-check when a modal is actually up now.
-            let modal_now = session.observe(50).map(|s| modal_present(&s)).unwrap_or(false);
+            let modal_now = session
+                .observe(50)
+                .map(|s| modal_present(&s))
+                .unwrap_or(false);
             if modal_now {
                 let closed_ok = drive_escape_check(session);
                 observed.escape_closes_modal = Some(closed_ok);
@@ -938,7 +957,9 @@ fn check_behavior(
 
 fn modal_present(screen: &crate::screen::ScreenState) -> bool {
     let tree = crate::semantic::build_tree(screen);
-    !tree.layer_nodes(crate::semantic::node::Layer::Modal).is_empty()
+    !tree
+        .layer_nodes(crate::semantic::node::Layer::Modal)
+        .is_empty()
 }
 
 /// Send Escape and report whether the modal layer is gone afterwards.

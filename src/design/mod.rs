@@ -19,8 +19,8 @@ pub use conformance::{
 };
 pub use loader::{default_contract, load_design_contract, parse_json, parse_yaml, to_yaml};
 pub use oracle::{
-    eval_active, eval_static, is_static, parse as parse_oracle, ActiveArgs, KNOWN_PREDICATES,
-    Oracle, OracleArg, OracleError, OracleOutcome,
+    eval_active, eval_static, is_static, parse as parse_oracle, ActiveArgs, Oracle, OracleArg,
+    OracleError, OracleOutcome, KNOWN_PREDICATES,
 };
 pub use rules::ContractRules;
 pub use schema::{

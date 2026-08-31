@@ -155,10 +155,7 @@ impl CellString {
                 continuation,
             });
         }
-        CellString {
-            slots,
-            cols,
-        }
+        CellString { slots, cols }
     }
 
     /// Slots in column order (dense: every column is covered).

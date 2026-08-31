@@ -14,7 +14,7 @@
 //! The MCP layer calls [`run_profile`] and reports the returned mode; it no
 //! longer interprets profile names.
 
-use crate::audit::{Finding, EvidenceKind, EvidenceRef};
+use crate::audit::{EvidenceKind, EvidenceRef, Finding};
 use crate::semantic;
 use crate::session::state::Session;
 use serde_json::json;
@@ -54,7 +54,8 @@ pub enum AuditProfile {
 impl AuditProfile {
     /// Parse a profile name. Unknown names are an error — the engine does
     /// not silently degrade a typo into a weaker audit.
-    pub fn parse(name: &str) -> Result<Self, String> {        match name {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
             "full" => Ok(AuditProfile::Full),
             "keyboard" => Ok(AuditProfile::Keyboard),
             "focus" => Ok(AuditProfile::Focus),
@@ -100,7 +101,10 @@ impl AuditProfile {
     /// Wave G item 66: mouse/performance/states/errors are real drivers now
     /// (they send input / sample latency); color stays frame-level, and
     /// discoverability remains the one static pass.
-    fn is_active(&self) -> bool {
+    /// Public so the MCP layer can apply the same driving/observing split
+    /// for the human control lease (item 76): active profiles refuse under
+    /// a live lease, static ones stay allowed.
+    pub fn is_active(&self) -> bool {
         matches!(
             self,
             AuditProfile::Full
@@ -141,10 +145,7 @@ pub struct ProfileReport {
 /// decides static-vs-active; the caller never interprets profile names.
 /// `contract` feeds `profile=contract` (Wave E item 49); other profiles
 /// ignore it.
-pub fn run_profile(
-    session: &mut Session,
-    profile_name: &str,
-) -> Result<ProfileReport, String> {
+pub fn run_profile(session: &mut Session, profile_name: &str) -> Result<ProfileReport, String> {
     run_profile_with_contract(session, profile_name, None)
 }
 
@@ -229,29 +230,21 @@ pub fn run_profile_with_contract(
             fs.extend(crate::audit::driver::focus_audit(session));
             fs.extend(crate::audit::driver::resize_audit(session));
             fs.extend(crate::audit::driver::clipping_audit(session));
-            fs.extend(crate::audit::driver::navigation_audit(session, 20, &mut graph));
-            fs.extend(tx(session, &|s| {
-                crate::audit::driver::mouse_audit(s, 8)
-            }));
+            fs.extend(crate::audit::driver::navigation_audit(
+                session, 20, &mut graph,
+            ));
+            fs.extend(tx(session, &|s| crate::audit::driver::mouse_audit(s, 8)));
             fs.extend(crate::audit::driver::performance_audit(session, 5));
-            fs.extend(tx(session, &|s| {
-                crate::audit::driver::states_audit(s, 6)
-            }));
-            fs.extend(tx(session, &|s| {
-                crate::audit::driver::errors_audit(s, 12)
-            }));
+            fs.extend(tx(session, &|s| crate::audit::driver::states_audit(s, 6)));
+            fs.extend(tx(session, &|s| crate::audit::driver::errors_audit(s, 12)));
             fs.extend(crate::audit::driver::color_audit(session));
             fs
         }
         AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
         AuditProfile::Focus => crate::audit::driver::focus_audit(session),
-        AuditProfile::Resize | AuditProfile::Layout => {
-            crate::audit::driver::resize_audit(session)
-        }
+        AuditProfile::Resize | AuditProfile::Layout => crate::audit::driver::resize_audit(session),
         AuditProfile::Clipping => crate::audit::driver::clipping_audit(session),
-        AuditProfile::Navigation => {
-            crate::audit::driver::navigation_audit(session, 20, &mut graph)
-        }
+        AuditProfile::Navigation => crate::audit::driver::navigation_audit(session, 20, &mut graph),
         AuditProfile::Mouse => tx(session, &|s| crate::audit::driver::mouse_audit(s, 12)),
         AuditProfile::Performance => crate::audit::driver::performance_audit(session, 7),
         AuditProfile::States => tx(session, &|s| crate::audit::driver::states_audit(s, 10)),
@@ -364,9 +357,16 @@ mod tests {
         assert_eq!(report.mode, "composite");
         // A plain python echo screen has little to audit, but the composite
         // must include the static passes AND have attempted the drivers.
-        let cats: Vec<&str> = report.findings.iter().map(|f| f.category.as_str()).collect();
+        let cats: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.category.as_str())
+            .collect();
         assert!(
-            cats.iter().any(|c| matches!(*c, "focus" | "layout" | "clipping" | "discoverability" | "keyboard")),
+            cats.iter().any(|c| matches!(
+                *c,
+                "focus" | "layout" | "clipping" | "discoverability" | "keyboard"
+            )),
             "static composite categories must be present: {:?}",
             cats
         );

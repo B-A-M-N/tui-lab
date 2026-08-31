@@ -703,12 +703,7 @@ impl CanonicalFrame {
     }
 
     /// Fill in run/session provenance (chainable).
-    pub fn with_provenance(
-        mut self,
-        run_id: &str,
-        session_id: &str,
-        generation: u32,
-    ) -> Self {
+    pub fn with_provenance(mut self, run_id: &str, session_id: &str, generation: u32) -> Self {
         self.run_id = Some(run_id.to_string());
         self.session_id = Some(session_id.to_string());
         self.generation = Some(generation);

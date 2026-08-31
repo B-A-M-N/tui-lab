@@ -303,7 +303,7 @@ mod tests {
                 }],
                 viewport_text: vec!["".to_string(), label.to_string(), "".to_string()],
                 scrollback: Vec::new(),
-            hyperlinks: Vec::new(),
+                hyperlinks: Vec::new(),
                 raw_hash: String::new(),
                 visual_hash: String::new(),
                 structure_hash: String::new(),

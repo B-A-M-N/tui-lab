@@ -86,16 +86,32 @@ pub struct Evidence {
 
 impl Evidence {
     fn graph(claim: impl Into<String>, detail: serde_json::Value) -> Self {
-        Evidence { source: "graph", claim: claim.into(), detail }
+        Evidence {
+            source: "graph",
+            claim: claim.into(),
+            detail,
+        }
     }
     fn contract(claim: impl Into<String>, detail: serde_json::Value) -> Self {
-        Evidence { source: "contract", claim: claim.into(), detail }
+        Evidence {
+            source: "contract",
+            claim: claim.into(),
+            detail,
+        }
     }
     fn affordance(claim: impl Into<String>, detail: serde_json::Value) -> Self {
-        Evidence { source: "affordance", claim: claim.into(), detail }
+        Evidence {
+            source: "affordance",
+            claim: claim.into(),
+            detail,
+        }
     }
     fn coverage(claim: impl Into<String>, detail: serde_json::Value) -> Self {
-        Evidence { source: "coverage", claim: claim.into(), detail }
+        Evidence {
+            source: "coverage",
+            claim: claim.into(),
+            detail,
+        }
     }
 }
 
@@ -110,10 +126,7 @@ pub fn suggest(
     // ── 1) Traversal actions the graph has never seen from this state ──
     for (name, key_json) in [
         ("tab", json!({ "action": "key", "key": "tab" })),
-        (
-            "shift+tab",
-            json!({ "action": "key", "key": "shift+tab" }),
-        ),
+        ("shift+tab", json!({ "action": "key", "key": "shift+tab" })),
         ("down", json!({ "action": "key", "key": "down" })),
         ("up", json!({ "action": "key", "key": "up" })),
         ("enter", json!({ "action": "key", "key": "enter" })),
@@ -129,7 +142,11 @@ pub fn suggest(
                     format!("'{name}' has never been executed from this state"),
                     json!({ "times_taken_from_state": 0, "state": ctx.current.as_str() }),
                 )],
-                risk: if name == "enter" { ActionRisk::Mutating } else { ActionRisk::Safe },
+                risk: if name == "enter" {
+                    ActionRisk::Mutating
+                } else {
+                    ActionRisk::Safe
+                },
                 control_id: None,
             });
         }
@@ -198,7 +215,10 @@ pub fn suggest(
             out.push(Candidate {
                 action: json!({ "action": "key", "key": key }),
                 reasons: vec![Evidence::affordance(
-                    format!("screen labels '{key}' for '{}' and it has not been tried from this state", aff.action),
+                    format!(
+                        "screen labels '{key}' for '{}' and it has not been tried from this state",
+                        aff.action
+                    ),
                     json!({ "hint_text": aff.hint_text, "visibility": aff.visibility }),
                 )],
                 risk: classify_risk(
@@ -221,7 +241,10 @@ pub fn suggest(
             out.push(Candidate {
                 action: json!({ "action": "focus_target", "target": { "by": "id", "id": c.id } }),
                 reasons: vec![Evidence::coverage(
-                    format!("control '{}' ('{}') has never held focus in this run", c.id, c.label),
+                    format!(
+                        "control '{}' ('{}') has never held focus in this run",
+                        c.id, c.label
+                    ),
                     json!({ "control_id": c.id, "label": c.label, "kind": c.kind }),
                 )],
                 risk: ActionRisk::Safe,
@@ -234,10 +257,7 @@ pub fn suggest(
     // merging their evidence lists.
     let mut deduped: Vec<Candidate> = Vec::new();
     for c in out {
-        if let Some(existing) = deduped
-            .iter_mut()
-            .find(|e| e.action == c.action)
-        {
+        if let Some(existing) = deduped.iter_mut().find(|e| e.action == c.action) {
             existing.reasons.extend(c.reasons);
             // The highest observed risk stands.
             if c.risk > existing.risk {
@@ -290,7 +310,11 @@ mod tests {
         ScreenState {
             cols: 80,
             rows: 2,
-            cursor: crate::screen::CursorState { x: 0, y: 0, visible: true },
+            cursor: crate::screen::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
             title: None,
             cells: Vec::new(),
             viewport_text: vec!["[ Save ]".into(), "q quit".into()],
@@ -328,7 +352,12 @@ mod tests {
             kind: ControlKind::Button,
             label: label.into(),
             value: None,
-            bounds: ControlBounds { x: 0, y: 0, width: 8, height: 1 },
+            bounds: ControlBounds {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 1,
+            },
             region_id: None,
             focusable: true,
             focused: false,
@@ -365,8 +394,9 @@ mod tests {
         let current = StateId::from_structure_hash("test-structure");
         // The explorer already tried tab from this state: an identity whose
         // id() equals `current` (no interaction layer → content key).
-        let id_self =
-            crate::exploration::state_graph::StateIdentity::from_structure_content("test-structure");
+        let id_self = crate::exploration::state_graph::StateIdentity::from_structure_content(
+            "test-structure",
+        );
         g.record_transition_identity(
             &id_self,
             &crate::exploration::state_graph::StateIdentity::from_parts("other"),
@@ -393,8 +423,10 @@ mod tests {
             .find(|c| c.action["key"] == "enter")
             .expect("enter never taken → suggested");
         assert!(
-            enter.reasons.iter().any(|r| r.source == "graph"
-                && r.detail["times_taken_from_state"] == 0),
+            enter
+                .reasons
+                .iter()
+                .any(|r| r.source == "graph" && r.detail["times_taken_from_state"] == 0),
             "reason must cite the graph: {:?}",
             enter.reasons
         );
@@ -419,7 +451,9 @@ mod tests {
         assert!(
             out.iter().all(|c| c.risk <= ActionRisk::Safe),
             "safe-gated context must only offer safe candidates: {:?}",
-            out.iter().map(|c| (c.action.to_string(), c.risk)).collect::<Vec<_>>()
+            out.iter()
+                .map(|c| (c.action.to_string(), c.risk))
+                .collect::<Vec<_>>()
         );
         assert!(
             !out.iter().any(|c| c.action["key"] == "enter"),

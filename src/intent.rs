@@ -19,8 +19,8 @@
 
 use crate::backend::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
 use crate::execution::CanonicalAction;
-use crate::semantic::SemanticScreen;
 use crate::semantic::controls::{Control, ControlKind};
+use crate::semantic::SemanticScreen;
 use serde::{Deserialize, Serialize};
 
 /// How an agent names what it wants to act on (Wave D item 31).
@@ -43,7 +43,10 @@ impl ActionTarget {
         match self {
             ActionTarget::Id { id } => format!("#{id}"),
             ActionTarget::Text { text } => format!("\"{text}\""),
-            ActionTarget::Role { role, text: Some(t) } => {
+            ActionTarget::Role {
+                role,
+                text: Some(t),
+            } => {
                 format!("{role} \"{t}\"")
             }
             ActionTarget::Role { role, text: None } => role.clone(),
@@ -238,8 +241,8 @@ pub fn classify_risk(verb: &ActionVerb, control: Option<&Control>) -> ActionRisk
     }
     let label = c.label.to_lowercase();
     let destructive_words = [
-        "delete", "remove", "destroy", "reset", "wipe", "purge", "format", "drop", "quit",
-        "exit", "shutdown", "kill",
+        "delete", "remove", "destroy", "reset", "wipe", "purge", "format", "drop", "quit", "exit",
+        "shutdown", "kill",
     ];
     let external_words = ["clipboard", "share", "upload", "send", "export", "publish"];
     let mut risk = base;
@@ -254,10 +257,7 @@ pub fn classify_risk(verb: &ActionVerb, control: Option<&Control>) -> ActionRisk
 /// Resolve a target against the semantic screen. Deterministic, and honest
 /// about ambiguity: multiple matches are an error carrying the matches,
 /// never a first-pick (item 31).
-pub fn resolve_target(
-    sem: &SemanticScreen,
-    target: &ActionTarget,
-) -> Result<Control, IntentError> {
+pub fn resolve_target(sem: &SemanticScreen, target: &ActionTarget) -> Result<Control, IntentError> {
     let controls = &sem.controls;
     let matches: Vec<&Control> = match target {
         ActionTarget::Id { id } => controls.iter().filter(|c| &c.id == id).collect(),
@@ -451,9 +451,10 @@ fn nearest_candidates(controls: &[Control], target: &ActionTarget) -> Vec<Contro
 /// beats nothing. Lower is better; anything above 3 is "no relation".
 fn text_distance_score(target: &ActionTarget, c: &Control) -> u32 {
     let want = match target {
-        ActionTarget::Text { text } | ActionTarget::Role { text: Some(text), .. } => {
-            text.to_lowercase()
-        }
+        ActionTarget::Text { text }
+        | ActionTarget::Role {
+            text: Some(text), ..
+        } => text.to_lowercase(),
         ActionTarget::Id { id } => id.to_lowercase(),
         _ => return 3,
     };
@@ -535,11 +536,10 @@ impl KeyEvent {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::controls::{ControlBounds};
+    use crate::semantic::controls::ControlBounds;
     use crate::semantic::focus::FocusInfo;
 
     fn control(id: &str, kind: ControlKind, label: &str, x: u16, y: u16) -> Control {
@@ -620,8 +620,13 @@ mod tests {
             ],
             None,
         );
-        let err = resolve_target(&s, &ActionTarget::Text { text: "Save".into() })
-            .expect_err("must be ambiguous");
+        let err = resolve_target(
+            &s,
+            &ActionTarget::Text {
+                text: "Save".into(),
+            },
+        )
+        .expect_err("must be ambiguous");
         let msg = err.message();
         match &err {
             IntentError::Ambiguous { matches, .. } => {
@@ -647,8 +652,13 @@ mod tests {
         let sav = resolve_target(&s, &ActionTarget::Text { text: "Sav".into() })
             .expect("unique substring resolves");
         assert_eq!(sav.id, "button/save");
-        let err2 = resolve_target(&s, &ActionTarget::Text { text: "Cancle".into() })
-            .expect_err("typo must not resolve");
+        let err2 = resolve_target(
+            &s,
+            &ActionTarget::Text {
+                text: "Cancle".into(),
+            },
+        )
+        .expect_err("typo must not resolve");
         match &err2 {
             IntentError::NotFound { candidates, .. } => {
                 assert!(
@@ -683,7 +693,13 @@ mod tests {
         assert_eq!(c.id, "button/cancel");
         // Role alone: three matches (field excluded) — ambiguous.
         assert!(matches!(
-            resolve_target(&s, &ActionTarget::Role { role: "button".into(), text: None }),
+            resolve_target(
+                &s,
+                &ActionTarget::Role {
+                    role: "button".into(),
+                    text: None
+                }
+            ),
             Err(IntentError::Ambiguous { .. })
         ));
         // Focused target.
@@ -695,9 +711,18 @@ mod tests {
     #[test]
     fn risk_classification_from_labels() {
         let save = control("button/save", ControlKind::Button, "Save", 0, 1);
-        let del = control("button/delete", ControlKind::Button, "Delete Database", 0, 2);
+        let del = control(
+            "button/delete",
+            ControlKind::Button,
+            "Delete Database",
+            0,
+            2,
+        );
         let next = control("button/next", ControlKind::Button, "Next", 0, 3);
-        assert_eq!(classify_risk(&ActionVerb::Activate, Some(&save)), ActionRisk::Mutating);
+        assert_eq!(
+            classify_risk(&ActionVerb::Activate, Some(&save)),
+            ActionRisk::Mutating
+        );
         assert_eq!(
             classify_risk(&ActionVerb::Activate, Some(&del)),
             ActionRisk::Destructive,
@@ -709,9 +734,15 @@ mod tests {
         );
         // Focus stays safe even on a destructive-labelled control: focusing
         // runs nothing (the earlier Mutating expectation was wrong).
-        assert_eq!(classify_risk(&ActionVerb::Focus, Some(&del)), ActionRisk::Safe);
+        assert_eq!(
+            classify_risk(&ActionVerb::Focus, Some(&del)),
+            ActionRisk::Safe
+        );
         // Focus is safe on a neutral control.
-        assert_eq!(classify_risk(&ActionVerb::Focus, Some(&next)), ActionRisk::Safe);
+        assert_eq!(
+            classify_risk(&ActionVerb::Focus, Some(&next)),
+            ActionRisk::Safe
+        );
         // Risk ordering supports gating.
         assert!(ActionRisk::Safe < ActionRisk::Mutating);
         assert!(ActionRisk::Mutating < ActionRisk::Destructive);
@@ -728,15 +759,14 @@ mod tests {
             Err(IntentError::VerbMismatch { .. })
         ));
         assert!(matches!(
-            plan_action(
-                &ActionVerb::Type { text: "x".into() },
-                &btn
-            ),
+            plan_action(&ActionVerb::Type { text: "x".into() }, &btn),
             Err(IntentError::VerbMismatch { .. })
         ));
         // Typing into a field plans a Type action.
         let planned = plan_action(
-            &ActionVerb::Type { text: "localhost".into() },
+            &ActionVerb::Type {
+                text: "localhost".into(),
+            },
             &field,
         )
         .expect("type into field");

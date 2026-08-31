@@ -27,10 +27,9 @@ fn start_modal(mgr: &mut SessionManager) -> String {
 /// loader, and its oracle expressions all validate.
 #[test]
 fn fixture_contract_parses_and_validates() {
-    let contract = design::load_design_contract(std::path::Path::new(
-        "fixtures/modal_contract.yaml",
-    ))
-    .expect("fixture contract loads");
+    let contract =
+        design::load_design_contract(std::path::Path::new("fixtures/modal_contract.yaml"))
+            .expect("fixture contract loads");
     assert_eq!(contract.schema.name, "modal-fixture");
     assert_eq!(contract.components.len(), 1);
     assert_eq!(contract.interactions.len(), 2);
@@ -59,13 +58,8 @@ fn volatile_pattern_policy_changes_structure_hash() {
     let mut parser = vt100::Parser::new(3, 30, 0);
     parser.process(b"job 42 running");
 
-    let default_hash = tui_lab::screen::from_vt(
-        parser.screen(),
-        process_state(),
-        None,
-        Vec::new(),
-    )
-    .structure_hash;
+    let default_hash =
+        tui_lab::screen::from_vt(parser.screen(), process_state(), None, Vec::new()).structure_hash;
 
     // Contract says bare job IDs are volatile.
     let policy = tui_lab::screen::normalize::from_patterns(&[r"\bjob \d+\b".to_string()])
@@ -86,8 +80,7 @@ fn volatile_pattern_policy_changes_structure_hash() {
 
     // Sanity: the default policy hash is stable across calls, and a policy
     // holding the SAME patterns the row matches must equal itself.
-    let policy2 =
-        tui_lab::screen::normalize::from_patterns(&[r"\bjob \d+\b".to_string()]).unwrap();
+    let policy2 = tui_lab::screen::normalize::from_patterns(&[r"\bjob \d+\b".to_string()]).unwrap();
     let policy_hash2 = tui_lab::screen::from_vt_with_policy(
         parser.screen(),
         process_state(),
@@ -100,8 +93,7 @@ fn volatile_pattern_policy_changes_structure_hash() {
 
     // A policy that normalizes "42" too must produce a DIFFERENT hash from
     // the job-only policy (patterns are part of hash identity).
-    let broader =
-        tui_lab::screen::normalize::from_patterns(&[r"\d+".to_string()]).unwrap();
+    let broader = tui_lab::screen::normalize::from_patterns(&[r"\d+".to_string()]).unwrap();
     let broader_hash = tui_lab::screen::from_vt_with_policy(
         parser.screen(),
         process_state(),
@@ -130,10 +122,9 @@ fn process_state() -> tui_lab::screen::ProcessState {
 /// closed it — the report is earned, not assumed.
 #[test]
 fn conformance_drives_the_modal_fixture() {
-    let contract = design::load_design_contract(std::path::Path::new(
-        "fixtures/modal_contract.yaml",
-    ))
-    .expect("fixture contract loads");
+    let contract =
+        design::load_design_contract(std::path::Path::new("fixtures/modal_contract.yaml"))
+            .expect("fixture contract loads");
 
     let mut mgr = SessionManager::new();
     let id = start_modal(&mut mgr);
@@ -144,8 +135,7 @@ fn conformance_drives_the_modal_fixture() {
     let report = design::check_contract(sess, &contract).expect("conformance runs");
 
     // The report must name every group it checked.
-    let groups: std::collections::HashSet<&str> =
-        report.results.iter().map(|r| r.group).collect();
+    let groups: std::collections::HashSet<&str> = report.results.iter().map(|r| r.group).collect();
     assert!(groups.contains("document"), "groups: {:?}", groups);
     assert!(groups.contains("component"), "groups: {:?}", groups);
     assert!(groups.contains("interaction"), "groups: {:?}", groups);
@@ -266,7 +256,8 @@ fn scenario_oracle_steps_replay() {
     let report = tui_lab::scenario::ScenarioRunner::run(&scenario, sess);
     assert_eq!(report.steps_total, 3);
     assert_eq!(
-        report.steps_failed, 0,
+        report.steps_failed,
+        0,
         "oracle steps must pass against the real modal: {:?}",
         report
             .step_results
@@ -284,9 +275,7 @@ fn failing_oracle_fails_scenario_step() {
     std::thread::sleep(std::time::Duration::from_millis(400));
 
     let mut recorder = tui_lab::scenario::recorder::ScenarioRecorder::new("oracle-fail");
-    recorder.record_assert(
-        serde_json::json!({"assertion": "oracle", "text": "modal_open()"}),
-    );
+    recorder.record_assert(serde_json::json!({"assertion": "oracle", "text": "modal_open()"}));
     let scenario = recorder.build();
 
     let sess = mgr.resolve_mut(None).expect("session");

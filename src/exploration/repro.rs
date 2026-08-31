@@ -34,13 +34,20 @@ impl FailureKind {
     /// Detect a failure from a post-action frame: process death is the
     /// honest, cheap signal (a UI assertion could false-positive on
     /// unrelated screens; a dead process cannot).
-    pub fn from_process(running: bool, exit_code: Option<i32>, exit_signal: Option<&str>) -> Option<Self> {
+    pub fn from_process(
+        running: bool,
+        exit_code: Option<i32>,
+        exit_signal: Option<&str>,
+    ) -> Option<Self> {
         if running {
             return None;
         }
-        let crashed = exit_code.map(|c| c != 0).unwrap_or(true)
-            || exit_signal.is_some();
-        Some(if crashed { FailureKind::Crash } else { FailureKind::ProcessDied })
+        let crashed = exit_code.map(|c| c != 0).unwrap_or(true) || exit_signal.is_some();
+        Some(if crashed {
+            FailureKind::Crash
+        } else {
+            FailureKind::ProcessDied
+        })
     }
 }
 
@@ -93,7 +100,9 @@ pub fn trace_from_steps(steps: &[ExplorationStep]) -> Vec<ReproAction> {
 /// Returns `None` for names that cannot be reconstructed.
 fn replayable_action(name: &str) -> Option<CanonicalAction> {
     use crate::backend::{KeyCode, KeyEvent, KeyModifiers};
-    let key = |c: KeyCode| CanonicalAction::Key { key: KeyEvent::new(c) };
+    let key = |c: KeyCode| CanonicalAction::Key {
+        key: KeyEvent::new(c),
+    };
     match name {
         "tab" => Some(key(KeyCode::Tab)),
         "shift+tab" => Some(CanonicalAction::Key {
@@ -201,13 +210,16 @@ pub fn minimize_crash(
     let attempts_total = std::cell::Cell::new(0u32);
     // Wrap the session in a cell: the minimizer's callback needs `&mut`.
     let mut session_opt = Some(session);
-    let mut minimizer = crate::exploration::repro_minimizer::ReproMinimizer::new(|candidate: &[ReproAction]| {
-        let s = session_opt.as_mut().expect("session available during minimize");
-        let mut attempts = attempts_total.take();
-        let r = test_candidate(s, candidate, &expected_failure, &mut attempts);
-        attempts_total.set(attempts);
-        r
-    });
+    let mut minimizer =
+        crate::exploration::repro_minimizer::ReproMinimizer::new(|candidate: &[ReproAction]| {
+            let s = session_opt
+                .as_mut()
+                .expect("session available during minimize");
+            let mut attempts = attempts_total.take();
+            let r = test_candidate(s, candidate, &expected_failure, &mut attempts);
+            attempts_total.set(attempts);
+            r
+        });
 
     let minimal = minimizer.minimize(&trace);
     let attempts = attempts_total.get();
@@ -237,7 +249,11 @@ pub fn minimize_crash(
         original_len,
         minimized_len: minimal.len(),
         reproduced,
-        failure: if reproduced { Some(expected_failure) } else { None },
+        failure: if reproduced {
+            Some(expected_failure)
+        } else {
+            None
+        },
         scenario,
         steps: step_summaries,
         attempts: attempts + 1,
@@ -334,8 +350,18 @@ mod tests {
     #[test]
     fn scenario_is_replayable_and_asserts_exit() {
         let minimal = vec![
-            ReproAction { index: 3, action: CanonicalAction::Key { key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Tab) } },
-            ReproAction { index: 7, action: CanonicalAction::Key { key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Enter) } },
+            ReproAction {
+                index: 3,
+                action: CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Tab),
+                },
+            },
+            ReproAction {
+                index: 7,
+                action: CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Enter),
+                },
+            },
         ];
         let s = build_scenario("settings-crash", &minimal, &FailureKind::Crash);
         assert!(s.name.starts_with("repro-"));

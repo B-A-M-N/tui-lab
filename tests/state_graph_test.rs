@@ -201,11 +201,7 @@ fn test_exploration_run_with_graph() {
     );
     let after = sess.observe(50).unwrap();
 
-    graph.record_transition_identity(
-        &before_identity,
-        &StateIdentity::from_frame(&after),
-        "tab",
-    );
+    graph.record_transition_identity(&before_identity, &StateIdentity::from_frame(&after), "tab");
 
     assert!(graph.state_count() >= 1);
     assert_eq!(graph.transition_count(), 1);

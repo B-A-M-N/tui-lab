@@ -50,12 +50,14 @@ fn unwrap_ok(raw: &rmcp::model::CallToolResult, ctx: &str) -> serde_json::Value 
     let v = raw
         .structured_content
         .clone()
-        .or_else(|| raw.content.first().map(|c| {
-            let rmcp::model::ContentBlock::Text(t) = c else {
-                panic!("{}: non-text content block", ctx);
-            };
-            serde_json::from_str(&t.text).expect("valid JSON envelope")
-        }))
+        .or_else(|| {
+            raw.content.first().map(|c| {
+                let rmcp::model::ContentBlock::Text(t) = c else {
+                    panic!("{}: non-text content block", ctx);
+                };
+                serde_json::from_str(&t.text).expect("valid JSON envelope")
+            })
+        })
         .expect("structured content");
     assert!(!raw.is_error.unwrap_or(false), "{} failed: {}", ctx, v);
     assert_eq!(
@@ -92,19 +94,18 @@ async fn sensitive_payload_never_reaches_persisted_run_artifacts() {
         })))
         .await;
     let start = unwrap_ok(&start_raw, "session start");
-    let session_id = start["session"]
-        .as_str()
-        .expect("session id")
-        .to_string();
+    let session_id = start["session"].as_str().expect("session id").to_string();
 
     // 2. Record a scenario first, so scenario capture is active during the
     //    sensitive act (the scenario path was the one path that already
     //    respected `sensitive` — verify it stays correct under the redesign).
     let rec_raw = server
-        .tui_record(params_typed::<tui_lab::mcp::params::TuiRecordParams>(serde_json::json!({
-            "action": "start",
-            "name": "leak-e2e",
-        })))
+        .tui_record(params_typed::<tui_lab::mcp::params::TuiRecordParams>(
+            serde_json::json!({
+                "action": "start",
+                "name": "leak-e2e",
+            }),
+        ))
         .await;
     let _rec = unwrap_ok(&rec_raw, "record start");
 
@@ -136,10 +137,12 @@ async fn sensitive_payload_never_reaches_persisted_run_artifacts() {
 
     // 5. Save the scenario recording so it lands in the run's artifacts.
     let save_raw = server
-        .tui_scenario(params_typed::<tui_lab::mcp::params::TuiScenarioParams>(serde_json::json!({
-            "action": "save",
-            "name": "leak-e2e",
-        })))
+        .tui_scenario(params_typed::<tui_lab::mcp::params::TuiScenarioParams>(
+            serde_json::json!({
+                "action": "save",
+                "name": "leak-e2e",
+            }),
+        ))
         .await;
     // Scenario save may legitimately fail if no steps were recorded for the
     // tool-traffic path; a leak test only needs it to not crash.
@@ -148,11 +151,13 @@ async fn sensitive_payload_never_reaches_persisted_run_artifacts() {
     // 6. Promote the ephemeral run into a persistent artifact root.
     let base = tempfile::tempdir().expect("tmpdir");
     let run_raw = server
-        .tui_run(params_typed::<tui_lab::mcp::params::TuiRunParams>(serde_json::json!({
-            "action": "persist",
-            "root": base.path().to_string_lossy().to_string(),
-            "kill_sessions": null,
-        })))
+        .tui_run(params_typed::<tui_lab::mcp::params::TuiRunParams>(
+            serde_json::json!({
+                "action": "persist",
+                "root": base.path().to_string_lossy().to_string(),
+                "kill_sessions": null,
+            }),
+        ))
         .await;
     let run = unwrap_ok(&run_raw, "persist");
     let artifact_root = run["artifact_root"]
@@ -162,11 +167,13 @@ async fn sensitive_payload_never_reaches_persisted_run_artifacts() {
 
     // 7. Close the run so every held artifact flushes.
     let close_raw = server
-        .tui_run(params_typed::<tui_lab::mcp::params::TuiRunParams>(serde_json::json!({
-            "action": "close",
-            "root": null,
-            "kill_sessions": true,
-        })))
+        .tui_run(params_typed::<tui_lab::mcp::params::TuiRunParams>(
+            serde_json::json!({
+                "action": "close",
+                "root": null,
+                "kill_sessions": true,
+            }),
+        ))
         .await;
     unwrap_ok(&close_raw, "close");
 
@@ -183,10 +190,8 @@ async fn sensitive_payload_never_reaches_persisted_run_artifacts() {
     );
 
     // Also verify the manifest reports a complete history for this small run.
-    let manifest = std::fs::read_to_string(
-        std::path::Path::new(&artifact_root).join("run.json"),
-    )
-    .expect("manifest");
+    let manifest = std::fs::read_to_string(std::path::Path::new(&artifact_root).join("run.json"))
+        .expect("manifest");
     assert!(
         manifest.contains("\"history_complete\": true"),
         "small run must be replay-complete: {manifest}"

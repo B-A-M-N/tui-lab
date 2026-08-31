@@ -5,6 +5,7 @@
 //! - item 67: finding comparison (FIXED / NEW / PERSISTING) via labeled
 //!   baselines through the MCP surface
 //! - item 73: session actors under cross-session parallelism
+//! - item 76: the human control lease refuses every machine-driving path
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -17,19 +18,16 @@ fn unwrap_ok(raw: &CallToolResult, ctx: &str) -> serde_json::Value {
     let v = raw
         .structured_content
         .clone()
-        .or_else(|| raw.content.first().map(|c| {
-            let rmcp::model::ContentBlock::Text(t) = c else {
-                panic!("{}: non-text content block", ctx);
-            };
-            serde_json::from_str(&t.text).expect("valid JSON envelope")
-        }))
+        .or_else(|| {
+            raw.content.first().map(|c| {
+                let rmcp::model::ContentBlock::Text(t) = c else {
+                    panic!("{}: non-text content block", ctx);
+                };
+                serde_json::from_str(&t.text).expect("valid JSON envelope")
+            })
+        })
         .expect("structured content");
-    assert!(
-        !raw.is_error.unwrap_or(false),
-        "{} failed: {}",
-        ctx,
-        v
-    );
+    assert!(!raw.is_error.unwrap_or(false), "{} failed: {}", ctx, v);
     v.get("data").cloned().expect("data payload")
 }
 
@@ -149,7 +147,9 @@ fn errors_audit_catches_on_screen_error_text() {
     );
     let lines = f.evidence[0].detail["lines"].as_array().expect("lines");
     assert!(
-        lines.iter().any(|l| l.as_str().unwrap_or("").contains("disk full")),
+        lines
+            .iter()
+            .any(|l| l.as_str().unwrap_or("").contains("disk full")),
         "offending line captured as evidence: {:?}",
         lines
     );
@@ -180,9 +180,10 @@ fn mouse_audit_risk_filters_destructive_labels() {
     // clicked a destructive-looking control; the no-targets finding (or a
     // results finding listing what it did) must exist.
     assert!(
-        findings
-            .iter()
-            .any(|f| f.id == "MOUSE-NO-TARGETS" || f.id == "MOUSE-OK" || f.id == "MOUSE-UNRESPONSIVE" || f.id == "MOUSE-NO-CAPS"),
+        findings.iter().any(|f| f.id == "MOUSE-NO-TARGETS"
+            || f.id == "MOUSE-OK"
+            || f.id == "MOUSE-UNRESPONSIVE"
+            || f.id == "MOUSE-NO-CAPS"),
         "mouse audit produces an honest verdict: {:?}",
         findings.iter().map(|f| &f.id).collect::<Vec<_>>()
     );
@@ -215,7 +216,10 @@ fn states_audit_reports_frame_state_findings() {
             .iter()
             .all(|f| f.category == "states" || f.id == "AUDIT-RESIDUE"),
         "states findings carry the states category: {:?}",
-        findings.iter().map(|f| (&f.id, &f.category)).collect::<Vec<_>>()
+        findings
+            .iter()
+            .map(|f| (&f.id, &f.category))
+            .collect::<Vec<_>>()
     );
     mgr.stop(&id).ok();
 }
@@ -382,9 +386,246 @@ async fn audit_on_one_session_does_not_block_another() {
         "three observes on B must complete while A runs a full audit (took {elapsed:?})"
     );
     server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": a })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": a }),
+        ))
         .await;
     server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": b })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": b }),
+        ))
+        .await;
+}
+
+// ─────────────────────────── item 76: lease enforcement ───────────────────────────
+
+/// Read the error out of a failure envelope.
+fn unwrap_err(raw: &CallToolResult, ctx: &str) -> serde_json::Value {
+    let v = raw
+        .structured_content
+        .clone()
+        .expect(&format!("{ctx}: structured content"));
+    assert!(
+        raw.is_error.unwrap_or(false),
+        "{ctx} should be a caller fault: {v}"
+    );
+    v
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lease_blocks_driving_and_allows_observing() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let id = start_session(&server, "print('lease-me'); input()").await;
+
+    // Take the lease (5 s TTL so the test never waits for expiry).
+    let take = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "lease", "id": id, "holder": "ana", "ttl_ms": 5000,
+            })))
+            .await,
+        "lease take",
+    );
+    assert_eq!(take["leased"], true, "{take}");
+    assert_eq!(take["holder"], "ana");
+
+    // Every driving path refuses with control_leased, naming the holder.
+    for (tool, args) in [
+        (
+            "tui_act",
+            serde_json::json!({ "action": "key", "key": "tab", "id": id }),
+        ),
+        (
+            "tui_explore",
+            serde_json::json!({ "mode": "random", "seed": 1, "actions": 2, "id": id }),
+        ),
+        (
+            "tui_explore",
+            serde_json::json!({ "mode": "semantic", "actions": 2, "id": id }),
+        ),
+        (
+            "tui_audit",
+            serde_json::json!({ "profile": "keyboard", "id": id }),
+        ),
+        (
+            "tui_audit",
+            serde_json::json!({ "profile": "full", "id": id }),
+        ),
+        (
+            "tui_record",
+            serde_json::json!({ "format": "start", "id": id }),
+        ),
+    ] {
+        let mut args = args;
+        args["id"] = serde_json::json!(id.clone());
+        let raw = match tool {
+            "tui_act" => server.tui_act(params_typed(args)).await,
+            "tui_explore" => server.tui_explore(params_typed(args)).await,
+            "tui_audit" => server.tui_audit(params_typed(args)).await,
+            "tui_record" => server.tui_record(params_typed(args)).await,
+            _ => unreachable!(),
+        };
+        let e = unwrap_err(&raw, &format!("{tool} under lease"));
+        assert_eq!(
+            e["category"], "control_leased",
+            "{tool} must refuse with control_leased: {e}"
+        );
+        let msg = e["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("ana"),
+            "refusal must name the lease holder: {msg}"
+        );
+    }
+
+    // Scenario replay refuses too.
+    let saved = unwrap_ok(
+        &server
+            .tui_scenario(params_typed(serde_json::json!({
+                "action": "save", "name": "lease-replay",
+                "steps": [{ "kind": "act", "action": "key", "key": "tab" }],
+            })))
+            .await,
+        "save replay scenario",
+    );
+    let raw = server
+        .tui_scenario(params_typed(serde_json::json!({
+            "action": "run", "name": saved["name"], "id": id,
+        })))
+        .await;
+    let e = unwrap_err(&raw, "replay under lease");
+    assert_eq!(e["category"], "control_leased", "{e}");
+
+    // Observation stays allowed while the lease is live.
+    let obs = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "summary", "id": id }),
+            ))
+            .await,
+        "observe under lease",
+    );
+    assert_eq!(obs["screen"], "80x24", "{obs}");
+    let graph = unwrap_ok(
+        &server
+            .tui_explore(params_typed(serde_json::json!({ "mode": "state_graph" })))
+            .await,
+        "state_graph under lease",
+    );
+    assert!(graph["states"].is_u64(), "{graph}");
+    // Static audits are observation, not driving: discoverability reads one
+    // frame and must stay allowed.
+    let static_audit = unwrap_ok(
+        &server
+            .tui_audit(params_typed(
+                serde_json::json!({ "profile": "discoverability", "id": id }),
+            ))
+            .await,
+        "static audit under lease",
+    );
+    assert_eq!(static_audit["mode"], "static", "{static_audit}");
+
+    // One-shot capture observes the frame: allowed under lease.
+    let cap = unwrap_ok(
+        &server
+            .tui_record(params_typed(
+                serde_json::json!({ "format": "svg", "id": id }),
+            ))
+            .await,
+        "svg capture under lease",
+    );
+    assert_eq!(cap["format"], "svg", "{cap}");
+
+    // Release: driving works again (proves the block was the lease, not breakage).
+    let rel = unwrap_ok(
+        &server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "release", "id": id }),
+            ))
+            .await,
+        "lease release",
+    );
+    assert_eq!(rel["released"], true, "{rel}");
+    let act = unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "tab", "id": id }),
+            ))
+            .await,
+        "act after release",
+    );
+    assert_eq!(act["action"], "key", "{act}");
+
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lease_is_exclusive_and_status_reports_it() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let id = start_session(&server, "print('lease-x'); input()").await;
+
+    let first = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "lease", "id": id, "holder": "human-1", "ttl_ms": 5000,
+            })))
+            .await,
+        "first lease",
+    );
+    assert_eq!(first["leased"], true);
+
+    // A second holder is refused (never silently stolen), naming who holds it.
+    let second = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "lease", "id": id, "holder": "agent-9", "ttl_ms": 5000,
+            })))
+            .await,
+        "second lease",
+    );
+    assert_eq!(second["leased"], false, "{second}");
+    assert_eq!(second["holder"], "human-1", "{second}");
+
+    // status carries the live lease.
+    let st = unwrap_ok(
+        &server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "status", "id": id }),
+            ))
+            .await,
+        "status under lease",
+    );
+    assert_eq!(st["lease"]["holder"], "human-1", "{st}");
+    assert!(
+        st["lease"]["remaining_ms"].as_u64().unwrap_or(0) > 0,
+        "{st}"
+    );
+
+    // Release with no lease afterwards is an honest false.
+    unwrap_ok(
+        &server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "release", "id": id }),
+            ))
+            .await,
+        "release",
+    );
+    let again = unwrap_ok(
+        &server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "release", "id": id }),
+            ))
+            .await,
+        "double release",
+    );
+    assert_eq!(again["released"], false, "{again}");
+
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
         .await;
 }

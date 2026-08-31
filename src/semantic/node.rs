@@ -432,10 +432,12 @@ mod tests {
     #[test]
     fn collect_by_role_finds_all() {
         let mut root = node("screen", Role::Screen, bounds(0, 0, 80, 24));
-        root.children.push(node("row/a", Role::TableRow, bounds(0, 1, 10, 1)));
+        root.children
+            .push(node("row/a", Role::TableRow, bounds(0, 1, 10, 1)));
         root.children
             .push(node("row/b", Role::TableRow, bounds(0, 2, 10, 1)));
-        root.children.push(node("btn/c", Role::Button, bounds(0, 3, 5, 1)));
+        root.children
+            .push(node("btn/c", Role::Button, bounds(0, 3, 5, 1)));
         let mut rows = Vec::new();
         root.collect_by_role(&Role::TableRow, &mut rows);
         assert_eq!(rows.len(), 2);

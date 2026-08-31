@@ -65,7 +65,11 @@ impl StateResidue {
 /// appended when restoration was incomplete. A failed pre-state capture
 /// surfaces as `Err` — the caller reports an engine error rather than
 /// running an audit it cannot verify.
-pub fn run_verified<F>(session: &mut Session, profile: &str, driver: F) -> Result<Vec<Finding>, String>
+pub fn run_verified<F>(
+    session: &mut Session,
+    profile: &str,
+    driver: F,
+) -> Result<Vec<Finding>, String>
 where
     F: FnOnce(&mut Session) -> Vec<Finding>,
 {

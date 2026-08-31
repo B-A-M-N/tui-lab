@@ -192,7 +192,10 @@ mod tests {
         for fw in ["ratatui", "textual"] {
             let s = snippet_for(fw).expect("snippet");
             assert!(s.contains("TUI_LAB_SEMANTIC"), "{fw}: names the env var");
-            assert!(s.contains("\"snapshot\"") || s.contains("'snapshot'"), "{fw}: snapshot frame");
+            assert!(
+                s.contains("\"snapshot\"") || s.contains("'snapshot'"),
+                "{fw}: snapshot frame"
+            );
         }
     }
 }
