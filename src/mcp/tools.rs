@@ -543,7 +543,31 @@ impl TuiLabServer {
                         let seq = batch.cursor;
                         if batch.cursor > from {
                             let evs = s.events_since(from);
-                            run.ingest_native_coverage_from_events(&s.id, &evs.events, 0);
+                            // Wave 5 item 41: widget-targeted coverage events
+                            // join the declaring node's app-attested source
+                            // locus (same NSP channel), so coverage→source is
+                            // exact. File targets stay plain.
+                            for ev in &evs.events {
+                                if let crate::events::TerminalEventKind::NativeEvent {
+                                    event,
+                                    target,
+                                } = &ev.kind
+                                {
+                                    if event != "coverage" {
+                                        continue;
+                                    }
+                                    let locus = s
+                                        .native_source_for_widget(target)
+                                        .filter(|_| !(target.starts_with("src/") || target.contains(".rs:") || target.contains('/')));
+                                    match locus {
+                                        Some(sr) => run
+                                            .record_coverage_event_with_identity(
+                                                &s.id, target, sr,
+                                            ),
+                                        None => run.record_coverage_event(&s.id, target),
+                                    }
+                                }
+                            }
                             run.set_event_cursor(&cursor_key, seq);
                         }
                         Ok(screen)
@@ -2457,13 +2481,19 @@ impl TuiLabServer {
         let p = p.0;
         let run = self.run.clone();
 
-        // Resolve the finding from the run ledger.
+        // Resolve the finding from the run ledger. Wave 5 item 45: when
+        // the STORED finding carries no loci but the run's coverage
+        // ledger has since learned loci for this finding's evidence
+        // target (coverage events often arrive after the audit pass),
+        // the join happens HERE so the explanation is source-linked even
+        // when the audit ran first. A pure lookup — the stored ledger is
+        // not mutated.
         let finding = {
             let run = run.lock().unwrap();
             run.findings()
                 .iter()
                 .find(|f| f.id == p.finding_id)
-                .cloned()
+                .map(|f| run.join_source_refs_if_known(f))
         };
         let finding = match finding {
             Some(f) => f,
@@ -2888,6 +2918,109 @@ impl TuiLabServer {
                     },
                 }))
             }
+            // ── bundle (Wave 5 item 46): the "did the fix hold?" packet ──
+            // One finding's repair packet joined with the labeled
+            // before/after diff: what the fix was, how to verify it, what
+            // the fresh audit pass says about THIS finding, and — the
+            // navigation-regression guard — every OTHER finding that
+            // changed between the same two passes.
+            RA::Bundle => {
+                let Some(finding_id) = p.finding_id.clone() else {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "bundle requires 'finding_id' (from tui://findings or the audit response)",
+                    );
+                };
+                let compare_label = p.compare_to.clone().unwrap_or_else(|| "baseline".into());
+                let run = self.run.lock().unwrap();
+                let Some(finding) = run.findings().iter().find(|f| f.id == finding_id) else {
+                    let labels = run.finding_baseline_labels();
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "unknown finding id '{finding_id}' in run '{}'. Record audits with label= to build baselines (stored: {})",
+                            run.id,
+                            if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
+                        ),
+                    );
+                };
+                // The packet for THIS finding (pure join; packets read run
+                // state and never mutate it).
+                let (packets, _skipped) = run.repair_packets();
+                let packet = packets
+                    .into_iter()
+                    .find(|p| p.finding.id == finding_id);
+                // The before/after verdicts from the labeled baseline.
+                let baseline = run.finding_baseline(&compare_label);
+                let (verdicts, before, regressions): (serde_json::Value, serde_json::Value, Vec<serde_json::Value>) = match baseline {
+                    None => (
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        Vec::new(),
+                    ),
+                    Some(base) => {
+                        let compared = crate::audit::compare::compare(base, run.findings());
+                        let this = compared
+                            .iter()
+                            .find(|c| c.finding.id == finding_id)
+                            .map(|c| json!({
+                                "fingerprint": c.fingerprint,
+                                "verdict": c.verdict,
+                            }))
+                            .unwrap_or(json!({
+                                "fingerprint": crate::audit::compare::fingerprint(finding),
+                                "verdict": "fixed",
+                                "note": "the bundled finding no longer appears in the current set",
+                            }));
+                        // The regression guard: every OTHER finding whose
+                        // verdict moved the wrong way between the passes.
+                        let others: Vec<serde_json::Value> = compared
+                            .iter()
+                            .filter(|c| c.finding.id != finding_id)
+                            .filter(|c| c.verdict == "new" || c.verdict == "regressed")
+                            .map(|c| json!({
+                                "id": c.finding.id,
+                                "category": c.finding.category,
+                                "summary": c.finding.summary,
+                                "verdict": c.verdict,
+                            }))
+                            .collect();
+                        let before_f = base
+                            .iter()
+                            .find(|b| b.id == finding_id)
+                            .map(|b| json!({
+                                "id": b.id,
+                                "summary": b.summary,
+                                "severity": b.severity,
+                            }));
+                        (
+                            this,
+                            before_f.unwrap_or(serde_json::Value::Null),
+                            others,
+                        )
+                    }
+                };
+                ok(json!({
+                    "finding_id": finding_id,
+                    "rule_id": finding.rule_id,
+                    "summary": finding.summary,
+                    "packet": packet,
+                    "before": before,
+                    "after": verdicts,
+                    "baseline": compare_label,
+                    "baseline_available": baseline.is_some(),
+                    "side_effects": {
+                        "new_or_regressed_elsewhere": regressions,
+                        "count": regressions.len(),
+                        "note": "navigation-regression guard: OTHER findings that appeared or worsened between the same two passes",
+                    },
+                    "note": if baseline.is_some() {
+                        "bundle = repair packet + this finding's before/after verdict + any side effects in the same diff"
+                    } else {
+                        "no baseline labeled '{compare_label}' — run tui_audit label=baseline before the fix and compare_to=baseline after"
+                    },
+                }))
+            }
         }
     }
 
@@ -3129,6 +3262,37 @@ impl TuiLabServer {
                         }))
                     }
                 }
+            }
+            // ── scaffold (Wave 5 item 43): starter contract from the
+            // observed UI ──
+            CT::Scaffold => {
+                let selector = p.id.clone();
+                let scaffolded = self
+                    .with_sess(selector.as_deref(), |sess| {
+                        let (screen, sem, _tree, _report) =
+                            sess.observe_fused(60).map_err(|e| e.to_string())?;
+                        Ok::<_, String>(crate::design::ProjectContract::scaffold_from(&screen, &sem))
+                    })
+                    .await;
+                let contract = match scaffolded {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => return err(ErrorCategory::BackendError, e),
+                    Err(e) => return e,
+                };
+                let yaml = match serde_yaml::to_string(&contract) {
+                    Ok(y) => y,
+                    Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
+                };
+                ok(json!({
+                    "action": "scaffold",
+                    "inferred": true,
+                    "contract_name": contract.schema.name,
+                    "components": contract.components.len(),
+                    "oracles": contract.oracles.len(),
+                    "viewports": contract.viewports.iter().map(|v| json!({"cols": v.cols, "rows": v.rows})).collect::<Vec<_>>(),
+                    "note": "scaffolded from ONE observed frame — everything declared was seen, nothing is yet required. Edit required=true / mode=validation as you fix intent, then tui_contract action=validate.",
+                    "yaml": yaml,
+                }))
             }
         }
     }

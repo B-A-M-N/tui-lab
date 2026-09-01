@@ -287,3 +287,177 @@ fn failing_oracle_fails_scenario_step() {
         report.step_results[0].detail
     );
 }
+
+// ── Wave 5: greenfield repair loop ──────────────────────────────────────
+
+#[test]
+fn repair_packet_keys_verification_on_rule_identity() {
+    // Item 42: two occurrences of the same rule get different instance
+    // ids but the SAME rule key — the verification recipe and packet
+    // identity must carry the rule, not the instance, so a fresh audit
+    // pass compares correctly across runs.
+    let mk = |inst: &str| crate_shim_finding("CLIP-001", inst);
+    let f1 = mk("CLIP-001");
+    let f2 = mk("CLIP-002");
+    for f in [f1, f2] {
+        let packet = tui_lab::audit::repair::RepairPacket::assemble(f, "run", vec![], |_| None)
+            .expect("packet");
+        assert_eq!(packet.rule_id, "CLIP-001", "rule identity, not instance");
+        assert!(
+            packet.verification.is_none(),
+            "no scenario → no invented recipe"
+        );
+    }
+}
+
+fn crate_shim_finding(rule: &str, inst: &str) -> tui_lab::audit::Finding {
+    tui_lab::audit::Finding {
+        id: inst.into(),
+        rule_id: Some(rule.into()),
+        severity: "warn".into(),
+        category: "layout".into(),
+        summary: "clipped".into(),
+        evidence: vec![tui_lab::audit::EvidenceRef::point(
+            tui_lab::audit::EvidenceKind::Region,
+            "region/main",
+            "clipped at bottom",
+        )],
+        confidence: 0.9,
+        reproduction: None,
+        source_refs: Vec::new(),
+    }
+}
+
+#[test]
+fn targeted_check_derived_from_evidence_target() {
+    // Item 44: the recipe names the exact control target to re-check, not
+    // "replay everything".
+    let mut f = crate_shim_finding("FOCUS-002", "FOCUS-002");
+    f.rule_id = Some("FOCUS-002".into());
+    f.reproduction = Some("scen-x".into());
+    let sc = tui_lab::scenario::model::Scenario::new("repro")
+        .act(serde_json::json!({"action":"key","key":"tab"}));
+    let packet = tui_lab::audit::repair::RepairPacket::assemble(f, "run", vec![], |_| {
+        Some(sc.clone())
+    })
+    .expect("packet");
+    let recipe = packet.verification.expect("recipe exists with repro");
+    assert_eq!(recipe.finding_rule_id, "FOCUS-002");
+    let targeted = recipe.target.expect("targeted check derived");
+    assert_eq!(targeted.target, "region/main");
+    assert!(
+        targeted.recheck_hint.contains("FOCUS-002"),
+        "hint names the rule: {targeted:?}"
+    );
+}
+
+#[test]
+fn contract_scaffold_declares_what_was_seen() {
+    // Item 43: scaffold from a synthetic frame + semantics. Everything in
+    // the contract must trace to something observed, and the extensions
+    // must carry the inferred marker.
+    use tui_lab::screen::{Cell, Color, ScreenState};
+    let mut screen = ScreenState::new(80, 24);
+    // ScreenState::new starts with an empty grid; fill it with blanks so
+    // the scaffold has a real frame to look at.
+    let blank = || Cell {
+        x: 0,
+        y: 0,
+        text: " ".into(),
+        fg: Color::unknown(),
+        bg: Color::unknown(),
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        reverse: false,
+        strike: false,
+    };
+    screen.cells = (0..(80 * 24)).map(|i| {
+        let mut c = blank();
+        c.x = (i % 80) as u16;
+        c.y = (i / 80) as u16;
+        c
+    }).collect();
+    screen.cells[12 * 80 + 30].reverse = true;
+    screen.viewport_text = vec![
+        "┌─ Main ─────────────┐".to_string(),
+        "│ [S]ave   [C]ancel  │".to_string(),
+        "└────────────────────┘".to_string(),
+    ];
+    let sem = tui_lab::semantic::analyze(&screen);
+    let contract =
+        tui_lab::design::ProjectContract::scaffold_from(&screen, &sem);
+    let marker = contract
+        .schema
+        .extensions
+        .get("scaffold.inferred")
+        .expect("inferred marker in extensions");
+    assert_eq!(marker["inferred"], true);
+    assert_eq!(contract.viewports.len(), 1, "one observed viewport");
+    assert_eq!(contract.viewports[0].cols, 80);
+    assert_eq!(contract.viewports[0].rows, 24);
+    // Every oracle names a control that exists in the analysis (nothing
+    // invented).
+    for o in &contract.oracles {
+        assert!(
+            o.expr.starts_with("control_exists("),
+            "scaffold only declares observed controls: {o:?}"
+        );
+    }
+    // The contract must survive a round-trip through its own serde (and
+    // the document validator must find no structural complaints).
+    let doc = serde_yaml::to_string(&contract).expect("yaml");
+    let back: tui_lab::design::ProjectContract =
+        serde_yaml::from_str(&doc).expect("round-trip");
+    let _ = back.validate();
+}
+
+#[test]
+fn coverage_event_with_identity_attests_source_locus() {
+    // Item 41: record_coverage_event_with_identity joins the app's own
+    // locus; the ledger entry carries it and feeds the finding enricher.
+    let mut run = tui_lab::run::RunContext::ephemeral();
+    run.record_coverage_event_with_identity(
+        "s1",
+        "#save.activate",
+        tui_lab::semantic::SourceRef {
+            file: "src/ui/save.rs".into(),
+            line: 42,
+            column: None,
+            symbol: Some("SaveButton".into()),
+            framework_id: None,
+            confidence: 1.0,
+            source: "native".into(),
+        },
+    );
+    run.record_coverage_event("s1", "#save.activate"); // plain hits still fold
+    let entry = run.coverage_ledger.get("#save.activate").expect("entry");
+    assert_eq!(entry.hits, 2);
+    assert_eq!(entry.source_refs.len(), 1, "deduped by location");
+    assert_eq!(entry.source_refs[0].file, "src/ui/save.rs");
+
+    // And the enricher: a finding whose evidence names this control gains
+    // the app-attested locus through the pure explain-time join.
+    let f = tui_lab::audit::Finding {
+        id: "MOUSE-001".into(),
+        rule_id: Some("MOUSE-001".into()),
+        severity: "warn".into(),
+        category: "mouse".into(),
+        summary: "unresponsive".into(),
+        evidence: vec![tui_lab::audit::EvidenceRef::point(
+            tui_lab::audit::EvidenceKind::Control,
+            "button/save",
+            "clicked, no response",
+        )],
+        confidence: 0.8,
+        reproduction: None,
+        source_refs: Vec::new(),
+    };
+    let joined = run.join_source_refs_if_known(&f);
+    assert!(
+        !joined.source_refs.is_empty(),
+        "explain-time join attaches the app-attested locus"
+    );
+    assert_eq!(joined.source_refs[0].file, "src/ui/save.rs");
+}

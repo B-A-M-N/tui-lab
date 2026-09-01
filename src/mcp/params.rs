@@ -265,13 +265,18 @@ selector_enum!(
         Status => "status", Persist => "persist", Close => "close",
         Context => "context", List => "list", Resume => "resume",
         Repair => "repair",
+        // Wave 5 item 46: one finding's repair packet joined with the
+        // finding-baseline diff (before/after) — the "did the fix hold
+        // without regressing anything?" bundle.
+        Bundle => "bundle",
     ]
 );
 
 selector_enum!(
     /// `tui_contract` action.
     ContractAction;
-    [ Load => "load", Validate => "validate", Status => "status", Compare => "compare" ]
+    [ Load => "load", Validate => "validate", Status => "status", Compare => "compare",
+      Scaffold => "scaffold" ]
 );
 
 impl AuditProfile {
@@ -1247,6 +1252,13 @@ pub struct TuiRunParams {
     /// `dir` field) — for callers that already hold the path.
     #[serde(default)]
     pub run_dir: Option<String>,
+    /// bundle: the finding id to bundle (Wave 5 item 46).
+    #[serde(default)]
+    pub finding_id: Option<String>,
+    /// bundle: the labeled baseline to diff against (the audit pass the
+    /// fix is being verified against; from tui_audit label=...).
+    #[serde(default)]
+    pub compare_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1327,7 +1339,7 @@ pub struct TuiFrameworkParams {
 /// and comparison against a saved baseline.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiContractParams {
-    /// load | validate | status | compare
+    /// load | validate | status | compare | scaffold
     pub action: Known<ContractAction>,
     /// Path to the contract document (YAML or JSON).
     #[serde(default)]

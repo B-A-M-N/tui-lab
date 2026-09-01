@@ -671,6 +671,37 @@ impl Session {
 
     /// Wave F items 58–63: the session's native channel snapshot (or None
     /// when the app never wrote one).
+    /// Wave 5 item 41: the source locus the app declared (over the native
+    /// side channel) for the widget this target names. Targets are
+    /// app-declared coverage strings — `#save`, `save.activate`,
+    /// `widget:#save` — matched by their leading id segment against the
+    /// latest native snapshot. Returns the node's `source` field, which
+    /// the framework adapter attested. None when the target is not
+    /// widget-shaped, the app sent no snapshot, or the node carries no
+    /// locus.
+    pub fn native_source_for_widget(
+        &self,
+        target: &str,
+    ) -> Option<crate::semantic::source_ref::SourceRef> {
+        // The id is the target's leading segment: strip `widget:` and take
+        // up to the first `.`/`:` action separator.
+        let id_part = target
+            .strip_prefix("widget:")
+            .unwrap_or(target)
+            .split(['.', ':', '/'])
+            .find(|s| !s.is_empty())?;
+        let id = if id_part.starts_with('#') {
+            id_part.to_string()
+        } else {
+            format!("#{id_part}")
+        };
+        let root = self.native_channel().latest.as_ref()?;
+        root.flatten()
+            .into_iter()
+            .find(|(_, n)| n.id == id || n.id == id_part)
+            .and_then(|(_, n)| n.source.clone())
+    }
+
     pub fn native_channel(&self) -> &crate::semantic::native::NativeChannel {
         &self.native
     }
