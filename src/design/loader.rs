@@ -211,4 +211,55 @@ oracles:
             "duplicates must fail: {err}"
         );
     }
+
+    // ── Wave 5: contracts without rigidity (items 33-36) ──
+
+    #[test]
+    fn extensions_namespace_round_trips_and_defaults_empty() {
+        // A contract with adapter-specific extension keys loads fine —
+        // `extensions:` is the sanctioned place for them (item 34).
+        let yaml = GOOD_YAML.replace(
+            "schema:\n  name: connections-tui\n  version: \"2\"",
+            "schema:\n  name: connections-tui\n  version: \"2\"\n  mode: strict\n  extensions:\n    ratatui.weight_min: 12\n    custom.vendor_note: \"hello\"",
+        );
+        let c = parse_yaml(&yaml).expect("extensions load");
+        assert_eq!(c.schema.mode, crate::design::ContractMode::Strict);
+        assert_eq!(c.schema.extensions.len(), 2);
+        assert_eq!(
+            c.schema.extensions.get("ratatui.weight_min"),
+            Some(&serde_json::json!(12))
+        );
+        // Round-trips through YAML.
+        let text = to_yaml(&c).unwrap();
+        let c2 = parse_yaml(&text).expect("round-trip");
+        assert_eq!(c, c2);
+        // A contract without extensions carries the empty map (not an
+        // error), and the default mode is Advisory.
+        let plain = parse_yaml(GOOD_YAML).unwrap();
+        assert!(plain.schema.extensions.is_empty());
+        assert_eq!(plain.schema.mode, crate::design::ContractMode::Advisory);
+    }
+
+    #[test]
+    fn mode_parses_all_three() {
+        for (text, want) in [
+            ("advisory", crate::design::ContractMode::Advisory),
+            ("validation", crate::design::ContractMode::Validation),
+            ("strict", crate::design::ContractMode::Strict),
+        ] {
+            let yaml = GOOD_YAML.replace("version: \"2\"", &format!("version: \"2\"\n  mode: {text}"));
+            let c = parse_yaml(&yaml).unwrap();
+            assert_eq!(c.schema.mode, want, "mode={text}");
+        }
+    }
+
+    #[test]
+    fn unknown_mode_fails_load() {
+        let yaml = GOOD_YAML.replace("version: \"2\"", "version: \"2\"\n  mode: pedantic");
+        let err = parse_yaml(&yaml).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("mode") || err.to_lowercase().contains("unknown"),
+            "unknown mode must fail the load naming the field: {err}"
+        );
+    }
 }

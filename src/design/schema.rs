@@ -12,6 +12,7 @@
 //! load, not silently no-op.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Top-level contract document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -64,6 +65,8 @@ fn default_schema() -> ContractSchema {
     ContractSchema {
         name: "unnamed".to_string(),
         version: "1".to_string(),
+        mode: ContractMode::default(),
+        extensions: HashMap::new(),
     }
 }
 
@@ -73,6 +76,57 @@ fn default_schema() -> ContractSchema {
 pub struct ContractSchema {
     pub name: String,
     pub version: String,
+    /// How strictly failures bind (re-review item 33). Default
+    /// [`ContractMode::Advisory`] — checks report but only required-flag
+    /// failures make the overall verdict FAIL. `Validation` promotes
+    /// advisory checks to gate; `Strict` additionally fails on
+    /// Unverified evidence. Declared per-contract so a contract chooses
+    /// its own rigor.
+    #[serde(default)]
+    pub mode: ContractMode,
+    /// Extension namespace (re-review item 34): adapter-specific fields
+    /// live here instead of being rejected or polluting the core schema.
+    /// The core ignores it; adapters read it. Keys are namespaced
+    /// (`ratatui.weight_min`), unknown keys pass through untouched.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extensions: HashMap<String, serde_json::Value>,
+}
+
+/// How strictly a contract's checks bind (re-review item 33).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractMode {
+    /// Checks report; only `required` failures make the overall verdict
+    /// FAIL. Optional checks WARN. The default — a contract is advice
+    /// unless it asks to gate.
+    #[default]
+    Advisory,
+    /// `required` failures FAIL the verdict; optional failures also FAIL
+    /// (declared expectations are claims, and a claim that missed is a
+    /// failure); Unverified stays non-fatal but is named.
+    Validation,
+    /// Validation plus: Unverified is fatal — a check that could not
+    /// gather evidence is treated as a failure. For CI gates that must
+    /// never silently skip.
+    Strict,
+}
+
+impl ContractMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContractMode::Advisory => "advisory",
+            ContractMode::Validation => "validation",
+            ContractMode::Strict => "strict",
+        }
+    }
+    /// Does an Unverified check fail the overall verdict under this mode?
+    pub fn unverified_is_fatal(&self) -> bool {
+        matches!(self, ContractMode::Strict)
+    }
+    /// Does an optional (non-required) failure fail the overall verdict?
+    pub fn optional_failure_is_fatal(&self) -> bool {
+        matches!(self, ContractMode::Validation | ContractMode::Strict)
+    }
 }
 
 /// How to launch the app this contract describes.
@@ -214,6 +268,8 @@ impl Default for ProjectContract {
         ProjectContract {
             schema: default_schema(),
             launch: None,
+            // NOTE: `mode` and `extensions` live inside `schema`; the
+            // default schema carries their defaults.
             viewports: vec![
                 ViewportReq { cols: 80, rows: 24 },
                 ViewportReq {

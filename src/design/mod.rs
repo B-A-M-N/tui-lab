@@ -15,7 +15,8 @@ pub mod rules;
 pub mod schema;
 
 pub use conformance::{
-    check_contract, validate_document, CheckResult, ContractReport, ObservedBehavior, Verdict,
+    check_contract, check_contract_with_mode, validate_document, CheckResult, ContractReport,
+    ObservedBehavior, Verdict,
 };
 pub use loader::{default_contract, load_design_contract, parse_json, parse_yaml, to_yaml};
 pub use oracle::{
@@ -24,6 +25,6 @@ pub use oracle::{
 };
 pub use rules::ContractRules;
 pub use schema::{
-    ComponentContract, ContractSchema, InteractionContract, Keybinding, LaunchContract,
-    LayoutConstraint, OracleDecl, ProjectContract, ViewportReq,
+    ComponentContract, ContractMode, ContractSchema, InteractionContract, Keybinding,
+    LaunchContract, LayoutConstraint, OracleDecl, ProjectContract, ViewportReq,
 };
