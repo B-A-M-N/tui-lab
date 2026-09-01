@@ -1476,6 +1476,7 @@ impl RunContext {
     /// spec; the live session list lives in the SessionManager, which the run
     /// does not own. The MCP layer fills it in.
     pub fn status(&self, sessions: Vec<serde_json::Value>) -> serde_json::Value {
+        let journal = self.journal.as_ref().map(|j| j.health_snapshot());
         json!({
             "run_id": self.id,
             "mode": if self.run_dir.is_some() { "persistent" } else { "ephemeral" },
@@ -1502,6 +1503,7 @@ impl RunContext {
                 "size": a.size,
                 "summary": a.summary,
             })).collect::<Vec<_>>(),
+            "journal": journal,
         })
     }
 
