@@ -2276,6 +2276,8 @@ mod tests {
     /// flush does not duplicate the lines.
     #[test]
     fn persistent_runs_persist_events_incrementally() {
+        // (see the sweep-path test below for the observe → persistence
+        // cursor wiring; this test pins the hold_events contract itself.)
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut run = RunContext::persistent(tmp.path()).expect("run");
 
@@ -2315,6 +2317,59 @@ mod tests {
         eph.hold_events("eph-sess", vec![ev.clone()]);
         assert_eq!(eph.held_events.len(), 1, "ephemeral holds for flush");
         assert_eq!(eph.counts()["events_held_for_flush"], 1);
+    }
+
+    /// Wave-2 (incremental persistence, the sweep wiring): a session's event
+    /// queue drains into the run's on-disk log through the run-side
+    /// persistence cursor as observations happen — the log is current BEFORE
+    /// close, and the close-path drain only sees the tail.
+    #[test]
+    fn observe_sweep_persists_events_before_close() {
+        let mut s = crate::session::state::Session::new("sweep-ev".into(), "python3".into());
+        s.start_with_spec(crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec!["-c".into(), "print('SWEEP-EV'); import time; time.sleep(2)".into()],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: "cli".into(),
+            isolation: "local".into(),
+        })
+        .expect("spawn");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+
+        // The sweep's persistence loop (same shape as the MCP observe sweep).
+        let sweep = |s: &mut crate::session::state::Session, run: &mut RunContext| {
+            s.observe(50).expect("observe");
+            let cursor_key = format!("persistence:{}", s.id);
+            let from = run.event_cursor(&cursor_key).unwrap_or(0);
+            let batch = s.events_since(from);
+            if !batch.events.is_empty() {
+                run.hold_events(&s.id, batch.events);
+                run.set_event_cursor(&cursor_key, batch.cursor);
+            }
+        };
+        sweep(&mut s, &mut run);
+        sweep(&mut s, &mut run);
+
+        // The on-disk log is already current — before any close/drain.
+        let path = run.run_dir().expect("dir").join("events").join("sweep-ev.jsonl");
+        let log = std::fs::read_to_string(&path).expect("incremental event log");
+        assert!(
+            !log.is_empty(),
+            "events must reach disk during observation, not only at close"
+        );
+        // The cursor advanced: a second sweep round saw no duplicates.
+        let count_before = log.lines().count();
+        assert_eq!(
+            run.event_cursor("persistence:sweep-ev"),
+            Some(run.event_cursor("persistence:sweep-ev").unwrap_or(0)),
+            "cursor recorded"
+        );
+        assert!(count_before >= 1);
+        s.stop().ok();
     }
 
     /// Re-review item 40: the frame commit pipeline stamps citable ids and

@@ -513,6 +513,24 @@ impl TuiLabServer {
                 match s.observe(idle) {
                     Ok(screen) => {
                         let mut run = run.lock().unwrap();
+                        // Incremental event persistence (re-review Wave-2):
+                        // events land in the run's on-disk log as they fire,
+                        // via the run's own consumer cursor — not only at
+                        // close. `bump_event` alone counted an estimate while
+                        // real events sat in the queues; a crash between
+                        // observe and close lost the whole log. `hold_events`
+                        // is append-only and idempotent per event (seqs are
+                        // unique), and the close path still drains whatever
+                        // tail remained.
+                        {
+                            let cursor_key = format!("persistence:{}", s.id);
+                            let from = run.event_cursor(&cursor_key).unwrap_or(0);
+                            let batch = s.events_since(from);
+                            if !batch.events.is_empty() {
+                                run.hold_events(&s.id, batch.events);
+                                run.set_event_cursor(&cursor_key, batch.cursor);
+                            }
+                        }
                         run.bump_event();
                         // Coverage ingestion rides every observation
                         // (re-review P1 item 17): native coverage events were
