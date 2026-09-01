@@ -321,7 +321,12 @@ pub fn reapply_interaction(
         // move `focused`). infer_focus keyed the old focus on labels; the
         // fresh pass re-derives it from reverse-video/cursor evidence.
         c.focused = focus.control_id.as_deref() == Some(c.id.as_str());
-        // Enabled: dim-style evidence is visual, so re-derive.
+        // Enabled: dim-style evidence is visual, so re-derive. Polarity
+        // matches the tree path (`infer_enabled`): every cell of the
+        // control renders dim → DISABLED; anything else (including a
+        // degenerate zero-cell bounds) is assumed enabled. The old line
+        // assigned the raw `all(dim)` predicate — every normal control
+        // read disabled and a fully dim control read enabled.
         let cells: Vec<&crate::screen::Cell> = screen
             .cells
             .iter()
@@ -331,7 +336,7 @@ pub fn reapply_interaction(
                     && cell.x < c.bounds.x + c.bounds.width.max(1)
             })
             .collect();
-        c.enabled = cells.iter().all(|cell| cell.dim);
+        c.enabled = cells.is_empty() || cells.iter().any(|cell| !cell.dim);
         // Field cursor / read-only re-derivation for fields.
         if matches!(c.kind, ControlKind::Field) {
             let cursor_inside = screen.cursor.visible
@@ -520,5 +525,50 @@ mod interaction_cache_tests {
             return Some(node);
         }
         node.children.iter().find_map(|c| find_label(c, label))
+    }
+
+    /// Re-review W1b (enabled polarity): the flat shape's dim rule must
+    /// agree with the tree path — every cell of a control renders dim →
+    /// DISABLED, and a normal (non-dim) control stays enabled. The old line
+    /// assigned `all(dim)` directly, inverting both.
+    #[test]
+    fn flat_enabled_matches_dim_polarity() {
+        let cache = &mut SemanticCache::new();
+        let native = crate::semantic::native::NativeChannel::default();
+
+        // Normal frame: both buttons must read enabled.
+        let normal = screen_with_two_buttons(1);
+        let (sem, _, _) = fuse(&normal, cache, &native);
+        assert!(
+            sem.controls.iter().all(|c| c.enabled),
+            "non-dim controls are enabled: {:?}",
+            sem.controls.iter().map(|c| (c.label.clone(), c.enabled)).collect::<Vec<_>>()
+        );
+
+        // Dim the Save span entirely (text unchanged — interaction-state
+        // re-derivation must flip it on the reapply pass). The rule is
+        // ALL cells of the control dim, so cover the full `[ Save ]`.
+        let mut dimmed = screen_with_two_buttons(1);
+        for cell in dimmed.cells.iter_mut() {
+            if cell.y == 0 && (0..8).contains(&cell.x) {
+                cell.dim = true;
+            }
+        }
+        let (sem2, tree2, _) = fuse(&dimmed, cache, &native);
+        let save = sem2
+            .controls
+            .iter()
+            .find(|c| c.label == "Save")
+            .expect("Save control");
+        assert!(!save.enabled, "fully dim control is disabled");
+        let cancel = sem2
+            .controls
+            .iter()
+            .find(|c| c.label == "Cancel")
+            .expect("Cancel control");
+        assert!(cancel.enabled, "non-dim control stays enabled");
+        // Tree shape agrees (infer_enabled polarity).
+        let save_node = find_label(&tree2.root, "Save").expect("Save node");
+        assert!(!save_node.state.enabled.value, "tree agrees: dim is disabled");
     }
 }
