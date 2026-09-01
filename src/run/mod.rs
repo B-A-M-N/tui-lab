@@ -262,6 +262,13 @@ pub struct CoverageEntry {
     pub first_seen: u64,
     /// Unix-millis of the last report.
     pub last_seen: u64,
+    /// Wave 5 item 41: source loci the app itself declared for the
+    /// component this target names (from the same NativeSemanticProtocol
+    /// channel — both facts are app-attested, so the join is exact, not
+    /// inferred). Empty for file targets and for components the app did
+    /// not declare a locus for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<crate::semantic::source_ref::SourceRef>,
 }
 
 impl RunContext {
@@ -1072,6 +1079,69 @@ impl RunContext {
         &self.findings
     }
 
+    /// Wave 5 item 45: the explain-time source join, as a pure lookup.
+    /// A finding that stored with no loci gains any loci the coverage
+    /// ledger can attest for its evidence targets — coverage events often
+    /// arrive AFTER the audit pass that produced the finding, and the
+    /// explanation surface should see the join without mutating stored
+    /// findings. Findings that already carry loci (or whose evidence names
+    /// no covered control) come back unchanged.
+    pub fn join_source_refs_if_known(
+        &self,
+        finding: &crate::audit::Finding,
+    ) -> crate::audit::Finding {
+        if !finding.source_refs.is_empty() {
+            return finding.clone();
+        }
+        // App-attested loci (item 41) outrank inferred ones: an entry that
+        // carries a native `source` field is the app's own claim about
+        // where that widget lives. Ledger KEYS that are file loci are the
+        // weaker, correlational join and only fill gaps.
+        let widget_targets: Vec<&String> = self
+            .coverage_ledger
+            .keys()
+            .filter(|t| !target_is_file_locus(t))
+            .collect();
+        if widget_targets.is_empty() {
+            return finding.clone();
+        }
+        let mut refs: Vec<crate::semantic::source_ref::SourceRef> = Vec::new();
+        for ev in &finding.evidence {
+            let target = ev.target.as_deref().unwrap_or("");
+            let Some(w) = widget_targets
+                .iter()
+                .find(|w| coverage_target_matches_control(w, target))
+            else {
+                continue;
+            };
+            // Prefer the app-attested loci stored on the matched entry.
+            if let Some(entry) = self.coverage_ledger.get(*w) {
+                refs.extend(entry.source_refs.iter().cloned());
+                if !entry.source_refs.is_empty() {
+                    continue;
+                }
+            }
+            // Fall back to file-locus keys (confidence 0.7 join).
+            for ft in self
+                .coverage_ledger
+                .keys()
+                .filter(|t| target_is_file_locus(t))
+            {
+                if let Some(sr) = source_ref_from_target(ft) {
+                    refs.push(sr);
+                }
+            }
+            break;
+        }
+        if refs.is_empty() {
+            return finding.clone();
+        }
+        refs.dedup_by(|a, b| a.location() == b.location());
+        let mut joined = finding.clone();
+        joined.source_refs = refs;
+        joined
+    }
+
     /// Assemble [`crate::audit::repair::RepairPacket`]s for every finding
     /// (audit item: vket/RepairPacket). Each packet joins the finding with
     /// its replayable reproduction, its source loci, and a verification
@@ -1166,11 +1236,37 @@ impl RunContext {
                 sessions: Vec::new(),
                 first_seen: now,
                 last_seen: now,
+                source_refs: Vec::new(),
             });
         entry.hits += 1;
         entry.last_seen = now;
         if !entry.sessions.iter().any(|s| s == session) {
             entry.sessions.push(session.to_string());
+        }
+    }
+
+    /// Wave 5 item 41: fold one coverage event WITH the declaring
+    /// component's app-attested source locus. The locus comes from the
+    /// same NativeSemanticProtocol channel (the node's `source` field), so
+    /// linking widget target → file:line is a join of two app-declared
+    /// facts, not an inference. Widget-shaped targets accumulate their
+    /// loci; file targets keep the locus they already are.
+    pub fn record_coverage_event_with_identity(
+        &mut self,
+        session: &str,
+        target: &str,
+        source_ref: crate::semantic::source_ref::SourceRef,
+    ) {
+        self.record_coverage_event(session, target);
+        let Some(entry) = self.coverage_ledger.get_mut(target) else {
+            return;
+        };
+        if !entry
+            .source_refs
+            .iter()
+            .any(|r| r.location() == source_ref.location())
+        {
+            entry.source_refs.push(source_ref);
         }
     }
 
@@ -2018,16 +2114,19 @@ fn coverage_target_matches_control(coverage_target: &str, control_id: &str) -> b
     if widget_slug.is_empty() {
         return false;
     }
-    // Control ids look like `button/save/40,12` or `field:host/2,3` —
-    // segments are kind/label/coords, so the label slug is the second to
-    // last path segment (fall back to the first for short ids).
-    let segs: Vec<&str> = control_id.split('/').collect();
-    let label_seg = if segs.len() >= 2 {
-        segs[segs.len() - 2].split(',').next().unwrap_or("")
-    } else {
-        segs[0].split(',').next().unwrap_or("")
-    };
-    let last_seg = label_seg.to_lowercase();
+    // Control ids are `kind/label` (`button/save`) or region-path'd
+    // `region/kind/label` (`dialog/main/button/save`, sometimes with a
+    // trailing `x,y` coordinate). Coordinates only appear as a comma
+    // inside the last segment, so: drop a trailing `,x,y` segment, then
+    // the label is the last remaining path segment.
+    let mut segs: Vec<&str> = control_id.split('/').collect();
+    if let Some(last) = segs.last() {
+        if last.contains(',') {
+            segs.pop();
+        }
+    }
+    let label_seg = segs.last().copied().unwrap_or("");
+    let last_seg = label_seg.split(',').next().unwrap_or("").to_lowercase();
     !last_seg.is_empty() && (widget_slug == last_seg || widget_slug.contains(&last_seg))
 }
 

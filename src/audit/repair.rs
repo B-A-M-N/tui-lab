@@ -28,6 +28,11 @@ use serde::Serialize;
 pub struct RepairPacket {
     /// The finding this packet repairs (verbatim, with its evidence).
     pub finding: crate::audit::Finding,
+    /// Wave 5 item 42: the RULE identity (`rule_id`, falling back to the
+    /// instance id when a producer never set the rule) — the stable key
+    /// across runs. Verification and regression bundles key on this, not
+    /// on the instance id, which is unique per occurrence.
+    pub rule_id: String,
     /// The replayable minimized reproduction (scenario id + steps), when
     /// the finding has one. `None` for static findings — declared, not
     /// hidden behind an empty string.
@@ -65,8 +70,27 @@ pub struct VerificationRecipe {
     pub replay_scenario: String,
     /// What must NOT reappear for the fix to count.
     pub expect_absent_finding: String,
-    /// The finding's rule id (the `id` field) to watch for.
+    /// The RULE id to watch for after the fix (Wave 5 item 42): stable
+    /// across runs, so a fresh audit pass comparing rule keys reports
+    /// FIXED/REGRESSED correctly even though instance ids differ.
     pub finding_rule_id: String,
+    /// Wave 5 item 44: the targeted probe. When the finding's evidence
+    /// names a control target, the recipe says exactly what to re-check —
+    /// the focused re-audit profile and the control target — instead of
+    /// "replay everything and look".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetedCheck>,
+}
+
+/// Wave 5 item 44: one targeted re-check derived from the finding's own
+/// evidence — the narrowest thing an agent can run to confirm the fix.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetedCheck {
+    /// The evidence target the finding anchored on (control id, region,
+    /// frame hash …).
+    pub target: String,
+    /// The cheapest audit surface that re-observes this target.
+    pub recheck_hint: String,
 }
 
 impl RepairPacket {
@@ -85,6 +109,22 @@ impl RepairPacket {
         if finding.evidence.is_empty() {
             return None;
         }
+        // Wave 5 item 42: rule identity is the stable verification key.
+        let rule_id = finding
+            .rule_id
+            .clone()
+            .unwrap_or_else(|| finding.id.clone());
+        let target = finding
+            .evidence
+            .first()
+            .and_then(|e| e.target.clone());
+        let targeted = target.as_ref().map(|t| TargetedCheck {
+            target: t.clone(),
+            recheck_hint: format!(
+                "re-run the '{}' audit (or tui_probe against this target) and confirm the '{}' rule no longer fires here",
+                finding.category, rule_id
+            ),
+        });
         let repro = finding.reproduction.as_deref().and_then(|id| {
             let sc = load_scenario(id)?;
             Some(ReproductionRef {
@@ -95,12 +135,19 @@ impl RepairPacket {
         });
         let verification = repro.as_ref().map(|r| VerificationRecipe {
             summary: format!(
-                "Replay scenario {} ({} steps); the {} finding must not reappear.",
-                r.scenario_id, r.steps, finding.id
+                "Replay scenario {} ({} steps); the rule {} must not reappear{}.",
+                r.scenario_id,
+                r.steps,
+                rule_id,
+                target
+                    .as_deref()
+                    .map(|t| format!(" on {t}"))
+                    .unwrap_or_default(),
             ),
             replay_scenario: r.scenario_id.clone(),
             expect_absent_finding: finding.summary.clone(),
-            finding_rule_id: finding.id.clone(),
+            finding_rule_id: rule_id.clone(),
+            target: targeted,
         });
         let actionable_refs = finding
             .source_refs
@@ -109,6 +156,7 @@ impl RepairPacket {
             .cloned()
             .collect();
         Some(RepairPacket {
+            rule_id,
             finding,
             reproduction: repro,
             source_refs: Vec::new(), // filled by the caller from finding

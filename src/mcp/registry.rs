@@ -93,12 +93,12 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_run",
-        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, repair packets for every finding, and context (this registry as JSON).",
+        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, repair packets for every finding, repair bundle for ONE finding (reproduction + app-attested source loci + targeted verification recipe + regression check), and context (this registry as JSON).",
         selector: Some(("action", <crate::mcp::params::RunAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
         name: "tui_contract",
-        summary: "Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).",
+        summary: "Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (regions become components, named controls become oracle assertions; carries the scaffold.inferred marker; edit from observation toward intent).",
         selector: Some(("action", <crate::mcp::params::ContractAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
