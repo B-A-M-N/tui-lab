@@ -14,30 +14,40 @@
 use serde_json::json;
 
 use crate::audit::{EvidenceKind, EvidenceRef, Finding};
-use crate::semantic;
 use crate::session::state::Session;
 
 /// The observable pre-state one audit run commits to restoring.
 #[derive(Debug, Clone)]
 pub struct PreState {
+    /// Human-readable focused control label (display).
     pub focus_control: Option<String>,
+    /// Stable focused control id (re-review P0.6): the authoritative
+    /// residue comparison. Labels can collide and inference can rename a
+    /// label; the semantic id is what the native channel and the tree agree
+    /// on.
+    pub focus_control_id: Option<String>,
     pub cols: u16,
     pub rows: u16,
     pub structure_hash: String,
 }
 
 impl PreState {
-    /// Capture the current observable state.
+    /// Capture the current observable state — through the FUSED
+    /// FrameAnalysis (re-review P0.6). Residue detection judged against
+    /// inference-only semantics could contradict the native channel
+    /// ("focus changed" by inference, "unchanged" by the app, or the
+    /// reverse); capture and verify must share one authority.
     pub fn capture(session: &mut Session) -> Result<Self, String> {
         let screen = session
             .observe(40)
             .map_err(|e| format!("pre-state capture failed: {e}"))?;
-        let sem = semantic::analyze(&screen);
+        let analysis = session.analyze_screen(screen);
         Ok(PreState {
-            focus_control: sem.focus.control.clone(),
-            cols: screen.cols,
-            rows: screen.rows,
-            structure_hash: screen.structure_hash.clone(),
+            focus_control: analysis.semantic.focus.control.clone(),
+            focus_control_id: analysis.semantic.focus.control_id.clone(),
+            cols: analysis.frame.cols,
+            rows: analysis.frame.rows,
+            structure_hash: analysis.frame.structure_hash.clone(),
         })
     }
 }
@@ -134,19 +144,23 @@ where
     Ok(findings)
 }
 
-/// Compare the live session against the captured pre-state.
+/// Compare the live session against the captured pre-state — through the
+/// same fused authority capture used (re-review P0.6). The focus-id
+/// comparison is authoritative; the label pair rides along for display.
 pub fn verify(session: &mut Session, pre: &PreState) -> Option<StateResidue> {
     let screen = session.observe(40).ok()?;
-    let sem = semantic::analyze(&screen);
+    let analysis = session.analyze_screen(screen);
+    let sem = &analysis.semantic;
+    let frame = &analysis.frame;
     let mut residue = StateResidue {
-        structure_changed: screen.structure_hash != pre.structure_hash,
+        structure_changed: frame.structure_hash != pre.structure_hash,
         ..Default::default()
     };
-    if sem.focus.control != pre.focus_control {
+    if sem.focus.control_id != pre.focus_control_id {
         residue.focus_moved = Some((pre.focus_control.clone(), sem.focus.control.clone()));
     }
-    if screen.cols != pre.cols || screen.rows != pre.rows {
-        residue.size_changed = Some((screen.cols, screen.rows));
+    if frame.cols != pre.cols || frame.rows != pre.rows {
+        residue.size_changed = Some((frame.cols, frame.rows));
     }
     Some(residue)
 }

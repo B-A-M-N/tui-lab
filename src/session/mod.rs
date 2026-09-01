@@ -24,4 +24,4 @@ pub use lease::LeaseState;
 pub use locator::ProjectLocator;
 pub use manager::SessionManager;
 pub use scratch::{EnvironmentPolicy, ScratchDir};
-pub use state::{LaunchSpec, Session};
+pub use state::{FrameAnalysis, LaunchSpec, Session};

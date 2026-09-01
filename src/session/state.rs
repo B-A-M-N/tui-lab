@@ -130,6 +130,37 @@ fn fused_key(screen: &crate::screen::ScreenState, native_seq: u64) -> String {
     )
 }
 
+/// The single-authority analysis of one terminal frame (re-review P0.4):
+/// the raw frame plus its FUSED semantic screen, semantic tree, native
+/// overlay report, and fused semantic identity. Produced only by a
+/// [`Session`] (`analyze_screen` / `analyze_last` / `observe_fused`
+/// territory), so every consumer sees the same native-participating truth
+/// and the old bare `semantic::analyze` re-inference paths — contract
+/// conformance, audit residue, exploration identity, scenario oracles —
+/// cannot disagree with what `tui_observe semantic` reports.
+#[derive(Debug, Clone)]
+pub struct FrameAnalysis {
+    /// The analyzed frame.
+    pub frame: crate::screen::ScreenState,
+    /// Fused semantic screen (inferred detection + native overlay).
+    pub semantic: crate::semantic::SemanticScreen,
+    /// Fused semantic tree.
+    pub tree: crate::semantic::node::SemanticTree,
+    /// What the native overlay joined (matched ids, native-only insertions,
+    /// applied focus).
+    pub native: crate::semantic::native::NativeOverlayReport,
+    /// Fused semantic identity — structure + interaction + native truth.
+    pub semantic_identity: String,
+}
+
+impl FrameAnalysis {
+    /// Convenience: the analyzed frame.
+    pub fn screen(&self) -> &crate::screen::ScreenState {
+        &self.frame
+    }
+}
+
+
 /// Rows whose cell text differs between two frames (Wave B item 12:
 /// `ScreenChanged.dirty_rows` derived at the only place with both frames).
 /// Compares viewport text per row — cheap, and matches what an incremental
@@ -1023,6 +1054,40 @@ impl Session {
             .fused_frame()
             .expect("observe() seeded `last`, so fused_frame() has a frame");
         Ok((screen, sem, tree, report))
+    }
+
+    /// THE authoritative per-frame analysis (re-review P0.4): one struct
+    /// carrying the frame plus its fused semantic screen, semantic tree,
+    /// native overlay report, and the fused semantic identity. Every
+    /// proof-producing subsystem — contract conformance, scenario replay,
+    /// audit residue detection, exploration state identity, assertions —
+    /// consumes THIS, so a cooperative app's native semantics are visible
+    /// everywhere and no two verdict paths can disagree.
+    ///
+    /// `analyze_last` serves the cached live frame; `analyze_screen`
+    /// analyzes an arbitrary frame a transaction owns (before/after), with
+    /// the native overlay positioned at the CURRENT channel state — the
+    /// honest option for historical frames, since overlay facts older than
+    /// the frame cannot be reconstructed after the channel advanced.
+    pub fn analyze_screen(
+        &self,
+        screen: crate::screen::ScreenState,
+    ) -> crate::session::state::FrameAnalysis {
+        let (sem, tree, native) =
+            crate::semantic::fuse(&screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        let semantic_identity = crate::semantic::semantic_identity_fused(&sem, &tree);
+        crate::session::state::FrameAnalysis {
+            frame: screen,
+            semantic: sem,
+            tree,
+            native,
+            semantic_identity,
+        }
+    }
+
+    /// Fused [`FrameAnalysis`] of the session's most recent frame.
+    pub fn analyze_last(&self) -> Option<crate::session::state::FrameAnalysis> {
+        self.last().map(|s| self.analyze_screen(s.clone()))
     }
 
     /// Send input. When recording, the backend has already delivered the exact

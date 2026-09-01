@@ -243,8 +243,12 @@ pub fn run(
         // participates in the identity — the same `analyze` the MCP observe
         // path uses. This is what stops the graph from collapsing
         // "same text, focus=Save" and "same text, focus=Cancel".
-        let before_identity = identity_of(tx.before());
-        let after_identity = identity_of(&after);
+        //
+        // Re-review P0.8: the analysis is the session's FUSED one, so a
+        // cooperative app's native semantics participate in state identity
+        // — never a bare re-inference that discards what the app reported.
+        let before_identity = fused_identity_of(session, tx.before());
+        let after_identity = fused_identity_of(session, &after);
 
         let novel_state = !identities.contains(&after_identity);
         if novel_state {
@@ -341,13 +345,15 @@ pub fn run(
     })
 }
 
-/// Layered [`StateIdentity`] for one frame (P0 fix 3): structure + visual
-/// hashes plus the interaction layer from semantic analysis, built with the
-/// same `analyze` used everywhere else.
-fn identity_of(
+/// Layered [`StateIdentity`] for one frame (P0 fix 3), computed through the
+/// session's fused semantic authority (re-review P0.8): the same fused truth
+/// every observe mode serves, so state identity built from a cooperative
+/// app's native semantics never regresses to bare inference.
+fn fused_identity_of(
+    session: &Session,
     screen: &crate::screen::ScreenState,
 ) -> crate::exploration::state_graph::StateIdentity {
-    let sem = crate::semantic::analyze(screen);
+    let sem = session.fuse_screen(screen);
     crate::exploration::state_graph::StateIdentity::with_semantic(screen, &sem)
 }
 

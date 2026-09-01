@@ -147,7 +147,13 @@ pub fn run_with_contract(
         // Execute via the one canonical executor.
         let tx = crate::execution::execute_act(session, &action, 80, 900, false)?;
         let after = tx.after().clone();
-        let after_sem = crate::semantic::analyze(&after);
+        // Re-review P0.7: the after-state identity comes from the SAME
+        // fused authority as the before-state — the state graph never
+        // mixes fused-before with inference-after (which could see one
+        // action as a transition between states that native semantics
+        // say are identical, or miss one that native semantics
+        // distinguish).
+        let after_sem = session.fuse_screen(&after);
         let after_identity = StateIdentity::with_semantic(&after, &after_sem);
 
         graph.record_transition_identity(&identity, &after_identity, candidate_name(&action));
