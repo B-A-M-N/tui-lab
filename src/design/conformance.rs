@@ -224,13 +224,14 @@ pub fn check_contract(
     results.extend(check_top_level_oracles(session, contract, &observed));
 
     // Restore the viewport we came in with.
-    let _ = session.resize(orig_cols, orig_rows);
-    let _ = session.wait(
-        crate::backend::WaitCond::ScreenStable {
-            quiet_for: std::time::Duration::from_millis(120),
-            after_screen_seq: None,
-        },
+    // Canonical transaction (re-review P1 item 22): the restore is evidence,
+    // not a side effect — same anchor/ledger/settle semantics as MCP acts.
+    let _ = execute_act(
+        session,
+        &CanonicalAction::Resize { cols: orig_cols, rows: orig_rows },
+        120,
         1500,
+        false,
     );
 
     let verdict = results.iter().fold(Verdict::Pass, |acc, r| {
@@ -643,34 +644,42 @@ fn check_layout(session: &mut Session, contract: &ProjectContract) -> Vec<CheckR
         }
     }
 
-    let _ = session.resize(orig_cols, orig_rows);
-    let _ = session.wait(
-        crate::backend::WaitCond::ScreenStable {
-            quiet_for: std::time::Duration::from_millis(120),
-            after_screen_seq: None,
-        },
+    // Canonical transaction (re-review P1 item 22): the restore is evidence,
+    // not a side effect — same anchor/ledger/settle semantics as MCP acts.
+    let _ = execute_act(
+        session,
+        &CanonicalAction::Resize { cols: orig_cols, rows: orig_rows },
+        120,
         1500,
+        false,
     );
     out
 }
 
 fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> CheckResult {
-    if let Err(e) = session.resize(cols, rows) {
-        return CheckResult::fail(
-            "layout",
-            name,
-            format!("resize to {cols}x{rows} failed: {e}"),
-        );
-    }
-    let _ = session.wait(
-        crate::backend::WaitCond::ScreenStable {
-            quiet_for: std::time::Duration::from_millis(150),
-            after_screen_seq: None,
-        },
-        2000,
-    );
-    check_clipping_here(
+    // Canonical transaction (re-review P1 item 22): the resize carries the
+    // settle semantics and lands in the run ledger like any other action.
+    // Item 23: the transaction's after-frame IS the authoritative
+    // post-resize frame — no extra observe().
+    let tx = match execute_act(
         session,
+        &CanonicalAction::Resize { cols, rows },
+        150,
+        2000,
+        false,
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            return CheckResult::fail(
+                "layout",
+                name,
+                format!("resize to {cols}x{rows} failed"),
+            )
+        }
+    };
+    let screen = tx.after().clone();
+    check_clipping_on_screen(
+        &screen,
         name,
         &LayoutConstraint {
             name: None,
@@ -679,6 +688,36 @@ fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> 
             no_clipping: true,
         },
     )
+}
+
+fn check_clipping_on_screen(
+    screen: &crate::screen::ScreenState,
+    name: String,
+    lc: &LayoutConstraint,
+) -> CheckResult {
+    if !lc.no_clipping {
+        return CheckResult::pass(
+            "layout",
+            name,
+            "clipping not required to be checked".to_string(),
+        );
+    }
+    let sem = semantic::analyze(screen);
+    let clipped: Vec<String> = sem
+        .regions
+        .iter()
+        .filter(|rg| !matches!(rg.clipping_state, semantic::ClippingState::None))
+        .map(|rg| rg.id.clone())
+        .collect();
+    if clipped.is_empty() {
+        CheckResult::pass("layout", name, "no region extends beyond the viewport".to_string())
+    } else {
+        CheckResult::fail(
+            "layout",
+            name,
+            format!("clipped regions: {}", clipped.join(", ")),
+        )
+    }
 }
 
 fn check_clipping_here(session: &mut Session, name: String, lc: &LayoutConstraint) -> CheckResult {
