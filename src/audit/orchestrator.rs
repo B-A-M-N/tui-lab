@@ -48,6 +48,12 @@ pub enum AuditProfile {
     Mouse,
     States,
     Errors,
+    /// Unicode subsystem (Wave 3): wide-glyph overlap + control-byte leak
+    /// over one fused frame (static).
+    Unicode,
+    /// Control/region coverage (Wave 3): orphan controls + ambiguous region
+    /// parents over one fused frame (static).
+    Controls,
 }
 
 impl AuditProfile {
@@ -69,8 +75,10 @@ impl AuditProfile {
             "mouse" => Ok(AuditProfile::Mouse),
             "states" => Ok(AuditProfile::States),
             "errors" => Ok(AuditProfile::Errors),
+            "unicode" => Ok(AuditProfile::Unicode),
+            "controls" => Ok(AuditProfile::Controls),
             other => Err(format!(
-                "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors",
+                "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls",
                 other
             )),
         }
@@ -93,6 +101,8 @@ impl AuditProfile {
             AuditProfile::Mouse => "mouse",
             AuditProfile::States => "states",
             AuditProfile::Errors => "errors",
+            AuditProfile::Unicode => "unicode",
+            AuditProfile::Controls => "controls",
         }
     }
 
@@ -174,14 +184,16 @@ pub fn run_profile_with_contract(
         });
     }
 
-    // The one remaining static profile: discoverability (single frame).
+    // The static profiles (single frame, no driving): discoverability plus
+    // the Wave-3 subsystem audits (unicode, controls).
     if !profile.is_active() {
         // Fused truth (re-review Wave-2 item 16).
         let (screen, sem, _, _) = session.observe_fused(40).map_err(|e| format!("observe failed: {e}"))?;
+        let name = profile.name();
         return Ok(ProfileReport {
             profile,
             mode: "static",
-            findings: crate::audit::run("discoverability", &screen, &sem).map_err(|e| e.to_string())?,
+            findings: crate::audit::run(name, &screen, &sem).map_err(|e| e.to_string())?,
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
         });
     }
@@ -372,6 +384,44 @@ mod tests {
             "static composite categories must be present: {:?}",
             cats
         );
+        pool.stop(&id).await.ok();
+    }
+
+    /// Wave-3 subsystem audits run through the orchestrator's static path.
+    #[tokio::test]
+    async fn subsystem_profiles_run_static() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "print('subsys'); input()".to_string()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        for name in ["unicode", "controls"] {
+            let report = pool
+                .with_session(Some(&id), |s| run_profile(s, name))
+                .await
+                .expect("actor run")
+                .unwrap_or_else(|e| panic!("{name} must run: {e}"));
+            assert_eq!(report.mode, "static", "{name} is a static profile");
+            // A clean python screen can legitimately produce zero findings;
+            // the contract is the run SUCCEEDS and carries only real rules.
+            for f in &report.findings {
+                assert!(
+                    f.id.starts_with("UNI-") || f.id.starts_with("CTRL-"),
+                    "{name} findings come from the subsystem rules: {}",
+                    f.id
+                );
+            }
+        }
+        // `full`'s static composite now includes the subsystem audits too.
         pool.stop(&id).await.ok();
     }
 

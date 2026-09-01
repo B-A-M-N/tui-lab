@@ -265,6 +265,14 @@ pub fn run(
     if want("keyboard") {
         out.extend(static_keyboard_audit(sem));
     }
+    // Wave-3 subsystem audits (static): unicode safety and control/region
+    // coverage. Deterministic reads of one fused frame.
+    if want("unicode") {
+        out.extend(unicode_audit(screen));
+    }
+    if want("controls") {
+        out.extend(controls_audit(screen, sem));
+    }
     // Re-review item 44: profiles with NO static pass are caller errors,
     // never fabricated `info` rows. This static entry point only accepts
     // profiles it can actually check; the active profiles (color,
@@ -274,7 +282,7 @@ pub fn run(
         return Err(anyhow::anyhow!(
             "profile '{}' has no static checks; use an audit action that drives \
              the app (probe/explore/orchestrator) or a profile with static checks \
-             (focus, layout, discoverability, keyboard)",
+             (focus, layout, discoverability, keyboard, unicode, controls)",
             profile
         ));
     }
@@ -285,7 +293,11 @@ pub fn run(
 /// The MCP audit surface validates with this instead of discovering the
 /// gap in the results (item 44: no placeholder findings).
 pub fn static_profile_available(profile: &str) -> bool {
-    matches!(profile, "full" | "focus" | "layout" | "clipping" | "discoverability" | "keyboard")
+    matches!(
+        profile,
+        "full" | "focus" | "layout" | "clipping" | "discoverability" | "keyboard"
+            | "unicode" | "controls"
+    )
 }
 
 fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
@@ -462,6 +474,208 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
     out
 }
 
+/// Wave-3 (unicode subsystem): the frame's unicode safety. The two failure
+/// classes the terminal-grid model cares about:
+/// 1. **Wide glyphs** — a double-width char (CJK, emoji) whose continuation
+///    column is NOT an empty spacer cell means the app wrote a narrow
+///    neighbor ON TOP of the glyph's second half: the column arithmetic the
+///    whole harness relies on (click coordinates, bounds, clipping math)
+///    is off by one from there to the end of the row.
+/// 2. **Unrenderable control bytes** — C0/C1 bytes that leaked through as
+///    literal cell text render as garbage or nothing at all; the app's
+///    output encoding is broken and any test asserting on that text will
+///    chase a phantom.
+fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    // 1) Wide glyphs with a non-empty continuation cell.
+    let mut wide_overlaps: Vec<(u16, u16)> = Vec::new();
+    for cell in &screen.cells {
+        let w = crate::screen::cell_string::display_width(&cell.text);
+        if w <= 1 {
+            continue;
+        }
+        // The continuation column(s) sit to the glyph's right on the same row.
+        for cont in 1..w {
+            let cx = cell.x + cont;
+            if cx >= screen.cols {
+                // Glyph whose second half falls off the screen edge is its
+                // own truncation finding.
+                wide_overlaps.push((cell.x, cell.y));
+                break;
+            }
+            if let Some(neighbor) = screen.cells.iter().find(|c| c.x == cx && c.y == cell.y) {
+                if !neighbor.text.is_empty() {
+                    wide_overlaps.push((cell.x, cell.y));
+                    break;
+                }
+            }
+        }
+    }
+    if !wide_overlaps.is_empty() {
+        let first = wide_overlaps[0];
+        let summary = format!(
+            "{} double-width glyph(s) overlap a following cell — column arithmetic is unreliable from the first overlap onward.",
+            wide_overlaps.len()
+        );
+        out.push(Finding {
+            id: "UNI-WIDE".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "unicode".into(),
+            summary: summary.clone(),
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Other,
+                "wide_glyph_overlap",
+                summary,
+            )
+            .with_detail(json!({
+                "count": wide_overlaps.len(),
+                "first": { "x": first.0, "y": first.1 },
+                "note": "click coordinates and bounds west of the overlap stay exact; east of it they are off by the accumulated width",
+            }))],
+            confidence: 0.9,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // 2) Control bytes that leaked into cell text.
+    let leaked: Vec<(u16, u16)> = screen
+        .cells
+        .iter()
+        .filter(|c| c.text.chars().any(|ch| ch.is_control() && ch != '\t'))
+        .map(|c| (c.x, c.y))
+        .collect();
+    if !leaked.is_empty() {
+        let summary = format!(
+            "{} cell(s) contain literal control characters — raw bytes leaked through the app's output encoding.",
+            leaked.len()
+        );
+        out.push(Finding {
+            id: "UNI-CTRL".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "unicode".into(),
+            summary: summary.clone(),
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Other,
+                "control_char_in_cell",
+                summary,
+            )
+            .with_detail(json!({
+                "count": leaked.len(),
+                "first": leaked.first(),
+            }))],
+            confidence: 0.85,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    out
+}
+
+/// Wave-3 (control/region coverage): structural coverage gaps a single
+/// fused frame can prove:
+/// 1. **Unclaimed controls** — a control outside every detected region
+///    usually means the region detection missed the panel that owns it
+///    (or the control is drawn at a raw position the app never declared);
+///    region-scoped operations (assert region=, clipping math) silently
+///    skip it.
+/// 2. **Region-overlapping controls** — a control claimed by 2+ regions is
+///    an ambiguous parent; `region:` scoping cannot resolve which panel
+///    owns it, and a layout change can silently move it between them.
+fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
+    let _ = screen;
+    let mut out = Vec::new();
+
+    fn region_contains(
+        r: &crate::semantic::regions::Region,
+        c: &Control,
+    ) -> bool {
+        let b = &r.bounds;
+        // A control is claimed by a region when its label start sits inside
+        // the region's bounds (the same join the focus/relationship engines
+        // use for single-line controls).
+        c.bounds.x >= b.x
+            && c.bounds.x < b.x + b.width.max(1)
+            && c.bounds.y >= b.y
+            && c.bounds.y < b.y + b.height.max(1)
+    }
+
+    let unclaimed: Vec<&Control> = sem
+        .controls
+        .iter()
+        .filter(|c| !sem.regions.iter().any(|r| region_contains(r, c)))
+        .collect();
+    if !unclaimed.is_empty() {
+        let labels: Vec<String> = unclaimed.iter().map(|c| c.label.clone()).collect();
+        let summary = format!(
+            "{} control(s) sit outside every detected region: {}.",
+            unclaimed.len(),
+            labels.join(", ")
+        );
+        out.push(Finding {
+            id: "CTRL-ORPHAN".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "controls".into(),
+            summary: summary.clone(),
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Other,
+                "unclaimed_controls",
+                summary,
+            )
+            .with_detail(json!({
+                "controls": labels,
+                "note": "region-scoped operations skip these; either region detection missed the panel or the control floats outside any panel",
+            }))],
+            confidence: 0.7,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    for c in &sem.controls {
+        let owners: Vec<&crate::semantic::regions::Region> = sem
+            .regions
+            .iter()
+            .filter(|r| region_contains(r, c))
+            .collect();
+        if owners.len() > 1 {
+            let ids: Vec<String> = owners.iter().map(|r| r.id.clone()).collect();
+            let summary = format!(
+                "Control '{}' is claimed by {} regions ({}).",
+                c.label,
+                owners.len(),
+                ids.join(", ")
+            );
+            out.push(Finding {
+                id: "CTRL-AMBIG".into(),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "controls".into(),
+                summary: summary.clone(),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "ambiguous_region_parent",
+                    summary,
+                )
+                .with_detail(json!({
+                    "control": c.label,
+                    "regions": ids,
+                }))],
+                confidence: 0.8,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+    }
+
+    out
+}
+
 fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
     let mut out = Vec::new();
     let buttons: Vec<&Control> = sem
@@ -594,5 +808,186 @@ mod tests {
         assert!(run("mouse", &s, &sem).is_err());
         assert!(static_profile_available("focus"));
         assert!(!static_profile_available("mouse"));
+    }
+
+    /// Wave-3 (unicode): a wide glyph followed by a NON-empty cell means
+    /// something was written over the glyph's continuation column — the
+    /// column arithmetic every consumer trusts is off from there eastward.
+    #[test]
+    fn unicode_audit_detects_wide_overlap_and_control_leak() {
+        use crate::screen::Cell;
+        let mut s = screen(vec!["界A"]);
+        s.cols = 8;
+        // Manually lay cells: 界 at (0,0) with continuation (1,0), then 'A'
+        // written at (1,0) ON TOP of the continuation — the overlap case.
+        s.cells = vec![
+            Cell {
+                x: 0,
+                y: 0,
+                text: "界".into(),
+                fg: crate::screen::Color::unknown(),
+                bg: crate::screen::Color::unknown(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+                strike: false,
+            },
+            Cell {
+                x: 1,
+                y: 0,
+                text: "A".into(),
+                fg: crate::screen::Color::unknown(),
+                bg: crate::screen::Color::unknown(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+                strike: false,
+            },
+        ];
+        let findings = unicode_audit(&s);
+        assert!(
+            findings.iter().any(|f| f.id == "UNI-WIDE"),
+            "wide overlap detected: {:?}",
+            findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+        );
+
+        // A correct wide row (empty continuation) produces no finding.
+        let mut ok = screen(vec!["界A"]);
+        ok.cols = 8;
+        ok.cells = vec![
+            Cell {
+                x: 0,
+                y: 0,
+                text: "界".into(),
+                fg: crate::screen::Color::unknown(),
+                bg: crate::screen::Color::unknown(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+                strike: false,
+            },
+            Cell {
+                x: 1,
+                y: 0,
+                text: String::new(),
+                fg: crate::screen::Color::unknown(),
+                bg: crate::screen::Color::unknown(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+                strike: false,
+            },
+            Cell {
+                x: 2,
+                y: 0,
+                text: "A".into(),
+                fg: crate::screen::Color::unknown(),
+                bg: crate::screen::Color::unknown(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+                strike: false,
+            },
+        ];
+        assert!(
+            unicode_audit(&ok).is_empty(),
+            "correct wide layout is clean"
+        );
+
+        // A literal control byte in a cell leaks through the encoding.
+        let mut leak = screen(vec!["a\x07b"]);
+        leak.cells = vec![Cell {
+            x: 0,
+            y: 0,
+            text: "a\u{7}b".into(),
+            fg: crate::screen::Color::unknown(),
+            bg: crate::screen::Color::unknown(),
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            reverse: false,
+            strike: false,
+        }];
+        assert!(
+            unicode_audit(&leak).iter().any(|f| f.id == "UNI-CTRL"),
+            "control leak detected"
+        );
+    }
+
+    /// Wave-3 (controls): a control outside every region is an orphan
+    /// (region-scoped ops skip it); one claimed by two regions is an
+    /// ambiguous parent.
+    #[test]
+    fn controls_audit_flags_orphans_and_ambiguous_parents() {
+        use crate::semantic::controls::{Control, ControlBounds, ControlKind};
+        use crate::semantic::regions::Region;
+
+        let s = screen(vec!["[ Save ]"]);
+        let control = Control {
+            id: "btn/save".into(),
+            kind: ControlKind::Button,
+            label: "Save".into(),
+            value: None,
+            bounds: ControlBounds { x: 1, y: 0, width: 4, height: 1 },
+            region_id: None,
+            focusable: true,
+            focused: false,
+            enabled: true,
+            selected: false,
+            checked: false,
+            shortcut: None,
+            confidence: crate::semantic::Confidence::inferred(0.9, &["test"]),
+            evidence: vec![],
+            source: "inferred".into(),
+        };
+        let mk_region = |id: &str, x: u16, w: u16| Region {
+            id: id.into(),
+            kind: crate::semantic::regions::RegionKind::Panel,
+            title: None,
+            bounds: crate::semantic::regions::Bounds { x, y: 0, width: w, height: 1 },
+            confidence: crate::semantic::Confidence::inferred(0.9, &["test"]),
+            parent_id: None,
+            child_ids: vec![],
+            clipping_state: crate::semantic::regions::ClippingState::None,
+        };
+        let sem = crate::semantic::SemanticScreen {
+            cols: s.cols,
+            rows: s.rows,
+            regions: vec![mk_region("left", 0, 8), mk_region("right", 1, 12)],
+            controls: vec![control.clone()],
+            focus: Default::default(),
+            relationships: vec![],
+            affordances: vec![],
+            components: vec![],
+        };
+        let findings = controls_audit(&s, &sem);
+        assert!(
+            findings.iter().any(|f| f.id == "CTRL-AMBIG"),
+            "two overlapping regions both claim the control: {:?}",
+            findings
+        );
+
+        // Orphan: no region covers x=1.
+        let sem2 = crate::semantic::SemanticScreen {
+            regions: vec![mk_region("far", 60, 10)],
+            ..sem.clone()
+        };
+        let findings2 = controls_audit(&s, &sem2);
+        assert!(
+            findings2.iter().any(|f| f.id == "CTRL-ORPHAN"),
+            "control outside every region is an orphan: {:?}",
+            findings2
+        );
     }
 }
