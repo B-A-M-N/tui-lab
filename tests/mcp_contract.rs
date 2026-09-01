@@ -139,6 +139,7 @@ fn contract_keys_action_sends_full_sequence() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let input = CanonicalAction::from_request(&p)
         .expect("build keys input")
@@ -300,6 +301,7 @@ fn contract_ctrl_key_encodes_typed_representation() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let input = CanonicalAction::from_request(&p)
         .expect("build key input")
@@ -559,6 +561,7 @@ fn contract_key_a_preserves_case() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let input = CanonicalAction::from_request(&p)
         .expect("build key A")
@@ -580,6 +583,7 @@ fn contract_key_shift_a_yields_uppercase() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let input = CanonicalAction::from_request(&p)
         .expect("build shift+a")
@@ -601,6 +605,7 @@ fn contract_key_ctrl_c() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let input = CanonicalAction::from_request(&p)
         .expect("build ctrl+c")
@@ -622,6 +627,7 @@ fn contract_key_bogus_modifier_errors() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let result = CanonicalAction::from_request(&p);
     assert!(result.is_err());
@@ -635,6 +641,7 @@ fn contract_key_f1_function() {
         completion: None,
         wait_ms: None,
         id: None,
+        guard: None,
     };
     let input = CanonicalAction::from_request(&p)
         .expect("build F1")

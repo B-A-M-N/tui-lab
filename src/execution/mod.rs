@@ -19,6 +19,9 @@ use crate::screen::diff::Transition;
 use crate::screen::ScreenState;
 use crate::session::state::Session;
 
+pub mod guard;
+pub use guard::MutationGuard;
+
 /// The typed, serializable action unit (re-review Wave-2 item 10).
 ///
 /// `execute_act` used to take a bare `(name: &str, input: Input)` pair: the
@@ -671,6 +674,72 @@ pub fn execute_act_with_visibility(
 /// for THIS action, so a silent/toggle/exit action is correctly reported as
 /// `Met` rather than a spurious timeout.
 pub fn execute_act_with_completion(
+    session: &mut Session,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+    visibility: InputVisibility,
+    completion: CompletionPolicy,
+) -> Result<InteractionTransaction, anyhow::Error> {
+    execute_act_with_guard(
+        session,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        visibility,
+        completion,
+        None,
+    )
+}
+
+/// The full-form act executor with an optional [`MutationGuard`]
+/// (re-review P0.9): when a guard is present, the executor validates the
+/// caller's expected state IMMEDIATELY before the send — inside the same
+/// call, so no other operation can interleave — and refuses to act on
+/// drift. The returned error carries the structured `stale_state` payload
+/// (category, expected, actual, summary) via its `stale_state` string; the
+/// MCP layer surfaces it as an `ExecutionGuard` error, not a timeout.
+///
+/// This closes the observe→act race: an agent that read the screen, had a
+/// modal open underneath it, then sent a click at the old coordinates now
+/// gets an honest refusal instead of a silent misdirected input.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_act_with_guard(
+    session: &mut Session,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+    visibility: InputVisibility,
+    completion: CompletionPolicy,
+    guard: Option<&MutationGuard>,
+) -> Result<InteractionTransaction, anyhow::Error> {
+    // Guard validation happens FIRST — before the baseline capture, before
+    // anything else touches the session — so the checked state is the state
+    // the action lands in.
+    if let Some(g) = guard {
+        if let Err(stale) = g.validate(session) {
+            return Err(anyhow::anyhow!(
+                "stale_state: {}",
+                serde_json::to_string(&stale).unwrap_or_default()
+            ));
+        }
+    }
+    execute_act_inner(
+        session,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        visibility,
+        completion,
+    )
+}
+
+/// The body of the canonical executor (was `execute_act_with_completion`).
+fn execute_act_inner(
     session: &mut Session,
     action: &CanonicalAction,
     quiet_ms: u64,
@@ -1513,6 +1582,7 @@ mod tests {
             completion: None,
             wait_ms: Some(500),
             id: Some("s1".into()),
+            guard: None,
         };
         let a = CanonicalAction::from_request(&req).expect("click");
         assert_eq!(a.name(), "mouse_click");
@@ -1530,6 +1600,7 @@ mod tests {
             completion: None,
             wait_ms: None,
             id: None,
+            guard: None,
         };
         assert!(
             CanonicalAction::from_request(&bad).is_err(),
@@ -1542,6 +1613,7 @@ mod tests {
             completion: None,
             wait_ms: None,
             id: None,
+            guard: None,
         };
         assert!(
             CanonicalAction::from_request(&raw).is_err(),
