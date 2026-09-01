@@ -334,7 +334,7 @@ impl TuiLabServer {
                         let caps = s.capabilities();
                         let launch = s.launch().cloned();
                         let version = s.backend_version();
-                        let kind = s.backend_kind.clone();
+                        let kind = s.backend_kind;
                         let generation = s.generation;
                         let iso_evidence = s.isolation_evidence().cloned();
                         (caps, launch, version, kind, generation, iso_evidence)
