@@ -514,7 +514,22 @@ impl TuiLabServer {
             let sweep = |s: &mut crate::session::Session| {
                 match s.observe(idle) {
                     Ok(screen) => {
-                        run.lock().unwrap().bump_event();
+                        let mut run = run.lock().unwrap();
+                        run.bump_event();
+                        // Coverage ingestion rides every observation
+                        // (re-review P1 item 17): native coverage events were
+                        // absorbed into the session queue by observe itself,
+                        // so the run ledger folds them here regardless of
+                        // which observe mode triggered the sweep.
+                        let batch = s.events_since(0);
+                        let cursor_key = format!("coverage:{}", s.id);
+                        let from = run.event_cursor(&cursor_key).unwrap_or(0);
+                        let seq = batch.cursor;
+                        if batch.cursor > from {
+                            let evs = s.events_since(from);
+                            run.ingest_native_coverage_from_events(&s.id, &evs.events, 0);
+                            run.set_event_cursor(&cursor_key, seq);
+                        }
                         Ok(screen)
                     }
                     Err(e) => Err((ErrorCategory::BackendError, e.to_string())),
@@ -559,29 +574,14 @@ impl TuiLabServer {
                     .filter(|r| r.kind == semantic::RegionKind::Dialog)
                     .count();
                 let focused = sem.focus.control.clone();
-                // Run focus graph: ledger this observation's focus against
-                // the previous observation's (per session). Both ledgers get
-                // fed (Wave D item 36): the legacy label list and the
-                // ID-keyed FocusGraph, the latter only when both frames
-                // resolved stable control IDs.
-                {
-                    let prev = sess
-                        .previous()
-                        .map(|p| semantic::analyze(p).focus)
-                        .unwrap_or_default();
-                    let mut run = run.lock().unwrap();
-                    run.record_focus_observation(
-                        &sess.id,
-                        prev.control.clone(),
-                        focused.clone(),
-                        prev.control_id.as_deref(),
-                        sem.focus.control_id.as_deref(),
-                        "unknown",
-                    );
-                    // Wave F item 64: fold any new native coverage events
-                    // into the run ledger.
-                    run.collect_native_coverage(&sess.id, sess.native_channel());
-                }
+                // Re-review P1 (items 17+18): a read no longer mutates
+                // behavioral evidence. Focus edges come from interaction
+                // transactions (`record_interaction`), never from a summary
+                // poll — "between two arbitrary reads" provenance ("unknown")
+                // polluted the graph. Native coverage ingestion moved to the
+                // frame pipeline (observe itself folds native events into the
+                // session queue), so tool selection cannot shift coverage
+                // accounting either.
                 ok(json!({
                     "screen": format!("{}x{}", screen.cols, screen.rows),
                     "title": screen.title,
@@ -1003,7 +1003,10 @@ impl TuiLabServer {
                     .clone()
                     .or_else(|| p.reference.clone())
                     .expect("validated above");
-                let sem = semantic::analyze(&screen);
+                let sem = sess
+                    .fused_frame()
+                    .map(|(s, _, _)| s)
+                    .unwrap_or_else(|| semantic::analyze(&screen));
                 let outcome = crate::design::eval_static(&expr, &screen, &sem);
                 {
                     // Scoped to the resolved session generation (item 5).
@@ -1090,11 +1093,10 @@ impl TuiLabServer {
                     ok(json!({ "checkpoints": run.checkpoints.list(&session_id) }))
                 }
                 CA::Save => {
-                    let screen = match sess.observe(40) {
-                        Ok(s) => s,
+                    let (screen, sem, _, _) = match sess.observe_fused(40) {
+                        Ok(t) => t,
                         Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                     };
-                    let sem = semantic::analyze(&screen);
                     let mut run = run.lock().unwrap();
                     let name = run.checkpoints.save(
                         &session_id,
@@ -1118,11 +1120,10 @@ impl TuiLabServer {
                             return err(ErrorCategory::InvalidRequest, "compare requires 'name'")
                         }
                     };
-                    let screen = match sess.observe(40) {
-                        Ok(s) => s,
+                    let (screen, sem, _, _) = match sess.observe_fused(40) {
+                        Ok(t) => t,
                         Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                     };
-                    let sem = semantic::analyze(&screen);
                     let run = run.lock().unwrap();
                     match run
                         .checkpoints
@@ -1851,11 +1852,10 @@ impl TuiLabServer {
                     // context carries the run's state graph, the current state's
                     // layered identity, the actions actually executed this run,
                     // the coverage set, and the risk allowance.
-                    let screen = match sess.observe(40) {
-                        Ok(s) => s,
+                    let (screen, sem, _, _) = match sess.observe_fused(40) {
+                        Ok(t) => t,
                         Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                     };
-                    let sem = semantic::analyze(&screen);
                     let identity = crate::exploration::state_graph::StateIdentity::with_semantic(
                         &screen, &sem,
                     );

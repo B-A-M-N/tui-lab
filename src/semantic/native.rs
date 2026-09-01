@@ -357,6 +357,16 @@ impl NativeChannel {
                     if let Some(focused) = focused_flag {
                         c.focused = focused;
                     }
+                    // Native role refinement on the flat shape too (re-review
+                    // P0): inference says Unknown + native says button ⇒ the
+                    // control becomes a button.
+                    if !node.role.is_empty() {
+                        if let Some(kind) = kind_from_slug(&node.role) {
+                            c.kind = kind;
+                            c.source = "native".to_string();
+                            c.confidence = crate::semantic::Confidence::native();
+                        }
+                    }
                     if let Some(enabled) = node.enabled {
                         c.enabled = enabled;
                         c.source = "native".to_string();
@@ -377,7 +387,22 @@ impl NativeChannel {
                 }
                 report.matched.push(node.id.clone());
             } else {
-                report.native_only.push(node.id.clone());
+                // Re-review P0 (native-only merge): an unmatched native node
+                // with bounds is semantic truth the app volunteered — it must
+                // become actionable state, not a report line. Insert it into
+                // both shapes: the tree under the nearest containing node,
+                // and the flat controls list as a native-sourced control.
+                let inserted = insert_native_only(&mut tree.root, node);
+                if inserted {
+                    if let Some(c) = native_node_to_control(node) {
+                        sem.controls.push(c);
+                    }
+                    report.native_only.push(node.id.clone());
+                } else {
+                    // No bounds: a pointer without geometry cannot be placed;
+                    // it stays report-only, honestly.
+                    report.native_only.push(node.id.clone());
+                }
             }
         }
         report
@@ -433,6 +458,19 @@ fn find_by_id<'a>(
 /// [`NativeChannel::overlay_fused`] — the two entry points must never drift
 /// apart in what they write.
 fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &NativeNode) {
+    // Role merge (re-review P0: native role is the primary reason the
+    // side-channel exists — inference says Unknown, the app says button,
+    // the fused tree must say button). Native role wins over Unknown /
+    // lowest-confidence inference; a non-Unknown inferred role is kept
+    // unless it disagrees, in which case native still wins (the app's
+    // self-report is the stronger evidence) but the node keeps its
+    // confidence rather than claiming 1.0.
+    if !node.role.is_empty() {
+        if let Some(role) = role_from_slug(&node.role) {
+            n.role = role;
+            n.confidence = crate::semantic::Confidence::native();
+        }
+    }
     // Enable provenance: app-declared enabled is native evidence.
     if let Some(enabled) = node.enabled {
         n.state.enabled = crate::semantic::node::EnabledState {
@@ -441,13 +479,184 @@ fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &Native
             confidence: 1.0,
         };
     }
+    if let Some(focusable) = node.focusable {
+        n.state.focusable = focusable;
+    }
     if let Some(label) = &node.label {
-        if n.label.is_none() {
+        if n.label.as_deref().map(str::is_empty).unwrap_or(true) {
             n.label = Some(label.clone());
         }
     }
     if let Some(value) = &node.value {
         n.value = Some(value.clone());
+    }
+}
+
+/// Map a native role slug onto the semantic [`Role`] vocabulary. Unknown
+/// slugs map to `None` — the node keeps its inferred role rather than
+/// degrading to `Unknown`.
+fn role_from_slug(slug: &str) -> Option<crate::semantic::node::Role> {
+    use crate::semantic::node::Role;
+    Some(match slug.to_lowercase().as_str() {
+        "button" => Role::Button,
+        "field" | "textbox" | "input" => Role::Field,
+        "checkbox" => Role::Checkbox,
+        "radio" => Role::Radio,
+        "tab" => Role::Tab,
+        "list" => Role::List,
+        "listitem" | "list_item" | "item" => Role::ListItem,
+        "menu" => Role::Menu,
+        "menuitem" | "menu_item" => Role::MenuItem,
+        "table" => Role::Table,
+        "tree" => Role::Tree,
+        "treeitem" | "tree_item" => Role::TreeItem,
+        "dialog" => Role::Dialog,
+        "panel" => Role::Panel,
+        "toolbar" => Role::Toolbar,
+        "footer" | "statusbar" | "status_bar" => Role::Footer,
+        "textarea" | "text_area" => Role::TextArea,
+        "select" | "dropdown" | "combobox" => Role::Dropdown,
+        "progressbar" | "progress_bar" | "progress" => Role::Progress,
+        "spinner" => Role::Spinner,
+        "label" | "text" => Role::Label,
+        "hyperlink" | "link" => Role::Hyperlink,
+        "screen" | "window" => Role::Screen,
+        _ => return None,
+    })
+}
+
+/// The flat-shape counterpart of [`role_from_slug`].
+fn kind_from_slug(slug: &str) -> Option<crate::semantic::controls::ControlKind> {
+    use crate::semantic::controls::ControlKind;
+    Some(match slug.to_lowercase().as_str() {
+        "button" => ControlKind::Button,
+        "field" | "textbox" | "input" => ControlKind::Field,
+        "checkbox" => ControlKind::Checkbox,
+        "radio" => ControlKind::Radio,
+        "tab" => ControlKind::Tab,
+        "list" => ControlKind::List,
+        "menuitem" | "menu_item" => ControlKind::MenuItem,
+        _ => return None,
+    })
+}
+
+/// Re-review P0 (native-only insertion): place an unmatched native node into
+/// the inferred tree. Attach under the smallest containing node (root when
+/// nothing contains it); returns `false` when the node has no usable bounds.
+fn insert_native_only(
+    root: &mut crate::semantic::node::SemanticNode,
+    native: &NativeNode,
+) -> bool {
+    let [x, y, w, h] = match native.bounds {
+        Some(b) if b[2] > 0 && b[3] > 0 => b,
+        _ => return false,
+    };
+    let mut n = native_to_semantic_node(native, x, y, w, h);
+    // Find the smallest node whose bounds fully contain the native bounds —
+    // the native parent when the app declared a hierarchy, else the inferred
+    // container.
+    let bounds = n.bounds.clone();
+    let target_id = smallest_containing_id(root, &bounds);
+    n.parent = Some(target_id.clone().unwrap_or_else(|| root.id.clone()));
+    match target_id {
+        Some(id) => {
+            if let Some(t) = root.find_mut(&id) {
+                t.children.push(n);
+            } else {
+                root.children.push(n);
+            }
+        }
+        None => root.children.push(n),
+    }
+    true
+}
+
+/// Build a [`SemanticNode`] from a native node with known bounds: role from
+/// the slug (Unknown when unmapped), `native_only` provenance via
+/// confidence 1.0 and source-tagged evidence.
+fn native_to_semantic_node(
+    native: &NativeNode,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+) -> crate::semantic::node::SemanticNode {
+    crate::semantic::node::SemanticNode {
+        id: native.id.clone(),
+        role: role_from_slug(&native.role)
+            .unwrap_or(crate::semantic::node::Role::Unknown),
+        parent: None,
+        bounds: crate::semantic::regions::Bounds { x, y, width: w, height: h },
+        label: native.label.clone(),
+        value: native.value.clone(),
+        state: crate::semantic::node::NodeState {
+            focusable: native.focusable.unwrap_or(false),
+            focused: native.focused.unwrap_or(false),
+            enabled: crate::semantic::node::EnabledState {
+                value: native.enabled.unwrap_or(true),
+                source: "native".to_string(),
+                confidence: 1.0,
+            },
+            ..crate::semantic::node::NodeState::default()
+        },
+        children: Vec::new(),
+        affordances: Vec::new(),
+        confidence: crate::semantic::Confidence::native(),
+    }
+}
+
+/// The flat-shape counterpart: a native-only node also becomes a Control so
+/// flat-mode consumers (summary/semantic views) see the same truth.
+fn native_node_to_control(native: &NativeNode) -> Option<crate::semantic::controls::Control> {
+    let [x, y, w, h] = native.bounds?;
+    Some(crate::semantic::controls::Control {
+        id: native.id.clone(),
+        kind: kind_from_slug(&native.role)
+            .unwrap_or(crate::semantic::controls::ControlKind::Button),
+        label: native.label.clone().unwrap_or_else(|| native.id.clone()),
+        value: native.value.clone(),
+        bounds: crate::semantic::controls::ControlBounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
+        region_id: None,
+        focusable: native.focusable.unwrap_or(false),
+        focused: native.focused.unwrap_or(false),
+        enabled: native.enabled.unwrap_or(true),
+        selected: false,
+        checked: false,
+        shortcut: None,
+        confidence: crate::semantic::Confidence::native(),
+        evidence: vec!["native-only-insertion".to_string()],
+        source: "native".to_string(),
+    })
+}
+
+/// The id of the smallest node in the tree whose bounds fully contain `b`.
+/// `None` when only the root would qualify (the caller attaches to root
+/// children directly).
+fn smallest_containing_id(
+    node: &crate::semantic::node::SemanticNode,
+    b: &crate::semantic::regions::Bounds,
+) -> Option<String> {
+    // Descend first: the deepest container wins.
+    for child in &node.children {
+        if let Some(found) = smallest_containing_id(child, b) {
+            return Some(found);
+        }
+    }
+    let contains = node.bounds.x <= b.x
+        && node.bounds.y <= b.y
+        && node.bounds.x + node.bounds.width >= b.x + b.width
+        && node.bounds.y + node.bounds.height >= b.y + b.height;
+    // Do not offer the root as a "container" — root.children.push is the
+    // fallback in the caller.
+    if contains && node.parent.is_some() {
+        Some(node.id.clone())
+    } else {
+        None
     }
 }
 

@@ -517,6 +517,7 @@ fn variant_name(kind: &TerminalEventKind) -> &'static str {
         TerminalEventKind::ProcessStarted => "ProcessStarted",
         TerminalEventKind::ProcessExited { .. } => "ProcessExited",
         TerminalEventKind::SemanticChanged => "SemanticChanged",
+        TerminalEventKind::NativeEvent { .. } => "NativeEvent",
     }
 }
 

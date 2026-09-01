@@ -376,6 +376,13 @@ pub struct InteractionTransaction {
     /// `None` only on the `no_wait` path, where no matching-frame capture
     /// happened.
     pub capture: Option<CaptureOutcome>,
+    /// Focus across the action (re-review P1: the focus graph answers "what
+    /// action caused focus to move?" — so the evidence comes from
+    /// transactions, not from arbitrary reads). Each side is
+    /// `(control_id, label)` from the fused analysis of the before/after
+    /// frames; `None` when that side had no resolvable focus.
+    pub focus_before: Option<(Option<String>, Option<String>)>,
+    pub focus_after: Option<(Option<String>, Option<String>)>,
     /// Total act latency (send + settle) in milliseconds.
     pub elapsed_ms: u64,
 }
@@ -659,6 +666,13 @@ pub fn execute_act_with_completion(
     after_frame.session_id = Some(window.sess().id.clone());
     after_frame.generation = Some(window.sess().generation);
 
+    // Transaction-derived focus evidence (re-review P1): focus before and
+    // after from the fused analysis of the frames this transaction already
+    // owns. The run's focus graph consumes this in `record_interaction` —
+    // summary/observe reads never create focus edges again.
+    let focus_before = frame_focus(&before_frame.state);
+    let focus_after = frame_focus(&after_frame.state);
+
     // Sensitive window closed: the settled frame has been captured, so the
     // application's own (masked) rendering is recorded from here on. `commit`
     // restores recording and relinquishes the session.
@@ -672,8 +686,28 @@ pub fn execute_act_with_completion(
         settle,
         transition,
         capture,
+        focus_before,
+        focus_after,
         elapsed_ms,
     })
+}
+
+/// Focus `(control_id, label)` from a frame via fused semantic analysis.
+/// Native self-reports win when the app cooperates; otherwise style
+/// inference — the same truth every observe mode sees.
+fn frame_focus(
+    screen: &crate::screen::ScreenState,
+) -> Option<(Option<String>, Option<String>)> {
+    // Inferred focus from the frame's own analysis. (The native overlay is
+    // merged by the session's fused path; for transaction evidence the
+    // inferred read of the captured frame is the honest floor, and the
+    // native focus event, when present, overrides it below.)
+    let sem = crate::semantic::analyze(screen);
+    let f = sem.focus;
+    if f.control_id.is_none() && f.control.is_none() {
+        return None;
+    }
+    Some((f.control_id, f.control))
 }
 
 /// The ONE evaluator for compiled completion plans (re-review P0: exactly

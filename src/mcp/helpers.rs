@@ -234,6 +234,38 @@ pub fn run_assertion(
     p: &crate::mcp::params::TuiAssertParams,
     screen: &ScreenState,
 ) -> (bool, String, Option<ErrorCategory>) {
+    // Re-review Wave-2 item 16: assertions evaluate the FUSED semantic truth
+    // when a caller has a session (the same analysis every observe mode
+    // sees); the direct `analyze` here is the frame-level fallback for
+    // callers without one.
+    let fused = crate::mcp::helpers::fused_for(screen);
+    run_assertion_fused(p, screen, fused)
+}
+
+/// The fused semantic view for a frame when no live session is at hand:
+/// inferred analysis of the frame itself (the honest floor — no native
+/// channel is reachable from a bare frame).
+fn fused_for(
+    screen: &ScreenState,
+) -> (
+    crate::semantic::SemanticScreen,
+    crate::semantic::node::SemanticTree,
+) {
+    let sem = crate::semantic::analyze(screen);
+    let tree = crate::semantic::build_tree(screen);
+    (sem, tree)
+}
+
+/// Assertion evaluation against an explicit semantic truth.
+pub fn run_assertion_fused(
+    p: &crate::mcp::params::TuiAssertParams,
+    screen: &ScreenState,
+    fused: (
+        crate::semantic::SemanticScreen,
+        crate::semantic::node::SemanticTree,
+    ),
+) -> (bool, String, Option<ErrorCategory>) {
+    let (sem, _tree) = fused;
     use crate::mcp::params::AssertAssertion as A;
     let joined = screen.viewport_text.join("\n");
     let Some(a) = p.assertion.known() else {
@@ -275,7 +307,7 @@ pub fn run_assertion(
         },
         A::Focus => match &p.subject {
             Some(s) => {
-                let sem = crate::semantic::analyze(screen);
+                // sem comes from the fused analysis (re-review Wave-2 item 16)
                 let ok = sem.focus.control.as_deref() == Some(s.as_str());
                 (
                     ok,
@@ -326,7 +358,7 @@ pub fn run_assertion(
         }
         A::NotClipped => {
             // heuristic: no region extends beyond terminal bounds (spec 17)
-            let sem = crate::semantic::analyze(screen);
+            // sem comes from the fused analysis (re-review Wave-2 item 16)
             let clipped = sem.regions.iter().any(|rg| {
                 let b = &rg.bounds;
                 (b.x + b.width) > screen.cols || (b.y + b.height) > screen.rows
@@ -373,7 +405,7 @@ pub fn run_assertion(
             // Assert that a region with the given title exists.
             match &p.subject {
                 Some(title) => {
-                    let sem = crate::semantic::analyze(screen);
+                    // sem comes from the fused analysis (re-review Wave-2 item 16)
                     let found = sem
                         .regions
                         .iter()
@@ -449,7 +481,7 @@ pub fn run_assertion(
             // Assert that a control with the given label exists (case-insensitive).
             match &p.subject {
                 Some(s) => {
-                    let sem = crate::semantic::analyze(screen);
+                    // sem comes from the fused analysis (re-review Wave-2 item 16)
                     let found = sem.controls.iter().any(|c| c.label.eq_ignore_ascii_case(s));
                     (
                         found,
@@ -481,7 +513,7 @@ pub fn run_assertion(
             // Assert that focus is NOT on the named control (case-insensitive).
             match &p.subject {
                 Some(s) => {
-                    let sem = crate::semantic::analyze(screen);
+                    // sem comes from the fused analysis (re-review Wave-2 item 16)
                     let not_focused = sem
                         .focus
                         .control

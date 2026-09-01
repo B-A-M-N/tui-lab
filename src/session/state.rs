@@ -108,6 +108,9 @@ pub struct Session {
     /// child's env; cooperative apps write their real semantic tree there
     /// and observation merges it over inference.
     native: crate::semantic::native::NativeChannel,
+    /// How many native-channel events have already been folded into the
+    /// session event queue (re-review P1: mode-independent ingestion).
+    native_events_absorbed: usize,
     /// Wave G item 76: the human control lease, when one is held.
     lease: crate::session::lease::LeaseState,
     /// Wave G item 77: what the current generation's launch actually got
@@ -177,6 +180,7 @@ impl Session {
             cursors: std::collections::HashMap::new(),
             semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
             native: crate::semantic::native::NativeChannel::default(),
+            native_events_absorbed: 0,
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
         }
@@ -496,6 +500,9 @@ impl Session {
         } else {
             self.native.reset();
         }
+        // Native event absorption restarts with the channel (re-review P1:
+        // counts stay aligned across generations).
+        self.native_events_absorbed = 0;
         let mut effective_env = effective_env; // native channel pair may append
         if let Some(pair) = self.native.env_pair() {
             if !crate::semantic::native::env_has_channel(&effective_env) {
@@ -572,8 +579,12 @@ impl Session {
     pub fn observe(&mut self, idle_ms: u64) -> anyhow::Result<ScreenState> {
         // Wave F items 58–63: drain any native semantic frames the app has
         // written since the last observation (bounded read, partial lines
-        // stay pending).
+        // stay pending). Native events (focus/activate/coverage) fold into
+        // the session event queue HERE — mode-independent (re-review P1:
+        // coverage accounting and native facts must not depend on which
+        // observe mode a caller chose).
         self.native.poll();
+        self.absorb_native_events();
         let s = self
             .backend
             .observe(std::time::Duration::from_millis(idle_ms))?;
@@ -650,6 +661,31 @@ impl Session {
         self.events.push(&self.id, self.generation, kind);
     }
 
+    /// Fold new native-channel events (focus / activate / coverage / any
+    /// app-declared verb) into the session event queue (re-review P1: the
+    /// unified event substrate). Idempotent per generation — an event is
+    /// absorbed exactly once, tracked by count; a restart resets the
+    /// channel with the session, so counts stay aligned.
+    fn absorb_native_events(&mut self) {
+        let from = self.native_events_absorbed;
+        let total = self.native.events.len();
+        if total <= from {
+            self.native_events_absorbed = total.min(from);
+            return;
+        }
+        for (_, event, target) in &self.native.events[from..total] {
+            self.events.push(
+                &self.id,
+                self.generation,
+                crate::events::TerminalEventKind::NativeEvent {
+                    event: event.clone(),
+                    target: target.clone(),
+                },
+            );
+        }
+        self.native_events_absorbed = total;
+    }
+
     /// Read events after `cursor` WITHOUT moving it (per-consumer cursors,
     /// Wave B item 13: the caller owns the position).
     pub fn events_since(&self, cursor: u64) -> crate::events::EventBatch {
@@ -723,6 +759,26 @@ impl Session {
         let (sem, tree, report) =
             crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
         Some((sem, tree, report))
+    }
+
+    /// Observe, then return the fused analysis of the fresh frame (re-review
+    /// Wave-2 item 16: THE way subsystems read semantics — no direct
+    /// `semantic::analyze` above the frame pipeline). Structural detection
+    /// is cached; the interaction pass and native overlay run fresh.
+    pub fn observe_fused(
+        &mut self,
+        idle_ms: u64,
+    ) -> anyhow::Result<(
+        crate::screen::ScreenState,
+        crate::semantic::SemanticScreen,
+        crate::semantic::node::SemanticTree,
+        crate::semantic::native::NativeOverlayReport,
+    )> {
+        let screen = self.observe(idle_ms)?;
+        let (sem, tree, report) = self
+            .fused_frame()
+            .expect("observe() seeded `last`, so fused_frame() has a frame");
+        Ok((screen, sem, tree, report))
     }
 
     /// Send input. When recording, the backend has already delivered the exact

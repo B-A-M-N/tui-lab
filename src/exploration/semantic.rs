@@ -98,8 +98,8 @@ pub fn run_with_contract(
             break;
         }
 
-        let screen = session.observe(40)?;
-        let sem = crate::semantic::analyze(&screen);
+        // Fused truth (re-review Wave-2 item 16).
+        let (screen, sem, _, _) = session.observe_fused(40)?;
         let identity = StateIdentity::with_semantic(&screen, &sem);
         if !identities.contains(&identity) {
             identities.push(identity.clone());
