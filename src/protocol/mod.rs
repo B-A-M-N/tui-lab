@@ -32,7 +32,7 @@
 //!   answerable.
 
 /// A single classified terminal operation decoded from the byte stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TerminalOp {
     /// A run of printable text (UTF-8 decoded, one op per unbroken run).
     Text(String),
@@ -76,7 +76,7 @@ pub enum TerminalOp {
 }
 
 /// The ESC-introduced string sequence kinds (terminated by ST / BEL).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StringKind {
     /// Device Control String (`ESC P`).
     Dcs,
@@ -111,7 +111,7 @@ impl StringKind {
 }
 
 /// A C0 control code recognized in the ground state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ControlCode {
     Bell,
     Backspace,
@@ -243,7 +243,7 @@ fn opaque_summary(bytes: &[u8]) -> String {
 
 /// A semantic terminal-mode event decoded from a private CSI h/l (DECSET /
 /// DECRESET) — the human-meaningful reading of `CSI ? 1049 h` and friends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalModeEvent {
     /// Semantic mode name, e.g. `alt_screen`, `cursor_visible`,
     /// `mouse_press_release`, `bracketed_paste`.
@@ -860,7 +860,7 @@ pub struct ProtocolTrace {
 }
 
 /// One operation plus where it started in the raw stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraceEntry {
     /// Byte offset into the source stream where this op began. Exact: tracked
     /// by the decoder as it consumed, never estimated after the fact.

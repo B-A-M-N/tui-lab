@@ -162,6 +162,7 @@ selector_enum!(
         Semantic => "semantic", Tree => "tree", Nodes => "nodes",
         Diff => "diff", Changes => "changes", Scrollback => "scrollback",
         Search => "search", CommandState => "command_state", History => "history",
+        Protocol => "protocol", Streams => "streams", TerminalModes => "terminal_modes",
     ]
 );
 

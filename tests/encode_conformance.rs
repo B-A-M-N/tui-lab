@@ -680,3 +680,43 @@ fn shift_tab_emits_csi_z() {
     );
     b.stop().expect("stop");
 }
+
+// ---------------------------------------------------------------------------
+// Wave-2 (protocol diagnostics): the backend retains the child's REAL raw
+// output bytes in a bounded ring, and the protocol decoder reconstructs the
+// mode timeline from them.
+// ---------------------------------------------------------------------------
+
+/// The raw ring captures actual escape sequences: a child emitting DECSET
+/// mouse mode produces CSI ? 1000 h in the raw window and a semantic
+/// `mouse` mode event from the decoder.
+#[test]
+fn raw_ring_captures_protocol_traffic_for_decoder() {
+    let mut b = spawn_hex_reader_with_init(b"\x1b[?1000;1006h\x1b[?25l", 1);
+    std::thread::sleep(Duration::from_millis(500));
+    let (bytes, cap, dropped) = b.raw_output_window();
+    assert!(cap > 0, "pty backend retains raw output");
+    assert!(!bytes.is_empty(), "raw window holds the init bytes");
+    assert_eq!(dropped, 0, "small traffic drops nothing");
+    assert!(
+        bytes.windows(3).any(|w| w == b"\x1b[?"),
+        "raw window holds the real DECSET bytes: {:02x?}",
+        &bytes[..bytes.len().min(32)]
+    );
+    // The protocol decoder reconstructs semantic mode events from it.
+    let trace = tui_lab::protocol::ProtocolTrace::decode(&bytes);
+    assert!(
+        trace
+            .modes
+            .iter()
+            .any(|m| m.mode == "mouse_press_release" && m.set),
+        "decoder reads DECSET 1000 as mouse mode set: {:?}",
+        trace.modes
+    );
+    assert!(
+        trace.modes.iter().any(|m| m.mode == "cursor_visible" && !m.set),
+        "decoder reads ?25l as cursor hidden: {:?}",
+        trace.modes
+    );
+    b.stop().expect("stop");
+}

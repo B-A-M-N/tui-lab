@@ -6,8 +6,8 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 
 - `tui_session` — Manage TUI sessions: start, restart, stop, list, status, plus the human control lease (lease/release).
   - action: start, restart, stop, list, status, lease, release
-- `tui_observe` — Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state.
-  - mode: summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history
+- `tui_observe` — Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state, protocol trace + mode timeline (portable-pty/line engines), pipe stdout/stderr streams.
+  - mode: summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history, protocol, streams, terminal_modes
 - `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how "done" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.
 - `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
   - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output

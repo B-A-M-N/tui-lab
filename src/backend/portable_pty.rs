@@ -267,6 +267,13 @@ impl vt100::Callbacks for BackendCallbacks {
     }
 }
 
+/// Wave-2 (protocol diagnostics): how many raw output bytes the backend
+/// retains for the protocol decoder. 256 KiB covers generous terminal
+/// traffic (a full-screen redraw is typically well under 8 KiB) at a small
+/// fixed cost; a firehose beyond it degrades by dropping the head, which
+/// `raw_output_stats` declares.
+const RAW_RING_CAPACITY: usize = 256 * 1024;
+
 pub struct PortablePtyBackend {
     cols: u16,
     rows: u16,
@@ -310,6 +317,12 @@ pub struct PortablePtyBackend {
     /// Wave F item 53: whether any scrollback row was ever captured —
     /// `Capabilities.scrollback` is promoted only on this evidence.
     scrollback_seen: bool,
+    /// Wave-2 (protocol diagnostics): bounded ring of the child's REAL raw
+    /// output bytes — escape sequences, OSC, DCS and all — so the protocol
+    /// decoder can reconstruct "what did this TUI actually emit".
+    raw_ring: std::collections::VecDeque<u8>,
+    /// Bytes dropped off the raw ring's head (declared eviction).
+    raw_dropped: u64,
 }
 
 impl PortablePtyBackend {
@@ -340,6 +353,8 @@ impl PortablePtyBackend {
             normalization_policy: std::sync::Arc::new(crate::screen::NormalizationPolicy::default()),
             scrollback_cache: Vec::new(),
             scrollback_seen: false,
+            raw_ring: std::collections::VecDeque::new(),
+            raw_dropped: 0,
         }
     }
 
@@ -361,14 +376,23 @@ impl PortablePtyBackend {
     fn pump(&mut self) -> BackendResult<(String, String)> {
         let before_contents = self.parser.screen().contents();
         let before_fp = self.interaction_fingerprint();
+        // Drain into a local buffer first so `absorb_raw` can take `&mut self`
+        // without holding the `chunk_rx` borrow across the mutation.
+        let mut drained_chunks: Vec<Vec<u8>> = Vec::new();
         if let Some(rx) = self.chunk_rx.as_ref() {
             // Non-blocking drain of everything currently buffered.
             while let Ok(chunk) = rx.try_recv() {
-                self.parser.process(&chunk);
-                self.output_seq += 1;
-                self.last_output_at_ms = now_ms();
-                self.last_output_instant = Instant::now();
+                drained_chunks.push(chunk);
             }
+        }
+        for chunk in &drained_chunks {
+            // Raw-output ring first (Wave-2 protocol diagnostics): the
+            // child's real bytes, before the parser interprets them.
+            self.absorb_raw(chunk);
+            self.parser.process(chunk);
+            self.output_seq += 1;
+            self.last_output_at_ms = now_ms();
+            self.last_output_instant = Instant::now();
         }
         // Wave F item 56: write back any query responses the callbacks
         // produced (DA/DSR/DECRQM/kitty ?u/OSC color reports). A real
@@ -481,6 +505,29 @@ impl PortablePtyBackend {
     /// position, cursor visibility, and (cols, rows) dimensions via blake3.
     /// A change in reverse-video styling alone will change the fingerprint
     /// (audit item 1).
+    /// Wave-2 (protocol diagnostics): push raw child bytes into the bounded
+    /// ring, declaring head eviction. Bounded at [`RAW_RING_CAPACITY`] so a
+    /// firehose child cannot grow memory without limit.
+    fn absorb_raw(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.raw_ring.len() >= RAW_RING_CAPACITY {
+                self.raw_ring.pop_front();
+                self.raw_dropped += 1;
+            }
+            self.raw_ring.push_back(b);
+        }
+    }
+
+    /// The retained raw output (oldest first) plus declared drop stats.
+    pub fn raw_output_window(&mut self) -> (Vec<u8>, usize, u64) {
+        let _ = self.pump();
+        (
+            self.raw_ring.iter().copied().collect(),
+            RAW_RING_CAPACITY,
+            self.raw_dropped,
+        )
+    }
+
     fn interaction_fingerprint(&self) -> String {
         let screen = self.parser.screen();
         let mut hasher = blake3::Hasher::new();
@@ -567,6 +614,20 @@ impl PortablePtyBackend {
 }
 
 impl TerminalBackend for PortablePtyBackend {
+    fn recent_raw_output(&mut self) -> BackendResult<Vec<u8>> {
+        let (bytes, _cap, _dropped) = self.raw_output_window();
+        Ok(bytes)
+    }
+
+    fn raw_output_stats(&mut self) -> (usize, u64) {
+        let (_bytes, cap, dropped) = self.raw_output_window();
+        (cap, dropped)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn start(
         &mut self,
         command: &str,

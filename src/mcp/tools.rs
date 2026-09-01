@@ -814,6 +814,78 @@ impl TuiLabServer {
                 ErrorCategory::Unsupported,
                 "run/session event history is not implemented; the current frame identity is available via mode=summary (structure_hash)",
             ),
+            // Wave-2 (protocol diagnostics): decode the backend's retained
+            // RAW output window into a protocol trace — "what did this TUI
+            // actually emit?", with OSC/DCS payloads redacted by default.
+            OM::Protocol => {
+                let (bytes, cap, dropped) = sess.raw_output_window();
+                if cap == 0 {
+                    return err(
+                        ErrorCategory::Unsupported,
+                        "this backend does not retain raw output; the protocol trace needs the portable-pty or line-cli engine",
+                    );
+                }
+                let trace = crate::protocol::ProtocolTrace::decode(&bytes);
+                let ops = trace
+                    .ops
+                    .iter()
+                    .map(|op| serde_json::to_value(op).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                ok(json!({
+                    "window": {
+                        "bytes": bytes.len(),
+                        "ring_capacity": cap,
+                        "dropped_head_bytes": dropped,
+                        "complete": dropped == 0,
+                    },
+                    "op_count": ops.len(),
+                    "ops": ops,
+                    "modes": trace.modes,
+                }))
+            }
+            // Wave-2 (streams): genuine stdout/stderr separation — the pipe
+            // engine's per-stream line stores. Other engines answer honestly
+            // that they interleave (a PTY merges the streams by construction).
+            OM::Streams => {
+                if let crate::session::state::BackendKind::Pipe = sess.backend_kind {
+                    // The pipe backend exposes its stores through the
+                    // session's typed engine accessors.
+                    let (out, errl) = sess.pipe_streams();
+                    ok(json!({
+                        "engine": "pipe",
+                        "stdout_lines": out,
+                        "stderr_lines": errl,
+                    }))
+                } else {
+                    ok(json!({
+                        "engine": sess.backend_kind,
+                        "note": "a PTY interleaves stdout and stderr by construction; per-stream separation requires the pipe engine",
+                    }))
+                }
+            }
+            // Wave-2 (terminal modes): the negotiated-mode timeline the
+            // protocol decoder reconstructed from the raw window (DECSET/
+            // DECRST: alt screen, cursor visibility, mouse, SGR, bracketed
+            // paste, synchronized update, application cursor keys).
+            OM::TerminalModes => {
+                let (bytes, cap, dropped) = sess.raw_output_window();
+                if cap == 0 {
+                    return err(
+                        ErrorCategory::Unsupported,
+                        "this backend does not retain raw output; the mode timeline needs the portable-pty or line-cli engine",
+                    );
+                }
+                let trace = crate::protocol::ProtocolTrace::decode(&bytes);
+                ok(json!({
+                    "window": {
+                        "bytes": bytes.len(),
+                        "ring_capacity": cap,
+                        "dropped_head_bytes": dropped,
+                        "complete": dropped == 0,
+                    },
+                    "modes": trace.modes,
+                }))
+            }
         }
         })
         .await
