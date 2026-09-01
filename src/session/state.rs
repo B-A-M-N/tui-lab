@@ -532,6 +532,10 @@ impl Session {
         self.last = None;
         let s = self.backend.state()?;
         self.last = Some(s);
+        // The process-start event belongs to the generation start, not the
+        // first observation: `last` is seeded here, so an observe()-only
+        // emission would never fire it.
+        self.push_event(crate::events::TerminalEventKind::ProcessStarted);
         Ok(())
     }
 
@@ -573,13 +577,19 @@ impl Session {
         let s = self
             .backend
             .observe(std::time::Duration::from_millis(idle_ms))?;
-        self.previous = self.last.take();
-        let prev = self.last.take();
-        if let Some(p) = &prev {
-            self.emit_frame_events(p, &s.screen);
-        } else {
-            // First observation of a generation: process started.
-            self.push_event(crate::events::TerminalEventKind::ProcessStarted);
+        // Take the previous last ONCE: it becomes both the diff base for
+        // event emission and the new `previous`. (A second `take()` on the
+        // now-empty slot returned `None` every time — emit_frame_events was
+        // dead and every observation pushed a spurious ProcessStarted.)
+        match self.last.take() {
+            Some(p) => {
+                self.emit_frame_events(&p, &s.screen);
+                self.previous = Some(p);
+            }
+            None => {
+                // First observation of a generation: process started.
+                self.push_event(crate::events::TerminalEventKind::ProcessStarted);
+            }
         }
         self.last = Some(s.screen.clone());
         Ok(s.screen)

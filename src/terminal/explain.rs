@@ -382,6 +382,7 @@ mod tests {
             ],
             confidence: 0.8,
             reproduction: None,
+            source_refs: Vec::new(),
         }
     }
 

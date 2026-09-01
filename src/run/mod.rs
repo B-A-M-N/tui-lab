@@ -20,10 +20,12 @@
 //! turns "implemented modules" into "product paths".
 
 pub mod artifacts;
+pub mod journal;
 pub mod manifest;
 pub mod recording_scope;
 
 pub use artifacts::{ArtifactKind, ArtifactRef};
+pub use journal::JournalHandle;
 pub use manifest::RunManifest;
 
 use crate::checkpoint::store::CheckpointStore;
@@ -190,7 +192,21 @@ pub struct RunContext {
     artifacts: Vec<ArtifactRef>,
     /// True once the ledger has been appended to transactions.jsonl for a
     /// persistent run (drives incremental appends, Wave B item 14).
+    /// SUPERSEDED as the flush authority by `journal` (background writer,
+    /// audit item: run-journal writer): the watermark now lives in the
+    /// writer and `flush` drains through it. Kept as the restore-time
+    /// watermark when a run is re-opened from an existing file.
     ledger_flushed_upto: u64,
+    /// Background journal writer (audit item: run-journal writer). The
+    /// driving path hands pre-serialized ledger lines to a dedicated thread
+    /// and never waits on the filesystem; `flush`/`Drop` drain it. `None`
+    /// for ephemeral runs (nothing is written) and for restored runs
+    /// until their first new record.
+    journal: Option<JournalHandle>,
+    /// True when ledger persistence has failed (writer spawn error or a
+    /// terminal write error) — surfaced by `flush` and status instead of
+    /// silently degrading to memory-only.
+    persistence_unhealthy: bool,
     /// Terminal-event batches drained from sessions (Wave B item 12/14):
     /// (session id, events). Filled by the MCP layer before flush; written
     /// to `events/<session>.jsonl` when the run persists.
@@ -258,6 +274,8 @@ impl RunContext {
             next_frame_id: 0,
             artifacts: Vec::new(),
             ledger_flushed_upto: 0,
+            journal: None,
+            persistence_unhealthy: false,
             held_events: Vec::new(),
             contract: None,
             contract_path: None,
@@ -956,9 +974,108 @@ impl RunContext {
         self.findings.extend(findings);
     }
 
+    /// Ingest findings, attaching probable source loci (W2.10) where the
+    /// app's own coverage declarations can name them. A native coverage
+    /// event target of the form `widget:<id>` or a bare `#id`/id maps to
+    /// every `file:line` target the app also declared: the app itself told
+    /// us both facts, so joining them is app-attested evidence, not
+    /// inference. Findings whose evidence names no covered control keep
+    /// `source_refs` empty — a locus is carried, never guessed.
+    pub fn extend_findings_with_source_refs(&mut self, findings: Vec<crate::audit::Finding>) {
+        // Coverage targets that are real file loci.
+        let file_targets: Vec<&String> = self
+            .coverage_ledger
+            .keys()
+            .filter(|t| target_is_file_locus(t))
+            .collect();
+        if file_targets.is_empty() {
+            self.findings.extend(findings);
+            return;
+        }
+        // Widget-ish targets (widget:<id>, #id, bare id) → the app declared
+        // coverage for that component in the same channel.
+        let widget_targets: Vec<&String> = self
+            .coverage_ledger
+            .keys()
+            .filter(|t| !target_is_file_locus(t))
+            .collect();
+        let mut enriched = findings;
+        for f in &mut enriched {
+            if !f.source_refs.is_empty() {
+                continue; // producer already attached loci; never overwrite
+            }
+            let mut refs: Vec<crate::semantic::source_ref::SourceRef> = Vec::new();
+            for ev in &f.evidence {
+                let target = ev.target.as_deref().unwrap_or("");
+                let matched = widget_targets
+                    .iter()
+                    .any(|w| coverage_target_matches_control(w, target));
+                if matched {
+                    // Attach every file locus the app declared — all of them
+                    // are candidate cause sites; per-locus confidence stays
+                    // modest because the app did not scope to this finding.
+                    for ft in &file_targets {
+                        if let Some(sr) = source_ref_from_target(ft) {
+                            refs.push(sr);
+                        }
+                    }
+                    break;
+                }
+            }
+            if !refs.is_empty() {
+                // Deduplicate by location.
+                refs.dedup_by(|a, b| a.location() == b.location());
+                f.source_refs = refs;
+            }
+        }
+        self.findings.extend(enriched);
+    }
+
     /// Findings accumulated in this run.
     pub fn findings(&self) -> &[crate::audit::Finding] {
         &self.findings
+    }
+
+    /// Assemble [`crate::audit::repair::RepairPacket`]s for every finding
+    /// (audit item: vket/RepairPacket). Each packet joins the finding with
+    /// its replayable reproduction, its source loci, and a verification
+    /// recipe — everything an agent needs to go from "bug detected" to
+    /// "specific source edit" without re-deriving the parts. Findings that
+    /// cannot form a packet (no evidence) are skipped and counted, never
+    /// silently dropped from the list.
+    pub fn repair_packets(&self) -> (Vec<crate::audit::repair::RepairPacket>, usize) {
+        let sessions: Vec<String> = self.session_specs.keys().cloned().collect();
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        for f in &self.findings {
+            let repro_ids: Vec<String> = self
+                .saved_scenarios
+                .keys()
+                .cloned()
+                .chain(self.scenario_names.values().cloned())
+                .collect();
+            // The loader resolves by id first, then unambiguous name.
+            let loader = |id: &str| {
+                let _ = &repro_ids;
+                self.load_scenario(id).ok()
+            };
+            let packet = crate::audit::repair::RepairPacket::assemble(
+                f.clone(),
+                &self.id,
+                sessions.clone(),
+                loader,
+            );
+            match packet {
+                Some(mut p) => {
+                    // Carry the finding's loci onto the packet (the assemble
+                    // API leaves them for the caller to avoid duplication).
+                    p.source_refs = f.source_refs.clone();
+                    out.push(p);
+                }
+                None => skipped += 1,
+            }
+        }
+        (out, skipped)
     }
 
     /// Persist the run manifest (identity + layout).
@@ -1138,6 +1255,31 @@ impl RunContext {
         let mut record = TransactionRecord::from_interaction(seq, session, tx);
         record.seq = seq;
         self.push_ledger(record);
+        // Focus graph from transactions (audit item): every driving path
+        // lands here with before/after frames, so the ID-keyed graph gets
+        // its edges from causal evidence — the input that actually moved
+        // focus — not from summary-mode polling. `via` is the canonical
+        // action name; the graph only joins edges whose ends resolved
+        // stable control IDs.
+        let before_focus = crate::semantic::analyze(tx.before()).focus;
+        let after_focus = crate::semantic::analyze(tx.after()).focus;
+        if before_focus.control_id != after_focus.control_id {
+            if let (Some(f), Some(t)) =
+                (before_focus.control_id.clone(), after_focus.control_id.clone())
+            {
+                self.focus_graph
+                    .transition(&f, &t, after_focus.control.as_deref(), tx.name());
+            }
+            // Legacy label ledger for display continuity.
+            if before_focus.control != after_focus.control {
+                self.focus_transitions.push((
+                    now_ms(),
+                    session.to_string(),
+                    before_focus.control.clone(),
+                    after_focus.control.clone(),
+                ));
+            }
+        }
     }
 
     /// Record a non-frame interaction (wait/observe) at evidence level.
@@ -1166,18 +1308,36 @@ impl RunContext {
 
     /// Shared bounded push with declared eviction (P0 fix 5).
     fn push_ledger(&mut self, record: TransactionRecord) {
-        // Persistent runs append immediately (Wave B item 14): the file is
-        // the authoritative history, memory is only a bounded window. The
-        // watermark rolls back on append failure so flush retries the tail.
-        if let Some(dir) = self.run_dir.clone() {
-            let flushed = self.ledger_flushed_upto;
-            self.transactions.push(record);
-            if self.append_ledger_incremental(&dir).is_err() {
-                self.ledger_flushed_upto = flushed;
+        // Background journal (audit item: run-journal writer): persistent
+        // runs hand the serialized record to the writer thread and never
+        // wait on the filesystem. The file remains the authoritative
+        // history; memory is only a bounded window. The watermark lives in
+        // the writer — `flush` drains through `wait_for`.
+        if let Some(dir) = self.run_dir.as_ref() {
+            if let Some(j) = &self.journal {
+                if let Ok(line) = serde_json::to_string(&record) {
+                    j.submit(record.seq, line);
+                }
+            } else {
+                // First record of a persistent run: spawn the writer now
+                // (lazily, so a run that never records anything pays
+                // nothing). A spawn failure degrades to the memory window
+                // only — flush reports persistence_unhealthy.
+                let path = dir.join("transactions.jsonl");
+                match journal::JournalHandle::spawn(path) {
+                    Ok(j) => {
+                        if let Ok(line) = serde_json::to_string(&record) {
+                            j.submit(record.seq, line);
+                        }
+                        self.journal = Some(j);
+                    }
+                    Err(_) => {
+                        self.persistence_unhealthy = true;
+                    }
+                }
             }
-        } else {
-            self.transactions.push(record);
         }
+        self.transactions.push(record);
         // Declared eviction (P0 fix 5) — for persistent runs this trims the
         // memory window only (disk already holds the records); for
         // ephemeral runs it is a real loss, which the manifest declares.
@@ -1322,13 +1482,25 @@ impl RunContext {
         let gtmp = dir.join("focus_graph_ids.json.tmp");
         std::fs::write(&gtmp, serde_json::to_vec_pretty(&self.focus_graph)?)?;
         std::fs::rename(&gtmp, dir.join("focus_graph_ids.json"))?;
-        // Transaction ledger (Wave-2 item 15 + Wave B item 14): NDJSON,
-        // APPENDED incrementally — every record whose seq exceeds
-        // `ledger_flushed_upto` is appended now, so a crash loses at most
-        // the last in-flight record instead of the whole unflushed tail.
-        // The eviction window still bounds memory; the file is the
-        // authoritative history for persistent runs.
-        self.append_ledger_incremental(&dir)?;
+        // Transaction ledger (Wave-2 item 15 + Wave B item 14 + the
+        // run-journal-writer audit item): records stream to the background
+        // writer as they are recorded; flush DRAINS — it waits for the
+        // writer's watermark to reach the total record count (bounded
+        // wait, honest timeout) so a crash loses at most the in-flight
+        // channel tail, and `flush` never reports success while lines are
+        // still unwritten.
+        if let Some(j) = &self.journal {
+            let target = self.transaction_count;
+            let reached = j.wait_for(target, std::time::Duration::from_secs(5));
+            if reached < target || j.is_unhealthy() {
+                self.persistence_unhealthy = true;
+            }
+            self.ledger_flushed_upto = reached;
+        } else if self.transaction_count > self.ledger_flushed_upto {
+            // Restored run with no writer yet (no new records since
+            // restore): the file is already authoritative; nothing to do.
+            self.ledger_flushed_upto = self.transaction_count;
+        }
         // Terminal-event logs (Wave B item 12/14).
         let ev_dir = dir.join("events");
         std::fs::create_dir_all(&ev_dir)?;
@@ -1438,34 +1610,48 @@ impl RunContext {
         self.checkpoints
             .reroot(root.join("checkpoints").to_string_lossy().to_string());
         self.run_dir = Some(root.clone());
+        // Records accumulated while ephemeral never went through the
+        // journal writer — write the whole window now (one synchronous
+        // pass at promotion, not per-record on the driving path), then
+        // arm the writer for everything after this point.
+        if self.transaction_count > 0 {
+            let ledger_path = root.join("transactions.jsonl");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&ledger_path)
+            {
+                use std::io::Write as _;
+                for tx in &self.transactions {
+                    if let Ok(line) = serde_json::to_string(tx) {
+                        let _ = file.write_all(line.as_bytes());
+                        let _ = file.write_all(b"\n");
+                    }
+                }
+            }
+            self.ledger_flushed_upto = self.transaction_count;
+        }
         // Flush everything accumulated while ephemeral into the new root.
         self.flush()?;
         self.write_manifest()?;
         Ok(root)
     }
 
-    /// Append every ledger record not yet on disk to
-    /// `<run>/transactions.jsonl` (Wave B item 14). Called by `flush` (and
-    /// by `record_interaction` for persistent runs) so the file grows
-    /// incrementally with the run. Evicted records are never rewritten —
-    /// they are already in the file if the run was persistent when they
-    /// landed, and the manifest's declared gap covers them if not.
-    fn append_ledger_incremental(&mut self, dir: &std::path::Path) -> anyhow::Result<()> {
-        use std::io::Write;
-        let path = dir.join("transactions.jsonl");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        for tx in &self.transactions {
-            if tx.seq >= self.ledger_flushed_upto {
-                let line = serde_json::to_string(tx)?;
-                file.write_all(line.as_bytes())?;
-                file.write_all(b"\n")?;
-                self.ledger_flushed_upto = tx.seq + 1;
-            }
+
+    /// Wait for the background journal writer to drain (bounded). Returns
+    /// the watermark reached. A no-op for ephemeral runs.
+    pub fn wait_for_journal(&self, deadline: std::time::Duration) -> u64 {
+        match &self.journal {
+            Some(j) => j.wait_for(self.transaction_count, deadline),
+            None => self.transaction_count,
         }
-        Ok(())
+    }
+
+    /// Whether ledger persistence has failed and the run is degrading to
+    /// memory-only (writer spawn error or terminal write error).
+    pub fn persistence_unhealthy(&self) -> bool {
+        self.persistence_unhealthy
+            || self.journal.as_ref().is_some_and(|j| j.is_unhealthy())
     }
 
     /// Assign the next citable frame id (Wave B item 11) and stamp the
@@ -1560,6 +1746,104 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Whether a coverage target is a real file locus (`src/lib.rs`, `src/
+/// lib.rs:42`, `src/lib.rs:42:7`). A path separator plus an extension is
+/// the discriminator — `#save.activate` and `main` are not files.
+fn target_is_file_locus(t: &str) -> bool {
+    let has_sep = t.contains('/') || t.contains('\\');
+    let has_ext = t.rsplit(['/', '\\']).next().is_some_and(|last| {
+        last.contains('.')
+            && !last.starts_with('.') // dotfile names like `.gitignore` edge — treat as no-ext
+    });
+    has_sep && has_ext
+}
+
+/// Parse `file:line[:col]` into a [`SourceRef`] with framework-adapter
+/// provenance: the app's coverage channel declared this locus, so the
+/// mapping is real, but the *link to this finding* is correlational —
+/// confidence 0.7 keeps an actionable-but-check-me posture (exactly at the
+/// `is_actionable()` fence, not above it). Windows-style `C:\...` paths
+/// keep their drive colon (the leading single letter is not a line number).
+fn source_ref_from_target(t: &str) -> Option<crate::semantic::source_ref::SourceRef> {
+    // Split on ':' and take trailing numeric segments as line[:col]; the
+    // rest (joined back) is the file. `src/a.rs:12:5` → file "src/a.rs",
+    // line 12, col 5. `C:\x\y.rs:12` → file "C:\x\y.rs" (the `C` segment
+    // is non-numeric and rejoins the path).
+    let segments: Vec<&str> = t.split(':').collect();
+    // Consume trailing numeric segments right-to-left: the first consumed
+    // is the column, the second is the line (file.rs:LINE:COL).
+    let mut col: Option<u32> = None;
+    let mut line: Option<u32> = None;
+    let mut idx = segments.len();
+    while idx > 0 {
+        let seg = segments[idx - 1];
+        if !seg.is_empty() && seg.parse::<u32>().is_ok() {
+            if col.is_none() {
+                col = seg.parse().ok();
+            } else if line.is_none() {
+                line = seg.parse().ok();
+            } else {
+                break;
+            }
+            idx -= 1;
+        } else {
+            break;
+        }
+    }
+    // A lone trailing numeric is the LINE, not the column (file.rs:42).
+    let (line, col) = match (line, col) {
+        (Some(l), Some(c)) => (Some(l), Some(c)),
+        (None, Some(c)) => (Some(c), None),
+        (l, c) => (l, c),
+    };
+    let line = line?;
+    let file = segments[..idx].join(":");
+    if file.is_empty() {
+        return None;
+    }
+    Some(crate::semantic::source_ref::SourceRef {
+        file,
+        line,
+        column: col,
+        symbol: None,
+        framework_id: None,
+        confidence: 0.7,
+        source: "framework-adapter".to_string(),
+    })
+}
+
+/// Whether an app-declared coverage widget target plausibly names the
+/// control a finding's evidence points at. Matching is by the control id's
+/// last path segment (the stable label slug): `widget:#save.activate` and
+/// `button/save` both reduce to something containing "save".
+fn coverage_target_matches_control(coverage_target: &str, control_id: &str) -> bool {
+    if control_id.is_empty() {
+        return false;
+    }
+    // Peel the coverage verb suffix: `widget:#save.activate` → `#save`.
+    let widget = coverage_target
+        .strip_prefix("widget:")
+        .unwrap_or(coverage_target)
+        .split('.')
+        .next()
+        .unwrap_or(coverage_target);
+    let widget_slug = widget.trim_start_matches(['#', '@']).to_lowercase();
+    if widget_slug.is_empty() {
+        return false;
+    }
+    // Control ids look like `button/save/40,12` or `field:host/2,3` —
+    // segments are kind/label/coords, so the label slug is the second to
+    // last path segment (fall back to the first for short ids).
+    let segs: Vec<&str> = control_id.split('/').collect();
+    let label_seg = if segs.len() >= 2 {
+        segs[segs.len() - 2].split(',').next().unwrap_or("")
+    } else {
+        segs[0].split(',').next().unwrap_or("")
+    };
+    let last_seg = label_seg.to_lowercase();
+    !last_seg.is_empty() && (widget_slug == last_seg || widget_slug.contains(&last_seg))
 }
 
 #[cfg(test)]
@@ -1678,13 +1962,18 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut run = RunContext::persistent(tmp.path()).expect("run");
 
-        // Record BEFORE any flush: the file must already hold the record.
+        // Records stream to the background journal writer; drain-wait for
+        // the watermark instead of assuming synchronous append (the old
+        // blocking append on the driving path is exactly what the
+        // run-journal-writer audit item removed).
         run.record_event("s1", "wait");
         let path = run.run_dir().expect("dir").join("transactions.jsonl");
+        run.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(&path).expect("ledger exists pre-flush");
-        assert_eq!(body.lines().count(), 1, "appended immediately: {body}");
+        assert_eq!(body.lines().count(), 1, "appended: {body}");
 
         run.record_event("s1", "wait");
+        run.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(&path).expect("reread");
         assert_eq!(body.lines().count(), 2, "second append: {body}");
 
@@ -1956,6 +2245,56 @@ mod tests {
         assert!(run.counts()["focus_transitions"].as_u64() >= Some(2));
     }
 
+    /// Focus graph from transactions (audit item): driving focus movement
+    /// through the canonical executor feeds the ID-keyed FocusGraph with a
+    /// `via=<action>` edge — causal evidence, no summary polling needed.
+    #[test]
+    fn focus_graph_is_fed_from_interaction_transactions() {
+        let mut run = RunContext::ephemeral();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/nsp_tui.py");
+        let mut s = crate::session::state::Session::new("fg-tx".into(), "python3".into());
+        s.start_with_spec(crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![fixture.into()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        })
+        .expect("spawn");
+        // Wait for the app to draw, then drive focus right (Save → Cancel).
+        let _ = s.observe(200);
+        for _ in 0..20 {
+            if s.native_channel().latest.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = s.observe(60);
+        }
+        let tx = crate::execution::execute_act(
+            &mut s,
+            &crate::execution::CanonicalAction::Key {
+                key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Right),
+            },
+            60,
+            2000,
+            false,
+        )
+        .expect("execute");
+        run.record_interaction("fg-tx", &tx);
+
+        // The graph has at least one driven edge tagged with the action.
+        let edges = &run.focus_graph.edges;
+        assert!(
+            edges.iter().any(|e| e.via == "key"),
+            "transaction fed a via=key edge: {:?}",
+            edges
+        );
+        s.stop().ok();
+    }
+
     #[test]
     fn status_reports_ephemeral_and_persistent_modes() {
         let eph = RunContext::ephemeral();
@@ -1997,6 +2336,7 @@ mod tests {
             )],
             confidence: 1.0,
             reproduction: None,
+            source_refs: Vec::new(),
         }]);
         run.record_focus_transition("sess-fix", None, Some("file".into()));
         let sc = crate::scenario::model::Scenario::new("restored-flow")
@@ -2083,8 +2423,10 @@ mod tests {
 
         let mut restored = RunContext::restore(&root).expect("restore");
         restored.record_event("sess-fix", "wait");
-        // The new record appends to the SAME ledger file (id preserved, no
-        // fork into a new run dir).
+        // The new record streams through the journal writer to the SAME
+        // ledger file (id preserved, no fork into a new run dir) — drain
+        // before reading (the writer is asynchronous by design).
+        restored.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(root.join("transactions.jsonl")).expect("ledger");
         assert_eq!(body.lines().count(), 2, "ledger appended in place: {body}");
         // And the manifest still declares the same run id.
@@ -2178,5 +2520,82 @@ mod tests {
         let restored = RunContext::restore(&root).expect("restore again");
         assert!(restored.is_closed(), "closed flag is durable");
         assert_eq!(restored.status(Vec::new())["closed"], true);
+    }
+}
+
+// W2.10 unit checks for the coverage→SourceRef join.
+#[cfg(test)]
+mod source_ref_tests {
+    use super::*;
+    use crate::audit::{EvidenceKind, EvidenceRef, Finding};
+
+    fn finding_pointing_at(control_id: &str) -> Finding {
+        Finding {
+            id: "TEST-001".into(),
+            severity: "error".into(),
+            category: "focus".into(),
+            summary: "test finding".into(),
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Control,
+                control_id,
+                "test control",
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn file_locus_discrimination() {
+        assert!(target_is_file_locus("src/lib.rs"));
+        assert!(target_is_file_locus("src/lib.rs:42"));
+        assert!(target_is_file_locus("ui\\panel.py:10:3"));
+        assert!(!target_is_file_locus("#save.activate"));
+        assert!(!target_is_file_locus("widget:#save"));
+        assert!(!target_is_file_locus("main"));
+    }
+
+    #[test]
+    fn target_parses_to_source_ref() {
+        let sr = source_ref_from_target("src/ui/settings.rs:184").expect("parse");
+        assert_eq!(sr.file, "src/ui/settings.rs");
+        assert_eq!(sr.line, 184);
+        assert!(sr.is_actionable(), "0.7 confidence is at the fence");
+        let with_col = source_ref_from_target("src/a.rs:12:5").expect("parse");
+        assert_eq!(with_col.column, Some(5));
+        assert!(source_ref_from_target("not-a-ref").is_none());
+    }
+
+    #[test]
+    fn coverage_widget_matches_control_id() {
+        assert!(coverage_target_matches_control(
+            "widget:#save.activate",
+            "button/save/40,12"
+        ));
+        assert!(coverage_target_matches_control("#cancel", "button/cancel/52,12"));
+        assert!(!coverage_target_matches_control(
+            "widget:#quit.activate",
+            "button/save/40,12"
+        ));
+        assert!(!coverage_target_matches_control("widget:#save", ""));
+    }
+
+    #[test]
+    fn findings_get_app_declared_loci_when_control_is_covered() {
+        let mut run = RunContext::ephemeral();
+        run.record_coverage_event("s1", "src/ui/settings.rs:184");
+        run.record_coverage_event("s1", "widget:#save.activate");
+        run.extend_findings_with_source_refs(vec![finding_pointing_at("button/save/40,12")]);
+        let f = run.findings().last().unwrap();
+        assert!(
+            !f.source_refs.is_empty(),
+            "covered control gets its app-declared locus"
+        );
+        assert!(f.source_refs[0].is_actionable());
+        // An uncovered control carries no locus — never guessed.
+        run.extend_findings_with_source_refs(vec![finding_pointing_at("button/other/1,1")]);
+        let f2 = run.findings().last().unwrap();
+        assert!(f2.source_refs.is_empty(), "no locus without coverage");
     }
 }

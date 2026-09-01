@@ -206,7 +206,9 @@ pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backen
         },
         W::ProcessExit => WaitCond::ProcessExit,
         W::Title => p.title.clone().map(WaitCond::Title)?,
-        W::Bell => WaitCond::Bell,
+        W::Bell => WaitCond::Bell {
+            after_bell_seq: None,
+        },
         W::Idle => WaitCond::Idle {
             quiet_for: idle_quiet,
             after_output_seq: None,

@@ -185,8 +185,7 @@ fn is_user_dir(dir: &str) -> bool {
             "~/.node_modules/.bin",
             "/usr/local/bin",
         ]
-        .iter()
-        .any(|u| name == *u)
+        .contains(&name)
 }
 
 /// A session-unique scratch directory for `HOME`/`TMPDIR`.
@@ -309,7 +308,7 @@ mod tests {
         assert!(path.contains("/usr/bin"), "system bin kept");
         assert!(path.contains("/sbin"), "distro sbin kept — not dropped by a hardcoded list");
         assert!(path.contains("/opt/tool/bin"), "opt tool bin kept");
-        assert!(!eff.iter().any(|(k, _)| k == "TERM") == false); // TERM kept
+        assert!(eff.iter().any(|(k, _)| k == "TERM"), "TERM kept");
         assert!(eff.iter().any(|(k, v)| k == "TERM" && v == "xterm"));
     }
 
@@ -325,7 +324,11 @@ mod tests {
     #[test]
     fn session_id_is_sanitized_for_filenames() {
         let s = ScratchDir::resolve("a/b;c", 0, "p");
-        assert!(!s.root().to_string_lossy().contains('/') || true); // a / inside a filename is fine because it's a subdir; the point is no ';' survives
-        assert!(!s.root().to_string_lossy().contains(';'), "delimiters stripped");
+        // A '/' inside the root is fine (it is a path separator); the point
+        // is no ';' survives sanitization.
+        assert!(
+            !s.root().to_string_lossy().contains(';'),
+            "delimiters stripped"
+        );
     }
 }

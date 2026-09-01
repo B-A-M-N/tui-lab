@@ -385,13 +385,19 @@ fn doctor() {
         "identity graph record + count",
     );
 
-    // 7. Coverage: honest probe for the optional tuicov executable.
+    // 7. Coverage: honest probe for the optional tuicov executable. Absent
+    // is a warn, not a fail — the lab works without it, only the optional
+    // coverage correlation degrades.
     let coverage = tui_lab::coverage::tuicov::is_available();
-    report(
+    tier(
         &mut out,
         "Coverage (tuicov)",
-        coverage,
-        "optional executable on PATH",
+        if coverage { Tier::Ok } else { Tier::Warn },
+        if coverage {
+            "optional executable on PATH"
+        } else {
+            "optional executable not on PATH — coverage correlation unavailable"
+        },
     );
 
     // 8. Framework probes: parse a synthetic ratatui manifest (this crate
@@ -406,14 +412,16 @@ fn doctor() {
         det.framework.as_deref() == Some("ratatui")
     })
     .unwrap_or(false);
-    report(
+    tier(
         &mut out,
         "Framework detection",
-        framework,
+        Tier::from_ok(framework),
         "ratatui manifest parse",
     );
 
-    // 9. python3 presence (fixtures + many audits depend on it).
+    // 9. python3 presence (fixtures + many audits depend on it). Missing
+    // python3 degrades audits that drive python fixtures — a warn, since
+    // the core PTY/semantic/recording paths run against any child.
     let python3 = std::process::Command::new("python3")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -421,11 +429,15 @@ fn doctor() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    report(
+    tier(
         &mut out,
         "python3 (fixture runtime)",
-        python3,
-        "child on PATH",
+        if python3 { Tier::Ok } else { Tier::Warn },
+        if python3 {
+            "child on PATH"
+        } else {
+            "python3 not on PATH — python-fixture audits unavailable"
+        },
     );
 
     let _ = writeln!(out);
@@ -439,11 +451,45 @@ fn doctor() {
 }
 
 fn report(out: &mut impl std::io::Write, name: &str, ok: bool, detail: &str) {
+    tier(out, name, Tier::from_ok(ok), detail);
+}
+
+/// Readiness tier for a doctor probe: only [`Tier::Fail`] (a core subsystem
+/// is actually broken) affects the exit code; [`Tier::Warn`] is degraded
+/// capability and [`Tier::Skip`] is an optional integration that isn't
+/// present. The old single ok/FAIL bit conflated "broken" with "absent" —
+/// an optional executable missing from PATH is not a failure of the lab.
+enum Tier {
+    Ok,
+    /// Degraded but functional (or an optional integration absent).
+    Warn,
+    Fail,
+}
+
+impl Tier {
+    fn from_ok(ok: bool) -> Self {
+        if ok {
+            Tier::Ok
+        } else {
+            Tier::Fail
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Tier::Ok => "[ok]",
+            Tier::Warn => "[warn]",
+            Tier::Fail => "[FAIL]",
+        }
+    }
+}
+
+fn tier(out: &mut impl std::io::Write, name: &str, t: Tier, detail: &str) {
     let _ = writeln!(
         out,
         "{:<28} {}  ({})",
         format!("{}:", name),
-        if ok { "[ok]" } else { "[FAIL]" },
+        t.label(),
         detail
     );
 }

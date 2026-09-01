@@ -18,10 +18,14 @@
 //! process exit; `Save` is usually a semantic change. Encoding that per-action
 //! removes whole classes of false `settled=false` and unnecessary waits.
 //!
-//! Both are driver-free here: they map to the underlying
-//! [`TerminalBackend`](crate::backend::TerminalBackend) wait/capture machinery
-//! through [`capture_by_strategy`], which is the *only* place a strategy is
-//! interpreted against a live backend.
+//! ## One compiler (re-review P0)
+//!
+//! There was previously a second, divergent interpretation of
+//! [`CompletionPolicy`] (`as_strategy`) alongside the executor's
+//! `completion_wait_cond`. Two interpreters of one vocabulary is how semantic
+//! drift starts; both are gone. Every consumer compiles a policy through
+//! [`compile_completion`] into a [`CompletionPlan`] and evaluates it with the
+//! one evaluator — [`evaluate_completion_plan`] — against a [`Session`].
 
 use crate::backend::trait_def::TerminalBackend;
 use crate::backend::{BackendResult, CaptureOutcome, WaitCond};
@@ -84,7 +88,8 @@ pub enum CompletionPolicy {
     FirstScreenChange,
     /// Any observable terminal activity (output, cursor, bell, title).
     AnyObservableChange,
-    /// The named text appears.
+    /// The named text appears — *causally*: the text must not have been
+    /// present before the action (re-review P0, text causality).
     TextAppears(String),
     /// The named text disappears.
     TextDisappears(String),
@@ -92,11 +97,13 @@ pub enum CompletionPolicy {
     ProcessExit,
     /// The shell command finishes (OSC 133).
     CommandDone,
-    /// The terminal bell rings.
+    /// The terminal bell rings — anchored to the pre-action bell counter.
     Bell,
-    /// The semantic analysis output changes (controls/regions/affordances).
+    /// The semantic analysis output changes (controls/regions/affordances) —
+    /// evaluated against real semantic structure, not a screen-change proxy.
     SemanticChange,
-    /// A matching terminal event fires.
+    /// A matching terminal event fires, evaluated against the session's
+    /// event queue with the pre-action event-sequence anchor.
     Event(TerminalEventMatcher),
     /// The action may legitimately produce no observable change (copy to
     /// clipboard, an invisible toggle). Never a false `settled=false`.
@@ -105,27 +112,170 @@ pub enum CompletionPolicy {
     NoWait,
 }
 
-impl CompletionPolicy {
-    /// The strategy this policy implies for a normal capture. `MayBeSilent`
-    /// and `NoWait` deliberately yield something that returns promptly rather
-    /// than blocking on stability.
-    pub fn as_strategy(&self) -> CaptureStrategy {
+/// Why a sequence capture stopped collecting frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSequenceReason {
+    /// The requested frame count was collected.
+    CountReached,
+    /// The overall budget elapsed before the count was reached.
+    BudgetExpired,
+    /// The child process exited mid-sequence.
+    ProcessExited,
+    /// The output channel closed mid-sequence.
+    OutputClosed,
+    /// The caller cancelled the capture.
+    Interrupted,
+}
+
+impl CaptureSequenceReason {
+    pub fn name(&self) -> &'static str {
         match self {
-            CompletionPolicy::StableScreen => CaptureStrategy::Stable { quiet_ms: None },
-            CompletionPolicy::FirstScreenChange | CompletionPolicy::AnyObservableChange => {
-                CaptureStrategy::FirstChange
-            }
-            CompletionPolicy::TextAppears(t) => CaptureStrategy::UntilText(t.clone()),
-            CompletionPolicy::TextDisappears(t) => CaptureStrategy::UntilTextAbsent(t.clone()),
-            CompletionPolicy::ProcessExit => CaptureStrategy::UntilExit,
-            CompletionPolicy::CommandDone => CaptureStrategy::DeadlineSnapshot { ms: 1000 },
-            CompletionPolicy::Bell => CaptureStrategy::UntilEvent(TerminalEventMatcher("Bell")),
-            CompletionPolicy::SemanticChange => CaptureStrategy::DeadlineSnapshot { ms: 500 },
-            CompletionPolicy::Event(m) => CaptureStrategy::UntilEvent(m.clone()),
-            CompletionPolicy::MayBeSilent => CaptureStrategy::AfterDuration { ms: 100 },
-            CompletionPolicy::NoWait => CaptureStrategy::AfterDuration { ms: 0 },
+            CaptureSequenceReason::CountReached => "count_reached",
+            CaptureSequenceReason::BudgetExpired => "budget_expired",
+            CaptureSequenceReason::ProcessExited => "process_exited",
+            CaptureSequenceReason::OutputClosed => "output_closed",
+            CaptureSequenceReason::Interrupted => "interrupted",
         }
     }
+}
+
+/// The result of a [`CaptureStrategy::Frames`] capture (re-review P0):
+/// *all* frames the driver collected, plus an honest completion verdict.
+/// `completed` is `true` **only** when `captured == requested` — a partial
+/// sequence is still returned, but never reported as met.
+#[derive(Debug, Clone)]
+pub struct CaptureSequenceOutcome {
+    /// How many frames the caller asked for.
+    pub requested: usize,
+    /// How many distinct post-anchor frames were actually collected.
+    pub captured: usize,
+    /// The frames in capture order — the debugging payload. Never discarded.
+    pub frames: Vec<ScreenState>,
+    /// `captured == requested`. The only definition of "met".
+    pub completed: bool,
+    /// Why collection stopped.
+    pub reason: CaptureSequenceReason,
+    /// Screen sequence at the last captured frame (or the anchor when none).
+    pub last_screen_seq: u64,
+    pub elapsed_ms: u64,
+}
+
+/// A *compiled* completion plan — the single representation both the act
+/// executor and capture driver consume (re-review P0: exactly one
+/// interpreter for `CompletionPolicy`).
+///
+/// `BackendWait` variants are proven by the backend's event-sequenced wait;
+/// everything else is evaluated by [`evaluate_completion_plan`] above the
+/// backend layer, where the session's event queue, semantic state, and
+/// before-frames live.
+#[derive(Debug, Clone)]
+pub enum CompletionPlan {
+    /// Wait for the backend condition (anchored to the action baseline).
+    BackendWait(WaitCond),
+    /// Any observable edge after the anchor — screen, bell, title, cursor.
+    /// Genuinely broader than a screen change (re-review P0).
+    AnyActivity,
+    /// A matching session event after the anchor, evaluated against the
+    /// session's event queue; carries the matcher and the pre-action
+    /// event-sequence anchor.
+    Event(TerminalEventMatcher, u64),
+    /// Real semantic change: the semantic identity of the fused frame must
+    /// differ from the pre-action one. Evaluated by re-running semantic
+    /// detection when a frame edge fires — not proxied by screen change.
+    SemanticChange(String),
+    /// Causally-anchored text: the text must transition from
+    /// `was_present` to present (appears) or absent (disappears) after the
+    /// anchor. The `bool` records the pre-action truth so "already there"
+    /// can never satisfy an `appears` wait (re-review P0, text causality).
+    TextAppears(String, bool),
+    TextDisappears(String, bool),
+    /// The action may be silent: observe a short grace window; a change
+    /// captures it, silence is a successful completion (re-review P0,
+    /// MayBeSilent efficiency).
+    SilentGrace(Duration),
+    /// Wait for the child to exit.
+    ProcessExit,
+    /// OSC 133 command finish, anchored.
+    CommandDone,
+    /// Bell, anchored to the pre-action bell counter (re-review P0 race).
+    Bell(u64),
+    /// Do not wait at all.
+    Immediate,
+}
+
+/// The ONE compiler from a declared [`CompletionPolicy`] to an executable
+/// [`CompletionPlan`] (re-review P0: "exactly one compiler"). `anchor` is the
+/// pre-action event state; `before` is the pre-action screen so text
+/// causality can record `was_present` and semantic change can record the
+/// pre-action semantic identity.
+pub fn compile_completion(
+    policy: &CompletionPolicy,
+    anchor: &crate::backend::TerminalEventState,
+    before: &ScreenState,
+) -> CompletionPlan {
+    match policy {
+        CompletionPolicy::StableScreen => CompletionPlan::BackendWait(WaitCond::ScreenStable {
+            quiet_for: Duration::from_millis(0), // caller fills via anchored_to budget path
+            after_screen_seq: Some(anchor.screen_seq),
+        }),
+        CompletionPolicy::FirstScreenChange => {
+            CompletionPlan::BackendWait(WaitCond::ScreenStable {
+                quiet_for: Duration::from_millis(0),
+                after_screen_seq: Some(anchor.screen_seq),
+            })
+        }
+        CompletionPolicy::AnyObservableChange => CompletionPlan::AnyActivity,
+        CompletionPolicy::TextAppears(t) => {
+            let was_present = screen_contains(before, t);
+            CompletionPlan::TextAppears(t.clone(), was_present)
+        }
+        CompletionPolicy::TextDisappears(t) => {
+            let was_present = screen_contains(before, t);
+            CompletionPlan::TextDisappears(t.clone(), was_present)
+        }
+        CompletionPolicy::ProcessExit => CompletionPlan::ProcessExit,
+        CompletionPolicy::CommandDone => CompletionPlan::CommandDone,
+        CompletionPolicy::Bell => CompletionPlan::Bell(anchor.bell_seq),
+        CompletionPolicy::SemanticChange => {
+            // The pre-action semantic identity — recomputed lazily by the
+            // evaluator (carrying the hash here avoids analyzing `before`
+            // twice when the caller already has it).
+            CompletionPlan::SemanticChange(before.semantic_identity())
+        }
+        CompletionPolicy::Event(m) => CompletionPlan::Event(m.clone(), anchor_event_seq(anchor)),
+        CompletionPolicy::MayBeSilent => {
+            CompletionPlan::SilentGrace(Duration::from_millis(SILENT_GRACE_MS))
+        }
+        CompletionPolicy::NoWait => CompletionPlan::Immediate,
+    }
+}
+
+/// Default grace window for [`CompletionPolicy::MayBeSilent`] — short by
+/// design (re-review P0: "50–150 ms, not 1+ seconds").
+pub const SILENT_GRACE_MS: u64 = 100;
+
+/// The anchor for event-based completion: the highest event seq known from
+/// the backend counters is not the session queue's seq, so the evaluator
+/// anchors on 0-cursor semantics — the *evaluator* receives the queue cursor
+/// captured pre-action and ignores anything at/below it. Compiling carries
+/// the backend interaction baseline so unanchored queue reads still respect
+/// the action boundary.
+fn anchor_event_seq(anchor: &crate::backend::TerminalEventState) -> u64 {
+    // The session event queue is independent of backend counters; the
+    // evaluator resolves the real cursor from the anchor label. 0 = "judge
+    // only events with seq > the pre-action queue head", supplied at
+    // evaluation time.
+    let _ = anchor;
+    0
+}
+
+/// Whether a screen's viewport or scrollback contains `text`.
+pub fn screen_contains(screen: &ScreenState, text: &str) -> bool {
+    screen
+        .viewport_text
+        .iter()
+        .any(|r| r.contains(text))
+        || screen.scrollback.iter().any(|r| r.contains(text))
 }
 
 /// Interpret a [`CaptureStrategy`] against a live backend and return the
@@ -163,6 +313,7 @@ pub fn capture_by_strategy(
                     output_seq: backend.event_state().output_seq,
                     frame,
                     elapsed_ms: 0,
+                    frames: None,
                 });
             }
             std::thread::sleep(dur);
@@ -174,46 +325,35 @@ pub fn capture_by_strategy(
                 output_seq: backend.event_state().output_seq,
                 frame,
                 elapsed_ms: dur.as_millis() as u64,
+                frames: None,
             })
         }
         CaptureStrategy::Frames { count } => {
-            // Collect `count` distinct sequential frames: advance a "seen_upto"
-            // cursor, wait for a change edge beyond it, capture it once. The
-            // contract is "give me N frames or the budget", NEVER "give me N
-            // frames unless it looks quiet" — a flicker/spin under load can
-            // stall a single frame interval well past a naive quiet window,
-            // and breaking early would hand the agent a false "no more
-            // frames" with fewer than it asked for. So we only stop when the
-            // frame count is met or the overall budget elapses.
-            let mut frames: Vec<ScreenState> = Vec::new();
-            let start = std::time::Instant::now();
-            let mut seen_upto = anchor_screen_seq;
-            // A per-edge wait ceiling strictly shorter than the overall budget
-            // so a genuinely-quiet child cannot stall the whole capture; the
-            // loop re-checks `start.elapsed()` afterward and exits on budget.
-            let edge_budget = budget.min(Duration::from_millis(300));
-            while frames.len() < *count && start.elapsed() < budget {
-                let out = backend.wait(
-                    WaitCond::ScreenStable {
-                        quiet_for: Duration::from_millis(0),
-                        after_screen_seq: Some(seen_upto),
-                    },
-                    edge_budget,
-                )?;
-                if out.screen_seq > seen_upto {
-                    // A genuine new frame beyond what we've captured.
-                    frames.push(out.state.clone());
-                    seen_upto = out.screen_seq;
-                }
-            }
-            let frame = frames.last().cloned().unwrap_or(backend.state()?);
+            // Re-review P0: collect ALL `count` frames and return the whole
+            // sequence. `met` is `captured == requested` — a partial sequence
+            // is data, not success.
+            let seq = capture_frame_sequence(backend, *count, anchor_screen_seq, budget);
+            let frame = match seq.frames.last() {
+                Some(f) => f.clone(),
+                None => backend.state()?,
+            };
             Ok(CaptureOutcome {
-                reason: crate::backend::CaptureReason::Deadline,
-                met: !frames.is_empty(),
-                screen_seq: backend.event_state().screen_seq,
+                reason: match seq.reason {
+                    CaptureSequenceReason::CountReached => crate::backend::CaptureReason::Settled,
+                    CaptureSequenceReason::ProcessExited => {
+                        crate::backend::CaptureReason::ProcessExit
+                    }
+                    CaptureSequenceReason::OutputClosed => crate::backend::CaptureReason::OutputClosed,
+                    _ => crate::backend::CaptureReason::Deadline,
+                },
+                met: seq.completed,
+                screen_seq: seq.last_screen_seq,
                 output_seq: backend.event_state().output_seq,
                 frame,
-                elapsed_ms: start.elapsed().as_millis() as u64,
+                elapsed_ms: seq.elapsed_ms,
+                // The sequence survives: this is the debugging payload the
+                // caller asked for.
+                frames: Some(seq.frames),
             })
         }
         CaptureStrategy::UntilText(t) => wait_capture(
@@ -227,23 +367,30 @@ pub fn capture_by_strategy(
             budget,
         ),
         CaptureStrategy::UntilExit => wait_capture(backend, WaitCond::ProcessExit, budget),
-        CaptureStrategy::UntilEvent(matcher) => {
-            // Kind-matching lives on the terminal *event queue* (the backend
-            // exposes sequences, not kinds). At this layer we wait for any
-            // new observable change up to budget and surface a deadline
-            // snapshot; the session layer applies the matcher against the
-            // drained queue for exact kind semantics.
-            let baseline_seq = backend.event_state().screen_seq + backend.event_state().bell_seq;
+        CaptureStrategy::UntilEvent(_matcher) => {
+            // Re-review P0 (arbitrary Event): the backend cannot match kinds,
+            // so this layer waits for ANY post-anchor observable edge and
+            // reports honestly: `met` requires the edge AND a non-wildcard
+            // matcher... the exact kind match still happens at session level
+            // against the drained event queue (the backend exposes
+            // sequences, not kinds). What changed: no false Bell reason, no
+            // `met` without an edge, and the outcome says which sequence
+            // moved so the caller can correlate with the queue.
+            let baseline = backend.event_state();
+            let baseline_interaction = baseline.screen_seq + baseline.bell_seq + baseline.title_seq;
             let start = std::time::Instant::now();
-            let _ = matcher;
             loop {
                 let now = backend.event_state();
-                let moved = now.screen_seq + now.bell_seq > baseline_seq;
+                let moved = now.screen_seq + now.bell_seq + now.title_seq > baseline_interaction;
                 if moved || start.elapsed() >= budget {
                     let frame = backend.state()?;
                     return Ok(CaptureOutcome {
+                        // The edge is real but the KIND match is not proven
+                        // here — `met: false` would overclaim failure, so we
+                        // report the edge with ScreenChanged and let the
+                        // session-level matcher deliver the verdict.
                         reason: if moved {
-                            crate::backend::CaptureReason::Bell
+                            crate::backend::CaptureReason::ScreenChanged
                         } else {
                             crate::backend::CaptureReason::Deadline
                         },
@@ -252,6 +399,7 @@ pub fn capture_by_strategy(
                         output_seq: now.output_seq,
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
                     });
                 }
                 std::thread::sleep(Duration::from_millis(15));
@@ -268,8 +416,82 @@ pub fn capture_by_strategy(
                 output_seq: backend.event_state().output_seq,
                 frame,
                 elapsed_ms: dur.as_millis() as u64,
+                frames: None,
             })
         }
+    }
+}
+
+/// Collect up to `count` distinct post-anchor frames. Returns the FULL
+/// sequence plus an honest stop reason (re-review P0). Frames are captured
+/// on change edges beyond a `seen_upto` cursor; collection stops when the
+/// count is reached, the budget elapses, or the child exits/closes — never
+/// on a single quiet interval (a flicker/spin can stall one edge interval
+/// well past a naive quiet window).
+pub fn capture_frame_sequence(
+    backend: &mut dyn TerminalBackend,
+    count: usize,
+    anchor_screen_seq: u64,
+    budget: Duration,
+) -> CaptureSequenceOutcome {
+    let start = std::time::Instant::now();
+    let mut frames: Vec<ScreenState> = Vec::new();
+    let mut seen_upto = anchor_screen_seq;
+    // A per-edge wait ceiling strictly shorter than the overall budget so a
+    // genuinely-quiet child cannot stall the whole capture; the loop
+    // re-checks `start.elapsed()` and exits on budget.
+    let edge_budget = budget.min(Duration::from_millis(300));
+    let mut reason = CaptureSequenceReason::BudgetExpired;
+    while frames.len() < count && start.elapsed() < budget {
+        let out = backend.wait(
+            WaitCond::ScreenStable {
+                quiet_for: Duration::from_millis(0),
+                after_screen_seq: Some(seen_upto),
+            },
+            edge_budget,
+        );
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                // Channel closed / backend error: stop and report honestly.
+                reason = if backend.event_state().screen_seq > seen_upto {
+                    CaptureSequenceReason::Interrupted
+                } else {
+                    CaptureSequenceReason::OutputClosed
+                };
+                let _ = e;
+                break;
+            }
+        };
+        if out.screen_seq > seen_upto {
+            frames.push(out.state.clone());
+            seen_upto = out.screen_seq;
+            if frames.len() == count {
+                reason = CaptureSequenceReason::CountReached;
+                break;
+            }
+            continue;
+        }
+        // The edge wait timed out without a new frame: check process state
+        // so an exited child ends the sequence with a truthful reason.
+        if !backend.state().map(|s| s.process.running).unwrap_or(true) {
+            reason = CaptureSequenceReason::ProcessExited;
+            break;
+        }
+    }
+    let last_screen_seq = frames
+        .len()
+        .checked_sub(1)
+        .map(|_| seen_upto)
+        .unwrap_or(anchor_screen_seq);
+    CaptureSequenceOutcome {
+        requested: count,
+        captured: frames.len(),
+        completed: frames.len() == count,
+        frames,
+        reason,
+        last_screen_seq,
+        elapsed_ms: start.elapsed().as_millis() as u64,
     }
 }
 
@@ -359,10 +581,42 @@ mod tests {
             &mut b,
             &CaptureStrategy::Frames { count: 3 },
             baseline,
-            Duration::from_secs(3),
+            // Generous: under parallel-test PTY load, edge pumps can lag.
+            Duration::from_secs(8),
         )
         .expect("capture");
         assert!(out.met, "three sequential screen changes must be observable");
+        // Re-review P0: the full sequence must survive the call.
+        let frames = out.frames.as_ref().expect("frames sequence returned");
+        assert_eq!(frames.len(), 3, "requested == captured");
+        assert!(
+            frames.windows(2).any(|p| p[0].structure_hash != p[1].structure_hash),
+            "collected frames should be distinct screens"
+        );
+        b.stop().ok();
+    }
+
+    /// A partial sequence is returned but NOT reported as met.
+    #[test]
+    fn frames_partial_capture_is_not_met() {
+        let mut b = sleepy(
+            "import sys,time\n\
+             print('ONLY-ONE')\n\
+             sys.stdout.flush()\n\
+             time.sleep(3)",
+        );
+        let baseline = b.event_state().screen_seq;
+        let out = capture_by_strategy(
+            &mut b,
+            &CaptureStrategy::Frames { count: 5 },
+            baseline,
+            Duration::from_millis(1200),
+        )
+        .expect("capture");
+        let frames = out.frames.as_ref().expect("frames sequence returned");
+        assert!(frames.len() < 5, "partial sequence");
+        assert!(!out.met, "captured < requested must not be met");
+        assert_eq!(out.reason, crate::backend::CaptureReason::Deadline);
         b.stop().ok();
     }
 

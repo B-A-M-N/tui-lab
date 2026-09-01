@@ -154,10 +154,52 @@ fn conformance_bell_is_edge_triggered() {
     let _ = b.wait(WaitCond::Text("before".into()), Duration::from_secs(5));
     // Bell wait must resolve only after the actual bell.
     let out = b
-        .wait(WaitCond::Bell, Duration::from_secs(5))
+        .wait(
+            WaitCond::Bell {
+                after_bell_seq: None,
+            },
+            Duration::from_secs(5),
+        )
         .expect("wait");
     assert!(out.met, "Bell wait should resolve after an actual bell");
     assert_eq!(out.reason, WaitReason::Bell);
+}
+
+/// Re-review P0 (Bell race): an anchored bell wait must resolve for a bell
+/// that fired BEFORE the wait was entered, as long as it is newer than the
+/// anchor. Sequence: bell fires, anchor captured, wait entered — the old
+/// unanchored form would hang to timeout here.
+#[test]
+fn conformance_bell_anchored_resolves_after_the_fact() {
+    let mut b = spawn_py(
+        "import sys,time\n\
+         sys.stdout.write('x')\n\
+         sys.stdout.flush()\n\
+         time.sleep(0.3)\n\
+         sys.stdout.write('\\a')\n\
+         sys.stdout.flush()\n\
+         time.sleep(2)\n",
+    );
+    let _ = b.wait(WaitCond::Text("x".into()), Duration::from_secs(5));
+    // The bell fires while "we are doing something else"...
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Pump the pending bytes (bells are counted during pump) and anchor.
+    let _ = b.state().expect("state pumps the stream");
+    let anchor = b.event_state();
+    assert!(anchor.bell_seq >= 1, "bell must have fired by now");
+    // ...and the anchored wait entered AFTER it must still see it.
+    let out = b
+        .wait(
+            WaitCond::Bell {
+                after_bell_seq: Some(0),
+            },
+            Duration::from_secs(2),
+        )
+        .expect("wait");
+    assert!(
+        out.met,
+        "anchored Bell must resolve for a bell newer than the anchor"
+    );
 }
 
 #[test]

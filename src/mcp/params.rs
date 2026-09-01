@@ -250,11 +250,13 @@ selector_enum!(
 
 selector_enum!(
     /// `tui_run` action. `list` (Wave G item 75) enumerates persisted runs;
-    /// `resume` (Wave G item 74) restores one as the server's live run.
+    /// `resume` (Wave G item 74) restores one as the server's live run;
+    /// `repair` (audit item: vket/RepairPacket) returns repair bundles.
     RunAction;
     [
         Status => "status", Persist => "persist", Close => "close",
         Context => "context", List => "list", Resume => "resume",
+        Repair => "repair",
     ]
 );
 

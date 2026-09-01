@@ -180,6 +180,7 @@ impl ContractReport {
                 }))],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
         out

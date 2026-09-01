@@ -85,6 +85,63 @@ pub fn analyze(screen: &ScreenState) -> SemanticScreen {
     }
 }
 
+/// Re-review P0 (real SemanticChange): a stable identity over the semantic
+/// content of a screen — which controls exist, their roles/labels/bounds,
+/// the region layout, affordances, and focus. Two frames with the same
+/// identity are semantically identical *even if* pixels differ (spinner
+/// frame, clock, cursor blink), and two frames with different identities
+/// are a genuine semantic change even if the structure hash alone would
+/// not move.
+///
+/// Deliberately NOT cached: completion evaluation calls this rarely (once
+/// per action on the before-frame, then on candidate after-frames), and
+/// caching risks exactly the staleness this exists to prevent.
+pub fn semantic_identity(screen: &ScreenState) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let sem = analyze(screen);
+    let mut h = DefaultHasher::new();
+    // Layout skeleton (normalized — volatile text already scrubbed).
+    screen.structure_hash.hash(&mut h);
+    // Semantic content over that skeleton: what the controls ARE.
+    for c in &sem.controls {
+        c.id.hash(&mut h);
+        format!("{:?}", c.kind).hash(&mut h);
+        c.label.hash(&mut h);
+        c.value.hash(&mut h);
+        c.bounds.x.hash(&mut h);
+        c.bounds.y.hash(&mut h);
+        c.bounds.width.hash(&mut h);
+        c.bounds.height.hash(&mut h);
+        c.focusable.hash(&mut h);
+        c.focused.hash(&mut h);
+        c.enabled.hash(&mut h);
+        c.selected.hash(&mut h);
+        c.checked.hash(&mut h);
+    }
+    for r in &sem.regions {
+        r.id.hash(&mut h);
+        format!("{:?}", r.kind).hash(&mut h);
+        r.title.hash(&mut h);
+        r.bounds.x.hash(&mut h);
+        r.bounds.y.hash(&mut h);
+        r.bounds.width.hash(&mut h);
+        r.bounds.height.hash(&mut h);
+        format!("{:?}", r.clipping_state).hash(&mut h);
+    }
+    for a in &sem.affordances {
+        a.action.hash(&mut h);
+        a.control_id.hash(&mut h);
+        format!("{:?}", a.invocation).hash(&mut h);
+        format!("{:?}", a.visibility).hash(&mut h);
+    }
+    // Focus is part of semantic truth: Tab between two controls with
+    // identical text changes the identity.
+    sem.focus.control_id.hash(&mut h);
+    sem.focus.control.hash(&mut h);
+    format!("semantic-id:v1:{:016x}", h.finish())
+}
+
 /// One detection pass producing BOTH shapes — the flat
 /// [`SemanticScreen`] and the [`SemanticTree`] — from the same detector
 /// outputs. This is the structural guarantee behind fused semantic truth

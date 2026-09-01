@@ -88,7 +88,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_run",
-        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, and context (this registry as JSON).",
+        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, repair packets for every finding, and context (this registry as JSON).",
         selector: Some(("action", <crate::mcp::params::RunAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
