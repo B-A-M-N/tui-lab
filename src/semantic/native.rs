@@ -680,12 +680,19 @@ fn native_to_semantic_node(
 
 /// The flat-shape counterpart: a native-only node also becomes a Control so
 /// flat-mode consumers (summary/semantic views) see the same truth.
+///
+/// Re-review P0.11: an unknown native role stays unknown. The old
+/// `unwrap_or(ControlKind::Button)` invented an actionable control out of
+/// anything the vocabulary didn't cover — a native role "graph" became a
+/// clickable Button and polluted exploration, mouse auditing, intent
+/// resolution, and risk classification. `ControlKind::Unknown` exists for
+/// exactly this; downstream consumers already treat it as non-actionable.
 fn native_node_to_control(native: &NativeNode) -> Option<crate::semantic::controls::Control> {
     let [x, y, w, h] = native.bounds?;
     Some(crate::semantic::controls::Control {
         id: native.id.clone(),
         kind: kind_from_slug(&native.role)
-            .unwrap_or(crate::semantic::controls::ControlKind::Button),
+            .unwrap_or(crate::semantic::controls::ControlKind::Unknown),
         label: native.label.clone().unwrap_or_else(|| native.id.clone()),
         value: native.value.clone(),
         bounds: crate::semantic::controls::ControlBounds {

@@ -7,7 +7,7 @@
 //! screens (an 80x24 blank on observe failure) are gone: execution errors
 //! fail the step with the real error.
 
-use super::model::{Scenario, StepKind};
+use super::model::{ParameterValue, Scenario, StepKind};
 use crate::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 
 #[derive(Debug, serde::Serialize)]
@@ -32,15 +32,56 @@ pub struct ScenarioRunner;
 
 impl ScenarioRunner {
     /// Run a scenario. Returns a report.
+    ///
+    /// Sensitive parameters (re-review P0.3) resolve from `values`; pass
+    /// `&[]` when the scenario declares none. Equivalent to
+    /// [`ScenarioRunner::run`] with no parameter values.
     pub fn run(
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
+    ) -> ScenarioRunReport {
+        Self::run_with_parameters(scenario, session, &[])
+    }
+
+    /// Run a scenario with caller-supplied sensitive-parameter values
+    /// (re-review P0.3). Values substitute `${NAME}` references in step
+    /// payloads; a reference whose value was not supplied fails its step as
+    /// `unresolved_parameter` — structured and honest — rather than
+    /// deserializing to a parse error or, worse, sending a literal
+    /// `${PASSWORD}` keystroke into the app.
+    pub fn run_with_parameters(
+        scenario: &Scenario,
+        session: &mut crate::session::state::Session,
+        values: &[ParameterValue],
     ) -> ScenarioRunReport {
         let mut results = Vec::new();
         let mut passed = 0;
         let mut failed = 0;
 
+        // Resolve the whole step list up front so ${NAME} references become
+        // real payloads before any step executes. Unresolved references are
+        // left in place and detected per-step below.
+        let resolved_params = scenario.resolve_parameters(values);
+
         for (i, step) in scenario.steps.iter().enumerate() {
+            let params = resolved_params[i].clone();
+            // Sensitive-parameter resolution check (re-review P0.3): before
+            // anything executes, a step still carrying a ${NAME} reference
+            // the scenario declares means the caller omitted the value.
+            if let Some(missing) = unresolved_reference(&params, scenario) {
+                results.push(StepResult {
+                    index: i,
+                    kind: format!("{:?}", step.kind).to_lowercase(),
+                    passed: false,
+                    detail: format!(
+                        "unresolved_parameter: '{}' was not supplied (declare it via \
+                         scenario parameters and pass its value at replay time)",
+                        missing
+                    ),
+                });
+                failed += 1;
+                continue;
+            }
             // Mutation guard (re-review Wave-2): a recorded precondition is
             // verified against the LIVE screen before the step's input
             // lands. A drift verdict fails the step without touching the
@@ -59,30 +100,43 @@ impl ScenarioRunner {
                 }
             }
             let (step_passed, detail) = match step.kind {
-                StepKind::Act => match serde_json::from_value::<TuiActRequest>(step.params.clone())
-                {
+                StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
                     Ok(req) => {
                         // Typed action (Wave-2 item 10): the scenario step's
                         // JSON is the same shape the live MCP call carried,
                         // so replay executes exactly what was recorded.
-                        // Sensitive steps route through the redacting executor
-                        // so a replayed secret never lands in a cast either
-                        // (leak fix).
+                        //
+                        // Re-review P0.2: replay honors the RECORDED
+                        // completion and quiet window. The old path forced
+                        // StableScreen/150/1150, so a recorded
+                        // `key q + completion=process_exit` replayed as a
+                        // 150ms screen settle — different semantics, false
+                        // failures on silent/exit actions, and a scenario
+                        // that was never an exact recording of live
+                        // behavior.
                         let vis = if req.sensitive() {
                             crate::execution::InputVisibility::Sensitive
                         } else {
                             crate::execution::InputVisibility::Normal
                         };
+                        let quiet = req
+                            .wait_ms()
+                            .or_else(|| req.completion_quiet_ms())
+                            .unwrap_or(150);
+                        let completion =
+                            req.completion()
+                                .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
                         let (step_passed, detail) =
                             match crate::execution::CanonicalAction::from_request(&req) {
                                 Ok(action) => {
-                                    match crate::execution::execute_act_with_visibility(
+                                    match crate::execution::execute_act_with_completion(
                                         session,
                                         &action,
-                                        150,
-                                        1150,
+                                        quiet,
+                                        quiet.saturating_add(1000),
                                         req.no_wait(),
                                         vis,
+                                        completion,
                                     ) {
                                         Ok(tx) => (
                                             tx.settled(),
@@ -102,7 +156,7 @@ impl ScenarioRunner {
                     Err(e) => (false, format!("unparseable act step: {e}")),
                 },
                 StepKind::Wait => {
-                    match serde_json::from_value::<TuiWaitParams>(step.params.clone()) {
+                    match serde_json::from_value::<TuiWaitParams>(params.clone()) {
                         Ok(wp) => match crate::mcp::helpers::build_wait(&wp) {
                             Some(cond) => {
                                 match crate::execution::execute_wait(
@@ -140,16 +194,24 @@ impl ScenarioRunner {
                             // "oracle", "text": "modal_open()"}), evaluated
                             // through the same language contracts and audits
                             // use.
-                            let is_oracle = step.params.get("assertion").and_then(|a| a.as_str())
+                            let is_oracle = params.get("assertion").and_then(|a| a.as_str())
                                 == Some("oracle");
                             if is_oracle {
                                 let expr =
-                                    step.params.get("text").and_then(|t| t.as_str()).or_else(
-                                        || step.params.get("reference").and_then(|t| t.as_str()),
+                                    params.get("text").and_then(|t| t.as_str()).or_else(
+                                        || params.get("reference").and_then(|t| t.as_str()),
                                     );
                                 match expr {
                                     Some(expr) => {
-                                        let sem = crate::semantic::analyze(&screen);
+                                        // Re-review P0.5: oracle evaluation reads
+                                        // the FUSED semantic truth (native
+                                        // channel participates), the same
+                                        // analysis `tui_observe semantic` shows —
+                                        // never a bare re-inference that can
+                                        // disagree with the observation the
+                                        // caller just made.
+                                        session.poll_native();
+                                        let sem = session.fuse_screen(&screen);
                                         let outcome =
                                             crate::design::eval_static(expr, &screen, &sem);
                                         if outcome.parse_error.is_some() {
@@ -172,8 +234,7 @@ impl ScenarioRunner {
                                     ),
                                 }
                             } else {
-                                match serde_json::from_value::<TuiAssertParams>(step.params.clone())
-                                {
+                                match serde_json::from_value::<TuiAssertParams>(params.clone()) {
                                     Ok(ap) => {
                                         let (p, d, invalid) =
                                             crate::execution::execute_assert(&ap, &screen);
@@ -267,4 +328,37 @@ fn check_expect(
         }
     }
     (true, "preconditions hold".to_string())
+}
+
+/// The first declared-but-unsupplied `${NAME}` reference remaining in a
+/// step's params (re-review P0.3), or `None` when the step is fully
+/// resolved. Only DECLARED parameters count: an undeclared `${...}` in a
+/// payload is the caller's literal text, not our business.
+fn unresolved_reference(
+    params: &serde_json::Value,
+    scenario: &Scenario,
+) -> Option<String> {
+    for p in &scenario.parameters {
+        let needle = p.reference();
+        let mut found = false;
+        walk_strings(params, &mut |s| {
+            if s.contains(&needle) {
+                found = true;
+            }
+        });
+        if found {
+            return Some(p.name.clone());
+        }
+    }
+    None
+}
+
+/// Visit every string in a JSON value.
+fn walk_strings(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
+    match v {
+        serde_json::Value::String(s) => f(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|i| walk_strings(i, f)),
+        serde_json::Value::Object(map) => map.values().for_each(|i| walk_strings(i, f)),
+        _ => {}
+    }
 }

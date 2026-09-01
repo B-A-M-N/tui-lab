@@ -26,6 +26,14 @@ pub struct Scenario {
     pub inherit_session: bool,
     /// Optional launch spec override (when inherit_session is false).
     pub launch: Option<ScenarioLaunch>,
+    /// Declared scenario parameters (re-review P0.3). A recorded secret
+    /// never lands in the scenario file — the recorder emits a
+    /// `${PARAMETER}` reference and declares the parameter here. Replay
+    /// resolves references from caller-supplied values; an unresolvable
+    /// reference fails the step as `unresolved_parameter`, never as a
+    /// parse error masquerading as a corrupt scenario.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<SensitiveParameter>,
     /// Ordered steps to execute.
     pub steps: Vec<ScenarioStep>,
 }
@@ -105,6 +113,49 @@ pub enum StepKind {
     Assert,
 }
 
+/// One declared scenario parameter (re-review P0.3): a named, typed slot the
+/// scenario's steps may reference as `${NAME}`. The VALUE never lives in the
+/// scenario — only the fact that a caller must supply one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensitiveParameter {
+    /// Reference name, spelled `${name}` inside step payloads.
+    pub name: String,
+    /// What kind of secret it is (advisory: names the input masking the
+    /// caller should expect, e.g. a password vs a token).
+    #[serde(default)]
+    pub kind: SensitiveKind,
+    /// Human-facing description of what to supply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The kind of a scenario parameter (advisory metadata).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitiveKind {
+    /// A password or passphrase.
+    #[default]
+    Password,
+    /// An API/token credential.
+    Token,
+    /// Any other secret text.
+    Secret,
+}
+
+impl SensitiveParameter {
+    /// The `${NAME}` reference spelling for this parameter.
+    pub fn reference(&self) -> String {
+        format!("${{{}}}", self.name)
+    }
+}
+
+/// A caller-supplied parameter value for replay.
+#[derive(Debug, Clone)]
+pub struct ParameterValue {
+    pub name: String,
+    pub value: String,
+}
+
 impl Scenario {
     /// Generate a fresh scenario id (`scn-<uuid>`).
     pub fn generate_id() -> String {
@@ -120,6 +171,7 @@ impl Scenario {
             metadata: None,
             inherit_session: true,
             launch: None,
+            parameters: Vec::new(),
             steps: Vec::new(),
         }
     }
@@ -163,4 +215,57 @@ impl Scenario {
     pub fn is_valid(&self) -> bool {
         !self.steps.is_empty()
     }
+
+    /// The declared parameter names (re-review P0.3), so a caller can learn
+    /// what it must supply before replay.
+    pub fn parameter_names(&self) -> Vec<&str> {
+        self.parameters.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Substitute `${NAME}` references throughout every step's params using
+    /// `values`. Unresolved references are LEFT AS-IS: resolution failure is
+    /// reported per-step at replay time (`unresolved_parameter`), not as a
+    /// scenario-wide parse error — and a caller that resolves nothing still
+    /// gets an honest run with failures naming the missing parameters.
+    pub fn resolve_parameters(&self, values: &[ParameterValue]) -> Vec<serde_json::Value> {
+        self.steps
+            .iter()
+            .map(|step| substitute(step.params.clone(), self, values))
+            .collect()
+    }
+}
+
+/// Walk a step's JSON, replacing `${NAME}` strings for which a value was
+/// supplied. Values are matched whole-string (a `"${PASSWORD}"` payload)
+/// and embedded (`"user:${USER}"`) — but never let a value inject JSON
+/// structure: substitution happens at the string level only.
+fn substitute(
+    mut v: serde_json::Value,
+    scenario: &Scenario,
+    values: &[ParameterValue],
+) -> serde_json::Value {
+    match &mut v {
+        serde_json::Value::String(s) => {
+            for p in &scenario.parameters {
+                let reference = p.reference();
+                if s.contains(&reference) {
+                    if let Some(val) = values.iter().find(|v| v.name == p.name) {
+                        *s = s.replace(&reference, &val.value);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                *item = substitute(item.take(), scenario, values);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                *item = substitute(item.take(), scenario, values);
+            }
+        }
+        _ => {}
+    }
+    v
 }

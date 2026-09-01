@@ -467,25 +467,39 @@ impl TuiActRequestSchema {
     }
 }
 
-/// Agent-facing names for a [`CompletionPolicy`](crate::capture::CompletionPolicy)
-/// (review P0 rigidity #4). These map 1:1 onto the strategy/condition the act
-/// executor honors — so a `tui_act(completion: "may_be_silent")` never reports
-/// a false `settled=false` when the action genuinely changes nothing, and a
-/// `completion: "process_exit"` waits for the child to exit rather than for a
-/// screen settle.
+/// Agent-facing completion specification (re-review P0.1). A completion is
+/// the action's declaration of what "done" means — and some completions need
+/// DATA (which text to wait for, how long quiet lasts). The old flat enum
+/// discarded that data: `completion: "text_appears"` deserialized into
+/// `CompletionPolicy::TextAppears("")`, a policy that can never match. So
+/// the wire model accepts two shapes:
+///
+/// * a plain string for the parameterless strategies (`"stable_screen"`,
+///   `"process_exit"`, …) — backward compatible with every recorded
+///   scenario and call made before this change;
+/// * an object `{"type": "text_appears", "text": "Save complete"}` for the
+///   parameterized ones, where the data travels inside the completion
+///   itself. The completion object is self-contained: no parallel
+///   `wait_text` field to keep in sync, nothing to silently drop.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum TuiCompletionParam {
+    /// `{"type": ..., ...}` — carries its own parameters.
+    Spec(CompletionSpec),
+    /// `"name"` — the parameterless shorthand, expanded losslessly.
+    Name(CompletionName),
+}
+
+/// The parameterless completion strategies, usable as bare strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum TuiCompletionParam {
+pub enum CompletionName {
     /// Action then screen settles at rest (the ordinary default).
     StableScreen,
     /// A visible change is enough; quiet is not required.
     FirstChange,
     /// Any observable terminal activity (output, cursor, bell, title).
     AnyChange,
-    /// A named text appears (paired with the `wait_text` field).
-    TextAppears,
-    /// A named text disappears (paired with the `wait_text` field).
-    TextDisappears,
     /// The child process exits.
     ProcessExit,
     /// The shell command finishes (OSC 133).
@@ -501,22 +515,106 @@ pub enum TuiCompletionParam {
     NoWait,
 }
 
-impl TuiCompletionParam {
-    /// The runtime [`CompletionPolicy`] this request name stands for.
+impl CompletionName {
+    /// The wire name for this strategy (used in error messages).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompletionName::StableScreen => "stable_screen",
+            CompletionName::FirstChange => "first_change",
+            CompletionName::AnyChange => "any_change",
+            CompletionName::ProcessExit => "process_exit",
+            CompletionName::CommandDone => "command_done",
+            CompletionName::Bell => "bell",
+            CompletionName::SemanticChange => "semantic_change",
+            CompletionName::MayBeSilent => "may_be_silent",
+            CompletionName::NoWait => "no_wait",
+        }
+    }
+
+    /// The runtime [`CompletionPolicy`] this name stands for.
     pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
         use crate::capture::CompletionPolicy as P;
         match self {
-            TuiCompletionParam::StableScreen => P::StableScreen,
-            TuiCompletionParam::FirstChange => P::FirstScreenChange,
-            TuiCompletionParam::AnyChange => P::AnyObservableChange,
-            TuiCompletionParam::TextAppears => P::TextAppears(String::new()),
-            TuiCompletionParam::TextDisappears => P::TextDisappears(String::new()),
-            TuiCompletionParam::ProcessExit => P::ProcessExit,
-            TuiCompletionParam::CommandDone => P::CommandDone,
-            TuiCompletionParam::Bell => P::Bell,
-            TuiCompletionParam::SemanticChange => P::SemanticChange,
-            TuiCompletionParam::MayBeSilent => P::MayBeSilent,
-            TuiCompletionParam::NoWait => P::NoWait,
+            CompletionName::StableScreen => P::StableScreen,
+            CompletionName::FirstChange => P::FirstScreenChange,
+            CompletionName::AnyChange => P::AnyObservableChange,
+            CompletionName::ProcessExit => P::ProcessExit,
+            CompletionName::CommandDone => P::CommandDone,
+            CompletionName::Bell => P::Bell,
+            CompletionName::SemanticChange => P::SemanticChange,
+            CompletionName::MayBeSilent => P::MayBeSilent,
+            CompletionName::NoWait => P::NoWait,
+        }
+    }
+}
+
+/// The self-describing completion strategies that carry their own data
+/// (re-review P0.1): the text waited for travels WITH the completion, so
+/// `{"type":"text_appears","text":"Saved"}` converts to
+/// `CompletionPolicy::TextAppears("Saved")` — never to an empty-string
+/// policy that can never match.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompletionSpec {
+    /// Action then screen settles at rest, with a caller-chosen quiet window.
+    StableScreen {
+        /// Quiet-window length in ms; defaults to the executor's quiet when
+        /// absent.
+        #[serde(default)]
+        quiet_ms: Option<u64>,
+    },
+    /// A named text appears — *causally*: it must not have been present
+    /// before the action.
+    TextAppears {
+        /// The text whose appearance completes the action.
+        text: String,
+    },
+    /// A named text disappears.
+    TextDisappears {
+        /// The text whose disappearance completes the action.
+        text: String,
+    },
+}
+
+impl CompletionSpec {
+    /// The runtime [`CompletionPolicy`] this spec stands for. The text
+    /// variants carry their payload through; `StableScreen` maps to the
+    /// ordinary settle policy (its optional `quiet_ms` reaches the executor
+    /// through [`CompletionSpec::quiet_ms`], since the runtime policy keeps
+    /// quiet separate).
+    pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
+        use crate::capture::CompletionPolicy as P;
+        match self {
+            CompletionSpec::StableScreen { .. } => P::StableScreen,
+            CompletionSpec::TextAppears { text } => P::TextAppears(text.clone()),
+            CompletionSpec::TextDisappears { text } => P::TextDisappears(text.clone()),
+        }
+    }
+
+    /// The quiet-window override declared by a `stable_screen` spec, if any.
+    pub fn quiet_ms(&self) -> Option<u64> {
+        match self {
+            CompletionSpec::StableScreen { quiet_ms } => *quiet_ms,
+            _ => None,
+        }
+    }
+}
+
+impl TuiCompletionParam {
+    /// The runtime [`CompletionPolicy`] this wire value stands for.
+    pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
+        match self {
+            TuiCompletionParam::Name(n) => n.to_policy(),
+            TuiCompletionParam::Spec(s) => s.to_policy(),
+        }
+    }
+
+    /// The quiet-window override declared by this wire value, if any
+    /// (`{"type":"stable_screen","quiet_ms":400}`).
+    pub fn quiet_ms(&self) -> Option<u64> {
+        match self {
+            TuiCompletionParam::Spec(s) => s.quiet_ms(),
+            TuiCompletionParam::Name(_) => None,
         }
     }
 }
@@ -674,11 +772,23 @@ pub enum TuiActRequestVariants {
         rows: u16,
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
     },
     Signal {
         signal: i32,
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
     },
 }
 
@@ -857,12 +967,24 @@ pub enum TuiActRequest {
         rows: u16,
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
     },
     /// Send a signal to the child process group.
     Signal {
         signal: i32,
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        no_wait: Option<bool>,
+        #[serde(default)]
+        completion: Option<TuiCompletionParam>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
     },
 }
 
@@ -881,8 +1003,8 @@ impl TuiActRequest {
             TuiActRequest::MouseMove { no_wait, .. } => *no_wait,
             TuiActRequest::MouseDrag { no_wait, .. } => *no_wait,
             TuiActRequest::MouseScroll { no_wait, .. } => *no_wait,
-            TuiActRequest::Resize { .. } => Some(false),
-            TuiActRequest::Signal { .. } => Some(false),
+            TuiActRequest::Resize { no_wait, .. } => *no_wait,
+            TuiActRequest::Signal { no_wait, .. } => *no_wait,
         }
         .unwrap_or(false)
     }
@@ -900,33 +1022,56 @@ impl TuiActRequest {
             TuiActRequest::MouseMove { wait_ms, .. } => *wait_ms,
             TuiActRequest::MouseDrag { wait_ms, .. } => *wait_ms,
             TuiActRequest::MouseScroll { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Resize { .. } => None,
-            TuiActRequest::Signal { .. } => None,
+            TuiActRequest::Resize { wait_ms, .. } => *wait_ms,
+            TuiActRequest::Signal { wait_ms, .. } => *wait_ms,
         }
     }
 
-    /// Optional [`CompletionPolicy`] override (review P0 rigidity #4). When an
-    /// agent declares a completion, the act executor honors it instead of
-    /// assuming "send ⇒ screen settles" — so a `MayBeSilent` completion never
-    /// reports a false `settled=false`. `Resize`/`Signal` have no settle
-    /// semantics and always resolve `None` (the default).
+    /// Optional completion override (re-review P0.1/P0.10): every canonical
+    /// action — Resize and Signal included — can declare what "done" means.
+    /// `signal: 15` + `{"type":"...","completion":"process_exit"}` is the
+    /// ordinary way to express "kill and wait for exit"; `resize` +
+    /// `{"type":"stable_screen","quiet_ms":400}` waits out reflow. The
+    /// completion spec is self-contained, so the conversion is lossless.
     pub fn completion(&self) -> Option<crate::capture::CompletionPolicy> {
         match self {
-            TuiActRequest::Key { completion, .. } => *completion,
-            TuiActRequest::Keys { completion, .. } => *completion,
-            TuiActRequest::Type { completion, .. } => *completion,
-            TuiActRequest::Paste { completion, .. } => *completion,
-            TuiActRequest::Raw { completion, .. } => *completion,
-            TuiActRequest::MouseClick { completion, .. } => *completion,
-            TuiActRequest::MousePress { completion, .. } => *completion,
-            TuiActRequest::MouseRelease { completion, .. } => *completion,
-            TuiActRequest::MouseMove { completion, .. } => *completion,
-            TuiActRequest::MouseDrag { completion, .. } => *completion,
-            TuiActRequest::MouseScroll { completion, .. } => *completion,
-            TuiActRequest::Resize { .. } => None,
-            TuiActRequest::Signal { .. } => None,
+            TuiActRequest::Key { completion, .. } => completion.clone(),
+            TuiActRequest::Keys { completion, .. } => completion.clone(),
+            TuiActRequest::Type { completion, .. } => completion.clone(),
+            TuiActRequest::Paste { completion, .. } => completion.clone(),
+            TuiActRequest::Raw { completion, .. } => completion.clone(),
+            TuiActRequest::MouseClick { completion, .. } => completion.clone(),
+            TuiActRequest::MousePress { completion, .. } => completion.clone(),
+            TuiActRequest::MouseRelease { completion, .. } => completion.clone(),
+            TuiActRequest::MouseMove { completion, .. } => completion.clone(),
+            TuiActRequest::MouseDrag { completion, .. } => completion.clone(),
+            TuiActRequest::MouseScroll { completion, .. } => completion.clone(),
+            TuiActRequest::Resize { completion, .. } => completion.clone(),
+            TuiActRequest::Signal { completion, .. } => completion.clone(),
         }
         .map(|c| c.to_policy())
+    }
+
+    /// The quiet-window override declared by the request's completion spec
+    /// (`{"type":"stable_screen","quiet_ms":400}`), when present. The act
+    /// handlers feed this into their quiet derivation so the wait length
+    /// travels with the completion.
+    pub fn completion_quiet_ms(&self) -> Option<u64> {
+        match self {
+            TuiActRequest::Key { completion, .. }
+            | TuiActRequest::Keys { completion, .. }
+            | TuiActRequest::Type { completion, .. }
+            | TuiActRequest::Paste { completion, .. }
+            | TuiActRequest::Raw { completion, .. }
+            | TuiActRequest::MouseClick { completion, .. }
+            | TuiActRequest::MousePress { completion, .. }
+            | TuiActRequest::MouseRelease { completion, .. }
+            | TuiActRequest::MouseMove { completion, .. }
+            | TuiActRequest::MouseDrag { completion, .. }
+            | TuiActRequest::MouseScroll { completion, .. }
+            | TuiActRequest::Resize { completion, .. }
+            | TuiActRequest::Signal { completion, .. } => completion.as_ref().and_then(|c| c.quiet_ms()),
+        }
     }
 
     pub fn id(&self) -> Option<&str> {

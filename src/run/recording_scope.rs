@@ -65,6 +65,19 @@ impl ScenarioRecording {
     pub fn record_act(&mut self, params: serde_json::Value) {
         self.recorder.record_act(params);
     }
+    /// Record a sensitive act step (re-review P0.3): the payload field is
+    /// replaced with a `${NAME}` reference and the parameter is declared on
+    /// the scenario — the value itself never lands in the file.
+    pub fn record_act_sensitive(
+        &mut self,
+        action_params: serde_json::Value,
+        payload_field: &str,
+        kind: crate::scenario::model::SensitiveKind,
+        byte_len: usize,
+    ) {
+        self.recorder
+            .record_act_sensitive(action_params, payload_field, kind, byte_len);
+    }
     pub fn record_wait(&mut self, params: serde_json::Value) {
         self.recorder.record_wait(params);
     }

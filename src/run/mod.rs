@@ -805,6 +805,26 @@ impl RunContext {
         }
     }
 
+    /// Record a SENSITIVE act step into matching session-generation
+    /// recordings (re-review P0.3): the payload field becomes a `${NAME}`
+    /// reference and the parameter is declared on the scenario. The secret
+    /// never reaches the scenario file.
+    pub fn record_scenario_act_sensitive(
+        &mut self,
+        session_id: &str,
+        generation: u32,
+        action_params: serde_json::Value,
+        payload_field: &str,
+        kind: crate::scenario::model::SensitiveKind,
+        byte_len: usize,
+    ) {
+        for r in self.recorders.values_mut() {
+            if r.matches(session_id, generation) {
+                r.record_act_sensitive(action_params.clone(), payload_field, kind, byte_len);
+            }
+        }
+    }
+
     /// Record a wait step into matching session-generation recordings.
     pub fn record_scenario_wait(
         &mut self,
