@@ -41,6 +41,23 @@ impl ScenarioRunner {
         let mut failed = 0;
 
         for (i, step) in scenario.steps.iter().enumerate() {
+            // Mutation guard (re-review Wave-2): a recorded precondition is
+            // verified against the LIVE screen before the step's input
+            // lands. A drift verdict fails the step without touching the
+            // app — the alternative (send into the wrong UI) corrupts both.
+            if let Some(expect) = &step.expect {
+                let (guard_ok, guard_detail) = check_expect(session, expect);
+                if !guard_ok {
+                    results.push(StepResult {
+                        index: i,
+                        kind: format!("{:?}", step.kind),
+                        passed: false,
+                        detail: format!("stale_state: {guard_detail}"),
+                    });
+                    failed += 1;
+                    continue;
+                }
+            }
             let (step_passed, detail) = match step.kind {
                 StepKind::Act => match serde_json::from_value::<TuiActRequest>(step.params.clone())
                 {
@@ -199,4 +216,55 @@ impl ScenarioRunner {
             step_results: results,
         }
     }
+}
+
+/// Verify one recorded precondition against the live session. The screen is
+/// fused (native overlay participates) so a cooperative app's focus counts.
+/// Every listed condition must hold; the first failure names itself.
+fn check_expect(
+    session: &mut crate::session::state::Session,
+    expect: &super::model::StepExpect,
+) -> (bool, String) {
+    session.poll_native();
+    let screen = match session.last().cloned() {
+        Some(s) => s,
+        None => match session.observe(0) {
+            Ok(s) => s,
+            Err(e) => return (false, format!("no frame to verify against: {e}")),
+        },
+    };
+    let fused = session.fuse_screen(&screen);
+    if let Some(want) = &expect.structure_hash {
+        if &screen.structure_hash != want {
+            return (
+                false,
+                format!(
+                    "structure drifted since capture: expected {}, live {}",
+                    want, screen.structure_hash
+                ),
+            );
+        }
+    }
+    if let Some(want_focus) = &expect.focus_control_id {
+        if fused.focus.control_id.as_deref() != Some(want_focus.as_str()) {
+            return (
+                false,
+                format!(
+                    "focus moved since capture: expected {want_focus}, live {:?}",
+                    fused.focus.control_id
+                ),
+            );
+        }
+    }
+    if let Some(text) = &expect.text_present {
+        let present = screen
+            .viewport_text
+            .iter()
+            .any(|r| r.contains(text.as_str()))
+            || screen.scrollback.iter().any(|r| r.contains(text.as_str()));
+        if !present {
+            return (false, format!("required text absent: {text:?}"));
+        }
+    }
+    (true, "preconditions hold".to_string())
 }
