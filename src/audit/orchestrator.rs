@@ -181,7 +181,7 @@ pub fn run_profile_with_contract(
         return Ok(ProfileReport {
             profile,
             mode: "static",
-            findings: crate::audit::run("discoverability", &screen, &sem),
+            findings: crate::audit::run("discoverability", &screen, &sem).map_err(|e| e.to_string())?,
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
         });
     }
@@ -196,7 +196,7 @@ pub fn run_profile_with_contract(
     if profile.wants_static_composite() {
         // Fused truth (re-review Wave-2 item 16).
         let (screen, sem, _, _) = session.observe_fused(40).map_err(|e| format!("observe failed: {e}"))?;
-        findings.extend(crate::audit::run("full", &screen, &sem));
+        findings.extend(crate::audit::run("full", &screen, &sem).map_err(|e| e.to_string())?);
     }
 
     // Item 65: every input-driving driver runs under an AuditTransaction —

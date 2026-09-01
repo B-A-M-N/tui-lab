@@ -787,15 +787,28 @@ impl RunContext {
         Some(rec.finish())
     }
 
-    /// Look up a recording id by name (any session). Ambiguous names return
-    /// the oldest match — callers that care about identity should hold ids
-    /// from `begin_scenario_recording`.
-    pub fn find_recording_by_name(&self, name: &str) -> Option<String> {
-        self.recorders
+    /// Look up a recording id by name (any session). Duplicate names are an
+    /// **error**, not an oldest-match fallback (re-review item 45): an
+    /// ambiguous name silently stopping the wrong recording is worse than
+    /// refusing. `Err(names)` lists every conflicting id so the caller can
+    /// disambiguate by id; callers that care about identity hold the id
+    /// from `begin_scenario_recording` in the first place.
+    pub fn find_recording_by_name(&self, name: &str) -> Result<String, Vec<String>> {
+        let matches: Vec<String> = self
+            .recorders
             .values()
             .filter(|r| r.name == name)
-            .min_by_key(|r| r.started_at)
             .map(|r| r.id.as_str().to_string())
+            .collect();
+        match matches.len() {
+            0 => Err(Vec::new()),
+            1 => Ok(matches.into_iter().next().expect("one match")),
+            _ => {
+                let mut ids = matches;
+                ids.sort();
+                Err(ids)
+            }
+        }
     }
 
     /// Metadata for all active recordings.
