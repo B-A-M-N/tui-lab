@@ -732,6 +732,13 @@ impl Session {
         self.backend.event_state()
     }
 
+    /// The session event queue's last sequence number (highest seq assigned
+    /// so far, 0 when empty). Used to anchor event-based completion so an
+    /// event firing immediately after the send is never missed.
+    pub fn event_queue_last_seq(&self) -> u64 {
+        self.events.last_seq()
+    }
+
     /// Semantic analysis of the last settled frame, served from the per-session
     /// [`crate::semantic::SemanticCache`]. Returns `None` when no observation
     /// has happened yet. The cache is keyed on `ScreenState::structure_hash`, so

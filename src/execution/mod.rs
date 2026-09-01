@@ -593,15 +593,27 @@ pub fn execute_act_with_completion(
         None => session.observe(0)?,
     };
     let baseline = session.event_state();
+    // Pre-action event-queue cursor, captured BEFORE the send. Used by
+    // CompletionPolicy::Event to anchor on events that fire *after* this
+    // action — the old code read the queue *after* the send and could miss
+    // an immediately-firing event (race).
+    let pre_event_seq = session.event_queue_last_seq();
     let anchor = ObservationAnchor {
         state: baseline,
         label: None,
         // Real monotonic per-session anchor index (re-review P1 fix 9).
         index: session.next_anchor(),
     };
+    // Pre-action fused semantic identity, computed BEFORE the transaction
+    // guard so fused_frame(&self) can borrow_mut the cache without
+    // conflicts. The String is stored so the guard window doesn't hold it.
+    let before_fused_identity = session
+        .fused_frame()
+        .map(|(sem, tree, _report)| crate::semantic::semantic_identity_fused(&sem, &tree))
+        .unwrap_or_default();
     // The ONE compiler runs on the pre-action frame before it moves into
     // the transaction evidence (re-review P0).
-    let plan = crate::capture::compile_completion(&completion, &baseline, &before);
+    let plan = crate::capture::compile_completion(&completion, &baseline, &before, pre_event_seq, quiet_ms, Some(before_fused_identity));
     let mut before_frame = CanonicalFrame::new(before, 0, baseline.output_seq);
     before_frame.session_id = Some(session.id.clone());
     before_frame.generation = Some(session.generation);
@@ -645,7 +657,7 @@ pub fn execute_act_with_completion(
         let budget = settle_budget_ms.max(quiet_ms.saturating_add(1000));
         // The ONE compiler (re-review P0): every policy becomes a
         // CompletionPlan here; there is no second interpretation anywhere.
-        let outcome = run_completion_plan(window.sess(), plan, quiet_ms, budget)?;
+        let outcome = run_completion_plan(window.sess(), plan, &baseline, quiet_ms, budget)?;
         let capture = outcome;
         // `MayBeSilent` is special: the action may legitimately produce no
         // observable change (clipboard copy, an invisible toggle). Silence
@@ -732,21 +744,21 @@ fn frame_focus(
 fn run_completion_plan(
     session: &mut Session,
     plan: crate::capture::CompletionPlan,
+    anchor: &crate::backend::TerminalEventState,
     quiet_ms: u64,
     budget_ms: u64,
 ) -> anyhow::Result<CaptureOutcome> {
     use crate::capture::CompletionPlan as Plan;
     let budget = std::time::Duration::from_millis(budget_ms);
-    let baseline = session.event_state();
     match plan {
         // Backend-proven conditions: one `wait_after` call each.
         Plan::BackendWait(cond) => {
             Ok(CaptureOutcome::from_wait(
-                session.wait_after(baseline, cond, budget_ms)?,
+                session.wait_after(*anchor, cond, budget_ms)?,
             ))
         }
         Plan::Bell(after_bell_seq) => Ok(CaptureOutcome::from_wait(session.wait_after(
-            baseline,
+            *anchor,
             WaitCond::Bell {
                 // The compile step already anchored this to the pre-action
                 // bell counter; `wait_after` must not overwrite it.
@@ -755,12 +767,14 @@ fn run_completion_plan(
             budget_ms,
         )?)),
         Plan::ProcessExit => Ok(CaptureOutcome::from_wait(
-            session.wait_after(baseline, WaitCond::ProcessExit, budget_ms)?,
+            session.wait_after(*anchor, WaitCond::ProcessExit, budget_ms)?,
         )),
         Plan::CommandDone => Ok(CaptureOutcome::from_wait(session.wait_after(
-            baseline,
+            *anchor,
             WaitCond::CommandDone {
-                after_command_seq: None,
+                // Anchor at pre-action command_seq so "command #N finished"
+                // is expressible even after several commands have run.
+                after_command_seq: Some(anchor.command_seq),
             },
             budget_ms,
         )?)),
@@ -768,9 +782,9 @@ fn run_completion_plan(
         // action anchor. Genuinely broader than a screen change (re-review
         // P0: bell-only / title-only reactions count).
         Plan::AnyActivity => Ok(CaptureOutcome::from_wait(session.wait_after(
-            baseline,
+            *anchor,
             WaitCond::AnyActivity {
-                after_interaction_seq: Some(baseline.interaction_seq),
+                after_interaction_seq: Some(anchor.interaction_seq),
             },
             budget_ms,
         )?)),
@@ -780,9 +794,9 @@ fn run_completion_plan(
         // `Idle`-proxied NoChange semantics (re-review P0 efficiency).
         Plan::SilentGrace(grace) => {
             let cond = WaitCond::AnyActivity {
-                after_interaction_seq: Some(baseline.interaction_seq),
+                after_interaction_seq: Some(anchor.interaction_seq),
             };
-            let outcome = session.wait_after(baseline, cond, grace.as_millis() as u64)?;
+            let outcome = session.wait_after(*anchor, cond, grace.as_millis() as u64)?;
             let mut out = CaptureOutcome::from_wait(outcome.clone());
             if !outcome.met {
                 // No observable change in the grace window: the honest
@@ -797,14 +811,15 @@ fn run_completion_plan(
         }
         // Everything below is evaluated by polling the session's own
         // state — the backend has no primitive for these predicates.
-        Plan::Event(matcher, _compiled_anchor) => {
+        Plan::Event(matcher, pre_event_seq) => {
             let start = std::time::Instant::now();
-            let anchor_seq = session.event_queue_stats()
-                .get("last_seq")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
             loop {
-                let batch = session.events_since(anchor_seq);
+                // Session-queue events are synthesized inside observe()
+                // (emit_frame_events diffs the fresh frame against the
+                // previous one), so a wait that never observes never sees
+                // new events — poll WITH a bounded idle window, not against
+                // a static queue.
+                let batch = session.observe(quiet_ms.min(30)).map(|_| session.events_since(pre_event_seq))?;
                 for ev in &batch.events {
                     if matcher.matches(&ev.kind) {
                         let frame = session.observe(quiet_ms)?;
@@ -834,19 +849,19 @@ fn run_completion_plan(
                 std::thread::sleep(std::time::Duration::from_millis(15));
             }
         }
-        // REAL semantic change (re-review P0): wait for any frame edge, then
-        // compare semantic identities. A spinner/clock/style-only change
-        // keeps identity equal and the wait continues; a genuine control /
-        // region / focus change resolves. Also resolves when the native
-        // side-channel (if any) shifts the fused semantics.
+        // REAL semantic change (re-review P0): the fused semantic identity
+        // must differ from the pre-action one. Drops the screen_seq gate
+        // so native-only semantic changes (no pixels changed) can resolve.
         Plan::SemanticChange(before_identity) => {
             let start = std::time::Instant::now();
-            let anchor_screen = baseline.screen_seq;
             loop {
-                let now = session.event_state();
-                if now.screen_seq > anchor_screen {
-                    let frame = session.observe(quiet_ms)?;
-                    if frame.semantic_identity() != before_identity {
+                // Pump first: fused_frame() reads the LAST captured frame;
+                // without an observe() the frame never advances and a change
+                // that already happened is invisible to the identity check.
+                let _ = session.observe(quiet_ms.min(30))?;
+                if let Some((sem, tree, _report)) = session.fused_frame() {
+                    if crate::semantic::semantic_identity_fused(&sem, &tree) != before_identity {
+                        let frame = session.observe(quiet_ms)?;
                         return Ok(CaptureOutcome {
                             reason: crate::backend::CaptureReason::ScreenChanged,
                             met: true,
