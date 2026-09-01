@@ -253,6 +253,35 @@ impl SessionPool {
         Ok(id)
     }
 
+    /// Typed-engine launch (re-review P0): the engine arrives as
+    /// [`BackendKind`], not a string the launch layer re-interprets. The
+    /// engine name recorded in the spec is derived from the kind — one
+    /// source of truth, no parse drift between MCP param and engine.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_typed(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        cols: u16,
+        rows: u16,
+        backend: crate::session::state::BackendKind,
+        isolation: &str,
+    ) -> Result<String, anyhow::Error> {
+        self.start(
+            command,
+            args,
+            cwd,
+            env,
+            cols,
+            rows,
+            backend.display(),
+            isolation,
+        )
+        .await
+    }
+
     /// Run a closure against a session (explicit id or the active one).
     pub async fn with_session<R, F>(&self, id: Option<&str>, job: F) -> Result<R, ActorError>
     where

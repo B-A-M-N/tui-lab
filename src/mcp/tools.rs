@@ -265,11 +265,26 @@ impl TuiLabServer {
                     Some(c) => c.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "start requires 'command'"),
                 };
-                // Honest backend/isolation negotiation (spec section 34). Do not
-                // silently start portable-pty when an unsupported backend is asked.
-                // Wave F items 50–51: `cli` selects the line CLI engine for
-                // non-screen targets (git/npm/pytest-style output).
-                let backend = p.backend.clone().unwrap_or_else(|| "auto".into());
+                // Honest backend/isolation negotiation (spec section 34). The
+                // engine selector is TYPED (re-review P0): `Known<BackendParam>`
+                // gives a closed schema enum; an unknown name is answered here
+                // with the accepted list instead of a string match deeper in.
+                // Resolve the typed engine for the session layer; `auto`
+                // defaults to the portable PTY engine.
+                let backend_kind = match p.backend.as_ref() {
+                    None => crate::session::state::BackendKind::PortableVt,
+                    Some(Known::Known(b)) => b.to_kind(),
+                    Some(Known::Other(other)) => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                                "unknown backend '{}' (supported: {})",
+                                other,
+                                crate::mcp::params::BackendParam::VARIANTS.join(", ")
+                            ),
+                        )
+                    }
+                };
                 // Wave G item 77: typed isolation profile; the enum converts
                 // into the engine-level Isolation.
                 let isolation_param =
@@ -290,37 +305,20 @@ impl TuiLabServer {
                         )
                     }
                 };
-                match backend.as_str() {
-                    "auto" | "portable_vt100" | "cli" | "line_cli" => {}
-                    "tui_test" => {
-                        return err(
-                            ErrorCategory::Unsupported,
-                            "backend 'tui_test' is not wired in this build; only 'auto'/'portable_vt100'/'cli' are supported",
-                        )
-                    }
-                    other => {
-                        return err(
-                            ErrorCategory::InvalidRequest,
-                            format!(
-                                "unknown backend '{}' (supported: auto, portable_vt100, cli)",
-                                other
-                            ),
-                        )
-                    }
-                }
                 let env: Vec<(String, String)> = p.env.unwrap_or_default().into_iter().collect();
                 let isolation_name = isolation.name().to_string();
                 let args = p.args.unwrap_or_default();
                 // Launch inside the pool; the actor owns the session from
-                // birth (Wave G item 73).
-                let started = self.sessions.start(
+                // birth (Wave G item 73). The engine is selected by the typed
+                // enum, not re-matched from the string here.
+                let started = self.sessions.start_typed(
                     &command,
                     &args,
                     p.cwd.as_deref(),
                     &env,
                     cols,
                     rows,
-                    &backend,
+                    backend_kind,
                     &isolation_name,
                 );
                 let id = match started.await {
