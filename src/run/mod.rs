@@ -74,6 +74,14 @@ pub struct TransactionRecord {
     pub changed_cells: usize,
     /// Settle latency in milliseconds.
     pub elapsed_ms: u64,
+    /// Send-phase latency (re-review item 39): transport + harness cost,
+    /// excluding the settle wait. Answers "were we slow?" separately.
+    #[serde(default)]
+    pub send_ms: u64,
+    /// Settle-phase latency (re-review item 39): the app's own response
+    /// time under the completion plan. Answers "was the app slow?"
+    #[serde(default)]
+    pub settle_ms: u64,
     /// The typed action (Wave-2 item 10) as it may be persisted (leak fix):
     /// `Full` when the visibility policy allows it, `Redacted { kind,
     /// byte_len }` for sensitive payloads — the payload itself never lands
@@ -114,6 +122,8 @@ impl TransactionRecord {
             after_structure: tx.after().structure_hash.clone(),
             changed_cells: tx.transition.screen_diff.changed_cells,
             elapsed_ms: tx.elapsed_ms,
+            send_ms: tx.send_ms,
+            settle_ms: tx.settle_ms,
             persisted_action,
         }
     }
@@ -209,8 +219,12 @@ pub struct RunContext {
     persistence_unhealthy: bool,
     /// Terminal-event batches drained from sessions (Wave B item 12/14):
     /// (session id, events). Filled by the MCP layer before flush; written
-    /// to `events/<session>.jsonl` when the run persists.
+    /// to `events/<session>.jsonl` when the run persists. Persistent runs
+    /// bypass this backlog (item 38: incremental appends at hold time).
     held_events: Vec<(String, Vec<crate::events::TerminalEvent>)>,
+    /// Events already written durably per session (item 38) — evidence for
+    /// status: "events persisted incrementally" vs "held in memory".
+    event_flushed_counts: HashMap<String, u64>,
     /// The loaded project contract (Wave E item 39): feeds conformance
     /// checks, exploration candidates, and audits.
     contract: Option<crate::design::ProjectContract>,
@@ -280,6 +294,7 @@ impl RunContext {
             journal: None,
             persistence_unhealthy: false,
             held_events: Vec::new(),
+            event_flushed_counts: HashMap::new(),
             contract: None,
             contract_path: None,
             contract_baselines: HashMap::new(),
@@ -1344,6 +1359,8 @@ impl RunContext {
             after_structure: String::new(),
             changed_cells: 0,
             elapsed_ms: 0,
+            send_ms: 0,
+            settle_ms: 0,
             persisted_action: None,
         });
     }
@@ -1706,11 +1723,112 @@ impl RunContext {
         id
     }
 
+    /// The frame commit pipeline (re-review item 40): the ONE path a
+    /// captured frame takes from raw capture to citable evidence.
+    ///
+    /// ```text
+    /// capture ──▶ assign frame_id ──▶ stamp run/session provenance
+    ///         ──▶ persist to frames.jsonl (persistent runs, O_APPEND)
+    /// ```
+    ///
+    /// Returns the citable id. Persistence is incremental (one append per
+    /// committed frame) so a crash keeps every frame committed before it;
+    /// a write failure marks the run `persistence_unhealthy` and the frame
+    /// still gets its id (the run ledger always holds it in memory).
+    pub fn commit_frame(
+        &mut self,
+        frame: &mut crate::backend::CanonicalFrame,
+        session: Option<&str>,
+    ) -> u64 {
+        let id = self.register_frame(frame);
+        if frame.session_id.is_none() {
+            frame.session_id = session.map(str::to_string);
+        }
+        if let Some(dir) = self.run_dir.as_ref() {
+            let line = serde_json::json!({
+                "frame_id": id,
+                "run_id": frame.run_id,
+                "session": frame.session_id,
+                "generation": frame.generation,
+                "screen_seq": frame.screen_seq,
+                "output_seq": frame.output_seq,
+                "structure_hash": frame.state.structure_hash,
+                "visual_hash": frame.state.visual_hash,
+                "semantic_identity": crate::semantic::semantic_identity(&frame.state),
+            });
+            let path = dir.join("frames.jsonl");
+            let body = format!("{line}\n");
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+            {
+                Ok(()) => {}
+                Err(_) => self.persistence_unhealthy = true,
+            }
+        }
+        id
+    }
+
     /// Hold one session's drained terminal events for persistence (Wave B
     /// item 14). Sessions own the live queue; the run keeps the export.
+    ///
+    /// Persistent runs (re-review item 38) append each batch to
+    /// `events/<session>.jsonl` *immediately* — one O_APPEND write per
+    /// batch — so a crash loses at most the batch in flight, never the
+    /// whole session history. `flush` then only handles the ephemeral-run
+    /// backlog (whole-file write at close, the old contract).
     pub fn hold_events(&mut self, session: &str, events: Vec<crate::events::TerminalEvent>) {
         if events.is_empty() {
             return;
+        }
+        if let Some(dir) = self.run_dir.as_ref() {
+            let ev_dir = dir.join("events");
+            if std::fs::create_dir_all(&ev_dir).is_err() {
+                self.persistence_unhealthy = true;
+                self.held_events.push((session.to_string(), events));
+                return;
+            }
+            let safe = sanitize(session);
+            let path = ev_dir.join(format!("{}.jsonl", safe));
+            let mut body = String::new();
+            for ev in &events {
+                if let Ok(line) = serde_json::to_string(ev) {
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+            }
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+            {
+                Ok(()) => {
+                    let written = self.event_flushed_counts.entry(session.to_string()).or_insert(0);
+                    *written += events.len() as u64;
+                    // Artifact registered once per session (the log is a
+                    // growing file, not a per-batch artifact).
+                    let artifact_path =
+                        std::path::PathBuf::from("events").join(format!("{}.jsonl", safe));
+                    if !self.artifacts.iter().any(|a| a.path.as_ref() == Some(&artifact_path)) {
+                        self.register_artifact(
+                            crate::run::ArtifactKind::EventLog,
+                            Some(artifact_path),
+                            None,
+                            Some(session.to_string()),
+                            "terminal event log (incrementally persisted)",
+                        );
+                    }
+                    self.event_count += events.len() as u64;
+                    return;
+                }
+                Err(_) => {
+                    self.persistence_unhealthy = true;
+                    // Fall through to the in-memory hold so flush retries.
+                }
+            }
         }
         self.held_events.push((session.to_string(), events));
     }
@@ -1744,6 +1862,7 @@ impl RunContext {
 
     /// Counts for `tui_run status`.
     pub fn counts(&self) -> serde_json::Value {
+        let held: u64 = self.held_events.iter().map(|(_, e)| e.len() as u64).sum();
         json!({
             "transactions": self.transaction_count,
             "transactions_in_ledger": self.transactions.len(),
@@ -1751,6 +1870,8 @@ impl RunContext {
             "dropped_records": self.dropped_records,
             "first_available_seq": self.first_available_seq,
             "events": self.event_count,
+            "events_persisted_incrementally": self.event_flushed_counts.values().sum::<u64>(),
+            "events_held_for_flush": held,
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.saved_scenarios.len(),
             "findings": self.findings.len(),
@@ -2126,6 +2247,85 @@ mod tests {
                 .any(|a| a.kind == ArtifactKind::EventLog),
             "event log registered as artifact"
         );
+    }
+
+    /// Re-review item 38: persistent runs persist events incrementally —
+    /// the batch is on disk at `hold_events` time, before any flush — and
+    /// flush does not duplicate the lines.
+    #[test]
+    fn persistent_runs_persist_events_incrementally() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+
+        // One synthetic event batch (no PTY needed for persistence logic).
+        let ev = crate::events::TerminalEvent {
+            at: 0,
+            seq: 0,
+            session: "incr-sess".to_string(),
+            generation: 0,
+            kind: crate::events::TerminalEventKind::Bell,
+        };
+        run.hold_events("incr-sess", vec![ev.clone(), ev.clone()]);
+        // The batch must already be on disk (incremental, not held).
+        assert!(
+            run.held_events.is_empty(),
+            "persistent runs must not hold events for flush"
+        );
+        let path = run
+            .run_dir()
+            .expect("dir")
+            .join("events")
+            .join("incr-sess.jsonl");
+        let log = std::fs::read_to_string(&path).expect("incremental log");
+        assert_eq!(log.lines().count(), 2, "both events appended");
+        // And the counter says so.
+        assert_eq!(run.event_flushed_counts.get("incr-sess"), Some(&2));
+        assert_eq!(run.counts()["events_persisted_incrementally"], 2);
+        assert_eq!(run.counts()["events_held_for_flush"], 0);
+
+        // Flush must not duplicate.
+        run.flush().expect("flush");
+        let log = std::fs::read_to_string(&path).expect("log after flush");
+        assert_eq!(log.lines().count(), 2, "flush must not re-append");
+
+        // An ephemeral run keeps the old hold-for-flush contract.
+        let mut eph = RunContext::ephemeral();
+        eph.hold_events("eph-sess", vec![ev.clone()]);
+        assert_eq!(eph.held_events.len(), 1, "ephemeral holds for flush");
+        assert_eq!(eph.counts()["events_held_for_flush"], 1);
+    }
+
+    /// Re-review item 40: the frame commit pipeline stamps citable ids and
+    /// appends to frames.jsonl incrementally for persistent runs.
+    #[test]
+    fn commit_frame_stamps_id_and_persists_incrementally() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+
+        let mut f = crate::backend::CanonicalFrame::new(
+            crate::screen::ScreenState::new(80, 24),
+            3,
+            9,
+        );
+        let id = run.commit_frame(&mut f, Some("cf-sess"));
+        assert_eq!(id, 1, "first committed frame gets id 1");
+        assert_eq!(f.frame_id, Some(1));
+        assert_eq!(f.run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(f.session_id.as_deref(), Some("cf-sess"));
+
+        let path = run.run_dir().expect("dir").join("frames.jsonl");
+        let log = std::fs::read_to_string(&path).expect("frames.jsonl");
+        let line: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("one line")).expect("json");
+        assert_eq!(line["frame_id"], 1);
+        assert!(line["semantic_identity"]
+            .as_str()
+            .expect("semantic identity string")
+            .starts_with("semantic-id:v1:"));
+
+        let mut g =
+            crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 4, 10);
+        assert_eq!(run.commit_frame(&mut g, Some("cf-sess")), 2, "ids monotonically increase");
     }
 
     #[test]

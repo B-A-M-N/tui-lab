@@ -742,6 +742,18 @@ impl Session {
         Some(self.semantic_cache.borrow_mut().analyze(screen))
     }
 
+    /// Structural-cache health (re-review item 41): hit counts surfaced on
+    /// summary so the cache's work is evidence, not folklore.
+    pub fn semantic_cache_hits(&self) -> u64 {
+        self.semantic_cache.borrow().hits()
+    }
+    pub fn semantic_cache_misses(&self) -> u64 {
+        self.semantic_cache.borrow().misses()
+    }
+    pub fn semantic_cache_hit_rate(&self) -> f32 {
+        self.semantic_cache.borrow().hit_rate()
+    }
+
     /// The fused semantic truth for the last settled frame (re-review
     /// Wave-4): one cached detection pass producing both shapes, then the
     /// native overlay applied fresh. Every semantic-bearing observe mode
