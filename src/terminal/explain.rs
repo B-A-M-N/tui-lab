@@ -433,9 +433,11 @@ mod tests {
             before,
             after,
             action: "press Enter".into(),
+            settle: crate::execution::SettleStatus::Met,
             terminal_events: vec![],
             frames: vec![],
             transition,
+            after_focus: None,
             timing_ms: 42,
             anomalies: vec!["focus moved".into()],
         }

@@ -11,6 +11,8 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how "done" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.
 - `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
   - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output
+- `tui_probe` — Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched anomalies. stimulus {kind:none} = drift probe.
+  - completion: stable, first_change, any_change, text_appears, text_disappears, process_exit, semantic_change, may_be_silent
 - `tui_assert` — Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
   - assertion: text, text_absent, position, focus, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, focused_not, oracle
 - `tui_checkpoint` — Save and compare named UI state checkpoints (durable under persistent runs).
@@ -32,6 +34,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_contract` — Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).
   - action: load, validate, status, compare
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
+
 
 ## Core principle: OBSERVE BEFORE ACTING, DIFF AFTER
 

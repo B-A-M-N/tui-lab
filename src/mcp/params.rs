@@ -965,6 +965,172 @@ impl TuiActRequest {
     }
 }
 
+/// `tui_probe` stimulus vocabulary (re-review Wave-2): the canonical small
+/// experiment set. `none` runs a drift probe (no input, pure observation).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeStimulus {
+    /// A single named key, optionally modified (`key: "enter"`,
+    /// `key: "ctrl+c"`, `key: "tab"`).
+    Key {
+        key: String,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        #[serde(default)]
+        shift: bool,
+    },
+    /// Type literal text.
+    Type { text: String },
+    /// Mouse click at cell coordinates.
+    Click { button: MouseButtonParam, x: u16, y: u16 },
+    /// No stimulus — observe drift between two settled frames.
+    None,
+}
+
+impl ProbeStimulus {
+    /// Convert to the canonical action (None stays None at the caller).
+    pub fn to_action(&self) -> Option<crate::execution::CanonicalAction> {
+        use crate::backend::{KeyModifiers, MouseButton};
+        use crate::execution::CanonicalAction as CA;
+        match self {
+            ProbeStimulus::None => None,
+            ProbeStimulus::Key { key, ctrl, alt, shift } => {
+                let mut mods = KeyModifiers::empty();
+                if *ctrl { mods |= KeyModifiers::CTRL; }
+                if *alt { mods |= KeyModifiers::ALT; }
+                if *shift { mods |= KeyModifiers::SHIFT; }
+                let code = parse_key_name(key)?;
+                Some(CA::Key { key: crate::backend::KeyEvent { code, modifiers: mods } })
+            }
+            ProbeStimulus::Type { text } => Some(CA::Type { text: text.clone() }),
+            ProbeStimulus::Click { button, x, y } => Some(CA::MouseClick {
+                button: match button {
+                    MouseButtonParam::Left => MouseButton::Left,
+                    MouseButtonParam::Middle => MouseButton::Middle,
+                    MouseButtonParam::Right => MouseButton::Right,
+                },
+                x: *x,
+                y: *y,
+            }),
+        }
+    }
+}
+
+/// Key-name parser for the probe stimulus vocabulary (the ergonomic subset:
+/// named keys + single characters).
+fn parse_key_name(name: &str) -> Option<crate::backend::KeyCode> {
+    use crate::backend::KeyCode;
+    Some(match name.to_ascii_lowercase().as_str() {
+        "enter" | "return" => KeyCode::Enter,
+        "escape" | "esc" => KeyCode::Escape,
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "insert" => KeyCode::Insert,
+        "delete" => KeyCode::Delete,
+        "space" => KeyCode::Char(' '),
+        other => {
+            let mut chars = other.chars();
+            let single = chars.next()?;
+            if chars.next().is_none() {
+                KeyCode::Char(single)
+            } else {
+                return None;
+            }
+        }
+    })
+}
+
+// `tui_probe` completion vocabulary: how the probe decides "after".
+selector_enum!(
+    /// Probe completion (a deliberately small closed set of the canonical
+    /// [`crate::capture::CompletionPolicy`] shapes an experiment needs).
+    ProbeCompletion;
+    [
+        Stable => "stable", FirstChange => "first_change",
+        AnyChange => "any_change", TextAppears => "text_appears",
+        TextDisappears => "text_disappears", ProcessExit => "process_exit",
+        SemanticChange => "semantic_change", MayBeSilent => "may_be_silent",
+    ]
+);
+
+impl ProbeCompletion {
+    /// Convert to the canonical completion policy.
+    pub fn to_policy(&self, text: Option<&str>) -> Option<crate::capture::CompletionPolicy> {
+        use crate::capture::CompletionPolicy as CP;
+        Some(match self {
+            ProbeCompletion::Stable => CP::StableScreen,
+            ProbeCompletion::FirstChange => CP::FirstScreenChange,
+            ProbeCompletion::AnyChange => CP::AnyObservableChange,
+            ProbeCompletion::TextAppears => CP::TextAppears(text?.to_string()),
+            ProbeCompletion::TextDisappears => CP::TextDisappears(text?.to_string()),
+            ProbeCompletion::ProcessExit => CP::ProcessExit,
+            ProbeCompletion::SemanticChange => CP::SemanticChange,
+            ProbeCompletion::MayBeSilent => CP::MayBeSilent,
+        })
+    }
+}
+
+/// Parameters for `tui_probe` (re-review Wave-2: the troubleshooting
+/// primitive is an agent-visible tool — "try this and tell me EVERYTHING
+/// materially different", with causal event scoping and the settled frame).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TuiProbeParams {
+    /// The experiment: a key/text/click stimulus, or `{"kind": "none"}` for
+    /// a drift probe.
+    #[serde(default)]
+    pub stimulus: Option<ProbeStimulus>,
+    /// How "after" is decided (default: `stable`).
+    #[serde(default)]
+    pub completion: Option<Known<ProbeCompletion>>,
+    /// Required text for `text_appears` / `text_disappears`.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Which watched aspects to surface as anomalies. Defaults to focus,
+    /// controls, regions, cursor.
+    #[serde(default)]
+    pub watch: Option<Vec<Known<ProbeWatchParam>>>,
+    /// Quiet interval for `stable` (ms). Default 120.
+    #[serde(default)]
+    pub quiet_ms: Option<u64>,
+    /// Overall ceiling so a never-settling TUI still returns. Default 5000.
+    #[serde(default)]
+    pub budget_ms: Option<u64>,
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+selector_enum!(
+    /// Watched probe aspects.
+    ProbeWatchParam;
+    [ Cursor => "cursor", Focus => "focus", Style => "style",
+      Controls => "controls", Regions => "regions", Process => "process" ]
+);
+
+impl ProbeWatchParam {
+    /// Convert to the diagnostic watch aspect.
+    pub fn to_watch(self) -> crate::diagnostic::ProbeWatch {
+        use crate::diagnostic::ProbeWatch as PW;
+        match self {
+            ProbeWatchParam::Cursor => PW::Cursor,
+            ProbeWatchParam::Focus => PW::Focus,
+            ProbeWatchParam::Style => PW::Style,
+            ProbeWatchParam::Controls => PW::Controls,
+            ProbeWatchParam::Regions => PW::Regions,
+            ProbeWatchParam::Process => PW::Process,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiWaitParams {
     pub condition: Known<WaitCondition>,
