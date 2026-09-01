@@ -16,6 +16,7 @@ pub mod line_cli;
 pub mod line_types;
 pub mod pipe;
 pub mod portable_pty;
+pub mod tmux;
 pub mod trait_def;
 
 pub use line_cli::PtyLineBackend;

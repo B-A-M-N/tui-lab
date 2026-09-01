@@ -361,6 +361,58 @@ impl TuiLabServer {
                     "isolation": iso_evidence,
                 }))
             }
+            // Re-review item 18: adopt an ALREADY-RUNNING TUI that lives in
+            // a tmux pane. This is brownfield in the second sense: the
+            // process predates TUI-Lab and belongs to the user. TUI-Lab
+            // never kills the pane on detach.
+            A::Attach => {
+                let target = match p.target.as_deref() {
+                    Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            "attach requires 'target' (tmux session:window.pane, e.g. 'main:0.0')",
+                        )
+                    }
+                };
+                let cols = p.cols.unwrap_or(80);
+                let rows = p.rows.unwrap_or(24);
+                let id = match self.sessions.attach_tmux(&target, cols, rows).await {
+                    Ok(id) => id,
+                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                };
+                let facts = self
+                    .with_sess(Some(&id), |s| {
+                        let caps = s.capabilities();
+                        let version = s.backend_version();
+                        let kind = s.backend_kind;
+                        let generation = s.generation;
+                        let process = s.process();
+                        (caps, version, kind, generation, process)
+                    })
+                    .await;
+                let (caps, version, kind, generation, process) = match facts {
+                    Ok(f) => f,
+                    Err(e) => return e,
+                };
+                if let Some(spec) = self.with_sess(Some(&id), |s| s.launch().cloned()).await.ok().flatten() {
+                    self.run.lock().unwrap().set_launch_spec(&id, spec);
+                }
+                let run_id = self.run.lock().unwrap().id.clone();
+                ok(json!({
+                    "session": id,
+                    "generation": generation,
+                    "run": run_id,
+                    "backend": { "name": kind, "version": version },
+                    "capabilities": caps,
+                    "attach": {
+                        "target": target,
+                        "engine": "tmux-attach",
+                        "note": "the attached TUI is NOT killed on stop; use tui_session action=stop to detach only",
+                    },
+                    "process": process,
+                }))
+            }
             A::Restart => {
                 let id = match p.id.clone().or_else(|| self.sessions.active_id()) {
                     Some(i) => i,
@@ -838,10 +890,39 @@ impl TuiLabServer {
                     })),
                 }
             }
-            OM::History => err(
-                ErrorCategory::Unsupported,
-                "run/session event history is not implemented; the current frame identity is available via mode=summary (structure_hash)",
-            ),
+            // Re-review item 15: the converged event history — what happened,
+            // in order, filtered. This is the "it broke somewhere in the
+            // last 30 seconds; what happened?" tool: window by seq, filter
+            // by kind, and every event carries its timestamp, session
+            // generation, and kind so an agent can correlate with frames
+            // and transactions. The session event queue is the ONE store
+            // (item 16); this projection names its events in the converged
+            // bus vocabulary.
+            OM::History => {
+                let query = crate::events::HistoryQuery {
+                    since_seq: p.since_seq.unwrap_or(0),
+                    until_seq: p.until_seq,
+                    limit: p.limit.map(|l| (l as usize).min(4096)),
+                    event_types: p.event_types.clone().unwrap_or_default(),
+                };
+                let all = sess.all_events();
+                let batch = crate::events::project_history(&all, &query, sess.events_evicted());
+                ok(json!({
+                    "history": batch.events.iter().map(|ev| json!({
+                        "seq": ev.seq,
+                        "at": ev.at,
+                        "source": ev.source.name(),
+                        "kind": ev.kind.name(),
+                        "detail": ev.kind,
+                    })).collect::<Vec<_>>(),
+                    "cursor": batch.cursor,
+                    "gap": batch.gap,
+                    "returned": batch.events.len(),
+                    "note": if batch.gap {
+                        "the ring evicted earlier events; this window is partial"
+                    } else { "" },
+                }))
+            }
             // Wave-2 (protocol diagnostics): decode the backend's retained
             // RAW output window into a protocol trace — "what did this TUI
             // actually emit?", with OSC/DCS payloads redacted by default.
@@ -1335,6 +1416,47 @@ impl TuiLabServer {
     )]
     pub async fn tui_wait(&self, p: Parameters<TuiWaitParams>) -> rmcp::model::CallToolResult {
         let p = p.0;
+        // Re-review item 17: condition=event waits on the declarative event
+        // predicate over the converged history — a session-queue concern,
+        // not a backend read condition.
+        if matches!(
+            p.condition.known(),
+            Some(crate::mcp::params::WaitCondition::Event)
+        ) {
+            let predicate = match p.event.clone() {
+                Some(pred) => pred,
+                None => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "condition=event requires the 'event' predicate object (kinds/contains/since_seq)",
+                    )
+                }
+            };
+            if predicate.kinds.is_empty() && predicate.contains.is_none() {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    "condition=event predicate is empty: supply 'kinds' and/or 'contains' (since_seq optional)",
+                );
+            }
+            let selector = p.id.clone();
+            let budget = p.budget_ms.unwrap_or(5000);
+            return self
+                .with_sess(selector.as_deref(), move |sess| {
+                    match crate::execution::execute_wait_event(sess, &predicate, budget) {
+                        Ok(out) => ok(json!({
+                            "met": out.met,
+                            "timeout": !out.met,
+                            "matched_seq": out.matched_seq,
+                            "matched_at": out.matched_at,
+                            "last_seq": out.last_seq,
+                            "elapsed_ms": out.elapsed_ms,
+                        })),
+                        Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| e);
+        }
         let cond = match build_wait(&p) {
             Some(c) => c,
             None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),

@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 pub const BUS_RING_CAPACITY: usize = 8192;
 
 /// Which source produced an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BusSource {
     Terminal,
@@ -288,6 +288,106 @@ impl EventBus {
     /// Events evicted by the ring bound.
     pub fn evicted(&self) -> u64 {
         self.evicted
+    }
+}
+
+/// Project a terminal-queue event into the converged-timeline vocabulary
+/// (re-review item 16 — consolidation, not duplication): the session event
+/// queue remains the ONE store; this translation is how `tui_observe
+/// history` and watch predicates name its events in bus terms, so the
+/// history view and the terminal event ring can never be two divergent
+/// authorities.
+impl BusEvent {
+    pub fn from_terminal(
+        ev: &crate::events::TerminalEvent,
+        source_seq: u64,
+        seq: u64,
+    ) -> Self {
+        BusEvent {
+            seq,
+            source: match ev.kind {
+                crate::events::TerminalEventKind::NativeEvent { .. } => BusSource::Native,
+                _ => BusSource::Terminal,
+            },
+            source_seq,
+            at: ev.at,
+            session: ev.session.clone(),
+            kind: BusEventKind::Terminal(ev.kind.clone()),
+        }
+    }
+}
+
+/// A filtered, windowed read of the converged timeline (re-review item 15):
+/// the shape `tui_observe mode=history` serves.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryQuery {
+    /// Return events with `seq > since_seq` (0 = from the ring's start).
+    pub since_seq: u64,
+    /// Return events with `seq <= until_seq` (None = no upper bound).
+    pub until_seq: Option<u64>,
+    /// Cap on returned events (None = ring capacity).
+    pub limit: Option<usize>,
+    /// Keep only these event kinds (by machine name, e.g. "bell",
+    /// "screen_changed", "native_event"); empty = all.
+    pub event_types: Vec<String>,
+}
+
+/// Resolve a history query against an ordered event slice, projecting onto
+/// the converged vocabulary with a `gap` flag when the ring has evicted
+/// earlier events the query would have wanted.
+pub fn project_history(
+    events: &[crate::events::TerminalEvent],
+    query: &HistoryQuery,
+    evicted: u64,
+) -> BusBatch {
+    // Project the whole retained window first so per-source counters count
+    // *every* event of that source in the store — stable across windows and
+    // independent of what this particular query serves.
+    let mut source_counts: std::collections::HashMap<BusSource, u64> =
+        std::collections::HashMap::new();
+    let projected: Vec<BusEvent> = events
+        .iter()
+        .map(|ev| {
+            let mut b = BusEvent::from_terminal(ev, 0, ev.seq);
+            let n = source_counts.entry(b.source).or_insert(0);
+            *n += 1;
+            b.source_seq = *n;
+            b
+        })
+        .collect();
+
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let mut out = Vec::new();
+    for ev in &projected {
+        if ev.seq <= query.since_seq {
+            continue;
+        }
+        if let Some(until) = query.until_seq {
+            if ev.seq > until {
+                break;
+            }
+        }
+        if !query.event_types.is_empty() && !query.event_types.iter().any(|t| t == ev.kind.name())
+        {
+            continue;
+        }
+        if out.len() >= limit {
+            break;
+        }
+        out.push(ev.clone());
+    }
+    // The cursor is the last event actually SERVED, so paging by cursor never
+    // skips anything — a `limit`-truncated response continues where it ended.
+    let cursor = out.last().map(|e| e.seq).unwrap_or(query.since_seq);
+    // The ring evicts from the front (seqs 1..=evicted), so a query reaching
+    // back behind the watermark saw a partial window. `since_seq` is
+    // exclusive — a query with `since_seq == evicted` wants exactly the
+    // retained window and is complete.
+    let gap = evicted > 0 && query.since_seq < evicted;
+    BusBatch {
+        events: out,
+        cursor,
+        gap,
     }
 }
 

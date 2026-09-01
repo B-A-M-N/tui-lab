@@ -28,7 +28,7 @@ pub const EVENT_RING_CAPACITY: usize = 4096;
 
 pub mod bus;
 
-pub use bus::{BusBatch, BusEvent, BusEventKind, BusSource, EventBus};
+pub use bus::{project_history, BusBatch, BusEvent, BusEventKind, BusSource, EventBus, HistoryQuery};
 
 /// One thing that happened on a terminal, in order.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -206,6 +206,13 @@ impl TerminalEventQueue {
             gap,
             first_available: gap.then_some(first_available),
         }
+    }
+
+    /// Every retained event, in seq order (re-review item 15: the history
+    /// projection reads the whole retained window, then filters — `since`
+    /// is cursor-shaped, history is query-shaped).
+    pub fn all(&self) -> Vec<TerminalEvent> {
+        self.events.clone()
     }
 
     /// Highest seq handed out so far (0 when empty).

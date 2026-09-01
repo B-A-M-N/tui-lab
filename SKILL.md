@@ -5,12 +5,12 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 ## Tools
 
 - `tui_session` — Manage TUI sessions: start, restart, stop, list, status, plus the human control lease (lease/release).
-  - action: start, restart, stop, list, status, lease, release
+  - action: start, restart, stop, list, status, lease, release, attach
 - `tui_observe` — Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state, protocol trace + mode timeline (portable-pty/line engines), pipe stdout/stderr streams.
   - mode: summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history, protocol, streams, terminal_modes
 - `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how "done" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.
 - `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
-  - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output
+  - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output, event
 - `tui_probe` — Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched anomalies. stimulus {kind:none} = drift probe.
   - completion: stable, first_change, any_change, text_appears, text_disappears, process_exit, semantic_change, may_be_silent
 - `tui_assert` — Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
@@ -34,6 +34,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_contract` — Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (regions become components, named controls become oracle assertions; carries the scaffold.inferred marker; edit from observation toward intent).
   - action: load, validate, status, compare, scaffold
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
+
 ## Core principle: OBSERVE BEFORE ACTING, DIFF AFTER
 
 - Prefer `tui_observe` modes `summary` and `semantic` over `screen`. Never ask
@@ -97,3 +98,4 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 - `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
 - `tui://sessions/{session_id}/screen` — Live screen text + geometry.
 - `tui://findings` — Findings accumulated this run (audits, contracts, exploration).
+
