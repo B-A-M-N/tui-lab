@@ -1330,25 +1330,30 @@ impl RunContext {
         // Focus graph from transactions (audit item): every driving path
         // lands here with before/after frames, so the ID-keyed graph gets
         // its edges from causal evidence — the input that actually moved
-        // focus — not from summary-mode polling. `via` is the canonical
-        // action name; the graph only joins edges whose ends resolved
-        // stable control IDs.
-        let before_focus = crate::semantic::analyze(tx.before()).focus;
-        let after_focus = crate::semantic::analyze(tx.after()).focus;
-        if before_focus.control_id != after_focus.control_id {
-            if let (Some(f), Some(t)) =
-                (before_focus.control_id.clone(), after_focus.control_id.clone())
-            {
-                self.focus_graph
-                    .transition(&f, &t, after_focus.control.as_deref(), tx.name());
+        // focus — not from summary-mode polling. The evidence is the
+        // transaction's OWN fused analysis (computed at execution time
+        // through the session cache + native overlay); re-running bare
+        // inference here threw away native facts and could disagree with
+        // observe-time focus. `via` is the action's EXACT signature
+        // (`tab`, `ctrl+c`, `mouse:left:click@12,3`) — `name()` alone said
+        // only "key", which flattened navigation provenance to uselessness
+        // (re-review P0).
+        let (before_focus, after_focus) = (tx.focus_before.clone(), tx.focus_after.clone());
+        if before_focus.as_ref().map(|f| &f.0) != after_focus.as_ref().map(|f| &f.0) {
+            if let (Some((Some(f), _)), Some((Some(t), _))) = (before_focus, after_focus) {
+                self.focus_graph.transition(&f, &t, None, &tx.signature());
             }
-            // Legacy label ledger for display continuity.
-            if before_focus.control != after_focus.control {
+            // Legacy label ledger for display continuity (label pair form).
+            let (b_label, a_label) = (
+                tx.focus_before.as_ref().and_then(|f| f.1.clone()),
+                tx.focus_after.as_ref().and_then(|f| f.1.clone()),
+            );
+            if b_label != a_label {
                 self.focus_transitions.push((
                     now_ms(),
                     session.to_string(),
-                    before_focus.control.clone(),
-                    after_focus.control.clone(),
+                    b_label,
+                    a_label,
                 ));
             }
         }
@@ -2544,11 +2549,13 @@ mod tests {
         .expect("execute");
         run.record_interaction("fg-tx", &tx);
 
-        // The graph has at least one driven edge tagged with the action.
+        // The graph has at least one driven edge tagged with the EXACT
+        // action identity (re-review P0): a Right keypress reads `right`,
+        // not the useless kind-only `key`.
         let edges = &run.focus_graph.edges;
         assert!(
-            edges.iter().any(|e| e.via == "key"),
-            "transaction fed a via=key edge: {:?}",
+            edges.iter().any(|e| e.via == "right"),
+            "transaction fed a via=right edge: {:?}",
             edges
         );
         s.stop().ok();

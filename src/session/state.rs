@@ -13,6 +13,61 @@ use crate::backend::{
 use crate::recording::AsciicastRecorder;
 use crate::screen::{ProcessState, ScreenState};
 
+/// Exact engine identity (re-review P0: no boolean classification). Backend
+/// selection compares THIS, not string classes — the old `wants_line !=
+/// current_is_line` test could not distinguish pipe from portable PTY, so a
+/// fresh session (which always starts portable) never swapped to a requested
+/// pipe engine: the spec said pipe, the process got a PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BackendKind {
+    /// Portable PTY + vt100 grid (fullscreen TUIs). `auto` resolves here.
+    #[serde(rename = "portable-pty+vt100")]
+    PortableVt,
+    /// Real PTY driven line-by-line (CLIs, REPLs, hybrid shells).
+    #[serde(rename = "line-cli+lines")]
+    PtyLine,
+    /// True pipes: no PTY, isatty() false, separated stdout/stderr.
+    #[serde(rename = "pipe")]
+    Pipe,
+    // Future engines (TuiTest fixture, tmux attach) are documented in the
+    // audit; they gain variants when they exist — not before.
+}
+
+impl BackendKind {
+    /// Parse the agent-facing LaunchSpec/MCP name. Unknown names are an
+    /// error, never a silent fallback.
+    pub fn parse(name: &str) -> anyhow::Result<Self> {
+        Ok(match name {
+            "auto" | "portable_vt100" => BackendKind::PortableVt,
+            "cli" | "line_cli" => BackendKind::PtyLine,
+            "pipe" => BackendKind::Pipe,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown backend '{other}' (supported: auto, portable_vt100, cli, pipe)"
+                ))
+            }
+        })
+    }
+
+    /// The engine's honest display name for session status.
+    pub fn display(&self) -> &'static str {
+        match self {
+            BackendKind::PortableVt => "portable-pty+vt100",
+            BackendKind::PtyLine => "line-cli+lines",
+            BackendKind::Pipe => "pipe",
+        }
+    }
+
+    /// Build the engine. The ONE construction site (make_backend folded in).
+    fn build(self, cols: u16, rows: u16) -> anyhow::Result<Box<dyn TerminalBackend>> {
+        Ok(match self {
+            BackendKind::PortableVt => Box::new(PortablePtyBackend::new(cols, rows)),
+            BackendKind::PtyLine => Box::new(PtyLineBackend::new(cols, rows)),
+            BackendKind::Pipe => Box::new(crate::backend::pipe::PipeBackend::new(cols, rows)),
+        })
+    }
+}
+
 /// The exact launch configuration for a target program (spec section 11).
 ///
 /// Stored permanently on the session. Every restart/reproduction uses the same
@@ -64,7 +119,7 @@ fn dirty_rows(prev: &ScreenState, next: &ScreenState) -> Vec<u16> {
 pub struct Session {
     pub id: String,
     pub command: String,
-    pub backend_kind: String,
+    pub backend_kind: BackendKind,
     pub generation: u32,
     launch: Option<LaunchSpec>,
     backend: Box<dyn TerminalBackend>,
@@ -146,26 +201,11 @@ impl Session {
     /// Wave F items 50–51: backend selection. `auto` / `portable_vt100` map
     /// to the PTY engine; `cli` / `line_cli` map to the line CLI engine.
     /// Unknown names are an error — never a silent fallback.
-    fn make_backend(kind: &str, cols: u16, rows: u16) -> anyhow::Result<Box<dyn TerminalBackend>> {
-        match kind {
-            "auto" | "portable_vt100" => Ok(Box::new(PortablePtyBackend::new(cols, rows))),
-            "cli" | "line_cli" => Ok(Box::new(PtyLineBackend::new(cols, rows))),
-            // True pipe semantics (no PTY, isatty() false), genuine
-            // stdout/stderr separation (review P1 #28). Implements the trait
-            // and reports working behavior.
-            "pipe" => Ok(Box::new(crate::backend::pipe::PipeBackend::new(cols, rows))),
-            other => Err(anyhow::anyhow!(
-                "unknown backend '{}' (supported: auto, portable_vt100, cli, pipe)",
-                other
-            )),
-        }
-    }
-
     pub fn new(id: String, command: String) -> Self {
         Session {
             id,
             command,
-            backend_kind: "portable-pty+vt100".to_string(),
+            backend_kind: BackendKind::PortableVt,
             generation: 1,
             launch: None,
             backend: Box::new(PortablePtyBackend::new(80, 24)),
@@ -450,22 +490,29 @@ impl Session {
 
     /// Start (or restart) the target program from a full spec (spec section 11).
     pub fn start_with_spec(&mut self, spec: LaunchSpec) -> anyhow::Result<()> {
-        // Wave F items 50–51: the LaunchSpec's backend field is now real
-        // selection. On restart the engine kind may not change (identity is
-        // preserved), but a first start builds the requested engine.
-        let wants_line = matches!(spec.backend.as_str(), "cli" | "line_cli");
-        let current_is_line = self.backend_kind == "line-cli+lines";
-        if wants_line != current_is_line {
-            // First start (or engine-kind change): build the requested
-            // backend. Recording hook and normalization policy re-attach
-            // below.
-            self.backend = Self::make_backend(&spec.backend, spec.cols, spec.rows)?;
-            self.backend_kind = if wants_line {
-                "line-cli+lines".to_string()
-            } else {
-                "portable-pty+vt100".to_string()
-            };
+        self.start_generation(spec, self.generation)
+    }
+
+    /// Start the target as an EXPLICIT generation. `restart()` reserves the
+    /// next generation BEFORE launching, so every generation-keyed artifact —
+    /// scratch dirs, native channel reset, ProcessStarted, isolation
+    /// evidence, run correlation — belongs to the generation that actually
+    /// runs, not to the one being replaced (re-review P0: the old order
+    /// launched generation N+1 under generation N's identity, then bumped).
+    /// A failed launch leaves the old generation as history; nothing is
+    /// silently re-used or rolled back.
+    pub fn start_generation(&mut self, spec: LaunchSpec, generation: u32) -> anyhow::Result<()> {
+        // Exact engine selection (re-review P0): compare parsed kinds, not
+        // string classes — pipe vs portable was invisible to the boolean
+        // test, so a requested pipe engine never got built on a fresh
+        // session. First start always builds the requested engine.
+        let requested = BackendKind::parse(&spec.backend)?;
+        if requested != self.backend_kind {
+            self.backend = requested.build(spec.cols, spec.rows)?;
+            self.backend_kind = requested;
         }
+        // THIS generation is now the live one — everything below keys on it.
+        self.generation = generation;
         // Wave G item 77: apply the isolation profile. The declared string
         // is parsed here (invalid names fail loudly at launch, not silently
         // downgrade); the effective env is profile-filtered, strict wraps
@@ -560,9 +607,22 @@ impl Session {
             }
         };
         self.backend.stop().ok();
-        self.start_with_spec(spec)?;
-        self.generation += 1;
-        Ok(())
+        // Reserve the NEW generation BEFORE the launch: scratch dirs, the
+        // native channel reset, ProcessStarted, and isolation evidence are
+        // all keyed on generation at start time. The old order launched N+1
+        // under N's identity and bumped afterwards.
+        let next = self.generation.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("generation counter exhausted for session '{}'", self.id)
+        })?;
+        match self.start_generation(spec, next) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The failed launch is recorded as history: generation `next`
+                // was consumed by a launch that did not come up. Do NOT
+                // silently retry under the old number (evidence would collide).
+                Err(e)
+            }
+        }
     }
 
     pub fn stop(&mut self) -> anyhow::Result<()> {
@@ -610,6 +670,17 @@ impl Session {
     /// when the app never wrote one).
     pub fn native_channel(&self) -> &crate::semantic::native::NativeChannel {
         &self.native
+    }
+
+    /// Drain the native channel NOW (bounded read; partial lines stay
+    /// pending) and fold fresh events into the queue. Necessary before any
+    /// fused read that must not be stale: `native.poll()` otherwise runs
+    /// only inside `observe()`, so a cooperative app's post-action declare
+    /// can sit unread in the channel file when a transaction's after-side
+    /// focus is computed from settle-wait state alone.
+    pub fn poll_native(&mut self) {
+        self.native.poll();
+        self.absorb_native_events();
     }
 
     /// Overlay the latest native snapshot onto an inferred semantic tree,
@@ -783,6 +854,21 @@ impl Session {
         Some((sem, tree, report))
     }
 
+    /// Fused analysis of an ARBITRARY frame owned by a transaction (re-view
+    /// P0: transaction focus/semantic evidence must see native facts, not a
+    /// bare re-inference — the old `frame_focus` called `semantic::analyze`
+    /// directly, so a cooperative app's self-reported focus was invisible to
+    /// exactly the evidence path that feeds the focus graph). Same cache +
+    /// native overlay as `fused_frame`, applied to the given frame.
+    pub fn fuse_screen(
+        &self,
+        screen: &crate::screen::ScreenState,
+    ) -> crate::semantic::SemanticScreen {
+        let (sem, _tree, _report) =
+            crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        sem
+    }
+
     /// Observe, then return the fused analysis of the fresh frame (re-review
     /// Wave-2 item 16: THE way subsystems read semantics — no direct
     /// `semantic::analyze` above the frame pipeline). Structural detection
@@ -871,10 +957,10 @@ impl Session {
     }
 
     pub fn backend_version(&self) -> &'static str {
-        if self.backend_kind == "line-cli+lines" {
-            "line-cli+lines/0.1"
-        } else {
-            "portable-pty+vt100/0.1"
+        match self.backend_kind {
+            BackendKind::PortableVt => "portable-pty+vt100/0.1",
+            BackendKind::PtyLine => "line-cli+lines/0.1",
+            BackendKind::Pipe => "pipe/0.1",
         }
     }
 }

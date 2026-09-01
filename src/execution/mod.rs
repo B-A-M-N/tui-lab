@@ -162,6 +162,92 @@ impl CanonicalAction {
         }
     }
 
+    /// EXACT provenance for evidence graphs (re-review P0): what was this
+    /// action, specifically — `tab`, `shift+tab`, `ctrl+c`, `down`,
+    /// `mouse:left:click@12,3`, `resize:80x24`, `signal:9`. `name()` says
+    /// the KIND; this says the IDENTITY, so a focus edge can read "moved
+    /// via tab" instead of the useless "via key".
+    pub fn signature(&self) -> String {
+        fn mods(m: crate::backend::KeyModifiers) -> String {
+            let mut out = String::new();
+            if m.contains(crate::backend::KeyModifiers::CTRL) {
+                out.push_str("ctrl+");
+            }
+            if m.contains(crate::backend::KeyModifiers::ALT) {
+                out.push_str("alt+");
+            }
+            if m.contains(crate::backend::KeyModifiers::SHIFT) {
+                out.push_str("shift+");
+            }
+            if m.contains(crate::backend::KeyModifiers::SUPER) {
+                out.push_str("super+");
+            }
+            out
+        }
+        fn key_name(k: &crate::backend::KeyEvent) -> String {
+            use crate::backend::KeyCode as C;
+            let base = match &k.code {
+                C::Char(c) => c.to_string(),
+                C::Enter => "enter".into(),
+                C::Escape => "escape".into(),
+                C::Tab => "tab".into(),
+                C::Backspace => "backspace".into(),
+                C::Up => "up".into(),
+                C::Down => "down".into(),
+                C::Left => "left".into(),
+                C::Right => "right".into(),
+                C::Home => "home".into(),
+                C::End => "end".into(),
+                C::PageUp => "pageup".into(),
+                C::PageDown => "pagedown".into(),
+                C::Insert => "insert".into(),
+                C::Delete => "delete".into(),
+                C::Function(n) => format!("f{n}"),
+            };
+            format!("{}{}", mods(k.modifiers), base)
+        }
+        fn button_name(b: crate::backend::MouseButton) -> &'static str {
+            match b {
+                crate::backend::MouseButton::Left => "left",
+                crate::backend::MouseButton::Middle => "middle",
+                crate::backend::MouseButton::Right => "right",
+            }
+        }
+        match self {
+            CanonicalAction::Key { key } => key_name(key),
+            CanonicalAction::Keys { keys } => keys
+                .iter()
+                .map(key_name)
+                .collect::<Vec<_>>()
+                .join("+"),
+            CanonicalAction::Type { .. } => "text".into(),
+            CanonicalAction::Paste { .. } => "paste".into(),
+            CanonicalAction::Raw { .. } => "raw".into(),
+            CanonicalAction::MouseClick { button, x, y } => {
+                format!("mouse:{}:click@{x},{y}", button_name(*button))
+            }
+            CanonicalAction::MousePress { button, x, y } => {
+                format!("mouse:{}:press@{x},{y}", button_name(*button))
+            }
+            CanonicalAction::MouseRelease { button, x, y } => {
+                format!("mouse:{}:release@{x},{y}", button_name(*button))
+            }
+            CanonicalAction::MouseMove { x, y } => format!("mouse:move@{x},{y}"),
+            CanonicalAction::MouseDrag { button, x, y } => {
+                format!("mouse:{}:drag@{x},{y}", button_name(*button))
+            }
+            CanonicalAction::MouseScroll { direction, x, y } => {
+                let d = match direction {
+                    crate::backend::ScrollDirection::Up => "up",
+                    crate::backend::ScrollDirection::Down => "down",
+                };
+                format!("mouse:wheel:{d}@{x},{y}")
+            }
+            CanonicalAction::Resize { cols, rows } => format!("resize:{cols}x{rows}"),
+            CanonicalAction::Signal { signal } => format!("signal:{signal}"),
+        }
+    }
+
     /// Byte length of the payload this action carries (leak-fix support for
     /// redacted persistence: the length is replay-relevant metadata and is
     /// safe to keep; the bytes are not).
@@ -423,6 +509,11 @@ impl InteractionTransaction {
         &self.action.action
     }
 
+    /// Exact action provenance string (focus-graph `via` edge evidence).
+    pub fn signature(&self) -> String {
+        self.action.action.signature()
+    }
+
     /// Legacy read of settlement as a bool. `Skipped` counts as *not*
     /// settled — "we did not test" must not pass a settled assertion.
     pub fn settled(&self) -> bool {
@@ -604,13 +695,27 @@ pub fn execute_act_with_completion(
         // Real monotonic per-session anchor index (re-review P1 fix 9).
         index: session.next_anchor(),
     };
-    // Pre-action fused semantic identity, computed BEFORE the transaction
-    // guard so fused_frame(&self) can borrow_mut the cache without
-    // conflicts. The String is stored so the guard window doesn't hold it.
-    let before_fused_identity = session
+    // Pre-action fused semantic identity + focus, computed BEFORE the
+    // transaction guard so fused_frame(&self) can borrow_mut the cache
+    // without conflicts. The String is stored so the guard window doesn't
+    // hold it. Focus MUST be pinned here (re-review P0): the native
+    // channel's snapshot is LIVE state, and by settle time it describes
+    // the after-frame — fusing the before-frame against it then would read
+    // post-action focus on both sides and cancel every transition.
+    let (before_fused_identity, focus_before) = session
         .fused_frame()
-        .map(|(sem, tree, _report)| crate::semantic::semantic_identity_fused(&sem, &tree))
-        .unwrap_or_default();
+        .map(|(sem, tree, _report)| {
+            let focus = if sem.focus.control_id.is_none() && sem.focus.control.is_none() {
+                None
+            } else {
+                Some((sem.focus.control_id.clone(), sem.focus.control.clone()))
+            };
+            (
+                crate::semantic::semantic_identity_fused(&sem, &tree),
+                focus,
+            )
+        })
+        .unwrap_or((Default::default(), None));
     // The ONE compiler runs on the pre-action frame before it moves into
     // the transaction evidence (re-review P0).
     let plan = crate::capture::compile_completion(&completion, &baseline, &before, pre_event_seq, quiet_ms, Some(before_fused_identity));
@@ -635,7 +740,16 @@ pub fn execute_act_with_completion(
     );
     let mut window = ActTransactionGuard::begin(session, sensitive_window);
     let send_start = std::time::Instant::now();
-    let send_result = window.sess().send(action.to_input());
+    // Canonical mutation dispatch (re-review P0): Resize is a SESSION
+    // mutation, not a byte write — it must go through Session::resize() so
+    // the stored LaunchSpec follows the real viewport and the Session resize
+    // event fires. Routing it through send()/Input::Resize silently left
+    // launch.cols/rows stale, so a restart resurrected the old size.
+    // Everything else is a transport write.
+    let send_result = match action {
+        CanonicalAction::Resize { cols, rows } => window.sess().resize(*cols, *rows),
+        _ => window.sess().send(action.to_input()),
+    };
     let send_ms = send_start.elapsed().as_millis() as u64;
     let send_failed = send_result.is_err();
     if send_failed {
@@ -688,12 +802,23 @@ pub fn execute_act_with_completion(
     after_frame.session_id = Some(window.sess().id.clone());
     after_frame.generation = Some(window.sess().generation);
 
-    // Transaction-derived focus evidence (re-review P1): focus before and
-    // after from the fused analysis of the frames this transaction already
-    // owns. The run's focus graph consumes this in `record_interaction` —
-    // summary/observe reads never create focus edges again.
-    let focus_before = frame_focus(&before_frame.state);
-    let focus_after = frame_focus(&after_frame.state);
+    // Transaction-derived focus evidence (re-review P1): focus before was
+    // pinned at anchor time (see the fused_frame call above — the native
+    // snapshot is live state and cannot be replayed onto the before-frame
+    // after the fact); focus after comes from the FUSED analysis of the
+    // settled frame. Native self-reports participate on both sides — the
+    // old bare `semantic::analyze` silently dropped native focus facts.
+    // The run's focus graph consumes these in `record_interaction` —
+    // summary/observe reads never create focus edges again. The drain is
+    // required for the same reason: the settle's last observe can race the
+    // app's post-action declare, and a non-polling read would fuse the
+    // after-frame against the PRE-action native snapshot.
+    let focus_after;
+    {
+        let sess = window.sess();
+        sess.poll_native();
+        focus_after = frame_focus(sess, &after_frame.state);
+    }
 
     // Sensitive window closed: the settled frame has been captured, so the
     // application's own (masked) rendering is recorded from here on. `commit`
@@ -720,13 +845,13 @@ pub fn execute_act_with_completion(
 /// Native self-reports win when the app cooperates; otherwise style
 /// inference — the same truth every observe mode sees.
 fn frame_focus(
+    session: &Session,
     screen: &crate::screen::ScreenState,
 ) -> Option<(Option<String>, Option<String>)> {
-    // Inferred focus from the frame's own analysis. (The native overlay is
-    // merged by the session's fused path; for transaction evidence the
-    // inferred read of the captured frame is the honest floor, and the
-    // native focus event, when present, overrides it below.)
-    let sem = crate::semantic::analyze(screen);
+    // FUSED focus from the frame via the session's cache + native overlay:
+    // the same truth every observe mode sees (re-review P0 — bare
+    // `semantic::analyze` here silently dropped native focus facts).
+    let sem = session.fuse_screen(screen);
     let f = sem.focus;
     if f.control_id.is_none() && f.control.is_none() {
         return None;
