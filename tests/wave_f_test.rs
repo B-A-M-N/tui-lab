@@ -445,7 +445,10 @@ fn coverage_ledger_accumulates_native_events() {
     )
     .expect("write");
     ch.poll();
-    let folded = run.collect_native_coverage("sess-x", &ch);
+    // The runtime path ingests exactly once from the session event queue;
+    // the test feeds the same events as a batch (the old whole-channel
+    // rescan double-counted on every call).
+    let folded = run.ingest_native_coverage_batch("sess-x", &ch.events_since(0));
     assert_eq!(folded, 3, "all coverage events folded");
     let ledger = &run.coverage_ledger;
     assert_eq!(ledger.len(), 2, "two distinct targets");

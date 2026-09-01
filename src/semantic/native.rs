@@ -31,9 +31,28 @@
 //!   `native_only` list) — never silently dropped.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+
+/// One native event: a timestamped focus/activate/coverage signal from the app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTuple {
+    /// Wall-clock timestamp (ms since epoch) at ingest.
+    pub ts: u64,
+    /// Event name (e.g. "focus", "activate", "coverage").
+    pub event: String,
+    /// Event target (e.g. "#save", "src/lib.rs:42").
+    pub target: String,
+    /// Monotonically increasing sequence number assigned at ingest.
+    pub seq: u64,
+}
+
+impl EventTuple {
+    pub fn new(ts: u64, event: String, target: String, seq: u64) -> Self {
+        Self { ts, event, target, seq }
+    }
+}
 
 /// Protocol version understood by this build.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -149,8 +168,10 @@ pub struct NativeChannel {
     pub latest: Option<NativeNode>,
     pub framework: Option<String>,
     pub app: Option<String>,
-    /// Focus/activate events as (at_ms, event, target).
-    pub events: Vec<(u64, String, String)>,
+    /// Focus/activate/coverage events in a bounded ring.
+    pub events: VecDeque<EventTuple>,
+    /// Monotonically increasing sequence counter (assigned at ingest).
+    native_seq: u64,
     pub frames_accepted: u64,
     pub frames_invalid: u64,
     /// Byte offset into the channel file already consumed.
@@ -255,14 +276,17 @@ impl NativeChannel {
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_millis() as u64)
                                         .unwrap_or(0);
-                                    self.events.push((
+                                    self.native_seq += 1;
+                                    let seq = self.native_seq;
+                                    self.events.push_back(EventTuple::new(
                                         now,
                                         frame.event.unwrap_or_default(),
                                         frame.target.unwrap_or_default(),
+                                        seq,
                                     ));
-                                    // Bounded event log.
+                                    // Bounded event log (ring cap).
                                     if self.events.len() > 1024 {
-                                        self.events.remove(0);
+                                        self.events.pop_front();
                                     }
                                 }
                                 _ => {}
@@ -414,10 +438,26 @@ impl NativeChannel {
         report
     }
 
+    /// Return events whose sequence number is strictly greater than `seq`,
+    /// in chronological order. This is the ring-safe consumption API: unlike
+    /// positional slicing it correctly yields new events even after the ring
+    /// has wrapped around (when `Vec`-based `remove(0)` cap would leave the
+    /// cursor past `len`).
+    pub fn events_since(&self, seq: u64) -> Vec<EventTuple> {
+        self.events.iter().filter(|e| e.seq > seq).cloned().collect()
+    }
+
+    /// The highest sequence number seen so far (0 when no events have been
+    /// ingested yet).
+    pub fn last_native_seq(&self) -> u64 {
+        self.native_seq
+    }
+
     /// Reset (session restart): keep the path, drop the state.
     pub fn reset(&mut self) {
         self.latest = None;
         self.events.clear();
+        self.native_seq = 0;
         self.frames_accepted = 0;
         self.frames_invalid = 0;
         self.consumed_to = 0;
@@ -1088,6 +1128,70 @@ mod tests {
             crate::semantic::native::tests_support::count_controls(&tree.root),
             "flat and tree shapes come from one detection pass"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Write N synthetic event lines through the REAL poll() path and drain.
+    fn ingest_events_via_poll(ch: &mut NativeChannel, path: &std::path::Path, n: usize) {
+        use std::fmt::Write as _;
+        let mut blob = String::new();
+        for i in 0..n {
+            let _ = writeln!(
+                blob,
+                "{}",
+                serde_json::json!({
+                    "v": 1,
+                    "type": "event",
+                    "event": "coverage",
+                    "target": format!("tgt-{i}"),
+                })
+            );
+        }
+        std::fs::write(path, blob).expect("write events");
+        ch.poll();
+    }
+
+    #[test]
+    fn native_ring_never_stops_absorbing() {
+        // The old Vec + remove(0) ring plus a positional usize cursor went
+        // permanently deaf at the cap: len froze at 1024 so `total <= from`
+        // held forever. With a seq-cursored VecDeque, events past the cap
+        // are still delivered by events_since (re-review P0).
+        let mut ch = NativeChannel::create().expect("channel");
+        let path = ch.path.clone().expect("path");
+        ingest_events_via_poll(&mut ch, &path, 1100);
+        // Ring capped at 1024 retained events.
+        assert_eq!(ch.events.len(), 1024, "ring cap enforced");
+        // But all 1100 seqs were assigned, and a seq cursor of 0 sees only
+        // what the ring retains (the first 76 evicted).
+        assert_eq!(ch.last_native_seq(), 1100);
+        assert_eq!(ch.events_since(0).len(), 1024);
+        // A consumer at the pre-cap position still gets the freshest events.
+        let fresh = ch.events_since(1049);
+        assert_eq!(fresh.len(), 51, "events 1050..=1100 delivered after wrap");
+        assert_eq!(fresh.last().expect("last").seq, 1100);
+        assert_eq!(fresh.last().expect("last").target, "tgt-1099");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn native_events_since_is_exactly_once() {
+        let mut ch = NativeChannel::create().expect("channel");
+        let path = ch.path.clone().expect("path");
+        ingest_events_via_poll(&mut ch, &path, 3);
+        let first = ch.events_since(0);
+        assert_eq!(first.len(), 3);
+        // Absorb at the channel head, push 2 more, absorb again: EXACTLY the
+        // 2 new ones — no double-count, no skip (the session's
+        // absorb_native_events loop relies on this).
+        let cursor = ch.last_native_seq();
+        ingest_events_via_poll(&mut ch, &path, 2);
+        let again = ch.events_since(cursor);
+        assert_eq!(again.len(), 2);
+        assert_eq!(again[0].target, "tgt-0");
+        assert_eq!(again[1].target, "tgt-1");
+        // Re-reading from the same cursor yields the same batch (idempotent).
+        assert_eq!(ch.events_since(cursor).len(), 2);
         std::fs::remove_file(&path).ok();
     }
 }
