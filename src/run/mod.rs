@@ -1174,22 +1174,24 @@ impl RunContext {
         }
     }
 
-    /// Wave F item 64: collect coverage events from a session's native
-    /// channel into the ledger. Returns how many events were folded in.
-    pub fn collect_native_coverage(
+    /// Coverage ingestion from a raw native-event batch. Kept for tests and
+    /// callers that hold events directly; the RUNTIME path is
+    /// [`Self::ingest_native_coverage_from_events`] — the session absorbs
+    /// native events into its queue exactly once (sequence-cursored, ring-
+    /// safe), and coverage truth flows from that single stream. The old
+    /// whole-channel rescan this replaces double-counted every event on
+    /// every call (re-review P0: exactly-once ingestion).
+    pub fn ingest_native_coverage_batch(
         &mut self,
         session: &str,
-        channel: &crate::semantic::native::NativeChannel,
+        events: &[crate::semantic::native::EventTuple],
     ) -> usize {
-        let events: Vec<(u64, String, String)> = channel
-            .events
-            .iter()
-            .filter(|(_, event, _)| event == "coverage")
-            .cloned()
-            .collect();
-        let n = events.len();
-        for (_, _, target) in events {
-            self.record_coverage_event(session, &target);
+        let mut n = 0;
+        for ev in events {
+            if ev.event == "coverage" {
+                self.record_coverage_event(session, &ev.target);
+                n += 1;
+            }
         }
         n
     }

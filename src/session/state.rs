@@ -110,7 +110,7 @@ pub struct Session {
     native: crate::semantic::native::NativeChannel,
     /// How many native-channel events have already been folded into the
     /// session event queue (re-review P1: mode-independent ingestion).
-    native_events_absorbed: usize,
+    native_events_absorbed_seq: u64,
     /// Wave G item 76: the human control lease, when one is held.
     lease: crate::session::lease::LeaseState,
     /// Wave G item 77: what the current generation's launch actually got
@@ -180,7 +180,7 @@ impl Session {
             cursors: std::collections::HashMap::new(),
             semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
             native: crate::semantic::native::NativeChannel::default(),
-            native_events_absorbed: 0,
+            native_events_absorbed_seq: 0,
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
         }
@@ -502,7 +502,7 @@ impl Session {
         }
         // Native event absorption restarts with the channel (re-review P1:
         // counts stay aligned across generations).
-        self.native_events_absorbed = 0;
+        self.native_events_absorbed_seq = 0;
         let mut effective_env = effective_env; // native channel pair may append
         if let Some(pair) = self.native.env_pair() {
             if !crate::semantic::native::env_has_channel(&effective_env) {
@@ -664,26 +664,29 @@ impl Session {
     /// Fold new native-channel events (focus / activate / coverage / any
     /// app-declared verb) into the session event queue (re-review P1: the
     /// unified event substrate). Idempotent per generation — an event is
-    /// absorbed exactly once, tracked by count; a restart resets the
-    /// channel with the session, so counts stay aligned.
+    /// absorbed exactly once, tracked by the channel's monotonic native_seq,
+    /// NOT by a Vec index: once the channel's ring hits its 1024-event cap,
+    /// len stays constant while old events evict, and a positional cursor
+    /// would permanently believe there is nothing new (re-review P0, the
+    /// long-run absorption stall). A restart resets the channel with the
+    /// session, so the cursor (reset to 0) stays aligned.
     fn absorb_native_events(&mut self) {
-        let from = self.native_events_absorbed;
-        let total = self.native.events.len();
-        if total <= from {
-            self.native_events_absorbed = total.min(from);
+        let cursor = self.native_events_absorbed_seq;
+        let fresh = self.native.events_since(cursor);
+        if fresh.is_empty() {
             return;
         }
-        for (_, event, target) in &self.native.events[from..total] {
+        for ev in &fresh {
             self.events.push(
                 &self.id,
                 self.generation,
                 crate::events::TerminalEventKind::NativeEvent {
-                    event: event.clone(),
-                    target: target.clone(),
+                    event: ev.event.clone(),
+                    target: ev.target.clone(),
                 },
             );
         }
-        self.native_events_absorbed = total;
+        self.native_events_absorbed_seq = self.native.last_native_seq();
     }
 
     /// Read events after `cursor` WITHOUT moving it (per-consumer cursors,
