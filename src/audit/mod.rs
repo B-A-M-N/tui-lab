@@ -183,14 +183,31 @@ impl Finding {
     }
 }
 
-/// Stable 8-hex discriminator for a (rule, target) pair.
+/// Schema prefix for finding-instance identity hashes.
+const FINDING_SCHEMA: &str = "finding:v1";
+
+/// Stable 8-hex discriminator for a (rule, target) pair, versioned BLAKE3.
+/// Mirrors the identity scheme in `state_graph.rs`: a canonical prefix +
+/// length-prefixed, ordered parts, truncated to 8 hex chars so the
+/// `{rule}@{hash8}` shape is preserved.
 fn short_hash(rule: &str, target: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    rule.hash(&mut h);
-    target.hash(&mut h);
-    format!("{:08x}", h.finish() as u32)
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(FINDING_SCHEMA.as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(b"discriminator");
+    hasher.update(&[0u8]);
+    hasher.update(&(rule.len() as u64).to_le_bytes());
+    hasher.update(rule.as_bytes());
+    hasher.update(&(target.len() as u64).to_le_bytes());
+    hasher.update(target.as_bytes());
+    // First 4 bytes of the digest as the discriminator — the same 8-hex
+    // shape the old SipHash produced. (Parsing the 64-char hex back as a
+    // u32 always overflows, which would collapse every finding to
+    // 00000000 — the discriminator must come from the digest bytes.)
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    let word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    format!("{:08x}", word)
 }
 
 impl Finding {
