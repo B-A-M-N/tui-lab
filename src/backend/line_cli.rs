@@ -80,7 +80,20 @@ pub struct PtyLineBackend {
     pending: String,
     /// Declared eviction counter (see MAX_LINES).
     lines_evicted: u64,
+    /// Per-edge screen snapshots (burst drain fix): when several logical
+    /// frames arrive coalesced in one read chunk, `screen_seq` jumps by N
+    /// in a single pump, and a collector anchored on the old seq would see
+    /// one edge and miss the N-1 intermediate screens. `pump()` therefore
+    /// synthesizes and retains one snapshot per seq bump; `wait()` serves
+    /// the snapshot matching the anchored seq instead of only the latest.
+    /// Ring-capped — a burst longer than the ring degrades to the old
+    /// behavior for its head, never to wrong data.
+    edge_snaps: std::collections::VecDeque<(u64, ScreenState)>,
 }
+
+/// How many per-edge snapshots to retain. Covers realistic redraw bursts
+/// (progress bars, table refreshes) with a small fixed cost per edge.
+const EDGE_SNAP_CAP: usize = 64;
 
 impl PtyLineBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -110,6 +123,7 @@ impl PtyLineBackend {
             lines: Vec::new(),
             pending: String::new(),
             lines_evicted: 0,
+            edge_snaps: std::collections::VecDeque::new(),
         }
     }
 
@@ -135,6 +149,15 @@ impl PtyLineBackend {
             if ch == '\n' {
                 self.lines.push(std::mem::take(&mut self.pending));
                 changed = true;
+                // Burst-drain fix: advance the seq per edge (not once per
+                // chunk) and snapshot while `lines` reflects exactly that
+                // edge — a coalesced chunk (six frames in one read after a
+                // scheduling stall) yields six distinct per-edge screens,
+                // not one collapsed edge the collector can't walk.
+                self.screen_seq += 1;
+                self.last_screen_change_at_ms = crate::backend::line_types::now_ms();
+                self.last_screen_change_instant = Instant::now();
+                self.retain_edge_snapshot();
             } else if ch == '\r' {
                 // "\r\n" is the pty's rendering of one newline — the '\n'
                 // that follows commits the line normally. A bare '\r'
@@ -150,6 +173,19 @@ impl PtyLineBackend {
                 pending_changed = true;
             }
         }
+        if pending_changed && !changed {
+            // A pending-line mutation is a *visible* screen change (the
+            // wave_f regression: unterminated prompts must stay visible and
+            // move the seq so anchored waits see them) — one bump per chunk,
+            // same as before the burst-drain fix. When the chunk ALSO
+            // committed a line, the commit edge's snapshot already reflects
+            // the final state and the intra-chunk pending accumulation
+            // folds into it: one write-chunk = one walkable edge. Only
+            // line-COMMIT semantics changed (per line, not per chunk) so a
+            // coalesced burst yields one edge per frame.
+            self.screen_seq += 1;
+            self.retain_edge_snapshot();
+        }
         if changed || pending_changed {
             self.content_seq += 1;
         }
@@ -157,9 +193,10 @@ impl PtyLineBackend {
             let drop = self.lines.len() - MAX_LINES;
             self.lines.drain(..drop);
             self.lines_evicted += drop as u64;
+            // Retained snapshots are fully rendered states, so line
+            // eviction needs no snapshot repair.
         }
         if changed || pending_changed {
-            self.screen_seq += 1;
             self.last_screen_change_at_ms = crate::backend::line_types::now_ms();
             self.last_screen_change_instant = Instant::now();
         }
@@ -180,6 +217,30 @@ impl PtyLineBackend {
             self.output_seq += 1;
             self.last_output_at_ms = crate::backend::line_types::now_ms();
             self.last_output_instant = Instant::now();
+            // Both edge kinds (line commits, pending-line mutations)
+            // snapshot themselves inside ingest, right where their seq
+            // bump happens.
+        }
+    }
+
+    /// Synthesize the current screen and file it under the current
+    /// `screen_seq` in the per-edge ring (used by the burst-drain fix).
+    fn retain_edge_snapshot(&mut self) {
+        let mut s = self.synth_screen();
+        s.scrollback = {
+            let keep = self.lines.len().saturating_sub(self.rows as usize);
+            self.lines[..keep].to_vec()
+        };
+        if self
+            .edge_snaps
+            .back()
+            .map(|(seq, _)| *seq != self.screen_seq)
+            .unwrap_or(true)
+        {
+            self.edge_snaps.push_back((self.screen_seq, s));
+            if self.edge_snaps.len() > EDGE_SNAP_CAP {
+                self.edge_snaps.pop_front();
+            }
         }
     }
 
@@ -490,13 +551,36 @@ impl TerminalBackend for PtyLineBackend {
         let baseline_screen_seq = self.screen_seq;
         loop {
             self.pump();
-            let screen = {
-                let mut s = self.synth_screen();
-                s.scrollback = {
-                    let keep = self.lines.len().saturating_sub(self.rows as usize);
-                    self.lines[..keep].to_vec()
-                };
-                s
+            // Burst-drain fix: when an anchored screen wait is satisfiable,
+            // serve the per-edge snapshot taken AT the anchored seq (the
+            // screen as it looked the instant that edge landed) — after a
+            // burst drain, the live screen is many edges past the anchor.
+            // Fallback to the live synth when the ring no longer holds the
+            // edge (cap eviction or pre-ring history).
+            let anchored_edge = match &cond {
+                WaitCond::ScreenStable {
+                    after_screen_seq: Some(anchor),
+                    ..
+                } if self.screen_seq > *anchor => Some(*anchor + 1),
+                _ => None,
+            };
+            let anchored_snap = anchored_edge
+                .and_then(|want| {
+                    self.edge_snaps
+                        .iter()
+                        .find(|(seq, _)| *seq == want)
+                        .map(|(seq, s)| (*seq, s.clone()))
+                });
+            let (screen, screen_seq_of_state) = match anchored_snap {
+                Some((seq, s)) => (s, seq),
+                None => {
+                    let mut s = self.synth_screen();
+                    s.scrollback = {
+                        let keep = self.lines.len().saturating_sub(self.rows as usize);
+                        self.lines[..keep].to_vec()
+                    };
+                    (s, self.screen_seq)
+                }
             };
             let (met, reason) = match &cond {
                 WaitCond::Text(t) => (
@@ -561,7 +645,11 @@ impl TerminalBackend for PtyLineBackend {
                     met: true,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     reason,
-                    screen_seq: self.screen_seq,
+                    // The seq OF THE RETURNED SCREEN: an anchored wait served
+                    // from the per-edge ring reports that edge's seq, so an
+                    // anchored collector walks the burst edge by edge instead
+                    // of jumping past it (burst-drain fix).
+                    screen_seq: screen_seq_of_state,
                     output_seq: self.output_seq,
                     state: screen,
                 });

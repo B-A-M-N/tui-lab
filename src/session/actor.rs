@@ -457,10 +457,21 @@ mod tests {
             )
             .await
             .expect("start");
+        // Python startup can exceed a single quiet-window observe under
+        // parallel PTY load; poll until the print lands (bounded) instead
+        // of betting on one 80ms window.
         let text = pool
             .with_session(Some(&id), |s: &mut Session| {
-                let scr = s.observe(80).expect("observe");
-                scr.viewport_text.join("\n")
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut text;
+                loop {
+                    let scr = s.observe(80).expect("observe");
+                    text = scr.viewport_text.join("\n");
+                    if text.contains("actor-ok") || std::time::Instant::now() > deadline {
+                        break;
+                    }
+                }
+                text
             })
             .await
             .expect("job");
