@@ -70,6 +70,10 @@ pub struct PipeBackend {
     recording_slot: RecordingHookSlot,
     /// Wave G item 77: clear the inherited env before applying pairs.
     clear_env_on_start: bool,
+    /// Per-stream: did the last ingest end inside an unterminated line?
+    /// Only that trailing partial continues into the next chunk; committed
+    /// lines stay committed (W1b pending-line fix).
+    trailing_unterminated: [bool; 2],
     // Event sequencing (same contract as the other backends).
     output_seq: u64,
     screen_seq: u64,
@@ -98,6 +102,16 @@ enum Stream {
     Stderr,
 }
 
+impl Stream {
+    /// Index into per-stream bookkeeping (`trailing_unterminated`).
+    fn slot(self) -> usize {
+        match self {
+            Stream::Stdout => 0,
+            Stream::Stderr => 1,
+        }
+    }
+}
+
 impl PipeBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
         let now = Instant::now();
@@ -115,6 +129,7 @@ impl PipeBackend {
             chunk_rx: None,
             reader_handles: Vec::new(),
             recording_slot: new_recording_hook_slot(),
+            trailing_unterminated: [false, false],
             clear_env_on_start: false,
             output_seq: 0,
             screen_seq: 0,
@@ -176,15 +191,22 @@ impl PipeBackend {
 
     /// Fold one stream's bytes into its own store AND the fused stream.
     fn ingest_stream(&mut self, stream: Stream, bytes: &[u8]) {
-        // Per-stream store: re-seat the previously-unterminated trailing line
-        // (so STDERR between two waits stays attached to the same partial
-        // line), then fold this chunk; `\n` commits, `\r` is a write-only CR
-        // that we collapse (cheap line model), everything else appends.
+        // Per-stream store: only the store's own unterminated trailing line
+        // continues — a line that ended with `\n` is committed and the next
+        // chunk must start a NEW line. The old unconditional
+        // `store.pop().unwrap_or_default()` re-opened committed lines, so
+        // "OUT-A\n" and a later chunk "OUT-B\n" fused into one "OUT-AOUT-B"
+        // line (W1b). Tracked by whether the last ingest ended mid-line.
         let store = match stream {
             Stream::Stdout => &mut self.stdout_lines,
             Stream::Stderr => &mut self.stderr_lines,
         };
-        let mut cur = store.pop().unwrap_or_default();
+        let mut cur = if self.trailing_unterminated[stream.slot()] {
+            store.pop().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.trailing_unterminated[stream.slot()] = true;
         for &b in bytes {
             match b {
                 b'\n' => {
@@ -192,6 +214,7 @@ impl PipeBackend {
                         cur.truncate(self.cols as usize);
                     }
                     store.push(std::mem::take(&mut cur));
+                    self.trailing_unterminated[stream.slot()] = false;
                 }
                 b'\r' => {}
                 b'\x07' => {}

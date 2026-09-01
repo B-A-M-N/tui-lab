@@ -523,6 +523,38 @@ fn pipe_child_sees_no_tty() {
     b.stop().ok();
 }
 
+/// W1b regression: two `\n`-terminated writes to the SAME stream must stay
+/// two lines. The old unconditional `store.pop()` re-opened the committed
+/// line, so a later chunk appended onto it ("A" + later "B" fused to "AB").
+/// A mid-line split (partial write, then continuation) must still continue.
+#[test]
+fn pipe_committed_lines_stay_committed_across_chunks() {
+    let mut b = pipe_backend(
+        "import sys,time\n\
+         sys.stdout.write('A\\n'); sys.stdout.flush()\n\
+         time.sleep(0.15)\n\
+         sys.stdout.write('B\\n'); sys.stdout.flush()\n\
+         time.sleep(0.15)\n\
+         sys.stdout.write('PART'); sys.stdout.flush()\n\
+         time.sleep(0.15)\n\
+         sys.stdout.write('UAL\\n'); sys.stdout.flush()\n\
+         time.sleep(1)",
+    );
+    let _ = b.wait(WaitCond::Text("UAL".into()), Duration::from_secs(5));
+    let out = b.stdout_lines();
+    assert!(out.contains(&"A".to_string()), "first line intact: {out:?}");
+    assert!(out.contains(&"B".to_string()), "second line NOT fused to A: {out:?}");
+    assert!(
+        out.contains(&"PARTUAL".to_string()),
+        "genuinely unterminated line continues across chunks: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("AB")),
+        "committed lines must not fuse: {out:?}"
+    );
+    b.stop().ok();
+}
+
 /// Review P1 #28: genuine stdout/stderr separation. A child writing to both
 /// file descriptors must surface each stream distinctly — the fused screen
 /// interleaves them, but `stdout_lines()` / `stderr_lines()` keep them apart.
