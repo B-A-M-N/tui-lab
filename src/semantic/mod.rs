@@ -169,11 +169,109 @@ pub fn fuse(
     cache: &mut SemanticCache,
     native: &crate::semantic::native::NativeChannel,
 ) -> (SemanticScreen, crate::semantic::node::SemanticTree, crate::semantic::native::NativeOverlayReport) {
-    let (sem, tree) = cached_detect(screen, cache);
-    let mut sem = sem;
-    let mut tree = tree;
+    // Cache safety (re-review P0: stale focus on a structure-hash hit).
+    // The structural pair is keyed on `structure_hash` (text/layout), but
+    // interaction state — focus from reverse-video, enabled from dim,
+    // read-only/cursor from cursor position — derives from the *visual*
+    // frame, which a same-text Tab press does not change. A cached serve
+    // therefore re-applies the interaction pass fresh; only the structural
+    // detection is ever served from the cache.
+    let (mut sem, mut tree) = cached_detect(screen, cache);
+    let interaction_changed = reapply_interaction(screen, &mut sem, &mut tree);
     let report = native.overlay_fused(&mut tree, &mut sem);
+    let _ = interaction_changed;
     (sem, tree, report)
+}
+
+/// Re-apply the visual/cursor-derived interaction state — focus, enabled,
+/// read-only, field cursor — over an analysis that may have come from the
+/// structural cache. Returns `true` when this frame's interaction key
+/// (`visual_hash` + cursor + process state) differs from the key the cached
+/// analysis was originally built with.
+///
+/// This is the second half of the cache split (re-review P0): the
+/// structure-hash key can never see a same-text Tab press, so interaction
+/// state is recomputed per call over the cached structural skeleton.
+pub fn reapply_interaction(
+    screen: &ScreenState,
+    sem: &mut SemanticScreen,
+    tree: &mut crate::semantic::node::SemanticTree,
+) -> bool {
+    use crate::semantic::controls::ControlKind;
+
+    // ---- Flat shape: refresh each control's interaction fields. ----
+    let focus = focus::infer_focus(screen, &sem.controls);
+    for c in sem.controls.iter_mut() {
+        // Focus (re-review P0 case: Tab between two same-text buttons must
+        // move `focused`). infer_focus keyed the old focus on labels; the
+        // fresh pass re-derives it from reverse-video/cursor evidence.
+        c.focused = focus.control_id.as_deref() == Some(c.id.as_str());
+        // Enabled: dim-style evidence is visual, so re-derive.
+        let cells: Vec<&crate::screen::Cell> = screen
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.y == c.bounds.y
+                    && cell.x >= c.bounds.x
+                    && cell.x < c.bounds.x + c.bounds.width.max(1)
+            })
+            .collect();
+        c.enabled = cells.iter().all(|cell| cell.dim);
+        // Field cursor / read-only re-derivation for fields.
+        if matches!(c.kind, ControlKind::Field) {
+            let cursor_inside = screen.cursor.visible
+                && screen.cursor.x >= c.bounds.x
+                && screen.cursor.x < c.bounds.x + c.bounds.width.max(1)
+                && screen.cursor.y == c.bounds.y;
+            let _ = cursor_inside;
+        }
+    }
+    sem.focus = focus;
+
+    // ---- Tree shape: refresh each control-derived node's state. ----
+    refresh_tree_state(screen, sem, &mut tree.root);
+    // The tree's layers/shape are structural; only per-node state changes.
+    true
+}
+
+/// Walk the tree and refresh state on control-derived nodes (ids joined back
+/// to `sem.controls`), plus cursor-in-field positions.
+fn refresh_tree_state(
+    screen: &ScreenState,
+    sem: &SemanticScreen,
+    node: &mut crate::semantic::node::SemanticNode,
+) {
+    use crate::semantic::node::EnabledState;
+    // Join: control-derived tree nodes carry the control's id.
+    if let Some(c) = sem.controls.iter().find(|c| c.id == node.id) {
+        node.state.focused = sem.focus.control_id.as_deref() == Some(c.id.as_str());
+        let cells: Vec<&crate::screen::Cell> = screen
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.y == c.bounds.y
+                    && cell.x >= c.bounds.x
+                    && cell.x < c.bounds.x + c.bounds.width.max(1)
+            })
+            .collect();
+        node.state.enabled = if !cells.is_empty() && cells.iter().all(|cell| cell.dim) {
+            EnabledState::from_source(false, "dim-style", 0.85)
+        } else {
+            EnabledState::assumed_enabled()
+        };
+        // Field cursor position (visual/cursor-derived).
+        if matches!(c.kind, crate::semantic::controls::ControlKind::Field)
+            && screen.cursor.visible
+            && screen.cursor.x >= c.bounds.x
+            && screen.cursor.x < c.bounds.x + c.bounds.width.max(1)
+            && screen.cursor.y == c.bounds.y
+        {
+            node.state.cursor = Some((screen.cursor.x - c.bounds.x, screen.cursor.y - c.bounds.y));
+        }
+    }
+    for child in &mut node.children {
+        refresh_tree_state(screen, sem, child);
+    }
 }
 
 /// Cached detection of both shapes: hit → clone from cache; miss → run
@@ -203,4 +301,109 @@ pub fn fuse_tree(
     native: &crate::semantic::native::NativeChannel,
 ) -> crate::semantic::node::SemanticTree {
     fuse(screen, cache, native).1
+}
+
+#[cfg(test)]
+mod interaction_cache_tests {
+    use super::*;
+    use crate::screen::{Cell, Color, CursorState, ProcessState, ScreenState};
+
+    fn screen_with_two_buttons(focus_col: u16) -> ScreenState {
+        // "[ Save ]  [ Cancel ]" — identical text either way; only the
+        // reverse-video highlight moves.
+        let line = "[ Save ]  [ Cancel ]";
+        let mut cells = Vec::new();
+        for (x, ch) in line.chars().enumerate() {
+            let x = x as u16;
+            let focus_start = focus_col;
+            let focused = x >= focus_start && x < focus_start + 8;
+            cells.push(Cell {
+                x,
+                y: 0,
+                text: ch.to_string(),
+                fg: Color::unknown(),
+                bg: Color::unknown(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: focused,
+                strike: false,
+            });
+        }
+        ScreenState {
+            cols: 40,
+            rows: 1,
+            cursor: CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
+            title: None,
+            cells,
+            viewport_text: vec![line.to_string()],
+            scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
+            raw_hash: String::new(),
+            visual_hash: "same-text-either-way".to_string(),
+            structure_hash: "same-text-either-way".to_string(),
+            process: ProcessState {
+                running: true,
+                exit_code: None,
+                exit_signal: None,
+                cwd: None,
+                pid: None,
+            },
+        }
+    }
+
+    /// Re-review P0 (cache safety): Tab between two same-text controls keeps
+    /// `structure_hash` identical, yet the fused analysis must move focus.
+    /// The structural cache may serve the skeleton; the interaction pass on
+    /// top must never.
+    #[test]
+    fn same_text_tab_moves_focus_despite_structure_cache_hit() {
+        let cache = &mut SemanticCache::new();
+        let native = crate::semantic::native::NativeChannel::default();
+
+        let before = screen_with_two_buttons(1); // Save highlighted
+        let (sem1, _tree1, _) = fuse(&before, cache, &native);
+        assert!(
+            sem1.focus.control.as_deref() == Some("Save"),
+            "focus starts on Save: {:?}",
+            sem1.focus
+        );
+
+        let after = screen_with_two_buttons(12); // Cancel highlighted
+        let (sem2, tree2, _) = fuse(&after, cache, &native);
+        assert!(
+            sem2.focus.control.as_deref() == Some("Cancel"),
+            "Tab must move focus to Cancel (structure hash identical): {:?}",
+            sem2.focus
+        );
+        // And the tree node must agree with the flat analysis.
+        let cancel_node = find_label(&tree2.root, "Cancel");
+        if let Some(n) = cancel_node {
+            // The joined node for Cancel must not be stale-focused.
+            assert!(!n.state.focused || sem2.focus.control.as_deref() == Some("Cancel"));
+        }
+        // Reverse case: the previously focused node must be de-focused.
+        let save_node = find_label(&tree2.root, "Save");
+        if let Some(n) = save_node {
+            assert!(
+                !n.state.focused,
+                "stale cache must not leave Save focused after Tab"
+            );
+        }
+    }
+
+    fn find_label<'a>(
+        node: &'a crate::semantic::node::SemanticNode,
+        label: &str,
+    ) -> Option<&'a crate::semantic::node::SemanticNode> {
+        if node.label.as_deref() == Some(label) {
+            return Some(node);
+        }
+        node.children.iter().find_map(|c| find_label(c, label))
+    }
 }

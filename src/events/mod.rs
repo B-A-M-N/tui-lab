@@ -86,6 +86,15 @@ pub enum TerminalEventKind {
     },
     /// Semantic analysis output changed (controls/regions/affordances).
     SemanticChanged,
+    /// Re-review P1 (unified event substrate): an event from the app's
+    /// native semantic side-channel. These are the app's OWN words about
+    /// itself, so they carry the strongest available evidence.
+    NativeEvent {
+        /// `focus`, `activate`, `coverage`, or any app-declared verb.
+        event: String,
+        /// The node id / coverage target the event names.
+        target: String,
+    },
 }
 
 impl TerminalEventKind {
@@ -103,6 +112,7 @@ impl TerminalEventKind {
             TerminalEventKind::ProcessStarted => "process_started",
             TerminalEventKind::ProcessExited { .. } => "process_exited",
             TerminalEventKind::SemanticChanged => "semantic_changed",
+            TerminalEventKind::NativeEvent { .. } => "native_event",
         }
     }
 }

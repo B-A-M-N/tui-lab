@@ -229,6 +229,9 @@ pub struct RunContext {
     /// This is interaction-correlated coverage: "did my last act exercise
     /// new app code" is answerable by diffing before/after a step.
     pub coverage_ledger: std::collections::BTreeMap<String, CoverageEntry>,
+    /// Per-consumer event cursors (re-review P1): exactly-once ingestion
+    /// positions for coverage folding and other event-derived ledgers.
+    pub event_cursors: std::collections::HashMap<String, u64>,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
 }
@@ -282,6 +285,7 @@ impl RunContext {
             contract_baselines: HashMap::new(),
             finding_baselines: HashMap::new(),
             coverage_ledger: std::collections::BTreeMap::new(),
+            event_cursors: std::collections::HashMap::new(),
             closed: false,
         }
     }
@@ -1156,6 +1160,40 @@ impl RunContext {
             self.record_coverage_event(session, &target);
         }
         n
+    }
+
+    /// Coverage ingestion from the unified event queue (re-review P1: tool
+    /// selection must not affect truth). Fold every absorbed
+    /// `NativeEvent { event: "coverage" }` after `cursor` into the ledger,
+    /// returning the new cursor. Callers pass a per-run stored cursor so
+    /// each event is ingested exactly once, regardless of which observe
+    /// modes ran.
+    pub fn ingest_native_coverage_from_events(
+        &mut self,
+        session: &str,
+        events: &[crate::events::TerminalEvent],
+        mut cursor: usize,
+    ) -> usize {
+        for ev in events.get(cursor..).unwrap_or(&[]) {
+            if let crate::events::TerminalEventKind::NativeEvent { event, target } = &ev.kind {
+                if event == "coverage" {
+                    self.record_coverage_event(session, target);
+                }
+            }
+            cursor += 1;
+        }
+        cursor
+    }
+
+    /// A named consumer's event cursor (re-review P1: per-consumer cursors
+    /// live in the run so ingestion is exactly-once across tool calls).
+    pub fn event_cursor(&self, consumer: &str) -> Option<u64> {
+        self.event_cursors.get(consumer).copied()
+    }
+
+    /// Advance a named consumer's event cursor.
+    pub fn set_event_cursor(&mut self, consumer: &str, seq: u64) {
+        self.event_cursors.insert(consumer.to_string(), seq);
     }
 
     /// Recordings held in memory (name + event count preview).

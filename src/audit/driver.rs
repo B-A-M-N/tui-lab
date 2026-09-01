@@ -44,8 +44,8 @@ pub fn keyboard_audit(
     graph: &mut crate::semantic::focus_graph::FocusGraph,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let baseline_sem = match session.observe(50) {
-        Ok(s) => semantic::analyze(&s),
+    let baseline_sem = match session.observe_fused(50) {
+        Ok((_, sem, _, _)) => sem,
         Err(e) => {
             findings.push(Finding {
                 id: "KB-ERR".into(),
@@ -70,11 +70,10 @@ pub fn keyboard_audit(
     let mut successful_tabs = 0u32;
 
     for i in 0..max_tabs {
-        let before = match session.observe(30) {
-            Ok(s) => s,
+        let (_before, sem_before, _, _) = match session.observe_fused(30) {
+            Ok(t) => t,
             Err(_) => break,
         };
-        let sem_before = semantic::analyze(&before);
         let focus_before = sem_before.focus.control.clone();
         focus_order.push(focus_before.clone());
 
@@ -269,8 +268,10 @@ pub fn keyboard_audit(
 /// Run focus audit: check exactly one apparent focus, Tab changes focus (item 53).
 pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let screen = match session.observe(50) {
-        Ok(s) => s,
+    // Fused truth (re-review Wave-2 item 16): the audit reads the same
+    // analysis every observe mode sees.
+    let (screen, sem, _tree, _report) = match session.observe_fused(50) {
+        Ok(t) => t,
         Err(e) => {
             findings.push(Finding {
                 id: "FOCUS-ERR".into(),
@@ -288,8 +289,6 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             return findings;
         }
     };
-
-    let sem = semantic::analyze(&screen);
 
     // Check: exactly one apparent focus
     let reverse_cells: Vec<_> = screen.cells.iter().filter(|c| c.reverse).collect();
@@ -408,8 +407,8 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
             },
             2000,
         );
-        let screen = match session.observe(100) {
-            Ok(s) => s,
+        let (_screen, sem, _tree, _report) = match session.observe_fused(100) {
+            Ok(t) => t,
             Err(e) => {
                 findings.push(Finding {
                     id: "RESZ-ERR".into(),
@@ -428,8 +427,6 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 continue;
             }
         };
-
-        let sem = semantic::analyze(&screen);
 
         // Check for clipping
         let clipped_regions: Vec<_> = sem
@@ -505,8 +502,8 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
 /// Run clipping audit: detect real clipping (item 55).
 pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let screen = match session.observe(50) {
-        Ok(s) => s,
+    let (screen, sem, _tree, _report) = match session.observe_fused(50) {
+        Ok(t) => t,
         Err(e) => {
             findings.push(Finding {
                 id: "CLIP-ERR".into(),
@@ -525,7 +522,6 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         }
     };
 
-    let sem = semantic::analyze(&screen);
     let cols = screen.cols;
     let rows = screen.rows;
 
@@ -812,7 +808,10 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         // capability-blind backend is still worth probing honestly.
     }
 
-    let sem = semantic::analyze(&screen);
+    let sem = session
+        .fused_frame()
+        .map(|(s, _, _)| s)
+        .unwrap_or_else(|| semantic::analyze(&screen));
     // Risk filter (Wave D risk classes): only click SAFE-looking targets —
     // buttons and links whose click might mutate or destroy state are
     // listed, not clicked, unless the screen marks them unambiguous. Here
@@ -1079,8 +1078,8 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
 /// inventory plus a bounded focus probe — never a fake "walked all states".
 pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let screen = match session.observe(50) {
-        Ok(s) => s,
+    let (_screen, sem, _tree, _report) = match session.observe_fused(50) {
+        Ok(t) => t,
         Err(e) => {
             findings.push(Finding {
                 id: "STATES-ERR".into(),
@@ -1098,7 +1097,6 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             return findings;
         }
     };
-    let sem = semantic::analyze(&screen);
     let disabled: Vec<&semantic::Control> = sem.controls.iter().filter(|c| !c.enabled).collect();
     let empty_like: Vec<&semantic::Control> = sem
         .controls

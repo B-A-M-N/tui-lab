@@ -15,7 +15,6 @@
 //! longer interprets profile names.
 
 use crate::audit::{EvidenceKind, EvidenceRef, Finding};
-use crate::semantic;
 use crate::session::state::Session;
 use serde_json::json;
 
@@ -177,8 +176,8 @@ pub fn run_profile_with_contract(
 
     // The one remaining static profile: discoverability (single frame).
     if !profile.is_active() {
-        let screen = observe_or_err(session)?;
-        let sem = semantic::analyze(&screen);
+        // Fused truth (re-review Wave-2 item 16).
+        let (screen, sem, _, _) = session.observe_fused(40).map_err(|e| format!("observe failed: {e}"))?;
         return Ok(ProfileReport {
             profile,
             mode: "static",
@@ -195,8 +194,8 @@ pub fn run_profile_with_contract(
 
     let mut findings = Vec::new();
     if profile.wants_static_composite() {
-        let screen = observe_or_err(session)?;
-        let sem = semantic::analyze(&screen);
+        // Fused truth (re-review Wave-2 item 16).
+        let (screen, sem, _, _) = session.observe_fused(40).map_err(|e| format!("observe failed: {e}"))?;
         findings.extend(crate::audit::run("full", &screen, &sem));
     }
 
@@ -266,12 +265,6 @@ pub fn run_profile_with_contract(
         findings,
         focus_graph: graph,
     })
-}
-
-fn observe_or_err(session: &mut Session) -> Result<crate::screen::ScreenState, String> {
-    session
-        .observe(40)
-        .map_err(|e| format!("observe failed: {e}"))
 }
 
 /// Error-shaped finding helper for driver-level failures (unused today;
