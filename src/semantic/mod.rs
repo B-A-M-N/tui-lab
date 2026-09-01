@@ -143,6 +143,104 @@ pub fn semantic_identity(screen: &ScreenState) -> String {
     format!("semantic-id:v1:{:016x}", h.finish())
 }
 
+/// Versioned BLAKE3 identity over the fused semantic screen + tree.
+/// Uses a canonical JSON serialization of roles, labels, bounds, focus,
+/// enabled/state fields so native overlays and inference changes are both
+/// caught. Reuses the "tui-lab:semantic:v1:" schema prefix so this key is
+/// distinguishable from other BLAKE3 digests in the codebase.
+pub fn semantic_identity_fused(sem: &SemanticScreen, tree: &SemanticTree) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tui-lab:semantic:v1:");
+    // Screen metadata.
+    let meta = serde_json::to_string(&serde_json::json!({
+        "cols": sem.cols,
+        "rows": sem.rows,
+    }))
+    .unwrap();
+    hasher.update(&(meta.len() as u64).to_le_bytes());
+    hasher.update(meta.as_bytes());
+    // Controls — sorted by id for determinism.
+    let mut controls = sem.controls.clone();
+    controls.sort_by(|a, b| a.id.cmp(&b.id));
+    for c in &controls {
+        let entry = serde_json::to_string(&serde_json::json!({
+            "id": c.id,
+            "kind": format!("{:?}", c.kind),
+            "label": c.label,
+            "value": c.value,
+            "bounds": [c.bounds.x, c.bounds.y, c.bounds.width, c.bounds.height],
+            "focusable": c.focusable,
+            "focused": c.focused,
+            "enabled": c.enabled,
+            "selected": c.selected,
+            "checked": c.checked,
+        }))
+        .unwrap();
+        hasher.update(&(entry.len() as u64).to_le_bytes());
+        hasher.update(entry.as_bytes());
+    }
+    // Regions — sorted by id.
+    let mut regions = sem.regions.clone();
+    regions.sort_by(|a, b| a.id.cmp(&b.id));
+    for r in &regions {
+        let entry = serde_json::to_string(&serde_json::json!({
+            "id": r.id,
+            "kind": format!("{:?}", r.kind),
+            "title": r.title,
+            "bounds": [r.bounds.x, r.bounds.y, r.bounds.width, r.bounds.height],
+            "clipping_state": format!("{:?}", r.clipping_state),
+        }))
+        .unwrap();
+        hasher.update(&(entry.len() as u64).to_le_bytes());
+        hasher.update(entry.as_bytes());
+    }
+    // Focus.
+    let focus = serde_json::to_string(&serde_json::json!({
+        "control_id": sem.focus.control_id,
+        "control": sem.focus.control,
+    }))
+    .unwrap();
+    hasher.update(&(focus.len() as u64).to_le_bytes());
+    hasher.update(focus.as_bytes());
+    // Tree nodes — depth-first, sorted children for determinism.
+    let mut nodes: Vec<&crate::semantic::node::SemanticNode> = Vec::new();
+    collect_nodes_rec(&tree.root, &mut nodes);
+    for node in &nodes {
+        let entry = serde_json::to_string(&serde_json::json!({
+            "id": node.id,
+            "role": node.role.slug(),
+            "label": node.label,
+            "value": node.value,
+            "bounds": [node.bounds.x, node.bounds.y, node.bounds.width, node.bounds.height],
+            "state": {
+                "focused": node.state.focused,
+                "selected": node.state.selected,
+                "checked": node.state.checked,
+                "enabled": node.state.enabled.value,
+                "read_only": node.state.read_only.value,
+            },
+        }))
+        .unwrap();
+        hasher.update(&(entry.len() as u64).to_le_bytes());
+        hasher.update(entry.as_bytes());
+    }
+    format!("tui-lab:semantic:v1:{}", hasher.finalize().to_hex())
+}
+
+/// Depth-first collection of tree nodes, children sorted by id for
+/// deterministic ordering. Mutates `out` in-place.
+fn collect_nodes_rec<'a>(
+    node: &'a crate::semantic::node::SemanticNode,
+    out: &mut Vec<&'a crate::semantic::node::SemanticNode>,
+) {
+    out.push(node);
+    let mut children: Vec<&'a crate::semantic::node::SemanticNode> = node.children.iter().collect();
+    children.sort_by(|a, b| a.id.cmp(&b.id));
+    for child in children {
+        collect_nodes_rec(child, out);
+    }
+}
+
 /// One detection pass producing BOTH shapes — the flat
 /// [`SemanticScreen`] and the [`SemanticTree`] — from the same detector
 /// outputs. This is the structural guarantee behind fused semantic truth

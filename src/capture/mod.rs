@@ -204,21 +204,34 @@ pub enum CompletionPlan {
 }
 
 /// The ONE compiler from a declared [`CompletionPolicy`] to an executable
-/// [`CompletionPlan`] (re-review P0: "exactly one compiler"). `anchor` is the
-/// pre-action event state; `before` is the pre-action screen so text
-/// causality can record `was_present` and semantic change can record the
-/// pre-action semantic identity.
+/// [`CompletionPlan`] (re-review P0: "exactly one compiler").
+///
+/// - `anchor`: the pre-action `TerminalEventState` (event counters at the
+///   moment before the action is sent).
+/// - `before`: the pre-action `ScreenState` (for text causality and
+///   semantic-change identity fallback).
+/// - `pre_event_seq`: the session event-queue last sequence *before* the
+///   action is sent.  Used by [`CompletionPolicy::Event`] so the evaluator
+///   never misses an event that fires immediately after the send.
+/// - `quiet_ms`: the quiet interval for [`CompletionPolicy::StableScreen`].
+/// - `fused_identity`: when present, the pre-action fused semantic identity
+///   for [`CompletionPolicy::SemanticChange`]; otherwise falls back to
+///   `before.semantic_identity()`.
 pub fn compile_completion(
     policy: &CompletionPolicy,
     anchor: &crate::backend::TerminalEventState,
     before: &ScreenState,
+    pre_event_seq: u64,
+    quiet_ms: u64,
+    fused_identity: Option<String>,
 ) -> CompletionPlan {
     match policy {
         CompletionPolicy::StableScreen => CompletionPlan::BackendWait(WaitCond::ScreenStable {
-            quiet_for: Duration::from_millis(0), // caller fills via anchored_to budget path
+            quiet_for: Duration::from_millis(quiet_ms),
             after_screen_seq: Some(anchor.screen_seq),
         }),
         CompletionPolicy::FirstScreenChange => {
+            // FirstScreenChange needs only one frame; no quiet window required.
             CompletionPlan::BackendWait(WaitCond::ScreenStable {
                 quiet_for: Duration::from_millis(0),
                 after_screen_seq: Some(anchor.screen_seq),
@@ -237,12 +250,11 @@ pub fn compile_completion(
         CompletionPolicy::CommandDone => CompletionPlan::CommandDone,
         CompletionPolicy::Bell => CompletionPlan::Bell(anchor.bell_seq),
         CompletionPolicy::SemanticChange => {
-            // The pre-action semantic identity — recomputed lazily by the
-            // evaluator (carrying the hash here avoids analyzing `before`
-            // twice when the caller already has it).
-            CompletionPlan::SemanticChange(before.semantic_identity())
+            // Pre-action fused semantic identity (or fallback to screen-based).
+            let identity = fused_identity.unwrap_or_else(|| before.semantic_identity());
+            CompletionPlan::SemanticChange(identity)
         }
-        CompletionPolicy::Event(m) => CompletionPlan::Event(m.clone(), anchor_event_seq(anchor)),
+        CompletionPolicy::Event(m) => CompletionPlan::Event(m.clone(), pre_event_seq),
         CompletionPolicy::MayBeSilent => {
             CompletionPlan::SilentGrace(Duration::from_millis(SILENT_GRACE_MS))
         }
@@ -253,21 +265,6 @@ pub fn compile_completion(
 /// Default grace window for [`CompletionPolicy::MayBeSilent`] — short by
 /// design (re-review P0: "50–150 ms, not 1+ seconds").
 pub const SILENT_GRACE_MS: u64 = 100;
-
-/// The anchor for event-based completion: the highest event seq known from
-/// the backend counters is not the session queue's seq, so the evaluator
-/// anchors on 0-cursor semantics — the *evaluator* receives the queue cursor
-/// captured pre-action and ignores anything at/below it. Compiling carries
-/// the backend interaction baseline so unanchored queue reads still respect
-/// the action boundary.
-fn anchor_event_seq(anchor: &crate::backend::TerminalEventState) -> u64 {
-    // The session event queue is independent of backend counters; the
-    // evaluator resolves the real cursor from the anchor label. 0 = "judge
-    // only events with seq > the pre-action queue head", supplied at
-    // evaluation time.
-    let _ = anchor;
-    0
-}
 
 /// Whether a screen's viewport or scrollback contains `text`.
 pub fn screen_contains(screen: &ScreenState, text: &str) -> bool {
