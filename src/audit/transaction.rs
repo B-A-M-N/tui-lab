@@ -117,6 +117,7 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
     }
     Finding {
         id: "AUDIT-RESIDUE".into(),
+        rule_id: None,
         severity: "warn".into(),
         category: "audit".into(),
         summary: format!(

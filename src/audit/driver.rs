@@ -49,6 +49,7 @@ pub fn keyboard_audit(
         Err(e) => {
             findings.push(Finding {
                 id: "KB-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "keyboard".into(),
                 summary: format!("Cannot observe baseline: {}", e),
@@ -92,6 +93,7 @@ pub fn keyboard_audit(
             Err(_e) => {
                 findings.push(Finding {
                     id: "KB-ERR".into(),
+                    rule_id: None,
                     severity: "error".into(),
                     category: "keyboard".into(),
                     summary: format!("Tab send failed at step {}", i),
@@ -122,6 +124,7 @@ pub fn keyboard_audit(
         if focus_before == focus_after {
             findings.push(Finding {
                 id: "KB-TRAP".into(),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "keyboard".into(),
                 summary: format!("Tab at step {} did not change focus", i),
@@ -145,6 +148,7 @@ pub fn keyboard_audit(
         if visited_states.contains(&state_key) {
             findings.push(Finding {
                 id: "KB-CYCLE".into(),
+                rule_id: None,
                 severity: "info".into(),
                 category: "keyboard".into(),
                 summary: format!(
@@ -207,6 +211,7 @@ pub fn keyboard_audit(
         if reverse_ok && !gaps.is_empty() {
             findings.push(Finding {
                 id: "KB-REVERSE-GAP".into(),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "keyboard".into(),
                 summary: format!(
@@ -229,6 +234,7 @@ pub fn keyboard_audit(
         if successful_tabs > 0 && reverse_ok {
             findings.push(Finding {
                 id: "KB-OK".into(),
+                rule_id: None,
                 severity: "info".into(),
                 category: "keyboard".into(),
                 summary: format!(
@@ -275,6 +281,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
         Err(e) => {
             findings.push(Finding {
                 id: "FOCUS-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "focus".into(),
                 summary: format!("Cannot observe: {}", e),
@@ -297,6 +304,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
     if !has_focus {
         findings.push(Finding {
             id: "FOCUS-001".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "focus".into(),
             summary: "No detectable focus target on this screen.".into(),
@@ -332,6 +340,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
         if sem_after.focus.control.as_ref() == Some(&focus_before) {
             findings.push(Finding {
                 id: "FOCUS-002".into(),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "focus".into(),
                 summary: "Tab did not change focus target.".into(),
@@ -350,6 +359,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
         } else {
             findings.push(Finding {
                 id: "FOCUS-OK".into(),
+                rule_id: None,
                 severity: "info".into(),
                 category: "focus".into(),
                 summary: format!(
@@ -385,6 +395,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
         if let Err(e) = session.resize(cols, rows) {
             findings.push(Finding {
                 id: "RESZ-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "resize".into(),
                 summary: format!("Resize to {}x{} failed: {}", cols, rows, e),
@@ -412,6 +423,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
             Err(e) => {
                 findings.push(Finding {
                     id: "RESZ-ERR".into(),
+                    rule_id: None,
                     severity: "error".into(),
                     category: "resize".into(),
                     summary: format!("Observe after resize to {}x{} failed: {}", cols, rows, e),
@@ -438,6 +450,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
         if !clipped_regions.is_empty() {
             findings.push(Finding {
                 id: "RESZ-CLIP".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "resize".into(),
                 summary: format!(
@@ -462,6 +475,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
         } else {
             findings.push(Finding {
                 id: "RESZ-OK".into(),
+                rule_id: None,
                 severity: "info".into(),
                 category: "resize".into(),
                 summary: format!(
@@ -507,6 +521,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         Err(e) => {
             findings.push(Finding {
                 id: "CLIP-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "clipping".into(),
                 summary: format!("Cannot observe: {}", e),
@@ -533,6 +548,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         if b.x.saturating_add(b.width) > cols || b.y.saturating_add(b.height) > rows {
             findings.push(Finding {
                 id: "CLIP-001".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "clipping".into(),
                 summary: format!("Region '{}' bounds exceed terminal", rg.id),
@@ -555,6 +571,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         if !matches!(rg.clipping_state, semantic::ClippingState::None) {
             findings.push(Finding {
                 id: "CLIP-002".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "clipping".into(),
                 summary: format!("Region '{}' clipped: {:?}", rg.id, rg.clipping_state),
@@ -583,6 +600,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         if has_incomplete_border(first_row) {
             findings.push(Finding {
                 id: "CLIP-003".into(),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "clipping".into(),
                 summary: "Top border has possible clipping at viewport edge".into(),
@@ -601,6 +619,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         if has_incomplete_border(last_row) {
             findings.push(Finding {
                 id: "CLIP-004".into(),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "clipping".into(),
                 summary: "Bottom border has possible clipping at viewport edge".into(),
@@ -619,6 +638,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
     if findings.is_empty() {
         findings.push(Finding {
             id: "CLIP-OK".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "clipping".into(),
             summary: format!("No clipping detected ({} regions)", sem.regions.len()),
@@ -656,6 +676,7 @@ pub fn navigation_audit(
     if tab_edges.is_empty() {
         findings.push(Finding {
             id: "NAV-NO-TRAVERSAL".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "navigation".into(),
             summary: "No Tab traversal observed: the screen exposes no keyboard navigation order."
@@ -679,6 +700,7 @@ pub fn navigation_audit(
         .collect();
     findings.push(Finding {
         id: "NAV-ORDER".into(),
+        rule_id: None,
         severity: "info".into(),
         category: "navigation".into(),
         summary: format!(
@@ -706,6 +728,7 @@ pub fn navigation_audit(
     if !gaps.is_empty() {
         findings.push(Finding {
             id: "NAV-REVERSE-GAP".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "navigation".into(),
             summary: format!(
@@ -724,6 +747,7 @@ pub fn navigation_audit(
     } else {
         findings.push(Finding {
             id: "NAV-REVERSE-OK".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "navigation".into(),
             summary: "Shift+Tab exactly reverses Tab (every forward edge has its inverse).".into(),
@@ -774,6 +798,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         Err(e) => {
             findings.push(Finding {
                 id: "MOUSE-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "mouse".into(),
                 summary: format!("Cannot observe: {}", e),
@@ -792,6 +817,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
     if !caps.mouse {
         findings.push(Finding {
             id: "MOUSE-NO-CAPS".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "mouse".into(),
             summary: "Backend reports no mouse-encoding capability; clicks are sent but the app may never receive them.".into(),
@@ -843,6 +869,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
     if clickable.is_empty() {
         findings.push(Finding {
             id: "MOUSE-NO-TARGETS".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "mouse".into(),
             summary: "No safe clickable controls detected; nothing clicked (destructive-looking labels are never clicked by the audit).".into(),
@@ -887,6 +914,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             Err(e) => {
                 findings.push(Finding {
                     id: "MOUSE-SEND-ERR".into(),
+                    rule_id: None,
                     severity: "warn".into(),
                     category: "mouse".into(),
                     summary: format!("Click send failed at ({}, {}): {}", cx, cy, e),
@@ -926,6 +954,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             } else {
                 "MOUSE-UNRESPONSIVE".into()
             },
+            rule_id: None,
             severity: if unresponsive.is_empty() {
                 "info".into()
             } else {
@@ -976,6 +1005,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
             Err(e) => {
                 findings.push(Finding {
                     id: "PERF-ERR".into(),
+                    rule_id: None,
                     severity: "error".into(),
                     category: "performance".into(),
                     summary: format!("Observe failed during sampling: {}", e),
@@ -1028,6 +1058,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
             "PERF-OK"
         }
         .into(),
+        rule_id: None,
         severity: if slow_observe { "warn" } else { "info" }.into(),
         category: "performance".into(),
         summary: format!(
@@ -1052,6 +1083,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
     if settle_saturated {
         findings.push(Finding {
             id: "PERF-NEVER-QUIET".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "performance".into(),
             summary: "Screen kept changing through most settle windows: waits anchored on screen-stability will burn their budgets (animations, clocks, spinners).".into(),
@@ -1083,6 +1115,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         Err(e) => {
             findings.push(Finding {
                 id: "STATES-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "states".into(),
                 summary: format!("Cannot observe: {}", e),
@@ -1107,6 +1140,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     if !disabled.is_empty() {
         findings.push(Finding {
             id: "STATES-DISABLED".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "states".into(),
             summary: format!(
@@ -1138,6 +1172,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     if !empty_like.is_empty() {
         findings.push(Finding {
             id: "STATES-EMPTY-CONTROLS".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "states".into(),
             summary: format!(
@@ -1193,6 +1228,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         if !focused_disabled.is_empty() {
             findings.push(Finding {
                 id: "STATES-DISABLED-FOCUSABLE".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "states".into(),
                 summary: format!(
@@ -1217,6 +1253,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     if findings.is_empty() {
         findings.push(Finding {
             id: "STATES-OK".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "states".into(),
             summary: format!(
@@ -1251,6 +1288,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
         Err(e) => {
             findings.push(Finding {
                 id: "ERR-AUDIT-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "errors".into(),
                 summary: format!("Cannot observe: {}", e),
@@ -1305,6 +1343,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
     if was_running && !still_running {
         findings.push(Finding {
             id: "ERR-CRASH".into(),
+            rule_id: None,
             severity: "error".into(),
             category: "errors".into(),
             summary: format!(
@@ -1362,6 +1401,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 .collect();
             findings.push(Finding {
                 id: "ERR-ON-SCREEN".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "errors".into(),
                 summary: format!(
@@ -1385,6 +1425,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
         } else {
             findings.push(Finding {
                 id: "ERR-OK".into(),
+                rule_id: None,
                 severity: "info".into(),
                 category: "errors".into(),
                 summary: format!(
@@ -1420,6 +1461,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         Err(e) => {
             findings.push(Finding {
                 id: "COLOR-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "color".into(),
                 summary: format!("Cannot observe: {}", e),
@@ -1447,6 +1489,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         .count();
     findings.push(Finding {
         id: "COLOR-INVENTORY".into(),
+        rule_id: None,
         severity: "info".into(),
         category: "color".into(),
         summary: format!(

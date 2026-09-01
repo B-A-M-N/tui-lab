@@ -58,6 +58,21 @@ pub struct FindingExplanation {
     pub steps: Vec<ExplainStep>,
     /// Overall confidence in the chain, derived from how many steps resolved.
     pub trace_confidence: f32,
+    /// Probable cause sites carried by the finding (re-review item 30: the
+    /// explanation covers the repair path, not just the diagnosis). Empty
+    /// means none are known — never a guess.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<crate::semantic::source_ref::SourceRef>,
+    /// The subset of `source_refs` a repair pass should open first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actionable_source_refs: Vec<crate::semantic::source_ref::SourceRef>,
+    /// The replayable reproduction scenario id, when the finding has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reproduction: Option<String>,
+    /// How to verify a fix, derived from the reproduction. `None` when
+    /// there is no reproduction — declared absence, not invented advice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
 }
 
 /// Explain a finding using the probe that produced it (and optionally a
@@ -90,6 +105,22 @@ pub fn explain_finding(
         resolved as f32 / steps.len() as f32
     };
 
+    // Repair path (item 30): join the loci and reproduction the finding
+    // already carries — the explanation must move an agent from diagnosis
+    // to edit without another round of lookups.
+    let actionable_source_refs = finding
+        .source_refs
+        .iter()
+        .filter(|r| r.is_actionable())
+        .cloned()
+        .collect();
+    let verification = finding.reproduction.as_ref().map(|scen| {
+        format!(
+            "replay scenario '{}' and confirm the '{}' finding does not reappear",
+            scen, finding.id
+        )
+    });
+
     FindingExplanation {
         id: finding.id.clone(),
         category: finding.category.clone(),
@@ -97,6 +128,10 @@ pub fn explain_finding(
         gist,
         steps,
         trace_confidence,
+        source_refs: finding.source_refs.clone(),
+        actionable_source_refs,
+        reproduction: finding.reproduction.clone(),
+        verification,
     }
 }
 
@@ -373,6 +408,7 @@ mod tests {
     fn finding() -> Finding {
         Finding {
             id: "EXPL-1".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "discoverability".into(),
             summary: "focus affordance has no visible cue".into(),

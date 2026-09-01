@@ -60,6 +60,7 @@ pub fn build_tree_from_parts(
         state: NodeState::default(),
         children: Vec::new(),
         affordances: Vec::new(),
+        identity: None,
         confidence: Confidence::inferred(1.0, &["grid"]),
     };
 
@@ -139,6 +140,7 @@ fn hyperlink_to_node(link: &crate::screen::cell::Hyperlink) -> SemanticNode {
         state: NodeState::default(),
         children: Vec::new(),
         affordances: Vec::new(),
+        identity: None,
         confidence: Confidence::native(),
     }
 }
@@ -155,6 +157,7 @@ fn region_to_node(r: &Region) -> SemanticNode {
         state: NodeState::default(),
         children: Vec::new(),
         affordances: Vec::new(),
+        identity: None,
         confidence: r.confidence.clone(),
     }
 }
@@ -217,6 +220,7 @@ fn control_to_node(
         state,
         children: Vec::new(),
         affordances: own_affordances,
+        identity: None,
         confidence: c.confidence.clone(),
     }
 }

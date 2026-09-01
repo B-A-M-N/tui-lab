@@ -975,7 +975,11 @@ impl RunContext {
 
     /// Append findings from an audit pass (typed; audit item 60's foundation).
     pub fn extend_findings(&mut self, findings: Vec<crate::audit::Finding>) {
-        self.findings.extend(findings);
+        // Instance-unique ids (re-review P1 item 31): rule stays in
+        // `rule_id`, the instance id gains a stable (rule, target)
+        // discriminator, so two findings from one rule can never collide.
+        self.findings
+            .extend(findings.into_iter().map(|f| f.instance()));
     }
 
     /// Ingest findings, attaching probable source loci (W2.10) where the
@@ -2364,6 +2368,7 @@ mod tests {
         run.record_event("sess-fix", "wait");
         run.extend_findings(vec![crate::audit::Finding {
             id: "RESTORE-ME".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "test".into(),
             summary: "finding that must survive restore".into(),
@@ -2405,7 +2410,9 @@ mod tests {
             "non-interaction entries keep their honest settle"
         );
         assert_eq!(restored.findings().len(), 1);
-        assert_eq!(restored.findings()[0].id, "RESTORE-ME");
+        // IDs persist with their instance discriminator (Finding::instance
+        // at record time), so the restored id is the instanced form.
+        assert_eq!(restored.findings()[0].id, "RESTORE-ME@96ce2a8a");
         assert_eq!(restored.focus_transitions().len(), 1);
         // Scenario listable + loadable by id (name index rebuilt). The list
         // is keyed by id; the unambiguous name resolves to the same thing.
@@ -2570,6 +2577,7 @@ mod source_ref_tests {
     fn finding_pointing_at(control_id: &str) -> Finding {
         Finding {
             id: "TEST-001".into(),
+            rule_id: None,
             severity: "error".into(),
             category: "focus".into(),
             summary: "test finding".into(),

@@ -1037,6 +1037,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
         state: NodeState::default(),
         children: Vec::new(),
         affordances: Vec::new(),
+        identity: None,
         confidence: w.confidence.clone(),
     };
 
@@ -1066,6 +1067,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                 state: NodeState::default(),
                 children: Vec::new(),
                 affordances: Vec::new(),
+                identity: None,
                 confidence: w.confidence.clone(),
             };
             for (i, (x, l)) in w.detail.columns.iter().enumerate() {
@@ -1084,6 +1086,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                     state: NodeState::default(),
                     children: Vec::new(),
                     affordances: Vec::new(),
+                    identity: None,
                     confidence: w.confidence.clone(),
                 });
             }
@@ -1109,6 +1112,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                     },
                     children: Vec::new(),
                     affordances: Vec::new(),
+                    identity: None,
                     confidence: w.confidence.clone(),
                 };
                 for (ci, ((x, hl), cell)) in
@@ -1132,6 +1136,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                         state: NodeState::default(),
                         children: Vec::new(),
                         affordances: Vec::new(),
+                        identity: None,
                         confidence: w.confidence.clone(),
                     });
                 }
@@ -1165,6 +1170,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                     },
                     children: Vec::new(),
                     affordances: Vec::new(),
+                    identity: None,
                     confidence: w.confidence.clone(),
                 });
             }
@@ -1190,6 +1196,7 @@ pub fn widget_to_node(w: &Widget, screen: &ScreenState) -> crate::semantic::node
                     },
                     children: Vec::new(),
                     affordances: Vec::new(),
+                    identity: None,
                     confidence: w.confidence.clone(),
                 });
             }

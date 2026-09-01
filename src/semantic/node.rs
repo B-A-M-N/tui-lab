@@ -237,6 +237,12 @@ pub struct SemanticNode {
     /// Affordances this node itself advertises (key hints, shortcuts).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affordances: Vec<Affordance>,
+    /// Re-review P1 item 28: the joined identity — semantic id (this
+    /// node's own id), native id, contract component name, and source
+    /// loci — so a finding can move from rendered problem to source edit.
+    /// `None` for pure inference with no joins (omitted on serialize).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::semantic::source_ref::ComponentIdentity>,
     pub confidence: Confidence,
 }
 
@@ -414,6 +420,7 @@ mod tests {
             state: NodeState::default(),
             children: Vec::new(),
             affordances: Vec::new(),
+            identity: None,
             confidence: Confidence::inferred(0.9, &["test"]),
         }
     }

@@ -126,7 +126,16 @@ impl EvidenceRef {
 /// Part XV) — a Finding can carry many citations, not just one inline blob.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
+    /// Instance-unique id (re-review P1: three clipped regions used to all
+    /// read `CLIP-001`, making every downstream citation ambiguous). The
+    /// rule is preserved in [`Self::rule_id`]; the instance id is the
+    /// rule plus a stable target/context discriminator assigned by
+    /// [`Finding::instance`].
     pub id: String,
+    /// The audit rule that produced this finding (`CLIP-001`,
+    /// `FOCUS-001`, …) — stable across runs, the comparison key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
     pub severity: String, // error | warn | info
     pub category: String,
     pub summary: String,
@@ -149,6 +158,42 @@ pub struct Finding {
 }
 
 impl Finding {
+    /// Split rule id + instance discriminator (re-review P1 item 31): the
+    /// instance id is unique per (rule, semantic target) pair, stable for
+    /// the same target on the same rule — comparisons fingerprint rule +
+    /// target, and two distinct clipped regions can never collide.
+    pub fn instance(mut self) -> Self {
+        let rule = self.rule_id.clone().unwrap_or_else(|| self.id.clone());
+        // Discriminator: the first evidence target (region/control id,
+        // screen hash, …) — the semantic target of the finding.
+        let target = self
+            .evidence
+            .first()
+            .map(|e| e.target.clone())
+            .unwrap_or_default();
+        if self.rule_id.is_none() {
+            self.rule_id = Some(rule.clone());
+        }
+        if target.as_deref().map(str::is_empty).unwrap_or(true) {
+            self.id = rule;
+        } else {
+            self.id = format!("{rule}@{}", short_hash(&rule, &target.unwrap_or_default()));
+        }
+        self
+    }
+}
+
+/// Stable 8-hex discriminator for a (rule, target) pair.
+fn short_hash(rule: &str, target: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    rule.hash(&mut h);
+    target.hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
+
+impl Finding {
     /// Build a finding with a single screen-snapshot evidence ref.
     pub fn with_screen(
         id: impl Into<String>,
@@ -162,6 +207,7 @@ impl Finding {
         let hash: String = screen_hash.into();
         Finding {
             id: id.into(),
+            rule_id: None,
             severity: severity.into(),
             category: category.into(),
             summary: s.clone(),
@@ -201,6 +247,7 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
     if want("navigation") {
         out.push(Finding {
             id: "NAV-INFO".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "navigation".into(),
             summary: "Navigation graph is built incrementally by tui_explore; static graph not available from a single frame.".into(),
@@ -221,6 +268,7 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
         );
         out.push(Finding {
             id: format!("{}-INFO", profile_name.to_uppercase()),
+            rule_id: None,
             severity: "info".into(),
             category: profile_name.clone(),
             summary: summary.clone(),
@@ -244,6 +292,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
         let summary = "No detectable focus target on this screen.".to_string();
         out.push(Finding {
             id: "FOCUS-001".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "focus".into(),
             summary: summary.clone(),
@@ -264,6 +313,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
         );
         out.push(Finding {
             id: "FOCUS-OK".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "focus".into(),
             summary: summary.clone(),
@@ -288,6 +338,7 @@ fn static_clipping_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
             let summary = format!("Region '{}' extends beyond terminal bounds.", rg.id);
             out.push(Finding {
                 id: "CLIP-001".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "clipping".into(),
                 summary: summary.clone(),
@@ -327,6 +378,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
         let summary = "No keyboard affordances detected on this screen.".to_string();
         out.push(Finding {
             id: "DISC-001".into(),
+            rule_id: None,
             severity: "warn".into(),
             category: "discoverability".into(),
             summary: summary.clone(),
@@ -348,6 +400,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
     );
     out.push(Finding {
         id: "DISC-OK".into(),
+        rule_id: None,
         severity: "info".into(),
         category: "discoverability".into(),
         summary: summary.clone(),
@@ -388,6 +441,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
             );
             out.push(Finding {
                 id: format!("DISC-HIDDEN-{}", verb.to_uppercase()),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "discoverability".into(),
                 summary: s.clone(),
@@ -420,6 +474,7 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
         let button_labels: Vec<String> = buttons.iter().map(|b| b.label.clone()).collect();
         out.push(Finding {
             id: "KB-INFO".into(),
+            rule_id: None,
             severity: "info".into(),
             category: "keyboard".into(),
             summary: summary.clone(),
