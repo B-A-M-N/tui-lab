@@ -686,6 +686,30 @@ impl Session {
         self.absorb_native_events();
     }
 
+    /// Wave-2 (protocol diagnostics): the backend's retained raw output
+    /// window — `(bytes, ring_capacity, bytes_dropped)` — for the protocol
+    /// decoder. `(0, 0)` capacity means the engine retains nothing.
+    pub fn raw_output_window(&mut self) -> (Vec<u8>, usize, u64) {
+        let bytes = self.backend.recent_raw_output().unwrap_or_default();
+        let (cap, dropped) = self.backend.raw_output_stats();
+        (bytes, cap, dropped)
+    }
+
+    /// Wave-2 (streams): the pipe engine's genuine stdout/stderr line
+    /// separation. Returns `(stdout, stderr)`; `(empty, empty)` on engines
+    /// that interleave by construction.
+    pub fn pipe_streams(&mut self) -> (Vec<String>, Vec<String>) {
+        // Downcast through the known engine shape: the pipe backend is
+        // uniquely reachable here (BackendKind::Pipe gates the caller).
+        let any = self.backend.as_any_mut();
+        if let Some(pipe) = any.downcast_mut::<crate::backend::pipe::PipeBackend>() {
+            // Safe interior path: pump + clone the stores.
+            (pipe.stdout_lines_pub(), pipe.stderr_lines_pub())
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    }
+
     /// Overlay the latest native snapshot onto an inferred semantic tree,
     /// returning the merge report. Native claims win over inference with
     /// `source: "native"` / confidence 1.0; unmatched native ids are

@@ -89,11 +89,21 @@ pub struct PtyLineBackend {
     /// Ring-capped — a burst longer than the ring degrades to the old
     /// behavior for its head, never to wrong data.
     edge_snaps: std::collections::VecDeque<(u64, ScreenState)>,
+    /// Wave-2 (protocol diagnostics): bounded ring of the child's real raw
+    /// output bytes (escape sequences included) for the protocol decoder.
+    raw_ring: std::collections::VecDeque<u8>,
+    /// Bytes dropped off the raw ring's head (declared eviction).
+    raw_dropped: u64,
 }
 
 /// How many per-edge snapshots to retain. Covers realistic redraw bursts
 /// (progress bars, table refreshes) with a small fixed cost per edge.
 const EDGE_SNAP_CAP: usize = 64;
+
+/// Wave-2 (protocol diagnostics): raw-output ring capacity, shared contract
+/// with the portable PTY backend — 256 KiB, head-drop declared through
+/// `raw_output_stats`.
+const RAW_RING_CAPACITY: usize = 256 * 1024;
 
 impl PtyLineBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -124,6 +134,8 @@ impl PtyLineBackend {
             pending: String::new(),
             lines_evicted: 0,
             edge_snaps: std::collections::VecDeque::new(),
+            raw_ring: std::collections::VecDeque::new(),
+            raw_dropped: 0,
         }
     }
 
@@ -202,6 +214,28 @@ impl PtyLineBackend {
         }
     }
 
+    /// Wave-2 (protocol diagnostics): push raw child bytes into the bounded
+    /// ring, declaring head eviction. Bounded at [`RAW_RING_CAPACITY`].
+    fn absorb_raw(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.raw_ring.len() >= RAW_RING_CAPACITY {
+                self.raw_ring.pop_front();
+                self.raw_dropped += 1;
+            }
+            self.raw_ring.push_back(b);
+        }
+    }
+
+    /// The retained raw output (oldest first) plus declared drop stats.
+    pub fn raw_output_window(&mut self) -> (Vec<u8>, usize, u64) {
+        self.pump();
+        (
+            self.raw_ring.iter().copied().collect(),
+            RAW_RING_CAPACITY,
+            self.raw_dropped,
+        )
+    }
+
     fn pump(&mut self) {
         loop {
             let chunk = {
@@ -213,6 +247,9 @@ impl PtyLineBackend {
                     None => break,
                 }
             };
+            // Raw ring first (Wave-2): the child's real bytes, before the
+            // line model folds them.
+            self.absorb_raw(&chunk);
             self.ingest(&chunk);
             self.output_seq += 1;
             self.last_output_at_ms = crate::backend::line_types::now_ms();
@@ -313,6 +350,20 @@ impl PtyLineBackend {
 }
 
 impl TerminalBackend for PtyLineBackend {
+    fn recent_raw_output(&mut self) -> BackendResult<Vec<u8>> {
+        let (bytes, _cap, _dropped) = self.raw_output_window();
+        Ok(bytes)
+    }
+
+    fn raw_output_stats(&mut self) -> (usize, u64) {
+        let (_bytes, cap, dropped) = self.raw_output_window();
+        (cap, dropped)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn start(
         &mut self,
         command: &str,

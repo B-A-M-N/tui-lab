@@ -116,6 +116,29 @@ pub trait TerminalBackend: Send {
         Ok(Vec::new())
     }
 
+    /// Wave-2 (protocol diagnostics): the most recent raw output bytes,
+    /// oldest first, from a bounded ring. This is the child's REAL byte
+    /// stream — escape sequences, OSC, DCS and all — so the protocol
+    /// decoder can answer "what did this TUI actually emit?". The ring is
+    /// bounded (`recent_raw_output_capacity`); when output exceeds it the
+    /// head is dropped and `recent_raw_output_dropped` reports how many
+    /// bytes were lost, so a caller never mistakes a partial window for the
+    /// whole stream. Default: not retained (honest empty + dropped=0 is
+    /// still distinguishable through the capacity=0 report).
+    fn recent_raw_output(&mut self) -> BackendResult<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    /// Capacity of the raw-output ring (0 = not retained), and how many
+    /// bytes were dropped off its head so far. Returns `(capacity, dropped)`.
+    fn raw_output_stats(&mut self) -> (usize, u64) {
+        (0, 0)
+    }
+
+    /// Downcast hook for engine-specific capability surfaces (the pipe
+    /// backend's stdout/stderr separation). Engines return `self`.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
     /// Wave F item 53: search viewport + scrollback for a case-insensitive
     /// substring. Returns every hit with its region and (for viewport hits)
     /// cell coordinates so a caller can click it. Default searches the

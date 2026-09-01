@@ -329,9 +329,22 @@ impl PipeBackend {
         self.pump();
         self.stdout_lines.clone()
     }
+
+    /// Session-facing stream read (Wave-2 streams mode): `(stdout, stderr)`
+    /// via the trait's downcast hook. Same data as the two accessors above.
+    pub fn stdout_lines_pub(&mut self) -> Vec<String> {
+        self.stdout_lines()
+    }
+
+    pub fn stderr_lines_pub(&mut self) -> Vec<String> {
+        self.stderr_lines()
+    }
 }
 
 impl TerminalBackend for PipeBackend {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn start(
         &mut self,
         command: &str,
