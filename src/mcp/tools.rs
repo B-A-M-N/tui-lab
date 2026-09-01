@@ -1234,12 +1234,25 @@ impl TuiLabServer {
                 let rec_id = match (&p.recording_id, &p.name) {
                     (Some(id), _) => id.clone(),
                     (None, Some(name)) => {
+                        // Item 45: an ambiguous name is refused with the
+                        // conflicting ids — never an oldest-match guess.
                         match self.run.lock().unwrap().find_recording_by_name(name) {
-                            Some(id) => id,
-                            None => {
+                            Ok(id) => id,
+                            Err(ids) if ids.is_empty() => {
                                 return err(
                                     ErrorCategory::InvalidRequest,
-                                    format!("no recording in progress named '{}'", name),
+                                    format!("no recording in progress named '{name}'"),
+                                )
+                            }
+                            Err(ids) => {
+                                return err(
+                                    ErrorCategory::InvalidRequest,
+                                    format!(
+                                        "'{name}' matches {} recordings in progress — pass \
+                                         recording_id explicitly: {}",
+                                        ids.len(),
+                                        ids.join(", ")
+                                    ),
                                 )
                             }
                         }

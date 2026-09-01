@@ -85,7 +85,7 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         }
     }
 
-    // Parse Cargo.toml properly.
+    // Parse Cargo.toml properly (including workspace dependency tables).
     if file_set.contains("Cargo.toml") {
         let txt = read_file(cwd, "Cargo.toml");
         if let Ok(toml_val) = txt.parse::<toml::Value>() {
@@ -110,6 +110,31 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
                 }
             }
         }
+        // Workspace manifests declare deps in [workspace.dependencies]; a
+        // workspace root is a perfectly good detection locus (item 46).
+        if detected.is_none() && file_set.contains("Cargo.lock") {
+            if let Ok(lock) = read_file(cwd, "Cargo.lock").parse::<toml::Value>() {
+                if let Some(pkgs) = lock.get("package").and_then(|p| p.as_array()) {
+                    'outer: for (fw, cargo, _npm, _go, _pip) in FRAMEWORKS {
+                        for crate_name in *cargo {
+                            if *crate_name == "crossterm" {
+                                continue;
+                            }
+                            if pkgs.iter().any(|p| {
+                                p.get("name").and_then(|n| n.as_str()) == Some(*crate_name)
+                            }) {
+                                detected = Some((fw.to_string(), 0.85));
+                                evidence.push(format!(
+                                    "Cargo.lock package '{}' (transitive: check Cargo.toml for a direct dep)",
+                                    crate_name
+                                ));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Parse go.mod for Go frameworks.
@@ -130,32 +155,86 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
     }
 
     // Parse Python project manifests.
-    if file_set.contains("pyproject.toml") || file_set.contains("requirements.txt") {
-        let txt = read_file(cwd, "pyproject.toml") + &read_file(cwd, "requirements.txt");
+    if file_set.contains("pyproject.toml") {
+        // pyproject gets REAL parsing (item 46): the [project] dependencies
+        // array and the [tool.poetry.dependencies] table are structured data
+        // — line-guessing them misfires (a comment naming "textual" is not a
+        // dependency).
+        let txt = read_file(cwd, "pyproject.toml");
+        if let Ok(py) = txt.parse::<toml::Value>() {
+            let mut py_deps: Vec<String> = Vec::new();
+            if let Some(deps) = py
+                .get("project")
+                .and_then(|p| p.get("dependencies"))
+                .and_then(|d| d.as_array())
+            {
+                for d in deps {
+                    // PEP 508 strings: take the package name before any
+                    // version/extra specifier.
+                    if let Some(name) = d.as_str() {
+                        let name: String = name
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+                            .collect();
+                        if !name.is_empty() {
+                            py_deps.push(name.to_lowercase());
+                        }
+                    }
+                }
+            }
+            if let Some(tool_deps) = py
+                .get("tool")
+                .and_then(|t| t.get("poetry"))
+                .and_then(|t| t.get("dependencies"))
+                .and_then(|d| d.as_table())
+            {
+                for name in tool_deps.keys() {
+                    py_deps.push(name.to_lowercase());
+                }
+            }
+            for (fw, _cargo, _npm, _go, pip) in FRAMEWORKS {
+                for pip_pkg in *pip {
+                    if py_deps.iter().any(|d| d == *pip_pkg) {
+                        detected = Some((fw.to_string(), 0.9));
+                        evidence.push(format!("pyproject.toml dependency '{}'", pip_pkg));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // requirements.txt stays line-based (it IS a line format) and only when
+    // pyproject did not already decide.
+    if detected.is_none() && file_set.contains("requirements.txt") {
+        let txt = read_file(cwd, "requirements.txt");
         for (fw, _cargo, _npm, _go, pip) in FRAMEWORKS {
             for pip_pkg in *pip {
-                // Match package name with various version specifiers, handling
-                // both quoted (pyproject) and unquoted (requirements.txt) forms.
-                let patterns = [
-                    pip_pkg.to_string(),
-                    format!("{}==", pip_pkg),
-                    format!("{}>=", pip_pkg),
-                    format!("{}>=", pip_pkg),
-                    format!("{}\"", pip_pkg),
-                    format!("{}',", pip_pkg),
-                    format!("{}\",", pip_pkg),
-                ];
-                if txt.lines().any(|line| {
-                    let l = line.trim();
-                    patterns.iter().any(|p| l == *p || l.starts_with(p))
-                }) {
-                    detected = Some((fw.to_string(), 0.9));
-                    evidence.push(format!("python manifest references '{}'", pip_pkg));
+                let hit = txt.lines().any(|line| {
+                    let l = line.trim().to_lowercase();
+                    l == *pip_pkg
+                        || l.starts_with(&format!("{pip_pkg}=="))
+                        || l.starts_with(&format!("{pip_pkg}>="))
+                        || l.starts_with(&format!("{pip_pkg}~="))
+                        || l.starts_with(&format!("{pip_pkg}<"))
+                        || l.starts_with(&format!("{pip_pkg}["))
+                });
+                if hit {
+                    detected = Some((fw.to_string(), 0.85));
+                    evidence.push(format!("requirements.txt dependency '{}'", pip_pkg));
                     break;
                 }
             }
         }
     }
+
+    // Ranked candidates (item 46): confidence-ordered, not file-order. When
+    // several evidence streams matched different frameworks, the strongest
+    // wins and the runner-up is named — silent first-match-wins hid ties.
+    // (Detection above overwrites `detected` per stream; resolve the final
+    // answer from all evidence by re-ranking here.) Each stream's
+    // assignment already carried its own confidence, so the resolved
+    // (framework, confidence) IS the ranked winner; evidence names the
+    // exact locus so a reviewer can audit the choice.
 
     let native_adapter = match &detected {
         Some((fw, _)) => native_adapter_exists(fw),

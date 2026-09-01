@@ -229,7 +229,11 @@ impl Finding {
 }
 
 /// Run the requested audit profile and return evidence-backed findings.
-pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
+pub fn run(
+    profile: &str,
+    screen: &ScreenState,
+    sem: &SemanticScreen,
+) -> anyhow::Result<Vec<Finding>> {
     let mut out = Vec::new();
     let want = |p: &str| profile == "full" || profile == p;
     if want("focus") {
@@ -244,45 +248,27 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
     if want("keyboard") {
         out.extend(static_keyboard_audit(sem));
     }
-    if want("navigation") {
-        out.push(Finding {
-            id: "NAV-INFO".into(),
-            rule_id: None,
-            severity: "info".into(),
-            category: "navigation".into(),
-            summary: "Navigation graph is built incrementally by tui_explore; static graph not available from a single frame.".into(),
-            evidence: vec![EvidenceRef::screen(
-                screen.structure_hash.clone(),
-                "static navigation graph not derivable from a single frame",
-            )],
-            confidence: 1.0,
-            reproduction: None,
-            source_refs: Vec::new(),
-        });
+    // Re-review item 44: profiles with NO static pass are caller errors,
+    // never fabricated `info` rows. This static entry point only accepts
+    // profiles it can actually check; the active profiles (color,
+    // performance, mouse, states, errors, navigation, contract) run
+    // through the orchestrator's real drivers instead.
+    if !static_profile_available(profile) {
+        return Err(anyhow::anyhow!(
+            "profile '{}' has no static checks; use an audit action that drives \
+             the app (probe/explore/orchestrator) or a profile with static checks \
+             (focus, layout, discoverability, keyboard)",
+            profile
+        ));
     }
-    if want("color") || want("performance") || want("mouse") || want("states") || want("errors") {
-        let profile_name = profile.to_string();
-        let summary = format!(
-            "Profile '{}' static checks not yet implemented; structure available via tui_observe mode=semantic.",
-            profile_name
-        );
-        out.push(Finding {
-            id: format!("{}-INFO", profile_name.to_uppercase()),
-            rule_id: None,
-            severity: "info".into(),
-            category: profile_name.clone(),
-            summary: summary.clone(),
-            evidence: vec![EvidenceRef::screen(screen.structure_hash.clone(), summary)
-                .with_detail(json!({
-                    "note": "static profile not implemented; use tui_observe mode=semantic",
-                    "profile": profile_name,
-                }))],
-            confidence: 1.0,
-            reproduction: None,
-            source_refs: Vec::new(),
-        });
-    }
-    out
+    Ok(out)
+}
+
+/// Whether `profile` is a static profile this build can actually run.
+/// The MCP audit surface validates with this instead of discovering the
+/// gap in the results (item 44: no placeholder findings).
+pub fn static_profile_available(profile: &str) -> bool {
+    matches!(profile, "full" | "focus" | "layout" | "clipping" | "discoverability" | "keyboard")
 }
 
 fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
@@ -581,10 +567,15 @@ mod tests {
     fn full_profile_runs() {
         let s = screen(vec!["[ OK ]", "q quit"]);
         let sem = crate::semantic::analyze(&s);
-        let findings = run("full", &s, &sem);
+        let findings = run("full", &s, &sem).expect("full is static-available");
         assert!(
             findings.iter().any(|f| f.category == "discoverability"),
             "discoverability runs in the full profile"
         );
+        // Item 44: a profile without static checks is a caller error, not
+        // a fabricated info finding.
+        assert!(run("mouse", &s, &sem).is_err());
+        assert!(static_profile_available("focus"));
+        assert!(!static_profile_available("mouse"));
     }
 }
