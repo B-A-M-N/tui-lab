@@ -790,3 +790,192 @@ fn fused_semantic_truth_across_all_shapes() {
     sess.stop().ok();
     std::fs::remove_file(path).ok();
 }
+
+// ─── Wave 6: durability/performance (items 49–52) ────────────────────────
+
+/// Item 49: the audit transaction reports its own timing — driver/verify/
+/// total milliseconds ride on the last finding's evidence, and a clean run
+/// still produces the AUDIT-METRICS info finding so the numbers never
+/// vanish.
+#[test]
+fn audit_transaction_reports_timing_metrics() {
+    let mut s = tui_lab::session::Session::new("w6-metrics".into(), "python3".into());
+    s.start_with_spec(tui_lab::session::state::LaunchSpec {
+        command: "python3".into(),
+        args: vec!["-c".into(), "print('w6'); input()".into()],
+        cwd: None,
+        env: vec![],
+        cols: 80,
+        rows: 24,
+        backend: "auto".into(),
+        isolation: "local".into(),
+    })
+    .expect("start");
+
+    // A driver that finds something: metrics attach to the last finding.
+    let findings = tui_lab::audit::transaction::run_verified(&mut s, "probe", |_sess| {
+        vec![tui_lab::audit::Finding {
+            id: "PROBE-1".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "probe".into(),
+            summary: "probe hit".into(),
+            evidence: vec![tui_lab::audit::EvidenceRef::point(
+                tui_lab::audit::EvidenceKind::Other,
+                "probe/target",
+                "hit",
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        }]
+    })
+    .expect("run");
+    assert_eq!(findings.len(), 1);
+    let m = findings[0].evidence[0].detail["audit_metrics"].clone();
+    assert_eq!(m["profile"], "probe");
+    assert!(
+        m["total_ms"].is_u64(),
+        "timing present on the finding: {m}"
+    );
+    assert!(
+        m["total_ms"].as_u64().unwrap() >= m["driver_ms"].as_u64().unwrap_or(0),
+        "total covers the driver phase: {m}"
+    );
+
+    // A clean driver: the AUDIT-METRICS info finding carries the numbers.
+    let clean = tui_lab::audit::transaction::run_verified(&mut s, "noop", |_| Vec::new())
+        .expect("clean run");
+    assert_eq!(clean.len(), 1, "exactly the metrics finding");
+    assert_eq!(clean[0].id, "AUDIT-METRICS");
+    assert_eq!(clean[0].severity, "info");
+    let cm = clean[0].evidence[0].detail["audit_metrics"].clone();
+    assert_eq!(cm["profile"], "noop");
+    assert!(cm["verify_ms"].is_u64(), "verify phase timed: {cm}");
+    s.stop().ok();
+}
+
+/// Item 51: committed frames land in a bounded hot ring queryable by
+/// citable id — ids, hashes, seqs, semantic identity — with declared
+/// eviction past the bound. The full grid stays cold.
+#[test]
+fn frame_records_are_hot_queryable_and_bounded() {
+    let mut run = tui_lab::run::RunContext::ephemeral();
+    let mut f1 = tui_lab::backend::CanonicalFrame::new(
+        tui_lab::screen::ScreenState::new(80, 24),
+        1,
+        10,
+    );
+    f1.state.structure_hash = "w6-a".into();
+    f1.state.visual_hash = "v-w6-a".into();
+    let id1 = run.commit_frame(&mut f1, Some("w6-sess"));
+    let mut f2 = tui_lab::backend::CanonicalFrame::new(
+        tui_lab::screen::ScreenState::new(80, 24),
+        2,
+        11,
+    );
+    f2.state.structure_hash = "w6-b".into();
+    let id2 = run.commit_frame(&mut f2, Some("w6-sess"));
+
+    let r1 = run.frame_record(id1).expect("hot record for frame 1");
+    assert_eq!(r1.session.as_deref(), Some("w6-sess"));
+    assert_eq!(r1.structure_hash, "w6-a");
+    assert_eq!(r1.visual_hash, "v-w6-a");
+    assert_eq!(r1.screen_seq, 1);
+    assert!(!r1.semantic_identity.is_empty(), "semantic identity stamped");
+    assert!(r1.commit_us <= 1_000_000, "commit timing plausible");
+    assert_eq!(run.frame_record(id2).expect("frame 2").screen_seq, 2);
+    assert_eq!(run.frame_hot_records().count(), 2, "both resident");
+
+    // Overflow: eviction is declared, never silent.
+    for i in 0..(tui_lab::run::FRAME_HOT_RING as u64 + 10) {
+        let mut f = tui_lab::backend::CanonicalFrame::new(
+            tui_lab::screen::ScreenState::new(80, 24),
+            100 + i,
+            0,
+        );
+        f.state.structure_hash = format!("w6-overflow-{i}");
+        run.commit_frame(&mut f, None);
+    }
+    assert!(
+        run.frame_hot_evicted() >= 10,
+        "eviction counted: {}",
+        run.frame_hot_evicted()
+    );
+    assert!(
+        run.frame_record(id1).is_none(),
+        "oldest record left the hot ring"
+    );
+    let status = run.status(Vec::new());
+    assert_eq!(status["frames"]["hot_evicted"], serde_json::json!(run.frame_hot_evicted()));
+    assert!(
+        status["frames"]["hot_resident"].as_u64().unwrap()
+            <= tui_lab::run::FRAME_HOT_RING as u64
+    );
+}
+
+/// Item 52: the fused commit is reactive — an unchanged frame identity is
+/// served from the memo (hits rise, no recompute), and any invalidating
+/// input (new frame, fresh native events) recomputes correctly.
+#[test]
+fn fused_commit_is_reactive_and_correctly_invalidated() {
+    use tui_lab::session::state::{LaunchSpec, Session};
+    let fixture = env!("CARGO_MANIFEST_DIR").to_string() + "/fixtures/nsp_tui.py";
+    let mut sess = Session::new("w6-reactive".into(), "python3".into());
+    sess.start_with_spec(LaunchSpec {
+        command: "python3".into(),
+        args: vec![fixture],
+        cwd: None,
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        backend: "auto".into(),
+        isolation: "local".into(),
+    })
+    .expect("start");
+    sess.observe(60).expect("first observe");
+    let hits_before = sess.fused_memo_hits();
+
+    // Same frame identity: repeated fused reads are memo-served.
+    let (sem1, tree1, report1) = sess.fused_frame().expect("fused 1");
+    let (sem2, tree2, report2) = sess.fused_frame().expect("fused 2");
+    assert_eq!(sem2.focus.control, sem1.focus.control);
+    assert_eq!(tree2.root.id, tree1.root.id);
+    assert_eq!(report2.native_ids, report1.native_ids);
+    assert!(
+        sess.fused_memo_hits() > hits_before,
+        "memo served repeat reads: {} -> {}",
+        hits_before,
+        sess.fused_memo_hits()
+    );
+
+    // Invalidate via explicit hook, and confirm recompute gives the same
+    // answer (correctness of the reactive path, not a stale memo).
+    sess.invalidate_fused();
+    let hits_mid = sess.fused_memo_hits();
+    let (sem3, _t3, r3) = sess.fused_frame().expect("fused 3");
+    assert_eq!(sem3.focus.control, sem1.focus.control, "same truth after recompute");
+    assert_eq!(r3.native_ids, report1.native_ids);
+    assert_eq!(
+        sess.fused_memo_hits(),
+        hits_mid,
+        "recompute did not count as a hit"
+    );
+
+    // A new frame (focus move changes the app's declared tree) invalidates
+    // through the key: the memo must not serve stale facts.
+    sess.send(tui_lab::backend::Input::Key(tui_lab::backend::KeyEvent::new(
+        tui_lab::backend::KeyCode::Right,
+    )))
+    .expect("focus move");
+    sess.observe(150).expect("observe after move");
+    let (sem4, _t4, _r4) = sess.fused_frame().expect("fused 4");
+    assert!(
+        sess.fused_memo_hits() == hits_mid,
+        "a new frame is a new identity — no memo hit for it"
+    );
+    let _ = sem4;
+
+    sess.stop().ok();
+    std::fs::remove_file(sess.native_channel().path.clone().unwrap()).ok();
+}
