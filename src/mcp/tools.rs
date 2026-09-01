@@ -611,6 +611,14 @@ impl TuiLabServer {
                         "active": sess.native_channel().latest.is_some(),
                         "framework": sess.native_channel().framework,
                     },
+                    // Cache layers (re-review item 41): the structural cache's
+                    // health is evidence — a hit rate near 1.0 on a static
+                    // screen says the fused path is not re-running detectors.
+                    "semantic_cache": {
+                        "hits": sess.semantic_cache_hits(),
+                        "misses": sess.semantic_cache_misses(),
+                        "hit_rate": sess.semantic_cache_hit_rate(),
+                    },
                 }))
             }
             OM::Screen => {
@@ -859,20 +867,27 @@ impl TuiLabServer {
             let frame_refs = {
                 let (sid, gen) = (sess.id.clone(), sess.generation);
                 let mut run = run.lock().unwrap();
-                // Citable frame identities (Wave B item 11): both frames get
-                // per-run ids and full provenance.
-                let b = run.register_frame(&mut {
-                    let mut f = tx.before_frame.clone();
-                    f.session_id = Some(sid.clone());
-                    f.generation = Some(gen);
-                    f
-                });
-                let a = run.register_frame(&mut {
-                    let mut f = tx.after_frame.clone();
-                    f.session_id = Some(sid.clone());
-                    f.generation = Some(gen);
-                    f
-                });
+                // Frame commit pipeline (re-review item 40): both frames go
+                // through the ONE commit path — id + provenance + incremental
+                // frames.jsonl append for persistent runs.
+                let b = run.commit_frame(
+                    &mut {
+                        let mut f = tx.before_frame.clone();
+                        f.session_id = Some(sid.clone());
+                        f.generation = Some(gen);
+                        f
+                    },
+                    Some(&sid),
+                );
+                let a = run.commit_frame(
+                    &mut {
+                        let mut f = tx.after_frame.clone();
+                        f.session_id = Some(sid.clone());
+                        f.generation = Some(gen);
+                        f
+                    },
+                    Some(&sid),
+                );
                 // Run ledger (Wave-2 item 15): the reconstructable transaction
                 // record, not just a counter. The ledger projects the action
                 // through the visibility policy — sensitive payloads are stored

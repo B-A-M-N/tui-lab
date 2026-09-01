@@ -385,6 +385,12 @@ pub struct InteractionTransaction {
     pub focus_after: Option<(Option<String>, Option<String>)>,
     /// Total act latency (send + settle) in milliseconds.
     pub elapsed_ms: u64,
+    /// Phase timings (re-review item 39): how long the input send took vs
+    /// how long the settle wait took, in milliseconds. `send_ms` isolates
+    /// transport/harness cost; `settle_ms` isolates the app's own response
+    /// time. Together they answer "was the app slow, or were we?"
+    pub send_ms: u64,
+    pub settle_ms: u64,
 }
 
 /// Action + persistence policy as one unit (leak fix): the executor always
@@ -616,7 +622,9 @@ pub fn execute_act_with_completion(
         InputVisibility::Sensitive | InputVisibility::NeverPersist
     );
     let mut window = ActTransactionGuard::begin(session, sensitive_window);
+    let send_start = std::time::Instant::now();
     let send_result = window.sess().send(action.to_input());
+    let send_ms = send_start.elapsed().as_millis() as u64;
     let send_failed = send_result.is_err();
     if send_failed {
         send_result?;
@@ -626,6 +634,7 @@ pub fn execute_act_with_completion(
     // no_wait flag: act, capture a fresh frame, report settlement as Skipped
     // (never a fake "settled").
     let skip = no_wait || matches!(completion, CompletionPolicy::NoWait);
+    let settle_start = std::time::Instant::now();
     let (settle, elapsed_ms, after_state, after_screen_seq, capture) = if skip {
         // Even with no_wait, capture a fresh frame so callers always get
         // both before and after — but settlement was NOT tested. Reporting
@@ -656,6 +665,7 @@ pub fn execute_act_with_completion(
             Some(capture),
         )
     };
+    let settle_ms = settle_start.elapsed().as_millis() as u64;
 
     let transition = crate::screen::diff(&before_frame.state, &after_state);
     let mut after_frame = CanonicalFrame::new(
@@ -689,6 +699,8 @@ pub fn execute_act_with_completion(
         focus_before,
         focus_after,
         elapsed_ms,
+        send_ms,
+        settle_ms,
     })
 }
 

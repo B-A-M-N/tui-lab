@@ -83,34 +83,20 @@ impl SemanticCache {
         let pair = crate::semantic::detect_frame(screen);
         let sem = pair.0;
         // Retain the last-analyzed frame (so a two-frame repaint alternation
-        // stays hot) before enforcing the cap.
+        // stays hot) before enforcing the cap — the shared retention rule.
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
             self.entries.remove(pos);
         }
         self.entries.push((key.clone(), (sem.clone(), pair.1)));
-        if self.entries.len() > MAX_ENTRIES {
-            // Keep the two most-recent distinct frames (the newest we just
-            // pushed plus the distinct prior one) so a two-frame repaint
-            // alternation stays hot; the rest are evicted.
-            let mut kept: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))> =
-                Vec::with_capacity(2);
-            for (k, s) in self.entries.iter().rev() {
-                if kept.is_empty() || kept[0].0 != *k {
-                    if kept.len() == 2 {
-                        break;
-                    }
-                    kept.push((k.clone(), s.clone()));
-                }
-            }
-            self.entries = kept;
-        }
+        self.enforce_retention();
         CacheResult { sem, hit: false, key }
     }
 
     /// Insert a precomputed (flat, tree) pair for `key`. The fused path
     /// (`crate::semantic::fuse`) uses this when it already ran
     /// [`crate::semantic::detect_frame`] via a cache miss on the pair-level
-    /// lookup.
+    /// lookup. Same retention policy as [`Self::analyze`] — the two entry
+    /// paths can never drift apart in what they keep.
     pub fn insert(
         &mut self,
         key: String,
@@ -120,19 +106,28 @@ impl SemanticCache {
             self.entries.remove(pos);
         }
         self.entries.push((key, pair));
-        if self.entries.len() > MAX_ENTRIES {
-            let mut kept: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))> =
-                Vec::with_capacity(2);
-            for (k, s) in self.entries.iter().rev() {
-                if kept.is_empty() || kept[0].0 != *k {
-                    if kept.len() == 2 {
-                        break;
-                    }
-                    kept.push((k.clone(), s.clone()));
-                }
-            }
-            self.entries = kept;
+        self.enforce_retention();
+    }
+
+    /// Shared eviction (re-review item 41): keep the two most-recent
+    /// distinct frames (so a two-frame repaint alternation stays hot),
+    /// drop the rest. Both `analyze` and `insert` go through this, so the
+    /// layers stay consistent.
+    fn enforce_retention(&mut self) {
+        if self.entries.len() <= MAX_ENTRIES {
+            return;
         }
+        let mut kept: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))> =
+            Vec::with_capacity(2);
+        for (k, s) in self.entries.iter().rev() {
+            if kept.is_empty() || kept[0].0 != *k {
+                if kept.len() == 2 {
+                    break;
+                }
+                kept.push((k.clone(), s.clone()));
+            }
+        }
+        self.entries = kept;
     }
 
     /// Hit rate since construction — a coarse health signal for whether the
