@@ -341,7 +341,7 @@ mod tests {
                 "-c".into(),
                 "import sys,time\n\
                  print('MENU'); sys.stdout.flush()\n\
-                 time.sleep(0.3)\n\
+                 input()\n\
                  sys.stdout.write('  [A] Alpha  [B] Beta\\n'); sys.stdout.flush()\n\
                  time.sleep(2)"
                     .into(),
@@ -354,15 +354,18 @@ mod tests {
             isolation: "local".into(),
         };
         sess.start_with_spec(spec).expect("start");
-        // Let the initial MENU line land so the baseline is the settled frame.
-        std::thread::sleep(Duration::from_millis(300));
+        // The child is gated on input(): MENU is the only line it can ever
+        // print before we say GO, so the baseline is the settled MENU frame
+        // deterministically (no fixed sleep to race) and "[B]" is guaranteed
+        // absent when the probe waits for its appearance.
+        sess.observe(300).expect("menu baseline");
 
         let result = run_probe(
             &mut sess,
-            None,
+            Some(crate::backend::Input::Text("GO\n".into())),
             &CaptureStrategy::UntilText("[B]".into()),
             &default_watch(),
-            Duration::from_secs(6),
+            Duration::from_secs(10),
         )
         .expect("probe");
         assert!(

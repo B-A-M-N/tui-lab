@@ -567,22 +567,50 @@ mod tests {
 
     /// Flicker diagnosis: collect multiple distinct frames as the screen
     /// changes, without waiting for it to settle.
+    ///
+    /// The child gates its own first print on an input line ("GO"), so t=0
+    /// is under the test's control: no frame can commit before the anchor
+    /// is taken, no matter how the scheduler staggers this thread against
+    /// the other PTY tests. The anchor is taken AFTER the GO echo has
+    /// landed (the PTY echo of the gate is itself a screen edge), so the
+    /// sequence collects exactly frame-0..2 and nothing else.
     #[test]
     fn frames_collects_multiple_distinct_screens() {
         let mut b = sleepy(
             "import sys,time\n\
+             input()\n\
              for i in range(6):\n\
              \x20   print(f'frame-{i}')\n\
              \x20   sys.stdout.flush()\n\
              \x20   time.sleep(0.1)\n\
              time.sleep(1)",
         );
-        let baseline = b.event_state().screen_seq;
+        // Child is alive and blocked on input(); it cannot print yet.
+        let pre = b.event_state().screen_seq;
+        b.send_input(crate::backend::Input::Text("GO\n".into()))
+            .expect("send start signal");
+        // Absorb the gate's own echo edge: the kernel line discipline
+        // echoes "GO\r\n" (exactly one committed line = exactly one seq
+        // edge, before input() can even return), so a quiet_for:0
+        // edge-wait anchored at `pre` meets on the echo and nothing else.
+        // quiet_for:0 cannot starve on stability; the budget only has to
+        // cover python startup under load. The wait returns the SERVED
+        // snapshot's seq, so `baseline` sits exactly past the echo.
+        let echo = b
+            .wait(
+                crate::backend::WaitCond::ScreenStable {
+                    quiet_for: Duration::from_millis(0),
+                    after_screen_seq: Some(pre),
+                },
+                Duration::from_secs(10),
+            )
+            .expect("echo edge");
+        assert!(echo.met, "the GO echo must land as a screen edge");
+        let baseline = echo.screen_seq;
         let out = capture_by_strategy(
             &mut b,
             &CaptureStrategy::Frames { count: 3 },
             baseline,
-            // Generous: under parallel-test PTY load, edge pumps can lag.
             Duration::from_secs(8),
         )
         .expect("capture");
@@ -597,25 +625,48 @@ mod tests {
         b.stop().ok();
     }
 
-    /// A partial sequence is returned but NOT reported as met.
+    /// A partial sequence is returned but NOT reported as met. Same gate as
+    /// the met-path test: the child's single print happens only after the
+    /// test says GO (anchor taken past the echo edge), so the baseline can
+    /// never miss it under load and the count is deterministic.
     #[test]
     fn frames_partial_capture_is_not_met() {
+        // The trailing sleep is far longer than the 1.2s capture budget
+        // (even with load-stretched edge waits), so the child cannot exit
+        // mid-collection and the stop reason is deterministically Deadline.
         let mut b = sleepy(
             "import sys,time\n\
+             input()\n\
              print('ONLY-ONE')\n\
              sys.stdout.flush()\n\
-             time.sleep(3)",
+             time.sleep(30)",
         );
-        let baseline = b.event_state().screen_seq;
+        let pre = b.event_state().screen_seq;
+        b.send_input(crate::backend::Input::Text("GO\n".into()))
+            .expect("send start signal");
+        // Same echo absorption as the met-path test: quiet_for:0 edge-wait
+        // anchored at `pre` meets exactly on the echo edge (kernel echo of
+        // "GO\r\n" commits one line before input() returns), then anchor
+        // past it so ONLY-ONE is the first collectible frame.
+        let echo = b
+            .wait(
+                crate::backend::WaitCond::ScreenStable {
+                    quiet_for: Duration::from_millis(0),
+                    after_screen_seq: Some(pre),
+                },
+                Duration::from_secs(10),
+            )
+            .expect("echo edge");
+        assert!(echo.met, "the GO echo must land as a screen edge");
         let out = capture_by_strategy(
             &mut b,
             &CaptureStrategy::Frames { count: 5 },
-            baseline,
+            echo.screen_seq,
             Duration::from_millis(1200),
         )
         .expect("capture");
         let frames = out.frames.as_ref().expect("frames sequence returned");
-        assert!(frames.len() < 5, "partial sequence");
+        assert_eq!(frames.len(), 1, "exactly the one gated frame arrived");
         assert!(!out.met, "captured < requested must not be met");
         assert_eq!(out.reason, crate::backend::CaptureReason::Deadline);
         b.stop().ok();
