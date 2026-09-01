@@ -221,6 +221,10 @@ pub fn build_wait(p: &crate::mcp::params::TuiWaitParams) -> Option<crate::backen
             text: p.text.clone()?,
             after_command_seq: None,
         },
+        // Re-review item 17: the event-predicate wait is handled directly by
+        // the tool handler (session-queue concern, not a backend WaitCond);
+        // build_wait never produces it.
+        W::Event => return None,
     })
 }
 

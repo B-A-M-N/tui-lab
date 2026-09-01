@@ -29,8 +29,12 @@ pub enum BackendKind {
     /// True pipes: no PTY, isatty() false, separated stdout/stderr.
     #[serde(rename = "pipe")]
     Pipe,
-    // Future engines (TuiTest fixture, tmux attach) are documented in the
-    // audit; they gain variants when they exist — not before.
+    /// Attach to an ALREADY-RUNNING TUI inside a tmux pane (re-review
+    /// item 18): render via `capture-pane`, input via `send-keys`, resize
+    /// via `resize-pane`. The "command" in the LaunchSpec is the tmux
+    /// target string `session:window.pane`.
+    #[serde(rename = "tmux-attach")]
+    TmuxAttach,
 }
 
 impl BackendKind {
@@ -44,9 +48,10 @@ impl BackendKind {
             "auto" | "portable_vt100" | "portable-pty+vt100" => BackendKind::PortableVt,
             "cli" | "line_cli" | "line-cli+lines" => BackendKind::PtyLine,
             "pipe" => BackendKind::Pipe,
+            "tmux" | "tmux_attach" | "tmux-attach" => BackendKind::TmuxAttach,
             other => {
                 return Err(anyhow::anyhow!(
-                    "unknown backend '{other}' (supported: auto, portable_vt100, cli, line_cli, pipe)"
+                    "unknown backend '{other}' (supported: auto, portable_vt100, cli, line_cli, pipe, tmux)"
                 ))
             }
         })
@@ -58,6 +63,7 @@ impl BackendKind {
             BackendKind::PortableVt => "portable-pty+vt100",
             BackendKind::PtyLine => "line-cli+lines",
             BackendKind::Pipe => "pipe",
+            BackendKind::TmuxAttach => "tmux-attach",
         }
     }
 
@@ -67,6 +73,11 @@ impl BackendKind {
             BackendKind::PortableVt => Box::new(PortablePtyBackend::new(cols, rows)),
             BackendKind::PtyLine => Box::new(PtyLineBackend::new(cols, rows)),
             BackendKind::Pipe => Box::new(crate::backend::pipe::PipeBackend::new(cols, rows)),
+            BackendKind::TmuxAttach => {
+                return Err(anyhow::anyhow!(
+                    "the tmux backend is built by attach(); select backend=tmux with tui_session action=attach"
+                ))
+            }
         })
     }
 }
@@ -200,6 +211,15 @@ pub struct Session {
     record_input: bool,
     /// Raw PTY byte-stream hook slot; attached to the backend at start.
     recording_slot: RecordingHookSlot,
+    /// Byte/resize facts observed by the reader thread, pending absorption
+    /// into the event queue (re-review item 15: output events come from the
+    /// reader thread via the session hook; `observe()` folds them in).
+    pending_ingest: std::sync::Arc<std::sync::Mutex<Vec<Ingest>>>,
+    /// The recorder slot INSIDE the session hook, shared so recording can be
+    /// toggled without replacing the hook (event ingestion never pauses).
+    hook_recorder: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>>>,
+    >,
     /// Monotonic anchor sequence (re-review P1: `ObservationAnchor.index`
     /// must be a real per-session counter, not a hardcoded 0). Allocated by
     /// [`Session::next_anchor`]; shared by every executor path.
@@ -247,26 +267,64 @@ pub struct Session {
     isolation_evidence: Option<crate::session::isolation::IsolationEvidence>,
 }
 
-/// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`].
-/// Lives behind `Arc<dyn RecordingHook>` on the backend's reader thread.
-struct RecorderHook {
-    sink: std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>,
+/// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`]
+/// AND byte/resize facts into the session event queue (re-review item 15:
+/// "bytes arrived" is the most fundamental thing that happens on a
+/// terminal — history without it cannot answer "what happened?"). Lives
+/// behind `Arc<dyn RecordingHook>` on the backend's reader thread, attached
+/// for the WHOLE session lifetime (not only while recording). The event
+/// side carries byte COUNTS, never the bytes themselves — payloads can
+/// contain secrets; counts are safe and useful for replay forensics.
+struct SessionHook {
+    /// Byte-chunk sizes and resizes, drained into the event queue by the
+    /// next `observe()`.
+    ingest: std::sync::Arc<std::sync::Mutex<Vec<Ingest>>>,
+    /// The active recorder, when recording is on — shared with the session
+    /// so `enable_recording`/`stop_recording` swap it WITHOUT touching the
+    /// hook slot (event ingestion is never interrupted).
+    recorder: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>>>,
+    >,
 }
 
-impl RecordingHook for RecorderHook {
+/// What the reader thread observed, pending absorption into the event queue.
+enum Ingest {
+    Output(usize),
+    Resize(u16, u16),
+}
+
+impl RecordingHook for SessionHook {
     fn on_output(&self, bytes: &[u8]) {
-        if let Ok(mut rec) = self.sink.lock() {
-            rec.record_output(bytes);
+        if let Ok(mut q) = self.ingest.lock() {
+            q.push(Ingest::Output(bytes.len()));
+        }
+        if let Ok(rec) = self.recorder.lock() {
+            if let Some(rec) = rec.as_ref() {
+                if let Ok(mut rec) = rec.lock() {
+                    rec.record_output(bytes);
+                }
+            }
         }
     }
     fn on_input(&self, bytes: &[u8]) {
-        if let Ok(mut rec) = self.sink.lock() {
-            rec.record_input(bytes);
+        if let Ok(rec) = self.recorder.lock() {
+            if let Some(rec) = rec.as_ref() {
+                if let Ok(mut rec) = rec.lock() {
+                    rec.record_input(bytes);
+                }
+            }
         }
     }
     fn on_resize(&self, cols: u16, rows: u16) {
-        if let Ok(mut rec) = self.sink.lock() {
-            rec.record_resize(cols, rows);
+        if let Ok(mut q) = self.ingest.lock() {
+            q.push(Ingest::Resize(cols, rows));
+        }
+        if let Ok(rec) = self.recorder.lock() {
+            if let Some(rec) = rec.as_ref() {
+                if let Ok(mut rec) = rec.lock() {
+                    rec.record_resize(cols, rows);
+                }
+            }
         }
     }
 }
@@ -276,7 +334,7 @@ impl Session {
     /// to the PTY engine; `cli` / `line_cli` map to the line CLI engine.
     /// Unknown names are an error — never a silent fallback.
     pub fn new(id: String, command: String) -> Self {
-        Session {
+        let mut s = Session {
             id,
             command,
             backend_kind: BackendKind::PortableVt,
@@ -289,6 +347,8 @@ impl Session {
             recorder: None,
             record_input: false,
             recording_slot: crate::backend::new_recording_hook_slot(),
+            pending_ingest: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            hook_recorder: std::sync::Arc::new(std::sync::Mutex::new(None)),
             next_anchor_seq: 0,
             events: crate::events::TerminalEventQueue::new(),
             cursors: std::collections::HashMap::new(),
@@ -299,6 +359,44 @@ impl Session {
             native_events_absorbed_seq: 0,
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
+        };
+        s.attach_session_hook();
+        s
+    }
+
+
+    /// Attach the session's permanent reader-thread hook: byte/resize facts
+    /// flow into the event queue for the whole session lifetime (re-review
+    /// item 15), and the recorder — when enabled — receives the same bytes.
+    /// One hook slot, one hook, two consumers; `enable_recording` swaps the
+    /// recorder INSIDE the hook instead of replacing it, so event ingestion
+    /// is never interrupted by recording toggling.
+    fn attach_session_hook(&mut self) {
+        let hook: std::sync::Arc<dyn RecordingHook> = std::sync::Arc::new(SessionHook {
+            ingest: self.pending_ingest.clone(),
+            recorder: self.hook_recorder.clone(),
+        });
+        *self.recording_slot.lock().expect("recording slot") = Some(hook);
+        self.backend.set_recording_hook(self.recording_slot.clone());
+    }
+
+    /// Drain the reader thread's pending byte/resize facts into the event
+    /// queue. Called from `observe()` so absorption is synchronous with the
+    /// parse that consumed the same bytes.
+    fn absorb_pending_ingest(&mut self) {
+        let pending: Vec<Ingest> = match self.pending_ingest.lock() {
+            Ok(mut q) => std::mem::take(q.as_mut()),
+            Err(_) => Vec::new(),
+        };
+        for fact in pending {
+            match fact {
+                Ingest::Output(n) => {
+                    self.push_event(crate::events::TerminalEventKind::Output { byte_len: n })
+                }
+                Ingest::Resize(c, r) => {
+                    self.push_event(crate::events::TerminalEventKind::Resize { cols: c, rows: r })
+                }
+            }
         }
     }
 
@@ -405,19 +503,27 @@ impl Session {
             record_input,
         )));
         self.recorder = Some(sink.clone());
-        // Attach the hook to the backend so raw bytes flow to the recorder.
-        let hook: std::sync::Arc<dyn RecordingHook> =
-            std::sync::Arc::new(RecorderHook { sink: sink.clone() });
-        *self.recording_slot.lock().expect("recording slot") = Some(hook);
-        self.backend.set_recording_hook(self.recording_slot.clone());
+        // The session hook is permanent; swap the recorder INSIDE it so the
+        // reader thread's event ingestion is never interrupted.
+        self.set_hook_recorder(Some(sink));
+    }
+
+    /// Point the session hook at the given recorder (or none). The hook slot
+    /// itself is untouched — the backend keeps delivering bytes to the event
+    /// queue and to whichever recorder is currently installed.
+    fn set_hook_recorder(
+        &mut self,
+        rec: Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>>,
+    ) {
+        if let Ok(mut inner) = self.hook_recorder.lock() {
+            *inner = rec;
+        }
     }
 
     /// Detach recording (stop capturing further bytes; existing events remain).
     pub fn disable_recording(&mut self) {
         self.recorder = None;
-        if let Ok(mut slot) = self.recording_slot.lock() {
-            *slot = None;
-        }
+        self.set_hook_recorder(None);
     }
 
     /// Stop recording and return the recorder so the caller can export it.
@@ -429,10 +535,9 @@ impl Session {
     pub fn stop_recording(
         &mut self,
     ) -> Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>> {
-        // Detach the hook so the reader thread stops feeding events.
-        if let Ok(mut slot) = self.recording_slot.lock() {
-            *slot = None;
-        }
+        // The session hook stays attached (event ingestion continues);
+        // only the recorder side stops.
+        self.set_hook_recorder(None);
         self.recorder.take()
     }
 
@@ -567,6 +672,28 @@ impl Session {
     /// Start (or restart) the target program from a full spec (spec section 11).
     pub fn start_with_spec(&mut self, spec: LaunchSpec) -> anyhow::Result<()> {
         self.start_generation(spec, self.generation)
+    }
+
+    /// Adopt an EXTERNALLY-constructed backend (re-review item 18: the tmux
+    /// attach engine is built by `TmuxBackend::attach`, which verifies the
+    /// target BEFORE the session exists). Replaces the default engine and
+    /// records the launch identity the session reports.
+    pub fn adopt_backend(
+        &mut self,
+        backend: Box<dyn TerminalBackend>,
+        kind: BackendKind,
+        cols: u16,
+        rows: u16,
+        spec: LaunchSpec,
+    ) {
+        self.backend = backend;
+        self.backend_kind = kind;
+        self.launch = Some(spec);
+        self.caps_at_start = self.backend.capabilities();
+        // The session hook must ride the NEW backend (the default hook was
+        // attached to the placeholder engine in `new`).
+        self.backend.set_recording_hook(self.recording_slot.clone());
+        let _ = (cols, rows);
     }
 
     /// Start the target as an EXPLICIT generation. `restart()` reserves the
@@ -721,6 +848,10 @@ impl Session {
         // observe mode a caller chose).
         self.native.poll();
         self.absorb_native_events();
+        // Reader-thread byte/resize facts (item 15) fold in BEFORE the
+        // backend read: they describe bytes the parser is about to consume,
+        // so history stays ordered with the screen events derived from them.
+        self.absorb_pending_ingest();
         let s = self
             .backend
             .observe(std::time::Duration::from_millis(idle_ms))?;
@@ -895,6 +1026,17 @@ impl Session {
     /// Wave B item 13: the caller owns the position).
     pub fn events_since(&self, cursor: u64) -> crate::events::EventBatch {
         self.events.since(cursor)
+    }
+
+    /// Every retained event, in seq order (re-review item 15: history reads
+    /// the whole retained window and filters by query, not by cursor).
+    pub fn all_events(&self) -> Vec<crate::events::TerminalEvent> {
+        self.events.all()
+    }
+
+    /// Events evicted by the event ring (the honest partial-window flag).
+    pub fn events_evicted(&self) -> u64 {
+        self.events.evicted()
     }
 
     /// Read events after the named consumer's stored cursor, then advance
@@ -1177,6 +1319,7 @@ impl Session {
             BackendKind::PortableVt => "portable-pty+vt100/0.1",
             BackendKind::PtyLine => "line-cli+lines/0.1",
             BackendKind::Pipe => "pipe/0.1",
+            BackendKind::TmuxAttach => "tmux-attach/0.1",
         }
     }
 }

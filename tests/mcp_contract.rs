@@ -153,6 +153,7 @@ fn contract_keys_action_sends_full_sequence() {
 #[test]
 fn contract_build_wait_screen_stable_has_quiet_interval() {
     let p = TuiWaitParams {
+        event: None,
         condition: "screen_stable".into(),
         text: None,
         title: None,
@@ -659,6 +660,7 @@ fn contract_key_f1_function() {
 #[test]
 fn contract_build_wait_idle_has_quiet_interval() {
     let p = TuiWaitParams {
+        event: None,
         condition: "idle".into(),
         text: None,
         title: None,
@@ -678,6 +680,7 @@ fn contract_build_wait_idle_has_quiet_interval() {
 #[test]
 fn contract_build_wait_quiet_ms_overrides_both_conditions() {
     let p_screen = TuiWaitParams {
+        event: None,
         condition: "screen_stable".into(),
         text: None,
         title: None,
@@ -694,6 +697,7 @@ fn contract_build_wait_quiet_ms_overrides_both_conditions() {
     }
 
     let p_idle = TuiWaitParams {
+        event: None,
         condition: "idle".into(),
         text: None,
         title: None,
@@ -713,6 +717,7 @@ fn contract_build_wait_quiet_ms_overrides_both_conditions() {
 #[test]
 fn contract_build_wait_unknown_condition_returns_none() {
     let p = TuiWaitParams {
+        event: None,
         condition: "nonexistent".into(),
         text: None,
         title: None,

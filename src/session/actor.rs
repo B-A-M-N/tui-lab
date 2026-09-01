@@ -282,6 +282,57 @@ impl SessionPool {
         .await
     }
 
+    /// Attach to an already-running TUI in a tmux pane (re-review item 18).
+    /// The target pane is verified to EXIST before the session is created —
+    /// attaching to a phantom pane fails here, naming the target, never as a
+    /// later observe error. The attached TUI is never killed by TUI-Lab
+    /// (detaching leaves it running; item 18).
+    pub async fn attach_tmux(
+        &self,
+        target: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<String, anyhow::Error> {
+        // Verify OUTSIDE the session: a missing pane is a caller error and
+        // must not leave a half-built session behind.
+        let backend = crate::backend::tmux::TmuxBackend::attach(target, cols, rows)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let id = format!("sess-{}", uuid::Uuid::new_v4().simple());
+        let owned_target = format!("tmux:{target}");
+        let mut s = Session::new(id.clone(), owned_target.clone());
+        s.adopt_backend(
+            Box::new(backend),
+            crate::session::state::BackendKind::TmuxAttach,
+            cols,
+            rows,
+            LaunchSpec {
+                command: owned_target.clone(),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+                cols,
+                rows,
+                backend: crate::session::state::BackendKind::TmuxAttach.display().to_string(),
+                isolation: "local".to_string(),
+            },
+        );
+        let actor = SessionActor::spawn(s);
+        actor
+            .send(move |s: &mut Session| -> anyhow::Result<()> {
+                // "Start" for an attach = verify the pane is still live.
+                s.backend_mut().start(&owned_target, &[], None, &[], cols, rows)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))??;
+        self.directory
+            .write()
+            .expect("session directory")
+            .insert(id.clone(), actor);
+        *self.active.lock().expect("active pointer") = Some(id.clone());
+        Ok(id)
+    }
+
     /// Run a closure against a session (explicit id or the active one).
     pub async fn with_session<R, F>(&self, id: Option<&str>, job: F) -> Result<R, ActorError>
     where
