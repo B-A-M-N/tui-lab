@@ -58,6 +58,21 @@ pub enum AuditProfile {
     /// real DECSET/DECRST timeline, cross-referenced with visible
     /// affordances (frame-level read of the raw ring; no input sent).
     TerminalModes,
+    /// Rendering subsystem (Wave 3c item 22): erase strategy, sync-update
+    /// discipline, cursor-hiding hygiene from the raw op census.
+    Rendering,
+    /// Input-protocol subsystem (Wave 3c item 24): the key encodings the
+    /// negotiated modes demand (SS3 vs CSI, SGR mouse, kitty flags).
+    InputProtocol,
+    /// Shell/CLI subsystem (Wave 3c item 30): prompt shape, OSC 133 marks,
+    /// exit reporting, alt-screen applicability.
+    ShellCli,
+    /// Lifecycle subsystem (Wave 3c item 29): terminal modes negotiated but
+    /// not restored — the broken-terminal-after-crash trap.
+    Lifecycle,
+    /// Query/response conformance (Wave 3c item 33): DSR 6n replayed and
+    /// the CPR answer verified against the live cursor.
+    QueryResponse,
 }
 
 impl AuditProfile {
@@ -82,6 +97,11 @@ impl AuditProfile {
             "unicode" => Ok(AuditProfile::Unicode),
             "controls" => Ok(AuditProfile::Controls),
             "terminal_modes" => Ok(AuditProfile::TerminalModes),
+            "rendering" => Ok(AuditProfile::Rendering),
+            "input_protocol" => Ok(AuditProfile::InputProtocol),
+            "shell_cli" => Ok(AuditProfile::ShellCli),
+            "lifecycle" => Ok(AuditProfile::Lifecycle),
+            "query_response" => Ok(AuditProfile::QueryResponse),
             other => Err(format!(
                 "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls",
                 other
@@ -109,6 +129,11 @@ impl AuditProfile {
             AuditProfile::Unicode => "unicode",
             AuditProfile::Controls => "controls",
             AuditProfile::TerminalModes => "terminal_modes",
+            AuditProfile::Rendering => "rendering",
+            AuditProfile::InputProtocol => "input_protocol",
+            AuditProfile::ShellCli => "shell_cli",
+            AuditProfile::Lifecycle => "lifecycle",
+            AuditProfile::QueryResponse => "query_response",
         }
     }
 
@@ -137,6 +162,13 @@ impl AuditProfile {
                 // Needs the session (raw ring + fused frame), not just one
                 // frame — same "active-side, non-driving" class as Color.
                 | AuditProfile::TerminalModes
+                | AuditProfile::Rendering
+                | AuditProfile::InputProtocol
+                | AuditProfile::ShellCli
+                | AuditProfile::Lifecycle
+                // Sends one device query (CSI 6n) — still observational,
+                // but it writes to the child, so it stays in the active class.
+                | AuditProfile::QueryResponse
         )
     }
 
@@ -261,6 +293,11 @@ pub fn run_profile_with_contract(
             fs.extend(tx(session, &|s| crate::audit::driver::errors_audit(s, 12)));
             fs.extend(crate::audit::driver::color_audit(session));
             fs.extend(crate::audit::driver::terminal_modes_audit(session));
+            fs.extend(crate::audit::driver::rendering_audit(session));
+            fs.extend(crate::audit::driver::input_protocol_audit(session));
+            fs.extend(crate::audit::driver::shell_cli_audit(session));
+            fs.extend(crate::audit::driver::lifecycle_audit(session));
+            fs.extend(crate::audit::driver::query_response_audit(session));
             fs
         }
         AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
@@ -276,6 +313,11 @@ pub fn run_profile_with_contract(
         // Frame-level read of the raw ring: observes but sends nothing, so
         // it does not need a transaction (Wave G split, item 66).
         AuditProfile::TerminalModes => crate::audit::driver::terminal_modes_audit(session),
+        AuditProfile::Rendering => crate::audit::driver::rendering_audit(session),
+        AuditProfile::InputProtocol => crate::audit::driver::input_protocol_audit(session),
+        AuditProfile::ShellCli => crate::audit::driver::shell_cli_audit(session),
+        AuditProfile::Lifecycle => crate::audit::driver::lifecycle_audit(session),
+        AuditProfile::QueryResponse => crate::audit::driver::query_response_audit(session),
         _ => unreachable!("non-active profiles returned above"),
     };
     findings.extend(active_findings);
@@ -354,6 +396,11 @@ mod tests {
             "unicode",
             "controls",
             "terminal_modes",
+            "rendering",
+            "input_protocol",
+            "shell_cli",
+            "lifecycle",
+            "query_response",
         ] {
             assert!(AuditProfile::parse(name).is_ok(), "{} must parse", name);
         }
@@ -492,6 +539,159 @@ mod tests {
             "mouse negotiated with a plain print() screen = hidden affordances"
         );
         pool.stop(&id).await.ok();
+    }
+
+    /// Wave 3c: a child that emits the flicker signature — repeated
+    /// erase-all cycles, cursor hidden more often than shown, no
+    /// synchronized-update — must trip REND-FLICKER and REND-CURSOR-LEAK,
+    /// and rendering/input_protocol/lifecycle/shell_cli must run clean of
+    /// engine errors through the orchestrator.
+    #[tokio::test]
+    async fn wave3c_profiles_read_real_traffic() {
+        let pool = crate::session::SessionPool::new();
+        // The loop redaws 3× with erase-all, hides the cursor twice,
+        // shows it once, and enables the alt screen without restoring it.
+        let id = pool
+            .start(
+                "python3",
+                &[
+                    "-c".into(),
+                    "import sys,time; w=sys.stdout.write; w('\\x1b[?1049h'); [ (w('\\x1b[2J'), w('\\x1b[?25l'), w('frame'), w('\\x1b[?25h' if i==2 else ''), sys.stdout.flush(), time.sleep(0.05)) for i in range(3)]; input()"
+                        .to_string(),
+                ],
+                None,
+                &[],
+                80,
+                24,
+                "portable_vt100",
+                "local",
+            )
+            .await
+            .expect("start");
+
+        let render = pool
+            .with_session(Some(&id), |s| run_profile(s, "rendering"))
+            .await
+            .expect("actor run")
+            .expect("rendering");
+        let ids: Vec<&str> = render.findings.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"REND-STYLE"), "style census present: {ids:?}");
+        assert!(
+            ids.contains(&"REND-FLICKER"),
+            "erase-all cycles without 2026 must trip the flicker rule: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"REND-CURSOR-LEAK"),
+            "2 hides vs 1 show must trip the cursor-leak rule: {ids:?}"
+        );
+
+        let inp = pool
+            .with_session(Some(&id), |s| run_profile(s, "input_protocol"))
+            .await
+            .expect("actor run")
+            .expect("input_protocol");
+        assert!(
+            inp.findings.iter().any(|f| f.id == "INP-ENCODING"),
+            "encoding plan must be present"
+        );
+
+        let lc = pool
+            .with_session(Some(&id), |s| run_profile(s, "lifecycle"))
+            .await
+            .expect("actor run")
+            .expect("lifecycle");
+        assert!(
+            lc.findings.iter().any(|f| f.id == "LC-DANGLING"),
+            "alt screen engaged and never restored must dangle: {:?}",
+            lc.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+        );
+
+        let sh = pool
+            .with_session(Some(&id), |s| run_profile(s, "shell_cli"))
+            .await
+            .expect("actor run")
+            .expect("shell_cli");
+        assert!(
+            sh.findings.iter().any(|f| f.id == "SH-ALTSCREEN"),
+            "alt screen active must be reported to steer heuristics off"
+        );
+        pool.stop(&id).await.ok();
+    }
+
+    /// Wave 3c item 33: on a responder-capable engine the audit must find
+    /// no unimplemented query class and must produce the live CPR probe;
+    /// on the pipe engine (no responder, no ring) it must degrade honestly
+    /// to QR-NOSRC naming the conformance risk.
+    #[tokio::test]
+    async fn query_response_verifies_cpr() {
+        let pool = crate::session::SessionPool::new();
+        // The child asks DA1 + DSR 6n itself, so the inventory has real
+        // queries to report.
+        let id = pool
+            .start(
+                "python3",
+                &[
+                    "-c".into(),
+                    "import sys; sys.stdout.write('\\x1b[0c\\x1b[6n'); sys.stdout.flush(); print('cpr-test'); input()"
+                        .to_string(),
+                ],
+                None,
+                &[],
+                80,
+                24,
+                "portable_vt100",
+                "local",
+            )
+            .await
+            .expect("start");
+        let report = pool
+            .with_session(Some(&id), |s| run_profile(s, "query_response"))
+            .await
+            .expect("actor run")
+            .expect("query_response");
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"QR-INVENTORY"), "inventory present: {ids:?}");
+        assert!(
+            ids.contains(&"QR-CPR-PROBE"),
+            "responder engine must produce the live CPR probe: {ids:?}"
+        );
+        let inv = report.findings.iter().find(|f| f.id == "QR-INVENTORY").unwrap();
+        let summary = &inv.summary;
+        assert!(
+            summary.contains("DA1") && summary.contains("DSR 6n"),
+            "the child's real DA1 + 6n queries must appear: {summary}"
+        );
+        pool.stop(&id).await.ok();
+
+        // Pipe engine: honest degradation.
+        let pool2 = crate::session::SessionPool::new();
+        let id2 = pool2
+            .start(
+                "python3",
+                &["-c".into(), "print('cpr-pipe'); input()".to_string()],
+                None,
+                &[],
+                80,
+                24,
+                "pipe",
+                "local",
+            )
+            .await
+            .expect("start pipe");
+        let report2 = pool2
+            .with_session(Some(&id2), |s| run_profile(s, "query_response"))
+            .await
+            .expect("actor run")
+            .expect("query_response pipe");
+        assert!(
+            report2
+                .findings
+                .iter()
+                .any(|f| f.id == "QR-NOSRC"),
+            "pipe engine has no responder and no ring — must say so: {:?}",
+            report2.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+        );
+        pool2.stop(&id2).await.ok();
     }
 
     #[tokio::test]
