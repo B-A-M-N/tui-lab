@@ -589,3 +589,94 @@ fn mouse_utf8_encoding_emits_utf8_coords() {
     );
     b.stop().expect("stop");
 }
+
+// ---------------------------------------------------------------------------
+// Alt-prefix and Ctrl+special (Wave 1b): ESC-prefix for Alt, C0 for the
+// Ctrl+{space,[,],\\,^,_} aliases — byte-exact through a real PTY.
+// ---------------------------------------------------------------------------
+
+/// Alt+key is ESC-prefixed (xterm default): Alt+x → 1b 'x'.
+#[test]
+fn alt_key_gets_esc_prefix() {
+    let mut b = spawn_hex_reader(2);
+    std::thread::sleep(Duration::from_millis(400));
+    b.send_input(Input::Key(KeyEvent::with_modifiers(
+        KeyCode::Char('x'),
+        KeyModifiers::ALT,
+    )))
+    .expect("send alt+x");
+    let out = b
+        .wait(WaitCond::Text("HEX:1b78".into()), Duration::from_secs(5))
+        .expect("wait");
+    assert!(
+        out.met,
+        "alt+x should emit ESC 'x' (1b78), got={}",
+        out.state.viewport_text.join(" ")
+    );
+    b.stop().expect("stop");
+}
+
+/// Shift+letter passes through as the uppercase character: Shift+a → 'A'.
+#[test]
+fn shift_letter_emits_uppercase() {
+    let mut b = spawn_hex_reader(1);
+    std::thread::sleep(Duration::from_millis(400));
+    b.send_input(Input::Key(KeyEvent::with_modifiers(
+        KeyCode::Char('a'),
+        KeyModifiers::SHIFT,
+    )))
+    .expect("send shift+a");
+    let out = b
+        .wait(WaitCond::Text("HEX:41".into()), Duration::from_secs(5))
+        .expect("wait");
+    assert!(
+        out.met,
+        "shift+a should emit 'A' (0x41), got={}",
+        out.state.viewport_text.join(" ")
+    );
+    b.stop().expect("stop");
+}
+
+/// Ctrl+Space → NUL (0x00), Ctrl+[ → ESC (0x1b), Ctrl+\\ → FS (0x1c).
+#[test]
+fn ctrl_special_chars_map_to_c0() {
+    // Three bytes in one read: 00 1b 1c.
+    let mut b = spawn_hex_reader(3);
+    std::thread::sleep(Duration::from_millis(400));
+    b.send_input(Input::Keys(vec![
+        KeyEvent::with_modifiers(KeyCode::Char(' '), KeyModifiers::CTRL),
+        KeyEvent::with_modifiers(KeyCode::Char('['), KeyModifiers::CTRL),
+        KeyEvent::with_modifiers(KeyCode::Char('\\'), KeyModifiers::CTRL),
+    ]))
+    .expect("send ctrl specials");
+    let out = b
+        .wait(WaitCond::Text("HEX:001b1c".into()), Duration::from_secs(5))
+        .expect("wait");
+    assert!(
+        out.met,
+        "ctrl+space/[/\\ should emit 00 1b 1c, got={}",
+        out.state.viewport_text.join(" ")
+    );
+    b.stop().expect("stop");
+}
+
+/// Shift+Tab is BackTab (CSI Z), not a tab — byte-exact.
+#[test]
+fn shift_tab_emits_csi_z() {
+    let mut b = spawn_hex_reader(3);
+    std::thread::sleep(Duration::from_millis(400));
+    b.send_input(Input::Key(KeyEvent::with_modifiers(
+        KeyCode::Tab,
+        KeyModifiers::SHIFT,
+    )))
+    .expect("send shift+tab");
+    let out = b
+        .wait(WaitCond::Text("HEX:1b5b5a".into()), Duration::from_secs(5))
+        .expect("wait");
+    assert!(
+        out.met,
+        "shift+tab should emit CSI Z (1b5b5a), got={}",
+        out.state.viewport_text.join(" ")
+    );
+    b.stop().expect("stop");
+}
