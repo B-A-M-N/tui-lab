@@ -54,6 +54,10 @@ pub enum AuditProfile {
     /// Control/region coverage (Wave 3): orphan controls + ambiguous region
     /// parents over one fused frame (static).
     Controls,
+    /// Terminal-modes subsystem (Wave 3): negotiated input modes from the
+    /// real DECSET/DECRST timeline, cross-referenced with visible
+    /// affordances (frame-level read of the raw ring; no input sent).
+    TerminalModes,
 }
 
 impl AuditProfile {
@@ -77,6 +81,7 @@ impl AuditProfile {
             "errors" => Ok(AuditProfile::Errors),
             "unicode" => Ok(AuditProfile::Unicode),
             "controls" => Ok(AuditProfile::Controls),
+            "terminal_modes" => Ok(AuditProfile::TerminalModes),
             other => Err(format!(
                 "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls",
                 other
@@ -103,6 +108,7 @@ impl AuditProfile {
             AuditProfile::Errors => "errors",
             AuditProfile::Unicode => "unicode",
             AuditProfile::Controls => "controls",
+            AuditProfile::TerminalModes => "terminal_modes",
         }
     }
 
@@ -128,6 +134,9 @@ impl AuditProfile {
                 | AuditProfile::Performance
                 | AuditProfile::States
                 | AuditProfile::Errors
+                // Needs the session (raw ring + fused frame), not just one
+                // frame — same "active-side, non-driving" class as Color.
+                | AuditProfile::TerminalModes
         )
     }
 
@@ -251,6 +260,7 @@ pub fn run_profile_with_contract(
             fs.extend(tx(session, &|s| crate::audit::driver::states_audit(s, 6)));
             fs.extend(tx(session, &|s| crate::audit::driver::errors_audit(s, 12)));
             fs.extend(crate::audit::driver::color_audit(session));
+            fs.extend(crate::audit::driver::terminal_modes_audit(session));
             fs
         }
         AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
@@ -263,6 +273,9 @@ pub fn run_profile_with_contract(
         AuditProfile::States => tx(session, &|s| crate::audit::driver::states_audit(s, 10)),
         AuditProfile::Errors => tx(session, &|s| crate::audit::driver::errors_audit(s, 15)),
         AuditProfile::Color => crate::audit::driver::color_audit(session),
+        // Frame-level read of the raw ring: observes but sends nothing, so
+        // it does not need a transaction (Wave G split, item 66).
+        AuditProfile::TerminalModes => crate::audit::driver::terminal_modes_audit(session),
         _ => unreachable!("non-active profiles returned above"),
     };
     findings.extend(active_findings);
@@ -338,6 +351,9 @@ mod tests {
             "mouse",
             "states",
             "errors",
+            "unicode",
+            "controls",
+            "terminal_modes",
         ] {
             assert!(AuditProfile::parse(name).is_ok(), "{} must parse", name);
         }
@@ -422,6 +438,59 @@ mod tests {
             }
         }
         // `full`'s static composite now includes the subsystem audits too.
+        pool.stop(&id).await.ok();
+    }
+
+    /// Wave 3 terminal-modes audit: the driver folds the child's REAL
+    /// DECSET/DECRST traffic. The child enables SGR mouse
+    /// (`\x1b[?1000;1006h`) without drawing any mouse affordance, so the
+    /// run must surface MODE-INVENTORY with the folded `mouse_press_release`
+    /// = on AND the MODE-MOUSE-HIDDEN cross-reference.
+    #[tokio::test]
+    async fn terminal_modes_folds_real_negotiation() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &[
+                    "-c".into(),
+                    "import sys; sys.stdout.write('\\x1b[?1000;1006h'); sys.stdout.flush(); \
+                     print('modes-audit'); input()"
+                        .to_string(),
+                ],
+                None,
+                &[],
+                80,
+                24,
+                // Mode evidence comes from the raw ring; force a retaining
+                // engine rather than trusting `auto` selection.
+                "portable_vt100",
+                "local",
+            )
+            .await
+            .expect("start");
+        let report = pool
+            .with_session(Some(&id), |s| run_profile(s, "terminal_modes"))
+            .await
+            .expect("actor run")
+            .expect("run terminal_modes");
+        assert_eq!(report.mode, "active");
+        let inv = report
+            .findings
+            .iter()
+            .find(|f| f.id == "MODE-INVENTORY")
+            .expect("mode inventory from the child's real escape sequences");
+        let evidence = serde_json::to_value(&inv.evidence).unwrap();
+        let modes = evidence[0]["detail"]["modes"].clone();
+        assert_eq!(
+            modes["mouse_press_release"], true,
+            "DECSET 1000 must fold to on: {modes}"
+        );
+        assert_eq!(modes["mouse_sgr_encoding"], true, "DECSET 1006 must fold to on");
+        assert!(
+            report.findings.iter().any(|f| f.id == "MODE-MOUSE-HIDDEN"),
+            "mouse negotiated with a plain print() screen = hidden affordances"
+        );
         pool.stop(&id).await.ok();
     }
 

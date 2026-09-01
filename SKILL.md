@@ -24,7 +24,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_explore` — Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph. Driving: blocked while a human lease is live.
   - mode: random, guided_candidates, semantic, state_graph
 - `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Active profiles drive the app: blocked while a human lease is live.
-  - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls
+  - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes
 - `tui_coverage` — Coverage: native NSP coverage-event ledger plus the optional tuicov executable (honest Unsupported when absent).
   - action: detect, summary, collect, delta, uncovered, ledger, start, stop
 - `tui_framework` — Framework detection, capability probes, and NativeSemanticProtocol adapter snippets (Ratatui/Textual/Python).
@@ -34,8 +34,6 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_contract` — Design contracts: load, validate, conformance status, and baseline compare (regressions become findings).
   - action: load, validate, status, compare
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
-
-
 ## Core principle: OBSERVE BEFORE ACTING, DIFF AFTER
 
 - Prefer `tui_observe` modes `summary` and `semantic` over `screen`. Never ask
@@ -99,6 +97,3 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 - `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
 - `tui://sessions/{session_id}/screen` — Live screen text + geometry.
 - `tui://findings` — Findings accumulated this run (audits, contracts, exploration).
-
-For detailed tool schemas, generate with `hermes-tui-lab skill`.
-

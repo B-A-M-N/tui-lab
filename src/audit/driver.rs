@@ -1514,3 +1514,191 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
     });
     findings
 }
+
+/// Wave-3 (terminal-modes subsystem): what input modes did this app
+/// actually negotiate, and do they agree with what the screen shows? Built
+/// on the Wave-2 raw-output ring + protocol decoder — the app's OWN
+/// DECSET/DECRST traffic, not a guess. The cross-references catch the
+/// classic walk-into-an-unfamiliar-TUI traps:
+/// - mouse mode negotiated but the screen labels no mouse affordance
+///   (the app responds to clicks a user can't discover), and the inverse
+/// - bracketed paste off while a multi-line paste target is visible (a
+///   paste will execute line-by-line — the destructive-enter-per-line trap)
+/// - application cursor keys on (arrows emit SS3, not CSI) — needed to
+///   interpret raw-capture evidence and to know why a naive key send
+///   "did nothing"
+pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let (bytes, cap, dropped) = session.raw_output_window();
+    if cap == 0 {
+        findings.push(Finding {
+            id: "MODE-NOSRC".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "terminal_modes".into(),
+            summary: "engine retains no raw output; mode timeline unavailable".into(),
+            evidence: vec![ev_other(
+                "raw_ring_absent",
+                "the backend does not retain the child's raw bytes",
+                json!({ "note": "use the portable-pty or line-cli engine for mode negotiation evidence" }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    }
+
+    let trace = crate::protocol::ProtocolTrace::decode(&bytes);
+    // Fold the timeline into current state per mode (later events win).
+    let mut state: std::collections::BTreeMap<&'static str, bool> = Default::default();
+    for m in &trace.modes {
+        state.insert(m.mode, m.set);
+    }
+    let screen = match session.observe(50) {
+        Ok(s) => s,
+        Err(e) => {
+            findings.push(Finding {
+                id: "MODE-ERR".into(),
+                rule_id: None,
+                severity: "error".into(),
+                category: "terminal_modes".into(),
+                summary: format!("Cannot observe: {}", e),
+                evidence: vec![ev_other_empty(
+                    "modes_observe_failed",
+                    "session.observe failed at terminal-modes audit start",
+                )],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            return findings;
+        }
+    };
+    let sem = session.fuse_screen(&screen);
+
+    let get = |k: &str| state.get(k).copied();
+    let summary = format!(
+        "negotiated modes (from {} bytes of real output{}): {}",
+        bytes.len(),
+        if dropped > 0 {
+            format!(", {dropped} head bytes dropped")
+        } else {
+            String::new()
+        },
+        if state.is_empty() {
+            "none".to_string()
+        } else {
+            state
+                .iter()
+                .map(|(k, v)| format!("{k}={}", if *v { "on" } else { "off" }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    findings.push(Finding {
+        id: "MODE-INVENTORY".into(),
+        rule_id: None,
+        severity: "info".into(),
+        category: "terminal_modes".into(),
+        summary: summary.clone(),
+        evidence: vec![ev_other(
+            "mode_timeline",
+            "DECSET/DECRST timeline folded to current state",
+            json!({
+                "modes": state,
+                "window_bytes": bytes.len(),
+                "dropped_head_bytes": dropped,
+                "complete_window": dropped == 0,
+                "event_count": trace.modes.len(),
+            }),
+        )],
+        confidence: 0.95,
+        reproduction: None,
+        source_refs: Vec::new(),
+    });
+
+    // Cross-reference: mouse negotiated but zero mouse affordances visible.
+    let mouse_on = get("mouse_press_release").unwrap_or(false)
+        || get("mouse_button_motion").unwrap_or(false)
+        || get("mouse_any_motion").unwrap_or(false);
+    let mouse_visible = sem
+        .affordances
+        .iter()
+        .any(|a| matches!(a.invocation, crate::semantic::Invocation::Mouse { .. }));
+    if mouse_on && !mouse_visible {
+        findings.push(Finding {
+            id: "MODE-MOUSE-HIDDEN".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "terminal_modes".into(),
+            summary: "mouse reporting is ON but the screen shows no mouse affordance — clickable surfaces a user cannot discover.".into(),
+            evidence: vec![ev_other(
+                "mouse_mode_no_affordance",
+                "negotiated mouse mode with zero visible mouse cues",
+                json!({
+                    "mouse_modes": state.iter().filter(|(k, _)| k.starts_with("mouse")).collect::<std::collections::BTreeMap<_, _>>(),
+                    "note": "either the UI hides affordances intentionally (confirm against the design contract) or mouse targets are invisible",
+                }),
+            )],
+            confidence: 0.7,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+    // The inverse is informational: affordances shown but mode off means
+    // clicks will not be reported (the app never sees them).
+    if !mouse_on && mouse_visible {
+        findings.push(Finding {
+            id: "MODE-MOUSE-INERT".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "terminal_modes".into(),
+            summary: "the screen shows mouse affordances but mouse reporting is OFF — clicks are never reported to the app.".into(),
+            evidence: vec![ev_other(
+                "affordance_no_mouse_mode",
+                "visible mouse cues with no negotiated mouse mode",
+                json!({
+                    "note": "cues may be decorative, or the app expects mouse mode to be enabled elsewhere",
+                }),
+            )],
+            confidence: 0.7,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+    // Bracketed paste off + multi-line paste target visible = the
+    // line-by-line execution trap.
+    let paste_on = get("bracketed_paste").unwrap_or(false);
+    if !paste_on {
+        let multiline_input = sem
+            .controls
+            .iter()
+            .any(|c| c.kind == crate::semantic::ControlKind::Field)
+            || screen
+                .viewport_text
+                .iter()
+                .any(|r| r.contains('>') || r.contains('$'));
+        if multiline_input {
+            findings.push(Finding {
+                id: "MODE-PASTE-RAW".into(),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "terminal_modes".into(),
+                summary: "bracketed paste is OFF near input fields — a multi-line paste executes line-by-line (the destructive enter-per-line trap).".into(),
+                evidence: vec![ev_other(
+                    "paste_unbracketed",
+                    "no ?2004 h observed; input target present",
+                    json!({
+                        "note": "paste via tui_act action=paste stays safe (the harness sends the payload whole); manual paste into the app is the risk",
+                    }),
+                )],
+                confidence: 0.6,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+    }
+
+    findings
+}

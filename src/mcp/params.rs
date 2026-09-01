@@ -223,7 +223,9 @@ selector_enum!(
 selector_enum!(
     /// `tui_audit` profile. `layout` is a documented alias of `resize`;
     /// `contract` (Wave E) folds conformance into findings. `unicode` and
-    /// `controls` (Wave 3) are static subsystem audits over one fused frame.
+    /// `controls` (Wave 3) are static subsystem audits over one fused frame;
+    /// `terminal_modes` reads the negotiated DECSET/DECRST timeline
+    /// (frame-level, no input sent).
     AuditProfile;
     [
         Full => "full", Keyboard => "keyboard", Focus => "focus", Resize => "resize",
@@ -231,6 +233,7 @@ selector_enum!(
         Navigation => "navigation", Contract => "contract", Color => "color",
         Performance => "performance", Mouse => "mouse", States => "states",
         Errors => "errors", Unicode => "unicode", Controls => "controls",
+        TerminalModes => "terminal_modes",
     ]
 );
 
