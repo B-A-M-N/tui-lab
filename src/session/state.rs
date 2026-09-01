@@ -1090,6 +1090,14 @@ impl Session {
         self.last().map(|s| self.analyze_screen(s.clone()))
     }
 
+    /// Mutable backend access for capture-layer callers (frame-sequence
+    /// capture walks the raw backend wait loop). Subsystem code should
+    /// prefer the Session methods; this exists so `capture` can operate
+    /// without duplicating session plumbing.
+    pub fn backend_mut(&mut self) -> &mut dyn TerminalBackend {
+        self.backend.as_mut()
+    }
+
     /// Send input. When recording, the backend has already delivered the exact
     /// encoded bytes to the recording hook, so the cast shows the real bytes
     /// (audit item 25).

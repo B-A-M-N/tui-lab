@@ -968,7 +968,7 @@ impl TuiLabServer {
             if let Some(refused) = lease_refused(sess) {
                 return refused;
             }
-            let tx = match crate::execution::execute_act_with_completion(
+            let tx = match crate::execution::execute_act_with_guard(
                 sess,
                 &action,
                 quiet,
@@ -976,9 +976,22 @@ impl TuiLabServer {
                 p.no_wait(),
                 visibility,
                 completion,
+                // Re-review P0.9: an agent-declared expected-state guard is
+                // validated atomically with the send. Drift refuses the
+                // action with a structured stale_state verdict instead of
+                // landing input in a changed UI.
+                p.guard().map(|g| g.to_guard()).as_ref(),
             ) {
                 Ok(t) => t,
-                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                Err(e) => {
+                    // A guard refusal is not a backend failure: classify it
+                    // so the agent knows to re-observe, not to retry blind.
+                    let msg = e.to_string();
+                    if msg.starts_with("stale_state") {
+                        return err(ErrorCategory::StaleState, msg);
+                    }
+                    return err(ErrorCategory::BackendError, msg);
+                }
             };
             // Scenario recording in progress? Append this act (audit: scenarios
             // capture real tool traffic; sensitive payloads are not recorded —
@@ -1146,30 +1159,60 @@ impl TuiLabServer {
                 out
             }
         };
+        // Re-review item 12: the stimulus is the canonical action grammar —
+        // the exact shapes tui_act takes — so the probe can apply anything
+        // the act tool can (paste, raw bytes, mouse families, resize,
+        // signal), not just the old key/type/click trio. Drift probes: no
+        // stimulus, or the legacy {"kind":"none"}.
+        let probe_guard = p.stimulus.as_ref().and_then(|s| s.guard());
         let stimulus = match &p.stimulus {
-            None | Some(crate::mcp::params::ProbeStimulus::None) => None,
+            None => None,
+            // A canonical request ALWAYS names a real action; the legacy
+            // `{"kind":"none"}` is the drift probe. Distinguish them by
+            // shape so a drift probe is not misreported as an unrecognized
+            // stimulus.
+            Some(crate::mcp::params::ProbeStimulus::Legacy(
+                crate::mcp::params::LegacyStimulus::None,
+            )) => None,
             Some(s) => match s.to_action() {
                 Some(a) => Some(a),
                 None => {
                     return err(
                         ErrorCategory::InvalidRequest,
-                        "unrecognized key name in stimulus (use a named key like 'enter'/'tab'/'up' or a single character)",
+                        "unrecognized stimulus: send a canonical action ({action:...}) or legacy {kind:none} for a drift probe",
                     )
                 }
             },
         };
+        // Re-review item 13: the structured capture spec — "the first N
+        // frames of the transition" and "sample after a fixed delay" are
+        // capture questions the completion names cannot ask. Handled as a
+        // wrapper around the standard probe (the settle policy still runs
+        // so `after` is decided, then the extra frames ride along).
+        let frame_capture = p.capture.as_ref().map(|c| match c {
+            crate::mcp::params::ProbeCapture::Frames { count } => (*count, 0u64),
+            crate::mcp::params::ProbeCapture::AfterDuration { ms } => (0usize, *ms),
+        });
         let quiet_ms = p.quiet_ms.unwrap_or(120);
         let budget_ms = p.budget_ms.unwrap_or(5000);
         let selector = p.id.clone();
         let run = self.run.clone();
         self.with_sess(selector.as_deref(), move |sess| {
-            match crate::diagnostic::run_probe(
+            // Item 13: the duration-sample capture needs its delay AFTER the
+            // settle; fold it into the effective budget so the wait inside
+            // the probe accounts for it.
+            let effective_budget = match frame_capture {
+                Some((_, extra_ms)) if extra_ms > 0 => budget_ms.saturating_add(extra_ms),
+                _ => budget_ms,
+            };
+            match crate::diagnostic::run_probe_with_guard(
                 sess,
                 stimulus,
                 completion,
                 &watch,
                 quiet_ms,
-                budget_ms,
+                effective_budget,
+                probe_guard.as_ref(),
             ) {
                 Ok(result) => {
                     {
@@ -1194,7 +1237,7 @@ impl TuiLabServer {
                         })
                         .collect::<Vec<_>>();
                     let anomalies = result.anomalies.clone();
-                    ok(json!({
+                    let mut result_json = json!({
                         "action": result.action,
                         "settle": format!("{:?}", result.settle),
                         "changed": result.has_changes(),
@@ -1229,7 +1272,54 @@ impl TuiLabServer {
                             },
                         },
                         "frames_captured": result.frames.len(),
-                    }))
+                    });
+                    // Item 13: a frames:N capture — the first N distinct
+                    // frames AFTER the settled state (the microscope view
+                    // of a redraw, animation, or spin loop). Reported
+                    // separately from the probe's own settle frames so the
+                    // completion evidence stays clean; an AfterDuration
+                    // capture samples one frame after a fixed delay.
+                    if let Some(spec) = frame_capture {
+                        let capture_json = match spec {
+                            (count, _) if count > 0 => {
+                                let anchor = sess.event_state().screen_seq;
+                                let outcome = crate::capture::capture_frame_sequence(
+                                    sess.backend_mut(),
+                                    count,
+                                    anchor,
+                                    std::time::Duration::from_millis(budget_ms),
+                                );
+                                json!({
+                                    "requested": outcome.requested,
+                                    "captured": outcome.captured,
+                                    "completed": outcome.completed,
+                                    "reason": outcome.reason.name(),
+                                    "elapsed_ms": outcome.elapsed_ms,
+                                    "frames": outcome.frames.iter().map(|f| json!({
+                                        "structure_hash": f.structure_hash,
+                                        "visual_hash": f.visual_hash,
+                                        "viewport_text": f.viewport_text,
+                                    })).collect::<Vec<_>>(),
+                                })
+                            }
+                            (_, delay_ms) => {
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(5000)));
+                                match sess.observe(30) {
+                                    Ok(f) => json!({
+                                        "sampled_after_ms": delay_ms,
+                                        "frame": {
+                                            "structure_hash": f.structure_hash,
+                                            "visual_hash": f.visual_hash,
+                                            "viewport_text": f.viewport_text,
+                                        },
+                                    }),
+                                    Err(e) => json!({ "error": format!("delayed sample failed: {e}") }),
+                                }
+                            }
+                        };
+                        result_json["capture"] = capture_json;
+                    }
+                    ok(result_json)
                 }
                 Err(e) => err(ErrorCategory::BackendError, e.to_string()),
             }

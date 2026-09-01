@@ -456,6 +456,35 @@ pub struct TuiObserveParams {
 #[doc(hidden)]
 pub struct TuiActRequestSchema;
 
+/// Agent-facing expected-state guard (re-review P0.9): the state the caller
+/// observed when it decided to act. The executor validates it atomically
+/// with the send; on drift the action is refused with a structured
+/// `stale_state` error naming expected vs actual — never a misdirected
+/// keystroke into a changed UI.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MutationGuardParam {
+    /// Session generation at decision time; a restart invalidates the guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+    /// Structure hash at decision time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_hash: Option<String>,
+    /// Focused control id at decision time (fused semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_control_id: Option<String>,
+}
+
+impl MutationGuardParam {
+    /// Convert to the executor guard.
+    pub fn to_guard(&self) -> crate::execution::MutationGuard {
+        crate::execution::MutationGuard {
+            generation: self.generation,
+            structure_hash: self.structure_hash.clone(),
+            focus_control_id: self.focus_control_id.clone(),
+        }
+    }
+}
+
 impl TuiActRequestSchema {
     pub fn wrapped(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         use schemars::json_schema;
@@ -636,6 +665,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     Keys {
         keys: Vec<String>,
@@ -647,6 +681,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     Type {
         text: String,
@@ -660,6 +699,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     Paste {
         paste: String,
@@ -673,6 +717,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     Raw {
         raw: Vec<u8>,
@@ -684,6 +733,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     MouseClick {
         x: u16,
@@ -698,6 +752,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     MousePress {
         x: u16,
@@ -712,6 +771,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     MouseRelease {
         x: u16,
@@ -726,6 +790,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     MouseMove {
         x: u16,
@@ -738,6 +807,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     MouseDrag {
         x: u16,
@@ -752,6 +826,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     MouseScroll {
         x: u16,
@@ -766,6 +845,11 @@ pub enum TuiActRequestVariants {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     Resize {
         cols: u16,
@@ -818,6 +902,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Send a sequence of key events.
     Keys {
@@ -830,6 +919,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Type text into the terminal.
     Type {
@@ -846,6 +940,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Paste text (with bracketed paste escape if negotiated).
     Paste {
@@ -860,6 +959,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Send raw bytes.
     Raw {
@@ -872,6 +976,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Mouse click (press + release).
     MouseClick {
@@ -887,6 +996,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Mouse press only.
     MousePress {
@@ -902,6 +1016,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Mouse release only.
     MouseRelease {
@@ -917,6 +1036,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Mouse move (no button).
     MouseMove {
@@ -930,6 +1054,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Mouse drag.
     MouseDrag {
@@ -945,6 +1074,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Mouse scroll.
     MouseScroll {
@@ -960,6 +1094,11 @@ pub enum TuiActRequest {
         wait_ms: Option<u64>,
         #[serde(default)]
         id: Option<String>,
+        /// Re-review P0.9: expected-state guard. Validated atomically with
+        /// the send; on drift the action is refused (`stale_state`), never
+        /// misdirected.
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Resize the terminal.
     Resize {
@@ -973,6 +1112,8 @@ pub enum TuiActRequest {
         completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
     /// Send a signal to the child process group.
     Signal {
@@ -985,6 +1126,8 @@ pub enum TuiActRequest {
         completion: Option<TuiCompletionParam>,
         #[serde(default)]
         wait_ms: Option<u64>,
+        #[serde(default)]
+        guard: Option<MutationGuardParam>,
     },
 }
 
@@ -1074,6 +1217,26 @@ impl TuiActRequest {
         }
     }
 
+    /// The request's expected-state guard (re-review P0.9), if any. Shared
+    /// field on every canonical action.
+    pub fn guard(&self) -> Option<&MutationGuardParam> {
+        match self {
+            TuiActRequest::Key { guard, .. }
+            | TuiActRequest::Keys { guard, .. }
+            | TuiActRequest::Type { guard, .. }
+            | TuiActRequest::Paste { guard, .. }
+            | TuiActRequest::Raw { guard, .. }
+            | TuiActRequest::MouseClick { guard, .. }
+            | TuiActRequest::MousePress { guard, .. }
+            | TuiActRequest::MouseRelease { guard, .. }
+            | TuiActRequest::MouseMove { guard, .. }
+            | TuiActRequest::MouseDrag { guard, .. }
+            | TuiActRequest::MouseScroll { guard, .. }
+            | TuiActRequest::Resize { guard, .. }
+            | TuiActRequest::Signal { guard, .. } => guard.as_ref(),
+        }
+    }
+
     pub fn id(&self) -> Option<&str> {
         match self {
             TuiActRequest::Key { id, .. } => id.as_deref(),
@@ -1123,11 +1286,49 @@ impl TuiActRequest {
     }
 }
 
-/// `tui_probe` stimulus vocabulary (re-review Wave-2): the canonical small
-/// experiment set. `none` runs a drift probe (no input, pure observation).
+/// `tui_probe` stimulus (re-review item 12): the FULL canonical action
+/// grammar — the same `TuiActRequest` shapes `tui_act` takes — plus the
+/// legacy `{kind: key|type|click|none}` compact form (kept deserializable so
+/// existing callers and recorded probes keep working). One action vocabulary
+/// across `tui_act`, `tui_probe`, scenario, and exploration: the probe's old
+/// local key parser (`{"kind":"key","key":"c","ctrl":true}`) had already
+/// drifted from the canonical one, which is exactly the class of divergence
+/// this unification removes. `{"action":"none"}` (or `{"kind":"none"}`) is a
+/// drift probe.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ProbeStimulus {
+    /// A full canonical action request — identical wire shape to `tui_act`.
+    Canonical(TuiActRequest),
+    /// The legacy compact form.
+    Legacy(LegacyStimulus),
+}
+
+impl ProbeStimulus {
+    /// The canonical action for this stimulus; `None` = drift probe (only
+    /// the legacy `none` shape means that — a canonical request always
+    /// names a real action).
+    pub fn to_action(&self) -> Option<crate::execution::CanonicalAction> {
+        match self {
+            ProbeStimulus::Canonical(req) => crate::execution::CanonicalAction::from_request(req).ok(),
+            ProbeStimulus::Legacy(l) => l.to_action(),
+        }
+    }
+
+    /// The executor guard the stimulus may carry (canonical form only).
+    pub fn guard(&self) -> Option<crate::execution::MutationGuard> {
+        match self {
+            ProbeStimulus::Canonical(req) => req.guard().map(|g| g.to_guard()),
+            ProbeStimulus::Legacy(_) => None,
+        }
+    }
+}
+
+/// `tui_probe` legacy compact stimulus vocabulary. Retained for wire
+/// compatibility; new callers send canonical actions.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ProbeStimulus {
+pub enum LegacyStimulus {
     /// A single named key, optionally modified (`key: "enter"`,
     /// `key: "ctrl+c"`, `key: "tab"`).
     Key {
@@ -1147,14 +1348,14 @@ pub enum ProbeStimulus {
     None,
 }
 
-impl ProbeStimulus {
+impl LegacyStimulus {
     /// Convert to the canonical action (None stays None at the caller).
     pub fn to_action(&self) -> Option<crate::execution::CanonicalAction> {
         use crate::backend::{KeyModifiers, MouseButton};
         use crate::execution::CanonicalAction as CA;
         match self {
-            ProbeStimulus::None => None,
-            ProbeStimulus::Key { key, ctrl, alt, shift } => {
+            LegacyStimulus::None => None,
+            LegacyStimulus::Key { key, ctrl, alt, shift } => {
                 let mut mods = KeyModifiers::empty();
                 if *ctrl { mods |= KeyModifiers::CTRL; }
                 if *alt { mods |= KeyModifiers::ALT; }
@@ -1162,8 +1363,8 @@ impl ProbeStimulus {
                 let code = parse_key_name(key)?;
                 Some(CA::Key { key: crate::backend::KeyEvent { code, modifiers: mods } })
             }
-            ProbeStimulus::Type { text } => Some(CA::Type { text: text.clone() }),
-            ProbeStimulus::Click { button, x, y } => Some(CA::MouseClick {
+            LegacyStimulus::Type { text } => Some(CA::Type { text: text.clone() }),
+            LegacyStimulus::Click { button, x, y } => Some(CA::MouseClick {
                 button: match button {
                     MouseButtonParam::Left => MouseButton::Left,
                     MouseButtonParam::Middle => MouseButton::Middle,
@@ -1243,13 +1444,23 @@ impl ProbeCompletion {
 /// materially different", with causal event scoping and the settled frame).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiProbeParams {
-    /// The experiment: a key/text/click stimulus, or `{"kind": "none"}` for
-    /// a drift probe.
+    /// The experiment: any canonical action (`{"action": ...}` — the exact
+    /// `tui_act` grammar) or the legacy compact `{"kind": ...}` shape;
+    /// omit (or `{"kind":"none"}`) for a drift probe.
     #[serde(default)]
     pub stimulus: Option<ProbeStimulus>,
-    /// How "after" is decided (default: `stable`).
+    /// How "after" is decided. Either the legacy bare name
+    /// (`"stable"`, `"text_appears"`, …) or a capture spec object
+    /// (re-review item 13): `{"strategy":"frames","count":8}` to grab the
+    /// first N frames of a transition ("press Enter and show me the first
+    /// 8 frames"), `{"strategy":"after_duration","ms":250}` to sample the
+    /// screen a fixed interval after the stimulus.
     #[serde(default)]
     pub completion: Option<Known<ProbeCompletion>>,
+    /// The structured capture spec (item 13). Takes precedence over
+    /// `completion` when present.
+    #[serde(default)]
+    pub capture: Option<ProbeCapture>,
     /// Required text for `text_appears` / `text_disappears`.
     #[serde(default)]
     pub text: Option<String>,
@@ -1265,6 +1476,39 @@ pub struct TuiProbeParams {
     pub budget_ms: Option<u64>,
     #[serde(default)]
     pub id: Option<String>,
+}
+
+/// The probe's capture strategies (re-review item 13): how the after-side
+/// of the experiment is collected. The completion names decide *when the
+/// action is done*; the frames/duration strategies decide *what to record*
+/// — "the first N frames of the transition" is a capture question, not a
+/// completion question, and the old enum could not ask it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum ProbeCapture {
+    /// Collect the first `count` distinct frames after the stimulus
+    /// (the terminal microscope: flicker/double-draw diagnosis).
+    Frames {
+        /// How many distinct post-stimulus frames to record.
+        count: usize,
+    },
+    /// Let the stimulus settle, then sample one frame after `ms`.
+    AfterDuration {
+        /// Delay between the stimulus and the sampled frame.
+        ms: u64,
+    },
+}
+
+impl ProbeCapture {
+    /// The capture's budget share of the overall probe budget (frames
+    /// want most of it; a duration sample needs only its delay plus
+    /// settle slack).
+    pub fn budget_hint(&self, total_ms: u64) -> u64 {
+        match self {
+            ProbeCapture::Frames { .. } => total_ms,
+            ProbeCapture::AfterDuration { ms } => ms.saturating_add(1000).min(total_ms),
+        }
+    }
 }
 
 selector_enum!(

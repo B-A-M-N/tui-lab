@@ -58,13 +58,38 @@ pub struct ProbeResult {
 
 impl ProbeResult {
     /// Whether the probe found *any* material change worth reporting.
+    ///
+    /// Re-review item 14: "material" is broader than cells and added
+    /// controls. A focus highlight that moves via reverse-video changes no
+    /// characters (style-only); a title rewrite, a bell, a native semantic
+    /// event, or a visual-layer change can each be the *whole* diagnostic
+    /// answer. Every one of those now counts.
     pub fn has_changes(&self) -> bool {
+        // Screen-level material change.
         self.transition.screen_diff.changed_cells > 0
-            || !self.transition.semantic_diff.controls_added.is_empty()
-            || !self.transition.semantic_diff.controls_removed.is_empty()
-            || !self.transition.semantic_diff.regions_added.is_empty()
+            || self.transition.screen_diff.style_changes > 0
+            || self.transition.screen_diff.title.is_some()
             || self.transition.screen_diff.cursor.is_some()
             || self.transition.screen_diff.process.is_some()
+            || self.transition.screen_diff.dimensions.is_some()
+            // Semantic-level material change — include MODIFIED controls
+            // (a label flip, an enable toggle) not only added/removed ones.
+            || !self.transition.semantic_diff.controls_added.is_empty()
+            || !self.transition.semantic_diff.controls_removed.is_empty()
+            || self.transition.semantic_diff.controls_changed_count > 0
+            || !self.transition.semantic_diff.regions_added.is_empty()
+            || !self.transition.semantic_diff.regions_removed.is_empty()
+            // Event-window signals: bell, native, visual. These carry facts
+            // the before/after frames cannot (a bell leaves no trace in a
+            // static frame).
+            || self.terminal_events.iter().any(|ev| {
+                matches!(
+                    ev.kind,
+                    crate::events::TerminalEventKind::Bell
+                        | crate::events::TerminalEventKind::NativeEvent { .. }
+                        | crate::events::TerminalEventKind::VisualChanged
+                )
+            })
     }
 }
 
@@ -95,6 +120,23 @@ pub fn run_probe(
     quiet_ms: u64,
     budget_ms: u64,
 ) -> anyhow::Result<ProbeResult> {
+    run_probe_with_guard(session, stimulus, completion, watch, quiet_ms, budget_ms, None)
+}
+
+/// [`run_probe`] with an expected-state guard (re-review P0.9): the guard
+/// is validated atomically with the stimulus send, so an experiment
+/// requested against a stale mental model is REFUSED (structured
+/// `stale_state` verdict) instead of misfiring into a changed UI.
+#[allow(clippy::too_many_arguments)]
+pub fn run_probe_with_guard(
+    session: &mut Session,
+    stimulus: Option<CanonicalAction>,
+    completion: CompletionPolicy,
+    watch: &[ProbeWatch],
+    quiet_ms: u64,
+    budget_ms: u64,
+    guard: Option<&crate::execution::MutationGuard>,
+) -> anyhow::Result<ProbeResult> {
     let start = Instant::now();
     let action = match &stimulus {
         Some(a) => a.signature(),
@@ -119,7 +161,7 @@ pub fn run_probe(
     //       executor's compiled completion plan.
     let (tx, events) = match stimulus {
         Some(act) => {
-            let tx = crate::execution::execute_act_with_completion(
+            let tx = crate::execution::execute_act_with_guard(
                 session,
                 &act,
                 quiet_ms,
@@ -127,6 +169,7 @@ pub fn run_probe(
                 false,
                 crate::execution::InputVisibility::Normal,
                 completion,
+                guard,
             )?;
             let batch = session.events_since(pre_seq);
             (Some(tx), batch.events)

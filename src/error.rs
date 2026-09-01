@@ -25,6 +25,11 @@ pub enum ErrorCategory {
     /// machine-driving tools refuse to act while the lease is valid. The
     /// agent can retry after `ttl_ms` elapses or ask for the lease back.
     ControlLeased,
+    /// An expected-state guard refused the action (re-review P0.9): the
+    /// screen changed between the caller's observation and its action.
+    /// The payload names expected vs actual so the agent can re-observe
+    /// and re-decide — retrying blind would misdirect input.
+    StaleState,
 }
 
 impl ErrorCategory {
@@ -39,6 +44,7 @@ impl ErrorCategory {
             ErrorCategory::InternalError => "internal_error",
             ErrorCategory::Unsupported => "unsupported",
             ErrorCategory::ControlLeased => "control_leased",
+            ErrorCategory::StaleState => "stale_state",
         }
     }
 }
