@@ -416,8 +416,14 @@ fn check_components(session: &mut Session, contract: &ProjectContract) -> Vec<Ch
     if contract.components.is_empty() {
         return out;
     }
-    let screen = match session.observe(50) {
-        Ok(s) => s,
+    // Re-review P0.4: component checks evaluate the FUSED FrameAnalysis —
+    // the same authority `tui_observe semantic` serves — so a cooperative
+    // app's native semantics (disabled Save, native focus, real roles)
+    // participate in conformance exactly as they appear in observation.
+    // The old bare `semantic::analyze` let contract status disagree with
+    // the observation an agent had just read.
+    let analysis = match session.observe(50) {
+        Ok(screen) => session.analyze_screen(screen),
         Err(e) => {
             out.push(CheckResult::fail(
                 "component",
@@ -427,11 +433,12 @@ fn check_components(session: &mut Session, contract: &ProjectContract) -> Vec<Ch
             return out;
         }
     };
-    let sem = semantic::analyze(&screen);
-    let tree = semantic::build_tree(&screen);
+    let screen = &analysis.frame;
+    let sem = &analysis.semantic;
+    let tree = &analysis.tree;
 
     for comp in &contract.components {
-        out.push(check_one_component(&screen, &sem, &tree, comp));
+        out.push(check_one_component(screen, sem, tree, comp));
     }
     out
 }
@@ -641,9 +648,12 @@ fn run_interaction(
         *driven += 1;
     }
 
-    // Evaluate the expect oracles against the settled frame.
-    let screen = match session.observe(60) {
-        Ok(s) => s,
+    // Evaluate the expect oracles against the settled frame — through the
+    // fused FrameAnalysis (re-review P0.4), so an interaction oracle sees
+    // native truth (a cooperatively-disabled button, native focus) exactly
+    // as observation reports it.
+    let analysis = match session.observe(60) {
+        Ok(s) => session.analyze_screen(s),
         Err(e) => {
             return CheckResult::fail(
                 "interaction",
@@ -652,7 +662,8 @@ fn run_interaction(
             )
         }
     };
-    let sem = semantic::analyze(&screen);
+    let screen = &analysis.frame;
+    let sem = &analysis.semantic;
     let changed = screen.structure_hash != before_hash;
 
     if inter.expect.is_empty() {
@@ -669,7 +680,7 @@ fn run_interaction(
     let mut failures = Vec::new();
     let mut passes = 0;
     for e in &inter.expect {
-        let outcome = oracle::eval_static(e, &screen, &sem);
+        let outcome = oracle::eval_static(e, screen, sem);
         if outcome.parse_error.is_some() || !outcome.passed {
             failures.push(outcome.detail.clone());
         } else {
@@ -772,7 +783,7 @@ fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> 
     };
     let screen = tx.after().clone();
     check_clipping_on_screen(
-        &screen,
+        &session.analyze_screen(screen),
         name,
         &LayoutConstraint {
             name: None,
@@ -784,7 +795,7 @@ fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> 
 }
 
 fn check_clipping_on_screen(
-    screen: &crate::screen::ScreenState,
+    analysis: &crate::session::state::FrameAnalysis,
     name: String,
     lc: &LayoutConstraint,
 ) -> CheckResult {
@@ -795,7 +806,9 @@ fn check_clipping_on_screen(
             "clipping not required to be checked".to_string(),
         );
     }
-    let sem = semantic::analyze(screen);
+    // Re-review P0.4: clipping reads the fused region set (native-declared
+    // regions clip like inferred ones).
+    let sem = &analysis.semantic;
     let clipped: Vec<String> = sem
         .regions
         .iter()
@@ -814,8 +827,8 @@ fn check_clipping_on_screen(
 }
 
 fn check_clipping_here(session: &mut Session, name: String, lc: &LayoutConstraint) -> CheckResult {
-    let screen = match session.observe(60) {
-        Ok(s) => s,
+    let analysis = match session.observe(60) {
+        Ok(s) => session.analyze_screen(s),
         Err(e) => return CheckResult::fail("layout", name, format!("observe failed: {e}")),
     };
     if !lc.no_clipping {
@@ -825,7 +838,8 @@ fn check_clipping_here(session: &mut Session, name: String, lc: &LayoutConstrain
             "clipping not required to be checked".to_string(),
         );
     }
-    let sem = semantic::analyze(&screen);
+    let screen = &analysis.frame;
+    let sem = &analysis.semantic;
     let clipped: Vec<String> = sem
         .regions
         .iter()
@@ -880,7 +894,7 @@ fn check_behavior(
     // ── escape_closes_modal ──
     if contract.escape_closes_modal {
         let pre = session.observe(50).ok();
-        let modal_before = pre.as_ref().map(modal_present).unwrap_or(false);
+        let modal_before = pre.as_ref().map(|_| modal_present(session)).unwrap_or(false);
         if !modal_before {
             // Establish the precondition from the contract itself: an
             // interaction whose expect declares `modal_open()` IS the
@@ -904,11 +918,7 @@ fn check_behavior(
                         }
                     }
                 }
-                opened = opened
-                    && session
-                        .observe(60)
-                        .map(|s| modal_present(&s))
-                        .unwrap_or(false);
+                opened = opened && session.observe(60).map(|_| modal_present(session)).unwrap_or(false);
             }
             if !opened {
                 // Item 32: no modal and no declared opener — the check
@@ -935,7 +945,7 @@ fn check_behavior(
             // Only escape-check when a modal is actually up now.
             let modal_now = session
                 .observe(50)
-                .map(|s| modal_present(&s))
+                .map(|_| modal_present(session))
                 .unwrap_or(false);
             if modal_now {
                 let closed_ok = drive_escape_check(session);
@@ -965,7 +975,7 @@ fn check_behavior(
                 if execute_act(session, &action, 80, 900, false).is_ok() {
                     *driven += 1;
                     let after = session.observe(60).ok();
-                    let modal_after = after.as_ref().map(modal_present).unwrap_or(true);
+                    let modal_after = after.as_ref().map(|_| modal_present(session)).unwrap_or(true);
                     let changed = after
                         .as_ref()
                         .map(|s| s.structure_hash != before_hash)
@@ -1004,11 +1014,14 @@ fn check_behavior(
         // Forward Tab sweep (bounded), then reverse Shift+Tab sweep.
         let mut forward = 0u32;
         for _ in 0..12 {
-            let before = match session.observe(30) {
+            // Fused before/after (re-review P0.4): the focus graph sees the
+            // same native-participating semantics observation does.
+            let before_b = match session.observe(30) {
                 Ok(s) => s,
                 Err(_) => break,
             };
-            let sem_b = semantic::analyze(&before);
+            let analysis_b = session.analyze_screen(before_b);
+            let sem_b = &analysis_b.semantic;
             let req = serde_json::json!({"action": "key", "key": "tab"});
             let Some(action) = serde_json::from_value::<crate::mcp::params::TuiActRequest>(req)
                 .ok()
@@ -1021,8 +1034,9 @@ fn check_behavior(
             };
             *driven += 1;
             forward += 1;
-            let after = tx.after().clone();
-            let sem_a = semantic::analyze(&after);
+            let after_a = tx.after().clone();
+            let analysis_a = session.analyze_screen(after_a);
+            let sem_a = &analysis_a.semantic;
             if let (Some(f), Some(t)) = (&sem_b.focus.control_id, &sem_a.focus.control_id) {
                 graph.record_edge(f, t, "tab", sem_a.focus.control.as_deref());
             }
@@ -1033,11 +1047,12 @@ fn check_behavior(
         }
         let mut reverse_ok = true;
         for _ in 0..forward {
-            let before = match session.observe(30) {
+            let before_r = match session.observe(30) {
                 Ok(s) => s,
                 Err(_) => break,
             };
-            let sem_b = semantic::analyze(&before);
+            let analysis_r = session.analyze_screen(before_r);
+            let sem_b = &analysis_r.semantic;
             let req = serde_json::json!({"action": "key", "key": "shift+tab"});
             let Some(action) = serde_json::from_value::<crate::mcp::params::TuiActRequest>(req)
                 .ok()
@@ -1051,8 +1066,9 @@ fn check_behavior(
                 break;
             };
             *driven += 1;
-            let after = tx.after().clone();
-            let sem_a = semantic::analyze(&after);
+            let after_r = tx.after().clone();
+            let analysis_a = session.analyze_screen(after_r);
+            let sem_a = &analysis_a.semantic;
             if let (Some(f), Some(t)) = (&sem_b.focus.control_id, &sem_a.focus.control_id) {
                 graph.record_edge(f, t, "shift+tab", sem_a.focus.control.as_deref());
             }
@@ -1105,11 +1121,17 @@ fn check_behavior(
     observed
 }
 
-fn modal_present(screen: &crate::screen::ScreenState) -> bool {
-    let tree = crate::semantic::build_tree(screen);
-    !tree
-        .layer_nodes(crate::semantic::node::Layer::Modal)
-        .is_empty()
+fn modal_present(session: &Session) -> bool {
+    // Re-review P0.4: modal detection reads the fused tree — a native
+    // overlay that declares a modal layer participates in the verdict.
+    session
+        .analyze_last()
+        .map(|a| {
+            !a.tree
+                .layer_nodes(crate::semantic::node::Layer::Modal)
+                .is_empty()
+        })
+        .unwrap_or(false)
 }
 
 /// Send Escape and report whether the modal layer is gone afterwards.
@@ -1126,7 +1148,7 @@ fn drive_escape_check(session: &mut Session) -> bool {
     }
     session
         .observe(60)
-        .map(|s| !modal_present(&s))
+        .map(|_| !modal_present(session))
         .unwrap_or(false)
 }
 
@@ -1142,8 +1164,10 @@ fn check_top_level_oracles(
     if contract.oracles.is_empty() {
         return out;
     }
-    let screen = match session.observe(50) {
-        Ok(s) => s,
+    // Fused oracle evaluation (re-review P0.4): top-level contract oracles
+    // run against the same FrameAnalysis observation serves.
+    let analysis = match session.observe(50) {
+        Ok(s) => session.analyze_screen(s),
         Err(e) => {
             out.push(CheckResult::fail(
                 "behavior",
@@ -1153,7 +1177,8 @@ fn check_top_level_oracles(
             return out;
         }
     };
-    let sem = semantic::analyze(&screen);
+    let screen = analysis.frame.clone();
+    let sem = analysis.semantic.clone();
     let answers = ActiveArgs {
         escape_closes_modal: observed.escape_closes_modal,
         reverse_tab_is_inverse: observed.reverse_tab_is_inverse,
