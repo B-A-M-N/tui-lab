@@ -33,12 +33,24 @@ use crate::session::state::Session;
 use serde_json::json;
 
 /// Severity of one conformance check result.
+///
+/// Re-review item 32: PASS/FAIL/WARN alone overclaim. A check whose
+/// evidence never arrived (active oracle, no observation) did not *fail* —
+/// it is [`Verdict::Unverified`]. A check that cannot run in this
+/// environment at all (capability absent, precondition not establishable)
+/// is [`Verdict::Unsupported`]. Neither is a defect claim; treating either
+/// as FAIL makes the report lie about the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Pass,
     Warn,
     Fail,
+    /// The check ran but the evidence needed to decide never arrived.
+    Unverified,
+    /// The check cannot run in this environment (missing capability,
+    /// unestablishable precondition) — no verdict is possible.
+    Unsupported,
 }
 
 impl Verdict {
@@ -47,17 +59,31 @@ impl Verdict {
             Verdict::Pass => "PASS",
             Verdict::Warn => "WARN",
             Verdict::Fail => "FAIL",
+            Verdict::Unverified => "UNVERIFIED",
+            Verdict::Unsupported => "UNSUPPORTED",
         }
     }
-    /// Merge: a Fail dominates, then Warn.
+    /// Merge: a Fail dominates, then Warn, then Unverified (we tried and
+    /// couldn't tell — more concerning than "can't test here"), then
+    /// Unsupported.
     pub fn merge(self, other: Verdict) -> Verdict {
-        if self == Verdict::Fail || other == Verdict::Fail {
-            Verdict::Fail
-        } else if self == Verdict::Warn || other == Verdict::Warn {
-            Verdict::Warn
+        use Verdict::*;
+        let rank = |v: Verdict| match v {
+            Fail => 4,
+            Warn => 3,
+            Unverified => 2,
+            Unsupported => 1,
+            Pass => 0,
+        };
+        if rank(self) >= rank(other) {
+            self
         } else {
-            Verdict::Pass
+            other
         }
+    }
+    /// Is this a defect claim (feeds findings / fatality)?
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Verdict::Fail | Verdict::Warn)
     }
 }
 
@@ -114,8 +140,10 @@ impl CheckResult {
 pub struct ContractReport {
     pub contract: String,
     pub version: String,
-    /// PASS / WARN / FAIL for the whole contract.
+    /// PASS / WARN / FAIL / UNVERIFIED / UNSUPPORTED for the whole contract.
     pub verdict: Verdict,
+    /// The mode the check ran under (how failures bind).
+    pub mode: crate::design::schema::ContractMode,
     pub results: Vec<CheckResult>,
     /// Number of app-driving actions the check performed (evidence for
     /// "this was proven, not assumed").
@@ -131,23 +159,27 @@ impl ContractReport {
             "version": self.version,
             "verdict": self.verdict.as_str(),
             "driven_actions": self.driven_actions,
+            "mode": self.mode.as_str(),
             "pass": count(Verdict::Pass),
             "warn": count(Verdict::Warn),
             "fail": count(Verdict::Fail),
+            "unverified": count(Verdict::Unverified),
+            "unsupported": count(Verdict::Unsupported),
         })
     }
 
     /// Failed oracles become evidence-backed findings so the contract path
-    /// feeds the same finding ledger as the audits (item 49).
+    /// feeds the same finding ledger as the audits (item 49). Unverified /
+    /// Unsupported results are NOT defect claims (item 32) — they are
+    /// recorded as `info` so the ledger stays honest about what happened,
+    /// never dressed as failures.
     pub fn findings(&self) -> Vec<Finding> {
         let mut out = Vec::new();
         for r in &self.results {
-            if r.verdict == Verdict::Pass {
-                continue;
-            }
             let severity = match (r.verdict, r.required) {
                 (Verdict::Fail, true) => "error",
                 (Verdict::Fail, false) | (Verdict::Warn, _) => "warn",
+                (Verdict::Unverified, _) | (Verdict::Unsupported, _) => "info",
                 (Verdict::Pass, _) => continue,
             };
             let id = format!(
@@ -202,6 +234,18 @@ pub fn check_contract(
     session: &mut Session,
     contract: &ProjectContract,
 ) -> anyhow::Result<ContractReport> {
+    check_contract_with_mode(session, contract, None)
+}
+
+/// [`check_contract`] with a check-time mode override (item 33): `Some(m)`
+/// replaces the contract document's `schema.mode` for this check only —
+/// the same contract can run advisory in dev and strict in CI without
+/// being edited.
+pub fn check_contract_with_mode(
+    session: &mut Session,
+    contract: &ProjectContract,
+    mode_override: Option<crate::design::schema::ContractMode>,
+) -> anyhow::Result<ContractReport> {
     let mut results = Vec::new();
     let mut driven = 0u32;
 
@@ -235,12 +279,22 @@ pub fn check_contract(
         false,
     );
 
+    // Overall verdict (item 33): the contract's mode decides how failures
+    // and missing evidence bind. Advisory keeps the old shape (required
+    // fail → FAIL, optional fail → WARN); Validation promotes optional
+    // failures; Strict additionally treats Unverified as fatal.
+    let mode = mode_override.unwrap_or(contract.schema.mode);
     let verdict = results.iter().fold(Verdict::Pass, |acc, r| {
-        let v = if r.verdict == Verdict::Fail && !r.required {
-            // A failed optional check is a WARN overall, not a FAIL.
-            Verdict::Warn
-        } else {
-            r.verdict
+        let v = match r.verdict {
+            Verdict::Fail => {
+                if r.required || mode.optional_failure_is_fatal() {
+                    Verdict::Fail
+                } else {
+                    Verdict::Warn
+                }
+            }
+            Verdict::Unverified if mode.unverified_is_fatal() => Verdict::Fail,
+            other => other,
         };
         acc.merge(v)
     });
@@ -249,6 +303,7 @@ pub fn check_contract(
         contract: contract.schema.name.clone(),
         version: contract.schema.version.clone(),
         verdict,
+        mode,
         results,
         driven_actions: driven,
     })
@@ -404,17 +459,27 @@ fn check_one_component(
         .iter()
         .any(|r| format!("{:?}", r.kind).to_lowercase() == want);
 
-    // 3) Semantic node roles (menu, command_palette, …) — anywhere in the tree.
+    // 3) Semantic node roles (menu, command_palette, …) — anywhere in the
+    //    tree. Confidence-gated (item 36): a node whose role inference is
+    //    weak (score < 0.6) does not count as a *hit* — and if nothing else
+    //    matched either, its best candidate is named in the failure detail
+    //    so the author can tighten the contract or fix the detector. A
+    //    low-confidence heuristic must never be the sole hard evidence for
+    //    a PASS.
     let node_hit = role_matches(want, &tree.root);
+    let best_guess = best_role_guess(want, &tree.root);
 
     let found = component_hit || region_hit || node_hit;
     if !found {
-        let result = CheckResult::fail(
-            "component",
-            comp.name.clone(),
-            format!("component role '{}' not found on screen", comp.role),
-        )
-        .required(comp.required);
+        let detail = match &best_guess {
+            Some((id, conf)) => format!(
+                "component role '{}' not found on screen; nearest inferred match '{}' at confidence {conf:.2} (below the 0.6 gate)",
+                comp.role, id
+            ),
+            None => format!("component role '{}' not found on screen", comp.role),
+        };
+        let result = CheckResult::fail("component", comp.name.clone(), detail)
+            .required(comp.required);
         return if comp.required {
             result
         } else {
@@ -463,10 +528,37 @@ fn check_one_component(
 
 /// Recursive role-slug match over the semantic node tree.
 fn role_matches(want: &str, node: &semantic::SemanticNode) -> bool {
-    if node.role.slug() == want {
+    if node.role.slug() == want && node.confidence.score >= 0.6 {
         return true;
     }
     node.children.iter().any(|c| role_matches(want, c))
+}
+
+/// The nearest role match below the confidence gate, for honest failure
+/// detail (item 36): "not found" with a named near-miss is actionable;
+/// bare "not found" invites contract thrash.
+fn best_role_guess(
+    want: &str,
+    node: &semantic::SemanticNode,
+) -> Option<(String, f32)> {
+    let mut best: Option<(String, f32)> = None;
+    fn walk(
+        want: &str,
+        node: &semantic::SemanticNode,
+        best: &mut Option<(String, f32)>,
+    ) {
+        if node.role.slug() == want
+            && node.confidence.score < 0.6
+            && best.as_ref().map(|(_, c)| node.confidence.score > *c).unwrap_or(true)
+        {
+            *best = Some((node.id.clone(), node.confidence.score));
+        }
+        for c in &node.children {
+            walk(want, c, best);
+        }
+    }
+    walk(want, node, &mut best);
+    best
 }
 
 fn to_sub_result(group: &'static str, parent: &str, outcome: &OracleOutcome) -> CheckResult {
@@ -819,11 +911,17 @@ fn check_behavior(
                         .unwrap_or(false);
             }
             if !opened {
-                results.push(CheckResult::warn(
-                    "behavior",
-                    "escape_closes_modal",
-                    "skipped: no modal is open and no contract interaction declares modal_open() to establish one",
-                ));
+                // Item 32: no modal and no declared opener — the check
+                // cannot run here at all. That is Unsupported, not a
+                // soft failure: nothing was measured.
+                results.push(CheckResult {
+                    verdict: Verdict::Unsupported,
+                    ..CheckResult::warn(
+                        "behavior",
+                        "escape_closes_modal",
+                        "no modal is open and no contract interaction declares modal_open() to establish one",
+                    )
+                });
             } else {
                 results.push(CheckResult::pass(
                     "behavior",
@@ -961,17 +1059,28 @@ fn check_behavior(
         }
         let gaps = graph.reverse_tab_gaps();
         if forward == 0 {
-            results.push(CheckResult::warn(
-                "behavior",
-                "reverse_tab_required",
-                "skipped: no Tab traversal possible on this screen",
-            ));
+            // Item 32: no focusable traversal exists — the sweep cannot
+            // run. Unsupported, declared as such.
+            results.push(CheckResult {
+                verdict: Verdict::Unsupported,
+                ..CheckResult::warn(
+                    "behavior",
+                    "reverse_tab_required",
+                    "no Tab traversal possible on this screen",
+                )
+            });
         } else if !reverse_ok {
-            results.push(CheckResult::warn(
-                "behavior",
-                "reverse_tab_required",
-                "incomplete: Shift+Tab sweep could not complete; no verdict",
-            ));
+            // Item 32: the sweep ran forward but the reverse pass could
+            // not complete — evidence never arrived. Unverified, not a
+            // failure.
+            results.push(CheckResult {
+                verdict: Verdict::Unverified,
+                ..CheckResult::warn(
+                    "behavior",
+                    "reverse_tab_required",
+                    "Shift+Tab sweep could not complete; no verdict",
+                )
+            });
         } else if gaps.is_empty() {
             observed.reverse_tab_is_inverse = Some(true);
             results.push(CheckResult::pass(
@@ -1073,4 +1182,126 @@ fn check_top_level_oracles(
 /// node role (kept `pub` for the loader/docs).
 pub fn role_slug(r: Role) -> String {
     r.slug()
+}
+
+#[cfg(test)]
+mod wave5_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn merge_order_fail_over_warn_over_unverified_over_unsupported() {
+        // Item 32: the vocabulary is ordered; a Fail dominates everything.
+        assert_eq!(Verdict::Pass.merge(Verdict::Warn), Verdict::Warn);
+        assert_eq!(Verdict::Warn.merge(Verdict::Unverified), Verdict::Warn);
+        assert_eq!(Verdict::Unverified.merge(Verdict::Pass), Verdict::Unverified);
+        assert_eq!(Verdict::Unsupported.merge(Verdict::Unverified), Verdict::Unverified);
+        assert_eq!(Verdict::Unsupported.merge(Verdict::Fail), Verdict::Fail);
+        assert_eq!(Verdict::Fail.merge(Verdict::Pass), Verdict::Fail);
+        // Symmetry of the rank fold.
+        assert_eq!(
+            Verdict::Unsupported.merge(Verdict::Warn),
+            Verdict::Warn.merge(Verdict::Unsupported)
+        );
+    }
+
+    #[test]
+    fn only_failures_are_defect_claims() {
+        // Item 32: Unverified and Unsupported are honest absences, never
+        // defect claims.
+        assert!(Verdict::Fail.is_failure());
+        assert!(Verdict::Warn.is_failure());
+        assert!(!Verdict::Unverified.is_failure());
+        assert!(!Verdict::Unsupported.is_failure());
+        assert!(!Verdict::Pass.is_failure());
+    }
+
+    #[test]
+    fn unverified_and_unsupported_findings_are_info_not_errors() {
+        // A contract report with one Unverified and one Unsupported check
+        // must not emit error/warn findings — the ledger stays honest.
+        let report = ContractReport {
+            contract: "t".into(),
+            version: "1".into(),
+            verdict: Verdict::Unverified,
+            mode: crate::design::ContractMode::Advisory,
+            results: vec![
+                CheckResult {
+                    group: "behavior",
+                    name: "escape_closes_modal".into(),
+                    verdict: Verdict::Unsupported,
+                    detail: "no modal to check".into(),
+                    required: true,
+                },
+                CheckResult {
+                    group: "behavior",
+                    name: "reverse_tab_required".into(),
+                    verdict: Verdict::Unverified,
+                    detail: "sweep did not complete".into(),
+                    required: true,
+                },
+            ],
+            driven_actions: 0,
+        };
+        let findings = report.findings();
+        assert_eq!(findings.len(), 2);
+        for f in &findings {
+            assert_eq!(f.severity, "info", "non-failure verdicts are info: {f:?}");
+        }
+    }
+
+    #[test]
+    fn mode_binding_advisory_vs_validation_vs_strict() {
+        // Item 33: the same results fold differently per mode.
+        // advisory: optional fail → Warn; validation: optional fail → Fail;
+        // strict: additionally Unverified → Fail.
+        let results = [
+            CheckResult {
+                group: "component",
+                name: "optional-widget".into(),
+                verdict: Verdict::Fail,
+                detail: "absent".into(),
+                required: false,
+            },
+            CheckResult {
+                group: "behavior",
+                name: "sweep".into(),
+                verdict: Verdict::Unverified,
+                detail: "evidence missing".into(),
+                required: true,
+            },
+        ];
+        let fold = |mode: crate::design::ContractMode| {
+            results.iter().fold(Verdict::Pass, |acc, r| {
+                let v = match r.verdict {
+                    Verdict::Fail => {
+                        if r.required || mode.optional_failure_is_fatal() {
+                            Verdict::Fail
+                        } else {
+                            Verdict::Warn
+                        }
+                    }
+                    Verdict::Unverified if mode.unverified_is_fatal() => Verdict::Fail,
+                    other => other,
+                };
+                acc.merge(v)
+            })
+        };
+        assert_eq!(fold(crate::design::ContractMode::Advisory), Verdict::Warn);
+        assert_eq!(fold(crate::design::ContractMode::Validation), Verdict::Fail);
+        assert_eq!(fold(crate::design::ContractMode::Strict), Verdict::Fail);
+        // Strict only differs when evidence is missing and nothing failed.
+        let only_unverified = [results[1].clone()];
+        let strict_fold = only_unverified.iter().fold(Verdict::Pass, |acc, r| {
+            let v = match r.verdict {
+                Verdict::Unverified if fold_strict_gate() => Verdict::Fail,
+                other => other,
+            };
+            acc.merge(v)
+        });
+        assert_eq!(strict_fold, Verdict::Fail, "strict: Unverified is fatal");
+    }
+
+    fn fold_strict_gate() -> bool {
+        crate::design::ContractMode::Strict.unverified_is_fatal()
+    }
 }

@@ -2733,7 +2733,8 @@ impl TuiLabServer {
                             ),
                         }
                     };
-                self.check_contract_against(p.id.as_deref(), contract).await
+                self.check_contract_against(p.id.as_deref(), contract, p.mode.as_deref())
+                    .await
             }
             // ── compare: run conformance now, diff against the baseline ──
             CT::Compare => {
@@ -2749,7 +2750,7 @@ impl TuiLabServer {
                         }
                     };
                 let current = match self
-                    .check_contract_inner(p.id.as_deref(), contract.clone())
+                    .check_contract_inner(p.id.as_deref(), contract.clone(), p.mode.as_deref())
                     .await
                 {
                     Ok(Ok(r)) => r,
@@ -2845,9 +2846,11 @@ impl TuiLabServer {
         &self,
         id: Option<&str>,
         contract: crate::design::ProjectContract,
+        mode_override: Option<&str>,
     ) -> rmcp::model::CallToolResult {
         let selector = id.map(str::to_string);
         let run = self.run.clone();
+        let mode = mode_override.and_then(parse_mode_override);
         match self
             .with_sess(selector.as_deref(), move |sess| {
                 // Conformance drives the app (declared keys, resizes,
@@ -2858,7 +2861,7 @@ impl TuiLabServer {
                 if let Some(refused) = lease_refused(sess) {
                     return Err(refused);
                 }
-                Ok(crate::design::check_contract(sess, &contract))
+                Ok(crate::design::check_contract_with_mode(sess, &contract, mode))
             })
             .await
         {
@@ -2886,15 +2889,17 @@ impl TuiLabServer {
         &self,
         id: Option<&str>,
         contract: crate::design::ProjectContract,
+        mode_override: Option<&str>,
     ) -> Result<anyhow::Result<crate::design::ContractReport>, rmcp::model::CallToolResult> {
         let selector = id.map(str::to_string);
+        let mode = mode_override.and_then(parse_mode_override);
         match self
             .with_sess(selector.as_deref(), move |sess| {
                 // Same lease rule as check_contract_against (item 76).
                 if let Some(refused) = lease_refused(sess) {
                     return Err(refused);
                 }
-                Ok(crate::design::check_contract(sess, &contract))
+                Ok(crate::design::check_contract_with_mode(sess, &contract, mode))
             })
             .await
         {
@@ -2902,6 +2907,18 @@ impl TuiLabServer {
             Ok(Err(refused)) => Err(refused),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Parse the `mode` tool parameter; `None` means "use the contract's own
+/// mode". Unknown strings are `None` here because the typed enum surfaces
+/// them as invalid_request at the parameter layer.
+fn parse_mode_override(s: &str) -> Option<crate::design::ContractMode> {
+    match s.trim().to_lowercase().as_str() {
+        "advisory" => Some(crate::design::ContractMode::Advisory),
+        "validation" => Some(crate::design::ContractMode::Validation),
+        "strict" => Some(crate::design::ContractMode::Strict),
+        _ => None,
     }
 }
 
@@ -2933,6 +2950,10 @@ fn diff_contract_reports(
             (Verdict::Pass, Verdict::Fail) => true,
             (Verdict::Pass, Verdict::Warn) => cur.required,
             (Verdict::Warn, Verdict::Fail) => cur.required,
+            // Item 32: Unverified/Unsupported are not failures — moving
+            // into them is a loss of evidence, surfaced separately, never
+            // counted as a regression (which would punish the harness for
+            // its own blind spots).
             _ => false,
         };
         let improved = matches!(

@@ -1091,4 +1091,10 @@ pub struct TuiContractParams {
     /// compare: label for the current run being compared (defaults to "current").
     #[serde(default)]
     pub label: Option<String>,
+    /// Check-time mode override (re-review item 33): advisory | validation
+    /// | strict. Overrides the contract document's `schema.mode` for this
+    /// check only — CI can run the same contract at both Validation (dev)
+    /// and Strict (gate) without editing it.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
