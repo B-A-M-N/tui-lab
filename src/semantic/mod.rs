@@ -84,3 +84,66 @@ pub fn analyze(screen: &ScreenState) -> SemanticScreen {
         components,
     }
 }
+
+/// One detection pass producing BOTH shapes — the flat
+/// [`SemanticScreen`] and the [`SemanticTree`] — from the same detector
+/// outputs. This is the structural guarantee behind fused semantic truth
+/// (re-review Wave-4): observe modes that render different shapes can never
+/// disagree about what's on screen, because they are built from one
+/// analysis, not two.
+pub fn detect_frame(screen: &ScreenState) -> (SemanticScreen, crate::semantic::node::SemanticTree) {
+    let sem = analyze(screen);
+    let widgets = widgets::detect_widgets(screen, &sem.regions);
+    let tree = tree_builder::build_tree_from_parts(
+        screen, &sem.regions, &sem.controls, &sem.focus, &sem.affordances, &widgets,
+    );
+    (sem, tree)
+}
+
+/// The fused truth for a screen: detection cached on `structure_hash`, then
+/// the native overlay applied fresh on every call. This is the one path all
+/// semantic-bearing observe modes route through.
+///
+/// The overlay is deliberately *outside* the cache: an app can rewrite its
+/// self-report without changing screen structure (focus moved, a value
+/// changed) — that is exactly the case the cache must not freeze.
+pub fn fuse(
+    screen: &ScreenState,
+    cache: &mut SemanticCache,
+    native: &crate::semantic::native::NativeChannel,
+) -> (SemanticScreen, crate::semantic::node::SemanticTree, crate::semantic::native::NativeOverlayReport) {
+    let (sem, tree) = cached_detect(screen, cache);
+    let mut sem = sem;
+    let mut tree = tree;
+    let report = native.overlay_fused(&mut tree, &mut sem);
+    (sem, tree, report)
+}
+
+/// Cached detection of both shapes: hit → clone from cache; miss → run
+/// [`detect_frame`] once and store both.
+fn cached_detect(
+    screen: &ScreenState,
+    cache: &mut SemanticCache,
+) -> (SemanticScreen, crate::semantic::node::SemanticTree) {
+    let key = screen.structure_hash.clone();
+    if key.is_empty() {
+        return detect_frame(screen);
+    }
+    if let Some(entry) = cache.entries.iter().position(|(k, _)| *k == key) {
+        let (sem, tree) = cache.entries[entry].1.clone();
+        return (sem, tree);
+    }
+    let pair = detect_frame(screen);
+    cache.insert(key, pair.clone());
+    pair
+}
+
+/// The tree from a fused (native-overlaid) frame, for callers that only
+/// need the node shape.
+pub fn fuse_tree(
+    screen: &ScreenState,
+    cache: &mut SemanticCache,
+    native: &crate::semantic::native::NativeChannel,
+) -> crate::semantic::node::SemanticTree {
+    fuse(screen, cache, native).1
+}

@@ -40,8 +40,8 @@ pub struct CacheResult {
 /// stays cached.
 #[derive(Debug, Default)]
 pub struct SemanticCache {
-    /// structure_hash → analysis.
-    entries: Vec<(String, SemanticScreen)>,
+    /// structure_hash → (flat analysis, tree).
+    pub(crate) entries: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))>,
     hits: u64,
     misses: u64,
 }
@@ -75,23 +75,25 @@ impl SemanticCache {
         }
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             // Hit: return the stored analysis; no detector runs.
-            let sem = self.entries[idx].1.clone();
+            let sem = self.entries[idx].1 .0.clone();
             self.hits += 1;
             return CacheResult { sem, hit: true, key };
         }
         self.misses += 1;
-        let sem = crate::semantic::analyze(screen);
+        let pair = crate::semantic::detect_frame(screen);
+        let sem = pair.0;
         // Retain the last-analyzed frame (so a two-frame repaint alternation
         // stays hot) before enforcing the cap.
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
             self.entries.remove(pos);
         }
-        self.entries.push((key.clone(), sem.clone()));
+        self.entries.push((key.clone(), (sem.clone(), pair.1)));
         if self.entries.len() > MAX_ENTRIES {
             // Keep the two most-recent distinct frames (the newest we just
             // pushed plus the distinct prior one) so a two-frame repaint
             // alternation stays hot; the rest are evicted.
-            let mut kept: Vec<(String, SemanticScreen)> = Vec::with_capacity(2);
+            let mut kept: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))> =
+                Vec::with_capacity(2);
             for (k, s) in self.entries.iter().rev() {
                 if kept.is_empty() || kept[0].0 != *k {
                     if kept.len() == 2 {
@@ -103,6 +105,34 @@ impl SemanticCache {
             self.entries = kept;
         }
         CacheResult { sem, hit: false, key }
+    }
+
+    /// Insert a precomputed (flat, tree) pair for `key`. The fused path
+    /// (`crate::semantic::fuse`) uses this when it already ran
+    /// [`crate::semantic::detect_frame`] via a cache miss on the pair-level
+    /// lookup.
+    pub fn insert(
+        &mut self,
+        key: String,
+        pair: (SemanticScreen, crate::semantic::node::SemanticTree),
+    ) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(pos);
+        }
+        self.entries.push((key, pair));
+        if self.entries.len() > MAX_ENTRIES {
+            let mut kept: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))> =
+                Vec::with_capacity(2);
+            for (k, s) in self.entries.iter().rev() {
+                if kept.is_empty() || kept[0].0 != *k {
+                    if kept.len() == 2 {
+                        break;
+                    }
+                    kept.push((k.clone(), s.clone()));
+                }
+            }
+            self.entries = kept;
+        }
     }
 
     /// Hit rate since construction — a coarse health signal for whether the
@@ -180,6 +210,31 @@ mod tests {
         // Third observation of A should hit even though B came between.
         let r = cache.analyze(&a);
         assert!(r.hit, "two-frame alternation must stay cached");
+    }
+
+    // Fused path (re-review Wave-4): `detect_frame` stores BOTH shapes; a
+    // hit must serve the tree too, not just the flat analysis.
+    #[test]
+    fn fused_pair_is_cached_together() {
+        let mut cache = SemanticCache::new();
+        let a = screen_with_hash("h-fused");
+        let (sem1, tree1) = crate::semantic::detect_frame(&a);
+        cache.insert("h-fused".to_string(), (sem1.clone(), tree1.clone()));
+        // A subsequent `analyze` hits the same entry and serves the flat
+        // half; the tree half is served by the pair-level lookup in
+        // `crate::semantic::fuse`.
+        let r = cache.analyze(&a);
+        assert!(r.hit, "insert made the frame hot for analyze");
+        assert_eq!(r.sem.cols, sem1.cols);
+        // And the pair-level path serves the stored tree without re-running
+        // the detectors: same root id, same child count.
+        let (sem2, tree2, _report) = crate::semantic::fuse(
+            &a,
+            &mut cache,
+            &crate::semantic::native::NativeChannel::default(),
+        );
+        assert_eq!(sem2.cols, sem1.cols);
+        assert_eq!(tree2.root.children.len(), tree1.root.children.len());
     }
 
     #[test]

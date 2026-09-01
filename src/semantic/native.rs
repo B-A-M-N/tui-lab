@@ -291,21 +291,89 @@ impl NativeChannel {
                 }
             }
             if let Some(n) = resolved {
-                // Enable provenance: app-declared enabled is native evidence.
-                if let Some(enabled) = node.enabled {
-                    n.state.enabled = crate::semantic::node::EnabledState {
-                        value: enabled,
-                        source: "native".to_string(),
-                        confidence: 1.0,
-                    };
+                apply_native_facts(n, node);
+                report.matched.push(node.id.clone());
+            } else {
+                report.native_only.push(node.id.clone());
+            }
+        }
+        report
+    }
+
+    /// Fused merge (re-review Wave-4): resolve each native node ONCE and
+    /// write it into both shapes — the [`SemanticTree`] (nodes mode) and the
+    /// flat [`crate::semantic::SemanticScreen`] (semantic/summary/tree modes)
+    /// — so every observe mode reports the same truth. A native node that
+    /// matches a tree node derived from a `Control` also fixes up that
+    /// control (control-derived tree nodes keep the control's id), and a
+    /// native focus declaration rewrites `sem.focus` wholesale: the app's
+    /// word on focus outranks style inference everywhere, not just in the
+    /// nodes view.
+    pub fn overlay_fused(
+        &self,
+        tree: &mut crate::semantic::node::SemanticTree,
+        sem: &mut crate::semantic::SemanticScreen,
+    ) -> NativeOverlayReport {
+        let Some(root) = &self.latest else {
+            return NativeOverlayReport::default();
+        };
+        let flat = root.flatten();
+        let mut report = NativeOverlayReport::default();
+        for (_path, node) in &flat {
+            report.native_ids.push(node.id.clone());
+            let mut resolved = resolve_node(&mut tree.root, node);
+            // Capture the join facts before the mutable move below — the
+            // tree node's id is the key back into `sem.controls`.
+            let resolved_id: Option<String> = resolved.as_ref().map(|n| n.id.clone());
+            let resolved_label: Option<String> =
+                resolved.as_ref().and_then(|n| n.label.clone());
+            if node.focused == Some(true) {
+                if let Some(n) = resolved.as_deref_mut() {
+                    n.state.focused = true;
+                    report.focus_applied = Some(node.id.clone());
                 }
-                if let Some(label) = &node.label {
-                    if n.label.is_none() {
-                        n.label = Some(label.clone());
+                // Fused: focus is mode-independent. Resolve the label from
+                // the tree node when the native node carries none (apps
+                // often declare ids only).
+                sem.focus = crate::semantic::FocusInfo {
+                    control: node.label.clone().or(resolved_label),
+                    control_id: Some(resolved_id.clone().unwrap_or_else(|| node.id.clone())),
+                    confidence: 1.0,
+                    evidence: vec![format!("native-focus:{}", node.id)],
+                };
+            }
+            if let Some(n) = resolved {
+                apply_native_facts(n, node);
+                // Mirror the same facts into the flat control with the same
+                // id (control-derived tree nodes keep the control's id, so
+                // the join key survives the tree build).
+                let joined_id = resolved_id.clone();
+                let focused_flag = node.focused;
+                if let Some(c) = sem
+                    .controls
+                    .iter_mut()
+                    .find(|c| Some(c.id.clone()) == joined_id)
+                {
+                    if let Some(focused) = focused_flag {
+                        c.focused = focused;
                     }
-                }
-                if let Some(value) = &node.value {
-                    n.value = Some(value.clone());
+                    if let Some(enabled) = node.enabled {
+                        c.enabled = enabled;
+                        c.source = "native".to_string();
+                    }
+                    if let Some(focusable) = node.focusable {
+                        c.focusable = focusable;
+                    }
+                    if let Some(value) = &node.value {
+                        c.value = Some(value.clone());
+                    }
+                    if let Some(label) = &node.label {
+                        // The control keeps its inferred label unless it had
+                        // none; the tree node mirrors the same rule above.
+                        if c.label.is_empty() {
+                            c.label = label.clone();
+                        }
+                    }
                 }
                 report.matched.push(node.id.clone());
             } else {
@@ -358,6 +426,29 @@ fn find_by_id<'a>(
         }
     }
     None
+}
+
+/// Apply one native node's declared facts onto its resolved tree node.
+/// Shared by [`NativeChannel::overlay`] and
+/// [`NativeChannel::overlay_fused`] — the two entry points must never drift
+/// apart in what they write.
+fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &NativeNode) {
+    // Enable provenance: app-declared enabled is native evidence.
+    if let Some(enabled) = node.enabled {
+        n.state.enabled = crate::semantic::node::EnabledState {
+            value: enabled,
+            source: "native".to_string(),
+            confidence: 1.0,
+        };
+    }
+    if let Some(label) = &node.label {
+        if n.label.is_none() {
+            n.label = Some(label.clone());
+        }
+    }
+    if let Some(value) = &node.value {
+        n.value = Some(value.clone());
+    }
 }
 
 /// Resolve a native node to its inferred counterpart.
@@ -459,6 +550,37 @@ fn collect_by_label<'a>(
 /// Whether a launch env already carries a native channel (skip re-injection).
 pub fn env_has_channel(env: &[(String, String)]) -> bool {
     env.iter().any(|(k, _)| k == ENV_VAR)
+}
+
+/// Test-only helpers shared with the fused-truth tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// Find the first tree node carrying `label` (depth-first).
+    pub fn find_label<'a>(
+        node: &'a crate::semantic::node::SemanticNode,
+        label: &str,
+    ) -> Option<&'a crate::semantic::node::SemanticNode> {
+        if node.label.as_deref() == Some(label) {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|c| find_label(c, label))
+    }
+
+    /// Count leaf nodes with interactive roles (the tree-side counterpart of
+    /// `SemanticScreen::controls` for the same detection pass).
+    pub fn count_controls(node: &crate::semantic::node::SemanticNode) -> usize {
+        let self_count = match node.role {
+            crate::semantic::node::Role::Button
+            | crate::semantic::node::Role::Field
+            | crate::semantic::node::Role::Checkbox
+            | crate::semantic::node::Role::Tab
+            | crate::semantic::node::Role::ListItem => 1,
+            _ => 0,
+        };
+        self_count + node.children.iter().map(|c| count_controls(c)).sum::<usize>()
+    }
 }
 
 /// Session-level registry of native channels (session id → channel).
@@ -613,6 +735,114 @@ mod tests {
         .expect("write full");
         ch.poll();
         assert_eq!(ch.frames_accepted, 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Fused truth (re-review Wave-4): one resolve, both shapes — the flat
+    // SemanticScreen must carry the same native facts the tree carries.
+    #[test]
+    fn overlay_fused_writes_native_facts_into_both_shapes() {
+        use crate::screen::cell::{Cell, Color, ProcessState};
+        let mut cells = Vec::new();
+        let mut viewport_text = Vec::new();
+        for (y, line) in ["[ Save ]", "[ Cancel ]"].iter().enumerate() {
+            viewport_text.push(line.to_string());
+            for (x, ch) in line.chars().enumerate() {
+                cells.push(Cell {
+                    x: x as u16,
+                    y: y as u16,
+                    text: ch.to_string(),
+                    fg: Color::unknown(),
+                    bg: Color::unknown(),
+                    bold: false,
+                    dim: false,
+                    italic: false,
+                    underline: false,
+                    reverse: false,
+                    strike: false,
+                });
+            }
+        }
+        let screen = crate::screen::ScreenState {
+            cols: 40,
+            rows: 2,
+            cursor: crate::screen::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
+            title: None,
+            cells,
+            viewport_text,
+            scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
+            raw_hash: String::new(),
+            visual_hash: String::new(),
+            structure_hash: String::new(),
+            process: ProcessState {
+                running: false,
+                exit_code: None,
+                exit_signal: None,
+                cwd: None,
+                pid: None,
+            },
+        };
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        // Whatever inference concluded (bracket-first heuristics may pick
+        // Save), the native declaration below must OVERRIDE it — record the
+        // pre-state only to prove the override when it differs.
+        let inferred_focus = sem.focus.control.clone();
+
+        // The app declares: cancel focused, save disabled.
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                r##"{"v":1,"type":"snapshot","app":"t","framework":"test","root":{"id":"#root","role":"screen","children":[{"id":"#save","role":"button","label":"Save","enabled":false},{"id":"#cancel","role":"button","label":"Cancel","focused":true}]}}"##
+            ),
+        )
+        .expect("write");
+        ch.poll();
+        assert!(ch.latest.is_some(), "snapshot accepted");
+
+        let report = ch.overlay_fused(&mut tree, &mut sem);
+        assert!(report.active(), "overlay engaged");
+        // Focus: same verdict in both shapes, and in the flat focus info.
+        assert_eq!(report.focus_applied.as_deref(), Some("#cancel"));
+        assert!(report.matched.iter().any(|id| id == "#save"), "save matched");
+        // Tree side: focused node flagged.
+        let cancel_node = crate::semantic::native::tests_support::find_label(&tree.root, "Cancel");
+        let save_node = crate::semantic::native::tests_support::find_label(&tree.root, "Save");
+        assert!(cancel_node.map(|n| n.state.focused).unwrap_or(false));
+        // Save declared disabled — tree carries it with native provenance.
+        assert_eq!(
+            save_node.map(|n| n.state.enabled.value).unwrap_or(true),
+            false
+        );
+        // Flat side: focus rewritten wholesale (label + confidence 1.0).
+        assert_eq!(sem.focus.control.as_deref(), Some("Cancel"));
+        assert_eq!(sem.focus.confidence, 1.0);
+        assert_ne!(
+            sem.focus.control, inferred_focus,
+            "native declaration overrode inference"
+        );
+        assert!(sem.focus.evidence[0].starts_with("native-focus:"));
+        // The matched control inherited native provenance.
+        let save_ctrl = sem
+            .controls
+            .iter()
+            .find(|c| c.label.contains("Save"))
+            .expect("save control inferred");
+        assert!(!save_ctrl.enabled, "save control disabled by native");
+        assert_eq!(save_ctrl.source, "native");
+        // And the tree/flat controls agree on count — same detection pass.
+        assert_eq!(
+            sem.controls.len(),
+            crate::semantic::native::tests_support::count_controls(&tree.root),
+            "flat and tree shapes come from one detection pass"
+        );
         std::fs::remove_file(&path).ok();
     }
 }
