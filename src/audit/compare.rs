@@ -109,6 +109,7 @@ mod tests {
             evidence: vec![EvidenceRef::point(EvidenceKind::Other, target, "evidence")],
             confidence: 0.9,
             reproduction: None,
+            source_refs: Vec::new(),
         }
     }
 

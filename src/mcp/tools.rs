@@ -1719,6 +1719,7 @@ impl TuiLabServer {
                 }))],
                 confidence: 0.9,
                 reproduction: None,
+                source_refs: Vec::new(),
             }]);
             return json!({
                 "reproduced": false,
@@ -1765,6 +1766,7 @@ impl TuiLabServer {
                 }))],
                 confidence: 1.0,
                 reproduction: Some(scenario_id.clone()),
+                source_refs: Vec::new(),
             }]);
             scenario_id.clone()
         };
@@ -2098,7 +2100,9 @@ impl TuiLabServer {
             let focus_summary = {
                 let mut run = run.lock().unwrap();
                 run.focus_graph.merge(&report.focus_graph);
-                run.extend_findings(report.findings.clone());
+                // W2.10: attach app-declared source loci where coverage
+                // evidence can name the finding's control.
+                run.extend_findings_with_source_refs(report.findings.clone());
                 if let Some(cmp_label) = compare_to.as_deref() {
                     match run.finding_baseline(cmp_label) {
                         Some(baseline) => {
@@ -2567,6 +2571,29 @@ impl TuiLabServer {
                 };
                 ok(manifest_like)
             }
+            // ── repair: RepairPackets for every finding (audit item) ──
+            RA::Repair => {
+                let (packets, skipped) = {
+                    let run = self.run.lock().unwrap();
+                    run.repair_packets()
+                };
+                if packets.is_empty() && skipped == 0 {
+                    return ok(json!({
+                        "packets": [],
+                        "skipped": 0,
+                        "note": "no findings recorded in this run — run an audit first (tui_audit action=run)",
+                    }));
+                }
+                ok(json!({
+                    "packets": packets,
+                    "skipped": skipped,
+                    "note": if skipped > 0 {
+                        Some(format!("{skipped} finding(s) could not form a packet (no evidence) and were skipped"))
+                    } else {
+                        None
+                    },
+                }))
+            }
         }
     }
 
@@ -2779,6 +2806,7 @@ impl TuiLabServer {
                                     }))],
                                     confidence: 1.0,
                                     reproduction: None,
+                                    source_refs: Vec::new(),
                                 })
                                 .collect();
                             run.extend_findings(findings);
@@ -2837,7 +2865,7 @@ impl TuiLabServer {
                 let summary = report.summary();
                 let results = report.results.clone();
                 let mut run = run.lock().unwrap();
-                run.extend_findings(findings);
+                run.extend_findings_with_source_refs(findings);
                 run.record_contract_baseline("baseline", &report);
                 ok(json!({
                     "verdict": report.verdict.as_str(),

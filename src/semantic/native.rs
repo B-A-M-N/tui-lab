@@ -579,7 +579,7 @@ pub(crate) mod tests_support {
             | crate::semantic::node::Role::ListItem => 1,
             _ => 0,
         };
-        self_count + node.children.iter().map(|c| count_controls(c)).sum::<usize>()
+        self_count + node.children.iter().map(count_controls).sum::<usize>()
     }
 }
 
@@ -817,9 +817,9 @@ mod tests {
         let save_node = crate::semantic::native::tests_support::find_label(&tree.root, "Save");
         assert!(cancel_node.map(|n| n.state.focused).unwrap_or(false));
         // Save declared disabled — tree carries it with native provenance.
-        assert_eq!(
-            save_node.map(|n| n.state.enabled.value).unwrap_or(true),
-            false
+        assert!(
+            !save_node.map(|n| n.state.enabled.value).unwrap_or(true),
+            "Save declared disabled"
         );
         // Flat side: focus rewritten wholesale (label + confidence 1.0).
         assert_eq!(sem.focus.control.as_deref(), Some("Cancel"));

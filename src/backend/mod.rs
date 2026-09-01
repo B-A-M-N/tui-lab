@@ -430,7 +430,24 @@ pub enum WaitCond {
     },
     ProcessExit,
     Title(String),
-    Bell,
+    Bell {
+        /// Causality anchor (review P0, Bell race): a bell with sequence
+        /// strictly greater than this resolves the wait. `None` means "the
+        /// next bell after the wait begins" (the old, race-prone behavior —
+        /// kept so unanchored callers still work, but action completions
+        /// always anchor via [`WaitCond::anchored_to`]).
+        after_bell_seq: Option<u64>,
+    },
+    /// Re-review P0 (AnyObservableChange): any user-observable terminal
+    /// activity — a screen change, a bell, a title change, or cursor motion
+    /// — with an interaction sequence strictly greater than the anchor.
+    /// Backends track `interaction_seq` as the sum of their observable
+    /// edge counters, so this is a *superset* of a pure screen change and
+    /// genuinely distinct from [`WaitCond::ScreenChange`] / anchored
+    /// `ScreenStable`.
+    AnyActivity {
+        after_interaction_seq: Option<u64>,
+    },
     Idle {
         quiet_for: Duration,
         after_output_seq: Option<u64>,
@@ -493,6 +510,23 @@ impl WaitCond {
             } => {
                 if after_command_seq.is_none() {
                     *after_command_seq = Some(baseline.command_seq);
+                }
+            }
+            // Review P0 (Bell race): edge-triggered conditions must anchor to
+            // the pre-action counters or the bell may fire between baseline
+            // capture and wait entry — then the wait blocks to timeout on an
+            // event that already happened. Anchoring makes "the reaction to
+            // MY action" well-defined for every edge condition.
+            WaitCond::Bell { after_bell_seq } => {
+                if after_bell_seq.is_none() {
+                    *after_bell_seq = Some(baseline.bell_seq);
+                }
+            }
+            WaitCond::AnyActivity {
+                after_interaction_seq,
+            } => {
+                if after_interaction_seq.is_none() {
+                    *after_interaction_seq = Some(baseline.interaction_seq);
                 }
             }
             _ => {}
@@ -642,6 +676,10 @@ pub struct CaptureOutcome {
     pub frame: ScreenState,
     /// Elapsed time in milliseconds from anchor to capture.
     pub elapsed_ms: u64,
+    /// The full frame sequence for sequence captures (re-review P0:
+    /// `CaptureStrategy::Frames` must return every frame it collected, not
+    /// only the last). `None` for single-frame captures.
+    pub frames: Option<Vec<ScreenState>>,
 }
 
 impl CaptureOutcome {
@@ -654,6 +692,7 @@ impl CaptureOutcome {
             output_seq: o.output_seq,
             frame: o.state,
             elapsed_ms: o.elapsed_ms,
+            frames: None,
         }
     }
 }

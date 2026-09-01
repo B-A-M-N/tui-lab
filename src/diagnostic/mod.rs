@@ -216,7 +216,7 @@ fn capture_session(
                     return Ok(session.last().cloned().unwrap_or(session.observe(0)?));
                 }
                 if start.elapsed() >= budget {
-                    return Ok(session.observe(0)?);
+                    return session.observe(0);
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
@@ -251,11 +251,11 @@ fn capture_session(
                     if s.viewport_text.iter().any(|r| r.contains(&t))
                         || s.scrollback.iter().any(|r| r.contains(&t))
                     {
-                        return Ok(session.observe(0)?);
+                        return session.observe(0);
                     }
                 }
                 if start.elapsed() >= budget {
-                    return Ok(session.observe(0)?);
+                    return session.observe(0);
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
@@ -270,11 +270,11 @@ fn capture_session(
                         .any(|r| r.contains(&t))
                         || s.scrollback.iter().any(|r| r.contains(&t));
                     if !present {
-                        return Ok(session.observe(0)?);
+                        return session.observe(0);
                     }
                 }
                 if start.elapsed() >= budget {
-                    return Ok(session.observe(0)?);
+                    return session.observe(0);
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
@@ -284,7 +284,7 @@ fn capture_session(
             while Instant::now() < deadline {
                 if let Some(s) = session.last() {
                     if !s.process.running {
-                        return Ok(session.observe(0)?);
+                        return session.observe(0);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(15));

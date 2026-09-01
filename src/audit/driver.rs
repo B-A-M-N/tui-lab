@@ -58,6 +58,7 @@ pub fn keyboard_audit(
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -102,6 +103,7 @@ pub fn keyboard_audit(
                     )],
                     confidence: 1.0,
                     reproduction: None,
+                    source_refs: Vec::new(),
                 });
                 break;
             }
@@ -135,6 +137,7 @@ pub fn keyboard_audit(
                 )],
                 confidence: 0.8,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
 
@@ -159,6 +162,7 @@ pub fn keyboard_audit(
                 )],
                 confidence: 0.9,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             break;
         }
@@ -220,6 +224,7 @@ pub fn keyboard_audit(
                 )],
                 confidence: 0.85,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
         if successful_tabs > 0 && reverse_ok {
@@ -248,6 +253,7 @@ pub fn keyboard_audit(
                 )],
                 confidence: 0.85,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -277,6 +283,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -301,6 +308,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             )],
             confidence: 0.7,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
 
@@ -338,6 +346,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.85,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         } else {
             findings.push(Finding {
@@ -359,6 +368,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: sem.focus.confidence,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -386,6 +396,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             continue;
         }
@@ -412,6 +423,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                     )],
                     confidence: 1.0,
                     reproduction: None,
+                    source_refs: Vec::new(),
                 });
                 continue;
             }
@@ -448,6 +460,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.95,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         } else {
             findings.push(Finding {
@@ -471,6 +484,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.9,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -505,6 +519,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -536,6 +551,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.96,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
 
@@ -557,6 +573,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.95,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -580,6 +597,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.6,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
 
@@ -597,6 +615,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 0.6,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -614,6 +633,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             )],
             confidence: 0.9,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
 
@@ -651,6 +671,7 @@ pub fn navigation_audit(
             )],
             confidence: 0.7,
             reproduction: None,
+            source_refs: Vec::new(),
         });
         return findings;
     }
@@ -683,6 +704,7 @@ pub fn navigation_audit(
         )],
         confidence: 0.9,
         reproduction: None,
+        source_refs: Vec::new(),
     });
 
     if !gaps.is_empty() {
@@ -701,6 +723,7 @@ pub fn navigation_audit(
             )],
             confidence: 0.85,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     } else {
         findings.push(Finding {
@@ -715,6 +738,7 @@ pub fn navigation_audit(
             )],
             confidence: 0.9,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
 
@@ -763,6 +787,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -781,6 +806,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             )],
             confidence: 1.0,
             reproduction: None,
+            source_refs: Vec::new(),
         });
         // Continue anyway: an app with mouse support behind a
         // capability-blind backend is still worth probing honestly.
@@ -831,6 +857,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             )],
             confidence: 0.9,
             reproduction: None,
+            source_refs: Vec::new(),
         });
         return findings;
     }
@@ -871,6 +898,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
                     )],
                     confidence: 0.9,
                     reproduction: None,
+                    source_refs: Vec::new(),
                 });
                 break;
             }
@@ -923,6 +951,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             )],
             confidence: 0.8,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
 
@@ -957,6 +986,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
                     )],
                     confidence: 1.0,
                     reproduction: None,
+                    source_refs: Vec::new(),
                 });
                 return findings;
             }
@@ -1018,6 +1048,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
         )],
         confidence: 0.95,
         reproduction: None,
+        source_refs: Vec::new(),
     });
     if settle_saturated {
         findings.push(Finding {
@@ -1036,6 +1067,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
             )],
             confidence: 0.8,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     findings
@@ -1061,6 +1093,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -1101,6 +1134,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             )],
             confidence: 0.7,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     if !empty_like.is_empty() {
@@ -1125,6 +1159,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             )],
             confidence: 0.6,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
 
@@ -1176,6 +1211,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                 )],
                 confidence: 0.75,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -1196,6 +1232,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             )],
             confidence: 0.85,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     findings
@@ -1225,6 +1262,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -1287,6 +1325,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
             )],
             confidence: 0.9,
             reproduction: None,
+            source_refs: Vec::new(),
         });
         // Skip the error scan on a dead screen; the crash IS the finding.
         return findings;
@@ -1343,6 +1382,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 )],
                 confidence: 0.85,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         } else {
             findings.push(Finding {
@@ -1363,6 +1403,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 )],
                 confidence: 0.9,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -1390,6 +1431,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
                 )],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
             return findings;
         }
@@ -1427,6 +1469,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         )],
         confidence: 0.9,
         reproduction: None,
+        source_refs: Vec::new(),
     });
     findings
 }

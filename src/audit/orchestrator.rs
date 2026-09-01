@@ -220,6 +220,7 @@ pub fn run_profile_with_contract(
                 .with_detail(json!({ "profile": profile.name(), "error": e }))],
                 confidence: 1.0,
                 reproduction: None,
+                source_refs: Vec::new(),
             }]
         })
     };
@@ -290,6 +291,7 @@ fn orchestration_error(profile: &str, summary: String) -> Finding {
         .with_detail(json!({"profile": profile}))],
         confidence: 1.0,
         reproduction: None,
+        source_refs: Vec::new(),
     }
 }
 

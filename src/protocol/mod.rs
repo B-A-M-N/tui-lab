@@ -153,8 +153,9 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// Intermediate state while decoding a chunk stream (CSI/OSC may span a chunk
 /// boundary, so the decoder carries state across `feed`s).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum DecodeState {
+    #[default]
     Ground,
     /// After `ESC`, expecting the discriminator (`[`, `]`, selector, command).
     Escape,
@@ -166,12 +167,6 @@ enum DecodeState {
     Osc(Option<u16>, Vec<u8>),
     /// Inside OSC after an `ESC`; a following `\` is the ST terminator.
     OscSt(Option<u16>, Vec<u8>),
-}
-
-impl Default for DecodeState {
-    fn default() -> Self {
-        DecodeState::Ground
-    }
 }
 
 /// Incremental, chunk-safe decoder. Feed the raw stream in pieces with
@@ -373,7 +368,7 @@ fn raw_final_byte(raw: &[u8]) -> Option<char> {
 
 /// Whether a CSI used the `?` private marker (private mode set/reset).
 fn csi_private(raw: &[u8]) -> bool {
-    raw.iter().any(|&b| b == b'?')
+    raw.contains(&b'?')
 }
 
 /// Split the leading `<number>;` off an OSC payload into its OSC number,

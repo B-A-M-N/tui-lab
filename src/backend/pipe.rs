@@ -541,7 +541,15 @@ impl TerminalBackend for PipeBackend {
 
     fn wait(&mut self, cond: WaitCond, budget: Duration) -> BackendResult<WaitOutcome> {
         let start = Instant::now();
-        let baseline_bell_seq = self.bell_seq;
+        // Review P0 (Bell race): an anchored Bell carries its own baseline;
+        // only an unanchored Bell falls back to "captured at wait entry".
+        let baseline_bell_seq = match &cond {
+            WaitCond::Bell {
+                after_bell_seq: Some(seq),
+            } => seq.saturating_sub(1),
+            _ => self.bell_seq,
+        };
+        let baseline_interaction_seq = self.screen_seq + self.bell_seq;
         let baseline_screen_seq = self.screen_seq;
         loop {
             self.pump();
@@ -573,7 +581,17 @@ impl TerminalBackend for PipeBackend {
                 }
                 WaitCond::ProcessExit => (!screen.process.running, WaitReason::ProcessExit),
                 WaitCond::Title(_) => (false, WaitReason::Title), // no titles on pipes
-                WaitCond::Bell => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::Bell { .. } => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::AnyActivity {
+                    after_interaction_seq,
+                } => {
+                    let cur = self.screen_seq + self.bell_seq;
+                    let anchored_ok = match after_interaction_seq {
+                        Some(seq) => cur > *seq,
+                        None => cur > baseline_interaction_seq,
+                    };
+                    (anchored_ok, WaitReason::ScreenChange)
+                }
                 WaitCond::Idle {
                     quiet_for,
                     after_output_seq,

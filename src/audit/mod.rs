@@ -8,6 +8,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 pub mod compare;
+pub mod repair;
 pub mod driver;
 pub mod orchestrator;
 pub mod transaction;
@@ -138,6 +139,13 @@ pub struct Finding {
     /// are not reproductions (most static findings).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reproduction: Option<String>,
+    /// Probable source loci for the problem (W2.10): empty for purely
+    /// screen-derived findings; populated when evidence can name a file:line
+    /// (native coverage events, framework adapters, stack-derived loci).
+    /// `SourceRef::is_actionable()` gates whether a repair pass should
+    /// trust the locus — a low-confidence guess is carried, not hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<crate::semantic::source_ref::SourceRef>,
 }
 
 impl Finding {
@@ -160,7 +168,17 @@ impl Finding {
             evidence: vec![EvidenceRef::screen(hash, s)],
             confidence,
             reproduction: None,
+            source_refs: Vec::new(),
         }
+    }
+
+    /// Attach probable source loci, returning the finding (chainable).
+    pub fn with_source_refs(
+        mut self,
+        refs: Vec<crate::semantic::source_ref::SourceRef>,
+    ) -> Self {
+        self.source_refs = refs;
+        self
     }
 }
 
@@ -192,6 +210,7 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
             )],
             confidence: 1.0,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     if want("color") || want("performance") || want("mouse") || want("states") || want("errors") {
@@ -212,6 +231,7 @@ pub fn run(profile: &str, screen: &ScreenState, sem: &SemanticScreen) -> Vec<Fin
                 }))],
             confidence: 1.0,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     out
@@ -234,6 +254,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
                 }))],
             confidence: 0.7,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     } else if sem.focus.control.is_some() {
         let ctrl = sem.focus.control.clone().unwrap_or_default();
@@ -253,6 +274,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
             ],
             confidence: sem.focus.confidence,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     out
@@ -277,6 +299,7 @@ fn static_clipping_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                 ],
                 confidence: 0.96,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -313,6 +336,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                 }))],
             confidence: 0.5,
             reproduction: None,
+            source_refs: Vec::new(),
         });
         return out;
     }
@@ -344,6 +368,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
         )],
         confidence: 0.85,
         reproduction: None,
+        source_refs: Vec::new(),
     });
 
     // Hidden-keybinding heuristic: prose words that commonly announce
@@ -373,6 +398,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                 ],
                 confidence: 0.6,
                 reproduction: None,
+                source_refs: Vec::new(),
             });
         }
     }
@@ -406,6 +432,7 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
             ],
             confidence: 0.85,
             reproduction: None,
+            source_refs: Vec::new(),
         });
     }
     out

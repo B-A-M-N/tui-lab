@@ -828,7 +828,7 @@ mod tests {
         // The exploration fence `risk <= Safe` must exclude Unknown (a frame
         // with Unknown risk cannot silently pass a safe-only filter).
         assert!(
-            !(ActionRisk::Unknown <= ActionRisk::Safe),
+            ActionRisk::Unknown > ActionRisk::Safe,
             "unknown risk must not pass a safe-only filter"
         );
         // And it must be treated as needing confirmation, like destructive

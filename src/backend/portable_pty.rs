@@ -555,6 +555,15 @@ impl PortablePtyBackend {
         }
         Ok(())
     }
+
+    /// Review P0 (AnyObservableChange): the backend's own observable-edge
+    /// counter — screen changes + bells + titles. A pure sum, so any single
+    /// edge advancing any component advances this. The `AnyActivity` wait
+    /// compares against it so "any observable change" is a real superset of
+    /// "screen change", including bell-only and title-only reactions.
+    fn interaction_seq(&self) -> u64 {
+        self.screen_seq + self.bell_seq + self.title_seq
+    }
 }
 
 impl TerminalBackend for PortablePtyBackend {
@@ -919,7 +928,16 @@ impl TerminalBackend for PortablePtyBackend {
 
     fn wait(&mut self, cond: WaitCond, budget: Duration) -> BackendResult<WaitOutcome> {
         let start = Instant::now();
-        let baseline_bell_seq = self.bell_seq;
+        // Review P0 (Bell race): an anchored Bell carries its own baseline;
+        // only an unanchored Bell falls back to "captured at wait entry".
+        let baseline_bell_seq = match &cond {
+            WaitCond::Bell {
+                after_bell_seq: Some(seq),
+            } => seq.saturating_sub(1),
+            WaitCond::Bell { after_bell_seq: None } => self.bell_seq,
+            _ => self.bell_seq,
+        };
+        let baseline_interaction_seq = self.interaction_seq();
 
         // For screen-change we need the baseline *interaction fingerprint*
         // now (style-only changes count as changes; audit item 3).
@@ -997,7 +1015,20 @@ impl TerminalBackend for PortablePtyBackend {
                     screen.title.as_deref() == Some(t.as_str()),
                     WaitReason::Title,
                 ),
-                WaitCond::Bell => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::Bell { .. } => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::AnyActivity {
+                    after_interaction_seq,
+                } => {
+                    // Any observable edge — screen, bell, title, cursor — with
+                    // an interaction sequence strictly greater than the
+                    // anchor. Genuinely broader than ScreenChange: a bell-only
+                    // or title-only reaction resolves here.
+                    let anchored_ok = match after_interaction_seq {
+                        Some(seq) => self.interaction_seq() > *seq,
+                        None => self.interaction_seq() > baseline_interaction_seq,
+                    };
+                    (anchored_ok, WaitReason::ScreenChange)
+                }
                 WaitCond::Idle {
                     quiet_for,
                     after_output_seq,

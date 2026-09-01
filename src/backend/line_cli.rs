@@ -139,11 +139,9 @@ impl PtyLineBackend {
                 // "\r\n" is the pty's rendering of one newline — the '\n'
                 // that follows commits the line normally. A bare '\r'
                 // restarts the pending line (progress-bar redraw).
-                if chars.peek() != Some(&'\n') {
-                    if !self.pending.is_empty() {
-                        self.pending.clear();
-                        pending_changed = true;
-                    }
+                if chars.peek() != Some(&'\n') && !self.pending.is_empty() {
+                    self.pending.clear();
+                    pending_changed = true;
                 }
             } else if ch == '\x07' {
                 self.bell_seq += 1;
@@ -480,7 +478,15 @@ impl TerminalBackend for PtyLineBackend {
 
     fn wait(&mut self, cond: WaitCond, budget: Duration) -> BackendResult<WaitOutcome> {
         let start = Instant::now();
-        let baseline_bell_seq = self.bell_seq;
+        // Review P0 (Bell race): an anchored Bell carries its own baseline;
+        // only an unanchored Bell falls back to "captured at wait entry".
+        let baseline_bell_seq = match &cond {
+            WaitCond::Bell {
+                after_bell_seq: Some(seq),
+            } => seq.saturating_sub(1),
+            _ => self.bell_seq,
+        };
+        let baseline_interaction_seq = self.screen_seq + self.bell_seq;
         let baseline_screen_seq = self.screen_seq;
         loop {
             self.pump();
@@ -519,7 +525,19 @@ impl TerminalBackend for PtyLineBackend {
                 }
                 WaitCond::ProcessExit => (!screen.process.running, WaitReason::ProcessExit),
                 WaitCond::Title(_) => (false, WaitReason::Title), // no titles on pipes
-                WaitCond::Bell => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::Bell { .. } => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::AnyActivity {
+                    after_interaction_seq,
+                } => {
+                    // Screen changes and bells are both observable here; the
+                    // title channel doesn't exist on this backend.
+                    let cur = self.screen_seq + self.bell_seq;
+                    let anchored_ok = match after_interaction_seq {
+                        Some(seq) => cur > *seq,
+                        None => cur > baseline_interaction_seq,
+                    };
+                    (anchored_ok, WaitReason::ScreenChange)
+                }
                 WaitCond::Idle {
                     quiet_for,
                     after_output_seq,

@@ -586,6 +586,9 @@ pub fn execute_act_with_completion(
         // Real monotonic per-session anchor index (re-review P1 fix 9).
         index: session.next_anchor(),
     };
+    // The ONE compiler runs on the pre-action frame before it moves into
+    // the transaction evidence (re-review P0).
+    let plan = crate::capture::compile_completion(&completion, &baseline, &before);
     let mut before_frame = CanonicalFrame::new(before, 0, baseline.output_seq);
     before_frame.session_id = Some(session.id.clone());
     before_frame.generation = Some(session.generation);
@@ -624,35 +627,24 @@ pub fn execute_act_with_completion(
         (SettleStatus::Skipped, 0, s, None, None)
     } else {
         let budget = settle_budget_ms.max(quiet_ms.saturating_add(1000));
-        // Map the completion policy to what "done" means, then wait_after that
-        // (re-review P0 rigidity): a silent action must not demand screen
-        // quiet, a quit must not wait for stability, etc. The default
-        // `StableScreen` reproduces the historic screen-settle behavior.
-        let policy_cond = completion_wait_cond(&completion, quiet_ms);
-        // Use the matching frame from wait_after (re-review P0). No second
-        // observe() — the captured state IS the authoritative after.
-        let outcome = window.sess().wait_after(baseline, policy_cond, budget)?;
-        let capture = CaptureOutcome::from_wait(outcome.clone());
+        // The ONE compiler (re-review P0): every policy becomes a
+        // CompletionPlan here; there is no second interpretation anywhere.
+        let outcome = run_completion_plan(window.sess(), plan, quiet_ms, budget)?;
+        let capture = outcome;
         // `MayBeSilent` is special: the action may legitimately produce no
-        // observable change (clipboard copy, an invisible toggle). A timeout
-        // here is NOT a failure — the capture holds whatever the screen shows
-        // and we call it Met, never a false `settled=false`.
-        let timed_out = !outcome.met;
-        let settle = if matches!(completion, CompletionPolicy::MayBeSilent) {
-            // The outcome frame is authoritative regardless of whether a
-            // screen edge fired; report Met so downstream automation does not
-            // misread a silent-but-valid action as a bug.
+        // observable change (clipboard copy, an invisible toggle). Silence
+        // here is a Met by construction — the plan reports it, never a
+        // false `settled=false`.
+        let settle = if capture.met {
             SettleStatus::Met
-        } else if timed_out {
-            SettleStatus::TimedOut
         } else {
-            SettleStatus::Met
+            SettleStatus::TimedOut
         };
-        let seq = outcome.screen_seq;
+        let seq = capture.screen_seq;
         (
             settle,
-            outcome.elapsed_ms,
-            outcome.state,
+            capture.elapsed_ms,
+            capture.frame.clone(),
             Some(seq),
             Some(capture),
         )
@@ -684,51 +676,246 @@ pub fn execute_act_with_completion(
     })
 }
 
-/// Map a [`CompletionPolicy`] to the backend wait that proves it. The
-/// `after_screen_seq` / `after_command_seq` anchors are left `None` so
-/// [`Session::wait_after`] fills them from the transaction baseline — that is
-/// what scopes "the reaction to MY action" versus "any prior activity".
-fn completion_wait_cond(completion: &CompletionPolicy, quiet_ms: u64) -> WaitCond {
-    let quiet = std::time::Duration::from_millis(quiet_ms);
-    match completion {
-        CompletionPolicy::StableScreen | CompletionPolicy::MayBeSilent => WaitCond::ScreenStable {
-            quiet_for: quiet,
-            after_screen_seq: None,
-        },
-        CompletionPolicy::FirstScreenChange | CompletionPolicy::AnyObservableChange => {
-            // First change edge after the anchor; no quiet required.
-            WaitCond::ScreenStable {
-                quiet_for: std::time::Duration::from_millis(0),
-                after_screen_seq: None,
+/// The ONE evaluator for compiled completion plans (re-review P0: exactly
+/// one interpreter). `BackendWait`/`Bell` conditions run against the
+/// backend's event-sequenced wait, anchored to the pre-action baseline.
+/// Everything the backend cannot prove — real semantic change, arbitrary
+/// event kinds, causally-anchored text transitions — is evaluated HERE,
+/// above the backend layer, where the session's event queue and semantic
+/// analysis live.
+fn run_completion_plan(
+    session: &mut Session,
+    plan: crate::capture::CompletionPlan,
+    quiet_ms: u64,
+    budget_ms: u64,
+) -> anyhow::Result<CaptureOutcome> {
+    use crate::capture::CompletionPlan as Plan;
+    let budget = std::time::Duration::from_millis(budget_ms);
+    let baseline = session.event_state();
+    match plan {
+        // Backend-proven conditions: one `wait_after` call each.
+        Plan::BackendWait(cond) => {
+            Ok(CaptureOutcome::from_wait(
+                session.wait_after(baseline, cond, budget_ms)?,
+            ))
+        }
+        Plan::Bell(after_bell_seq) => Ok(CaptureOutcome::from_wait(session.wait_after(
+            baseline,
+            WaitCond::Bell {
+                // The compile step already anchored this to the pre-action
+                // bell counter; `wait_after` must not overwrite it.
+                after_bell_seq: Some(after_bell_seq),
+            },
+            budget_ms,
+        )?)),
+        Plan::ProcessExit => Ok(CaptureOutcome::from_wait(
+            session.wait_after(baseline, WaitCond::ProcessExit, budget_ms)?,
+        )),
+        Plan::CommandDone => Ok(CaptureOutcome::from_wait(session.wait_after(
+            baseline,
+            WaitCond::CommandDone {
+                after_command_seq: None,
+            },
+            budget_ms,
+        )?)),
+        // Any observable edge — screen, bell, title, cursor — beyond the
+        // action anchor. Genuinely broader than a screen change (re-review
+        // P0: bell-only / title-only reactions count).
+        Plan::AnyActivity => Ok(CaptureOutcome::from_wait(session.wait_after(
+            baseline,
+            WaitCond::AnyActivity {
+                after_interaction_seq: Some(baseline.interaction_seq),
+            },
+            budget_ms,
+        )?)),
+        // The action may be silent: a SHORT grace window (not the whole
+        // settle budget). A change inside the window is captured; silence
+        // ends the wait as a successful completion with reason
+        // `Idle`-proxied NoChange semantics (re-review P0 efficiency).
+        Plan::SilentGrace(grace) => {
+            let cond = WaitCond::AnyActivity {
+                after_interaction_seq: Some(baseline.interaction_seq),
+            };
+            let outcome = session.wait_after(baseline, cond, grace.as_millis() as u64)?;
+            let mut out = CaptureOutcome::from_wait(outcome.clone());
+            if !outcome.met {
+                // No observable change in the grace window: the honest
+                // reading of a silent action. Re-frame as success.
+                out.frame = session.observe(quiet_ms)?;
+                out.screen_seq = session.event_state().screen_seq;
+                out.output_seq = session.event_state().output_seq;
+                out.reason = crate::backend::CaptureReason::Idle;
+                out.met = true;
+            }
+            Ok(out)
+        }
+        // Everything below is evaluated by polling the session's own
+        // state — the backend has no primitive for these predicates.
+        Plan::Event(matcher, _compiled_anchor) => {
+            let start = std::time::Instant::now();
+            let anchor_seq = session.event_queue_stats()
+                .get("last_seq")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            loop {
+                let batch = session.events_since(anchor_seq);
+                for ev in &batch.events {
+                    if matcher.matches(&ev.kind) {
+                        let frame = session.observe(quiet_ms)?;
+                        return Ok(CaptureOutcome {
+                            reason: crate::backend::CaptureReason::ScreenChanged,
+                            met: true,
+                            screen_seq: session.event_state().screen_seq,
+                            output_seq: session.event_state().output_seq,
+                            frame,
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                            frames: None,
+                        });
+                    }
+                }
+                if start.elapsed() >= budget {
+                    let frame = session.observe(quiet_ms)?;
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::Deadline,
+                        met: false,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
             }
         }
-        CompletionPolicy::TextAppears(t) => WaitCond::Text(t.clone()),
-        CompletionPolicy::TextDisappears(t) => WaitCond::TextAbsent(t.clone()),
-        CompletionPolicy::ProcessExit => WaitCond::ProcessExit,
-        CompletionPolicy::CommandDone => WaitCond::CommandDone {
-            after_command_seq: None,
-        },
-        CompletionPolicy::Bell => WaitCond::Bell,
-        CompletionPolicy::SemanticChange => {
-            // The backend cannot wait on a semantic diff directly; treat a
-            // first screen change as the closest honest proxy, and the
-            // transaction's semantic `transition` carries the real diff.
-            WaitCond::ScreenStable {
-                quiet_for: std::time::Duration::from_millis(0),
-                after_screen_seq: None,
+        // REAL semantic change (re-review P0): wait for any frame edge, then
+        // compare semantic identities. A spinner/clock/style-only change
+        // keeps identity equal and the wait continues; a genuine control /
+        // region / focus change resolves. Also resolves when the native
+        // side-channel (if any) shifts the fused semantics.
+        Plan::SemanticChange(before_identity) => {
+            let start = std::time::Instant::now();
+            let anchor_screen = baseline.screen_seq;
+            loop {
+                let now = session.event_state();
+                if now.screen_seq > anchor_screen {
+                    let frame = session.observe(quiet_ms)?;
+                    if frame.semantic_identity() != before_identity {
+                        return Ok(CaptureOutcome {
+                            reason: crate::backend::CaptureReason::ScreenChanged,
+                            met: true,
+                            screen_seq: session.event_state().screen_seq,
+                            output_seq: session.event_state().output_seq,
+                            frame,
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                            frames: None,
+                        });
+                    }
+                }
+                if start.elapsed() >= budget {
+                    let frame = session.observe(quiet_ms)?;
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::Deadline,
+                        met: false,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
             }
         }
-        CompletionPolicy::Event(_) => WaitCond::ScreenStable {
-            quiet_for: std::time::Duration::from_millis(0),
-            after_screen_seq: None,
-        },
-        CompletionPolicy::NoWait => {
-            // Not reachable on the wait path (the caller skips it), but a
-            // sensible fallback: snapshot now.
-            WaitCond::ScreenStable {
-                quiet_for: std::time::Duration::from_millis(0),
-                after_screen_seq: None,
+        // Causally-anchored text transitions (re-review P0): `appears`
+        // requires the text to be ABSENT at anchor and present after;
+        // `disappears` the reverse. Presence at the anchor can never
+        // satisfy an `appears` — the compiler recorded `was_present` and
+        // the evaluator enforces the transition.
+        Plan::TextAppears(text, was_present) => {
+            let start = std::time::Instant::now();
+            loop {
+                let frame = session.observe(quiet_ms.min(30))?;
+                let present = crate::capture::screen_contains(&frame, &text);
+                if present && !was_present {
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::TextMatched,
+                        met: true,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                    });
+                }
+                if start.elapsed() >= budget {
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::Deadline,
+                        met: false,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
             }
+        }
+        Plan::TextDisappears(text, was_present) => {
+            let start = std::time::Instant::now();
+            if !was_present {
+                // Text was never there: the transition already holds. One
+                // fresh frame documents it; no wait is needed.
+                let frame = session.observe(quiet_ms)?;
+                return Ok(CaptureOutcome {
+                    reason: crate::backend::CaptureReason::TextAbsent,
+                    met: true,
+                    screen_seq: session.event_state().screen_seq,
+                    output_seq: session.event_state().output_seq,
+                    frame,
+                    elapsed_ms: 0,
+                    frames: None,
+                });
+            }
+            loop {
+                let frame = session.observe(quiet_ms.min(30))?;
+                if !crate::capture::screen_contains(&frame, &text) {
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::TextAbsent,
+                        met: true,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                    });
+                }
+                if start.elapsed() >= budget {
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::Deadline,
+                        met: false,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+        Plan::Immediate => {
+            let frame = session.observe(quiet_ms)?;
+            Ok(CaptureOutcome {
+                reason: crate::backend::CaptureReason::Deadline,
+                met: true,
+                screen_seq: session.event_state().screen_seq,
+                output_seq: session.event_state().output_seq,
+                frame,
+                elapsed_ms: 0,
+                frames: None,
+            })
         }
     }
 }

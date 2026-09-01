@@ -148,6 +148,7 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
         }))],
         confidence: 0.95,
         reproduction: None,
+        source_refs: Vec::new(),
     }
 }
 

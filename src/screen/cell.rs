@@ -151,4 +151,13 @@ impl ScreenState {
         }
         out
     }
+
+    /// Re-review P0 (real SemanticChange): a stable identity over the
+    /// semantic content of this frame — controls, regions, affordances,
+    /// focus. Same identity ⇒ same semantic truth regardless of volatile
+    /// pixels (spinner, clock); different identity ⇒ genuine semantic
+    /// change. Delegates to [`crate::semantic::semantic_identity`].
+    pub fn semantic_identity(&self) -> String {
+        crate::semantic::semantic_identity(self)
+    }
 }
