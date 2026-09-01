@@ -78,7 +78,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_audit",
-        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Active profiles drive the app: blocked while a human lease is live.",
+        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Active profiles are blocked while a human lease is live.",
         selector: Some(("profile", <crate::mcp::params::AuditProfile as EnumVariants>::VARIANTS)),
     },
     ToolCapability {

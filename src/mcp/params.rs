@@ -1280,6 +1280,16 @@ pub struct TuiAuditParams {
     pub label: Option<String>,
     #[serde(default)]
     pub compare_to: Option<String>,
+    /// Wave 4 item 36: mutation-safety selector. Default (absent/false)
+    /// runs only observational profiles and reports invasive ones as
+    /// withheld (ORCH-GATED). `true` runs everything.
+    #[serde(default)]
+    pub allow_mutation: Option<bool>,
+    /// Wave 4 item 37: deep-audit mode — restart-replay between
+    /// mutating drivers so each sees a fresh app (requires a session we
+    /// launched; degrades honestly on attached sessions).
+    #[serde(default)]
+    pub deep_isolation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
