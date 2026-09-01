@@ -72,6 +72,29 @@ pub struct ScenarioStep {
     /// The action or assertion parameters.
     #[serde(flatten)]
     pub params: serde_json::Value,
+    /// Mutation guard (re-review Wave-2): the state the step was captured
+    /// against, verified before the step executes on replay. `None` (the
+    /// historical shape — and the default on deserialize for old scenario
+    /// files) means no guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<StepExpect>,
+}
+
+/// The recorded preconditions for one step, checked before the step's input
+/// lands. If the app has drifted — a modal opened, the list reordered, focus
+/// moved — the step FAILS with `stale_state` instead of sending a keystroke
+/// into the wrong UI and corrupting both the app and the replay verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepExpect {
+    /// Structure hash observed at capture time (layout skeleton, normalized).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_hash: Option<String>,
+    /// Focused control id at capture time, when one was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_control_id: Option<String>,
+    /// Text the step required to be present at capture time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_present: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +129,7 @@ impl Scenario {
         self.steps.push(ScenarioStep {
             kind: StepKind::Act,
             params,
+            expect: None,
         });
         self
     }
@@ -115,6 +139,7 @@ impl Scenario {
         self.steps.push(ScenarioStep {
             kind: StepKind::Wait,
             params,
+            expect: None,
         });
         self
     }
@@ -124,6 +149,7 @@ impl Scenario {
         self.steps.push(ScenarioStep {
             kind: StepKind::Assert,
             params,
+            expect: None,
         });
         self
     }

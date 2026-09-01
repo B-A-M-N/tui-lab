@@ -26,6 +26,36 @@ impl ScenarioRecorder {
                 steps.push(super::model::ScenarioStep {
                     kind: super::model::StepKind::Act,
                     params,
+                    expect: None,
+                });
+                steps
+            },
+            ..self.scenario.clone()
+        };
+    }
+
+    /// Record an act step WITH its mutation guard (re-review Wave-2): the
+    /// captured before-frame's structure hash and resolved focus become the
+    /// `expect` precondition the runner verifies before replaying this step.
+    /// Recording guards is opt-in per step; replaying an unguarded step is
+    /// the historical, always-allowed path.
+    pub fn record_act_with_expect(
+        &mut self,
+        params: serde_json::Value,
+        tx: &crate::execution::InteractionTransaction,
+    ) {
+        let expect = super::model::StepExpect {
+            structure_hash: Some(tx.before_frame.state.structure_hash.clone()),
+            focus_control_id: tx.focus_before.as_ref().and_then(|f| f.0.clone()),
+            text_present: None,
+        };
+        self.scenario = Scenario {
+            steps: {
+                let mut steps = self.scenario.steps.clone();
+                steps.push(super::model::ScenarioStep {
+                    kind: super::model::StepKind::Act,
+                    params,
+                    expect: Some(expect),
                 });
                 steps
             },
@@ -41,6 +71,7 @@ impl ScenarioRecorder {
                 steps.push(super::model::ScenarioStep {
                     kind: super::model::StepKind::Wait,
                     params,
+                    expect: None,
                 });
                 steps
             },
@@ -56,6 +87,7 @@ impl ScenarioRecorder {
                 steps.push(super::model::ScenarioStep {
                     kind: super::model::StepKind::Assert,
                     params,
+                    expect: None,
                 });
                 steps
             },

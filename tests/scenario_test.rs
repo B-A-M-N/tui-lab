@@ -170,3 +170,111 @@ fn scenario_runner_actually_sends_input() {
         screen.viewport_text
     );
 }
+
+// ── Wave-2: mutation guards (StepExpect) ─────────────────────────────────
+
+/// A guarded step whose recorded structure hash no longer matches the live
+/// screen fails with `stale_state` — and the input is NOT sent (the child
+/// sees nothing). The old behavior sent the keystroke into whatever UI
+/// happened to be up.
+#[test]
+fn stale_guard_blocks_input_on_drift() {
+    use tui_lab::scenario::model::StepExpect;
+
+    // Child prints READY, then blocks on stdin: a line is only visible if
+    // input actually arrived.
+    let mut mgr = tui_lab::session::SessionManager::new();
+    let args: Vec<String> = vec![
+        "-c".into(),
+        "print('GUARD-READY'); import sys; sys.stdin.readline(); print('GUARD-GOT-INPUT'); import time; time.sleep(5)".into(),
+    ];
+    let id = mgr
+        .start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .expect("start");
+    let sess = mgr.resolve_mut(Some(&id)).unwrap();
+    sess.observe(300).expect("baseline");
+
+    // A captured structure hash that CANNOT match (capture happened on a
+    // different layout — the drift simulation).
+    let step = tui_lab::scenario::model::ScenarioStep {
+        kind: tui_lab::scenario::model::StepKind::Act,
+        params: serde_json::json!({"action": "type", "text": "should not land\n"}),
+        expect: Some(StepExpect {
+            structure_hash: Some("definitely-not-the-live-hash".into()),
+            focus_control_id: None,
+            text_present: None,
+        }),
+    };
+    let scenario = tui_lab::scenario::model::Scenario {
+        steps: vec![step],
+        ..tui_lab::scenario::model::Scenario::new("guard-test")
+    };
+
+    let report = ScenarioRunner::run(&scenario, sess);
+    assert_eq!(report.steps_failed, 1, "guard must fail: {:?}", report.step_results);
+    assert!(
+        report.step_results[0].detail.contains("stale_state"),
+        "verdict names the drift: {}",
+        report.step_results[0].detail
+    );
+    assert!(
+        report.step_results[0].detail.contains("structure drifted"),
+        "verdict names the condition: {}",
+        report.step_results[0].detail
+    );
+
+    // Prove the input never landed: give the child a moment, then check
+    // GUARD-GOT-INPUT is absent from any frame.
+    sess.observe(300).expect("post check");
+    let frame = sess.last().expect("frame");
+    assert!(
+        !frame.viewport_text.iter().any(|r| r.contains("GUARD-GOT-INPUT")),
+        "guarded input must NOT reach the app: {:?}",
+        frame.viewport_text
+    );
+    mgr.stop(&id).ok();
+}
+
+/// A guard that matches lets the step run normally.
+#[test]
+fn satisfied_guard_lets_step_run() {
+    use tui_lab::scenario::model::StepExpect;
+
+    let mut mgr = tui_lab::session::SessionManager::new();
+    let args: Vec<String> = vec![
+        "-c".into(),
+        "print('OK-READY'); import sys; sys.stdin.readline(); print('OK-GOT-INPUT'); import time; time.sleep(5)".into(),
+    ];
+    let id = mgr
+        .start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .expect("start");
+    let sess = mgr.resolve_mut(Some(&id)).unwrap();
+    let frame = sess.observe(300).expect("baseline");
+    let live_hash = frame.structure_hash.clone();
+
+    let step = tui_lab::scenario::model::ScenarioStep {
+        kind: tui_lab::scenario::model::StepKind::Act,
+        params: serde_json::json!({"action": "type", "text": "go\n"}),
+        expect: Some(StepExpect {
+            structure_hash: Some(live_hash),
+            focus_control_id: None,
+            text_present: Some("OK-READY".into()),
+        }),
+    };
+    let scenario = tui_lab::scenario::model::Scenario {
+        steps: vec![step],
+        ..tui_lab::scenario::model::Scenario::new("guard-ok")
+    };
+
+    let report = ScenarioRunner::run(&scenario, sess);
+    assert_eq!(report.steps_passed, 1, "satisfied guard passes: {:?}", report.step_results);
+    // The input really landed this time.
+    let out = sess
+        .wait(
+            tui_lab::backend::WaitCond::Text("OK-GOT-INPUT".into()),
+            5000,
+        )
+        .expect("wait text");
+    assert!(out.met, "input delivered when the guard held");
+    mgr.stop(&id).ok();
+}
