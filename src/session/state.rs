@@ -983,6 +983,13 @@ impl Session {
         self.backend.command_state()
     }
 
+    /// Current negotiated input modes (Wave 3 input-protocol audit): the
+    /// same state `send` uses to choose key encodings, so an audit can
+    /// report exactly what the engine will emit.
+    pub fn input_modes(&self) -> crate::backend::InputModes {
+        self.backend.input_modes()
+    }
+
     pub fn backend_version(&self) -> &'static str {
         match self.backend_kind {
             BackendKind::PortableVt => "portable-pty+vt100/0.1",

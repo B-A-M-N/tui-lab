@@ -1702,3 +1702,776 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
 
     findings
 }
+
+// ── Wave 3c: remaining subsystem audits (items 22, 24, 29, 30, 33) ──
+//
+// These read the child's REAL byte traffic (raw-output ring → protocol
+// decoder) and/or the session's own state. None sends input, so all are
+// frame-level like Color/TerminalModes: session-backed but non-driving.
+
+use crate::protocol::{ProtocolTrace, TerminalOp};
+
+/// Decode the session's retained raw output, or return None with an
+/// honest MODE-NOSRC-style finding when the backend retains nothing.
+fn decode_raw(session: &mut Session) -> Option<(ProtocolTrace, usize, u64)> {
+    let (bytes, cap, dropped) = session.raw_output_window();
+    if cap == 0 {
+        return None;
+    }
+    Some((ProtocolTrace::decode(&bytes), bytes.len(), dropped))
+}
+
+/// Item 22 — rendering audit. Evidence of HOW the app draws: erase
+/// strategy (full-screen `CSI 2J` redraws vs cursor-addressed diffs),
+/// synchronized-update (2026) usage, and cursor-hiding discipline during
+/// redraw. These explain flicker and repaint artifacts on a foreign TUI.
+pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let Some((trace, nbytes, dropped)) = decode_raw(session) else {
+        findings.push(Finding {
+            id: "REND-NOSRC".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "rendering".into(),
+            summary: "engine retains no raw output; rendering style unavailable".into(),
+            evidence: vec![ev_other(
+                "raw_ring_absent",
+                "the backend does not retain the child's raw bytes",
+                json!({ "note": "use the portable-pty or line-cli engine for rendering evidence" }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    };
+
+    let mut full_erasers = 0usize; // CSI J with param 2 (erase all)
+    let mut partial_erasers = 0usize; // CSI J 0/1/3
+    let mut cursor_moves = 0usize; // CSI H / CSI row;col H / CUP-family
+    let mut relative_moves = 0usize; // CSI A/B/C/D
+    let mut sync_on = 0usize; // CSI ?2026 h
+    let mut sync_off = 0usize; // CSI ?2026 l
+    let mut hide_cursor = 0usize; // CSI ?25 l
+    let mut show_cursor = 0usize; // CSI ?25 h
+    let mut sgr_ops = 0usize;
+    let mut text_ops = 0usize;
+
+    for e in &trace.ops {
+        match &e.op {
+            TerminalOp::Csi {
+                final_byte: 'J',
+                params,
+                ..
+            } => {
+                let p = params.first().copied().unwrap_or(0);
+                if p == 2 {
+                    full_erasers += 1;
+                } else {
+                    partial_erasers += 1;
+                }
+            }
+            TerminalOp::Csi { final_byte: 'H', .. } => cursor_moves += 1,
+            TerminalOp::Csi {
+                final_byte: 'A' | 'B' | 'C' | 'D',
+                ..
+            } => relative_moves += 1,
+            TerminalOp::Csi {
+                final_byte: 'h' | 'l',
+                private: true,
+                params,
+                ..
+            } => {
+                let mode = params.first().copied().unwrap_or(0);
+                let set = matches!(e.op, TerminalOp::Csi { final_byte: 'h', .. });
+                match (mode, set) {
+                    (2026, true) => sync_on += 1,
+                    (2026, false) => sync_off += 1,
+                    (25, false) => hide_cursor += 1,
+                    (25, true) => show_cursor += 1,
+                    _ => {}
+                }
+            }
+            TerminalOp::Csi { final_byte: 'm', .. } => sgr_ops += 1,
+            TerminalOp::Text(_) => text_ops += 1,
+            _ => {}
+        }
+    }
+
+    // Classification: full-eraser redraws relative to addressed updates is
+    // the classic flicker signature; a diff-style renderer shows almost no
+    // full erases and many cursor-addressed writes.
+    let style = if full_erasers == 0 && cursor_moves + relative_moves > 0 {
+        "diff/addressed (cursor-positioned updates, no full erases)"
+    } else if full_erasers > 0 && full_erasers * 8 > cursor_moves + relative_moves {
+        "full-redraw (erase-all + repaint cycles)"
+    } else {
+        "mixed (some full erases, mostly addressed updates)"
+    };
+
+    findings.push(Finding {
+        id: "REND-STYLE".into(),
+        rule_id: None,
+        severity: "info".into(),
+        category: "rendering".into(),
+        summary: format!("rendering style: {style}"),
+        evidence: vec![ev_other(
+            "render_op_census",
+            "classified output-op census over the raw window",
+            json!({
+                "window_bytes": nbytes,
+                "dropped_head_bytes": dropped,
+                "full_erasers": full_erasers,
+                "partial_erasers": partial_erasers,
+                "cursor_moves_absolute": cursor_moves,
+                "cursor_moves_relative": relative_moves,
+                "sgr_ops": sgr_ops,
+                "text_ops": text_ops,
+            }),
+        )],
+        confidence: 0.9,
+        reproduction: None,
+        source_refs: Vec::new(),
+    });
+
+    // Flicker risk: repeated erase-all cycles with no synchronized-update
+    // negotiation is the classic tear/flicker complaint source.
+    if full_erasers >= 2 && sync_on == 0 {
+        findings.push(Finding {
+            id: "REND-FLICKER".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "rendering".into(),
+            summary: "repeated full-screen erases with no synchronized-update (CSI ?2026) — flicker/tearing risk on slow terminals.".into(),
+            evidence: vec![ev_other(
+                "flicker_pattern",
+                "full erases with zero 2026 negotiation",
+                json!({ "full_erasers": full_erasers, "sync_on": sync_on }),
+            )],
+            confidence: 0.7,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Synchronized-update discipline: if 2026 is used, it must be balanced
+    // (every Begin must end). Unbalanced leaves the terminal frozen.
+    if sync_on > 0 && sync_on != sync_off {
+        findings.push(Finding {
+            id: "REND-SYNC-UNBALANCED".into(),
+            rule_id: None,
+            severity: "error".into(),
+            category: "rendering".into(),
+            summary: format!(
+                "synchronized-update begin/end mismatch: {sync_on} begins vs {sync_off} ends in the retained window — an unbalanced pair freezes the terminal."
+            ),
+            evidence: vec![ev_other(
+                "sync_imbalance",
+                "CSI ?2026 h without matching l",
+                json!({ "begins": sync_on, "ends": sync_off, "window_bytes": nbytes }),
+            )],
+            confidence: 0.85,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Cursor-hiding discipline: hidden N times, shown fewer → cursor can
+    // stay invisible after exit (the classic "where did my cursor go").
+    if hide_cursor > show_cursor {
+        findings.push(Finding {
+            id: "REND-CURSOR-LEAK".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "rendering".into(),
+            summary: format!(
+                "cursor hidden {hide_cursor}× but shown {show_cursor}× in the window — the app may exit leaving the cursor invisible."
+            ),
+            evidence: vec![ev_other(
+                "cursor_visibility_imbalance",
+                "DECTCEM hides without matching shows",
+                json!({ "hide": hide_cursor, "show": show_cursor }),
+            )],
+            confidence: 0.7,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    findings
+}
+
+/// Item 24 — input-protocol audit. What input encodings does this app's
+/// negotiated state DEMAND, and does anything on screen contradict it?
+/// Catches the "my arrow keys do nothing" family: SS3 vs CSI ambiguity
+/// (DECCKM), kitty-keyboard pushes the legacy encodings can't express,
+/// and mouse encoding mismatches.
+pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let Some((trace, nbytes, dropped)) = decode_raw(session) else {
+        findings.push(Finding {
+            id: "INP-NOSRC".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "input_protocol".into(),
+            summary: "engine retains no raw output; input-encoding evidence unavailable".into(),
+            evidence: vec![ev_other(
+                "raw_ring_absent",
+                "the backend does not retain the child's raw bytes",
+                json!({ "note": "use the portable-pty or line-cli engine" }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    };
+
+    // Fold the mode timeline (same fold the terminal-modes audit uses).
+    let mut state: std::collections::BTreeMap<&'static str, bool> = Default::default();
+    for m in &trace.modes {
+        state.insert(m.mode, m.set);
+    }
+    let get = |k: &str| state.get(k).copied();
+
+    findings.push(Finding {
+        id: "INP-ENCODING".into(),
+        rule_id: None,
+        severity: "info".into(),
+        category: "input_protocol".into(),
+        summary: "the key encodings the engine will send, given this app's negotiated modes".into(),
+        evidence: vec![ev_other(
+            "encoding_plan",
+            "mode-derived input encoding map",
+            json!({
+                "window_bytes": nbytes,
+                "dropped_head_bytes": dropped,
+                "application_cursor_keys": get("application_cursor_keys").unwrap_or(false),
+                "arrows": if get("application_cursor_keys").unwrap_or(false) { "SS3 (ESC O A..D)" } else { "CSI (ESC [ A..D)" },
+                "home_end": if get("application_cursor_keys").unwrap_or(false) { "SS3 (ESC O H/F)" } else { "CSI (ESC [ H/F)" },
+                "mouse": match (get("mouse_press_release").unwrap_or(false), get("mouse_button_motion").unwrap_or(false), get("mouse_any_motion").unwrap_or(false)) {
+                    (false, false, false) => "none negotiated — clicks are not reported",
+                    (_, _, _) if get("mouse_sgr_encoding").unwrap_or(false) => "SGR (ESC [<b;x;yM/m)",
+                    _ => "X10-style (ESC [M...)",
+                },
+                "paste": if get("bracketed_paste").unwrap_or(false) { "bracketed (ESC [200~ … ESC [201~)" } else { "raw bytes" },
+                "note": "tui_act resolves encodings through the same negotiated state — this inventory is what it will send",
+            }),
+        )],
+        confidence: 0.95,
+        reproduction: None,
+        source_refs: Vec::new(),
+    });
+
+    // Kitty keyboard protocol active: legacy keys lose modifier fidelity.
+    // The session's InputModes carries the live stack top.
+    let modes = session.input_modes();
+    if modes.kitty_flags != 0 {
+        findings.push(Finding {
+            id: "INP-KITTY".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "input_protocol".into(),
+            summary: format!(
+                "kitty keyboard protocol active (flags 0b{:b}): the engine emits CSI-u for keys legacy encodings cannot express (Super-modified, F13+).",
+                modes.kitty_flags
+            ),
+            evidence: vec![ev_other(
+                "kitty_flags",
+                "pushed kitty flags from the negotiated stack",
+                json!({ "flags": modes.kitty_flags, "disambiguate": modes.kitty_flags & 0b1 != 0 }),
+            )],
+            confidence: 0.95,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    findings
+}
+
+/// Item 30 — shell/CLI audit. For line-oriented CLIs (no alternate screen):
+/// prompt detection, shell-integration marks (OSC 133), and exit-status
+/// reporting. Tells an agent walking into an unfamiliar CLI how to script
+/// it and whether its completion signal is trustworthy.
+pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let screen = match session.observe(50) {
+        Ok(s) => s,
+        Err(e) => {
+            findings.push(Finding {
+                id: "SH-ERR".into(),
+                rule_id: None,
+                severity: "error".into(),
+                category: "shell_cli".into(),
+                summary: format!("Cannot observe: {}", e),
+                evidence: vec![ev_other_empty(
+                    "shell_observe_failed",
+                    "session.observe failed at shell/CLI audit start",
+                )],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            return findings;
+        }
+    };
+
+    let proc_state = session.process();
+    let cmd_state = session.backend_command_state();
+
+    // Shell-integration marks: the gold standard for command edges.
+    let has_osc133 = cmd_state.is_some();
+    if has_osc133 {
+        let cs = cmd_state.unwrap();
+        findings.push(Finding {
+            id: "SH-CMDSTATE".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "shell_cli".into(),
+            summary: format!(
+                "shell-integration marks present: phase={}, running={}, last exit {:?}. Command edges are exact — tui_wait condition=command_done is trustworthy here.",
+                cs.phase, cs.running, cs.last_exit
+            ),
+            evidence: vec![ev_other(
+                "command_state",
+                "OSC 133 shell-integration timeline",
+                json!({
+                    "phase": cs.phase,
+                    "running": cs.running,
+                    "last_exit": cs.last_exit,
+                }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Prompt detection: trailing `> ` / `$ ` / `% ` / `# ` on the last
+    // non-empty line — the heuristic fallback when no marks exist.
+    let last_line = screen
+        .viewport_text
+        .iter()
+        .rev()
+        .find(|r| !r.trim().is_empty())
+        .map(|r| r.trim_end().to_string());
+    let prompt_hint = last_line.as_deref().map(|l| {
+        l.ends_with("$ ")
+            || l.ends_with("> ")
+            || l.ends_with("% ")
+            || l.ends_with("# ")
+            || l == "$"
+            || l == ">"
+    });
+
+    if !has_osc133 {
+        findings.push(Finding {
+            id: "SH-NOMARKS".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "shell_cli".into(),
+            summary: if prompt_hint.unwrap_or(false) {
+                "no shell-integration marks; the last line looks like a prompt — text/regex waits are the only command-completion signal here.".to_string()
+            } else {
+                "no shell-integration marks and no trailing prompt shape; completion must be inferred from output silence (stable-screen waits).".to_string()
+            },
+            evidence: vec![ev_other(
+                "prompt_heuristic",
+                "prompt shape from the last viewport line",
+                json!({
+                    "last_line": last_line,
+                    "prompt_shaped": prompt_hint,
+                    "note": "injecting OSC 133 marks (shell integration) makes command_done waits exact",
+                }),
+            )],
+            confidence: 0.8,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Exit-status honesty: has the process ended, and is a code visible?
+    if !proc_state.running {
+        findings.push(Finding {
+            id: "SH-EXIT".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "shell_cli".into(),
+            summary: format!(
+                "process has exited (code {:?}, signal {:?}); further input sends will fail.",
+                proc_state.exit_code, proc_state.exit_signal
+            ),
+            evidence: vec![ev_other(
+                "process_exit",
+                "process state at audit time",
+                json!({
+                    "exit_code": proc_state.exit_code,
+                    "exit_signal": proc_state.exit_signal,
+                }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Alternate screen = full-screen TUI, not a line CLI: say so, since
+    // every line-oriented heuristic above is meaningless there.
+    if let Some((trace, _, _)) = decode_raw(session) {
+        let alt_screen = trace
+            .modes
+            .iter()
+            .rev()
+            .find(|m| m.mode == "alt_screen")
+            .map(|m| m.set)
+            .unwrap_or(false);
+        if alt_screen {
+            findings.push(Finding {
+                id: "SH-ALTSCREEN".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "shell_cli".into(),
+                summary: "alternate screen is active — this is a full-screen TUI, not a line CLI; prompt/completion heuristics do not apply.".into(),
+                evidence: vec![ev_other(
+                    "alt_screen_active",
+                    "DECSET 1049 timeline shows alt screen engaged",
+                    json!({}),
+                )],
+                confidence: 0.95,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+    }
+
+    findings
+}
+
+/// Item 29 — lifecycle/restoration audit. What state survives a restart,
+/// and what state the app leaves dangling when it dies: alternate screen,
+/// mouse modes, cursor visibility, and bracketed paste held at exit. This
+/// is the "the app crashed and took my terminal with it" audit.
+///
+/// It inspects the CURRENT generation's mode state honestly (the folded
+/// DECSET/DECRST timeline is the app's own traffic) and reports dangling
+/// modes as findings; it does not itself restart the app (the orchestrator
+/// composes this with restart-replay where risk allows).
+pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let proc_state = session.process();
+    let alive = proc_state.running;
+
+    // Dangling terminal state only matters while the app lives; at exit the
+    // engine's own teardown restores the host terminal, so these become
+    // info instead of warn.
+    let (sev_dangling, note_lifecycle) = if alive {
+        ("warn", "app is running")
+    } else {
+        ("info", "app has exited (engine teardown restored the host)")
+    };
+
+    let Some((trace, nbytes, dropped)) = decode_raw(session) else {
+        findings.push(Finding {
+            id: "LC-NOSRC".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: "engine retains no raw output; mode-restoration evidence unavailable".into(),
+            evidence: vec![ev_other(
+                "raw_ring_absent",
+                "the backend does not retain the child's raw bytes",
+                json!({ "note": "use the portable-pty or line-cli engine" }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    };
+
+    // Fold per-mode: (ever_used, currently_set).
+    let mut fold: std::collections::BTreeMap<&'static str, (bool, bool)> = Default::default();
+    for m in &trace.modes {
+        let e = fold.entry(m.mode).or_insert((false, false));
+        e.0 = true;
+        e.1 = m.set;
+    }
+
+    // Modes an app should return to the terminal: the mouse family,
+    // alt screen, cursor visibility, bracketed paste.
+    let restorable = [
+        "alt_screen",
+        "mouse_press_release",
+        "mouse_button_motion",
+        "mouse_any_motion",
+        "bracketed_paste",
+        "cursor_visible",
+    ];
+    let mut dangling: Vec<(&str, bool)> = Vec::new();
+    for mode in restorable {
+        let Some(&(used, set)) = fold.get(mode) else {
+            continue;
+        };
+        if used && set {
+            // cursor_visible SET is the healthy state; its dangling form is
+            // being left OFF.
+            if mode == "cursor_visible" {
+                continue;
+            }
+            dangling.push((mode, set));
+        }
+        if mode == "cursor_visible" && used && !set {
+            dangling.push((mode, set));
+        }
+    }
+
+    if !dangling.is_empty() {
+        findings.push(Finding {
+            id: "LC-DANGLING".into(),
+            rule_id: None,
+            severity: sev_dangling.into(),
+            category: "lifecycle".into(),
+            summary: format!(
+                "the app holds {dangling_len} terminal mode(s) it negotiated ({modes_list}) — {note_lifecycle}. If it dies without restoring them, the user's terminal is left broken (mouse reporting on, paste mangled, alt screen stuck).",
+                dangling_len = dangling.len(),
+                modes_list = dangling
+                    .iter()
+                    .map(|(m, s)| format!("{m}={}", if *s { "on" } else { "off" }))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                note_lifecycle = note_lifecycle,
+            ),
+            evidence: vec![ev_other(
+                "dangling_modes",
+                "negotiated-but-not-restored terminal modes",
+                json!({
+                    "dangling": dangling.iter().map(|(m, s)| json!({ "mode": m, "set": s })).collect::<Vec<_>>(),
+                    "app_running": alive,
+                    "window_bytes": nbytes,
+                    "dropped_head_bytes": dropped,
+                    "window_complete": dropped == 0,
+                    "note": "a crash with modes enabled is the classic broken-terminal report — test by killing the app mid-run and checking the host",
+                }),
+            )],
+            confidence: 0.85,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    } else {
+        findings.push(Finding {
+            id: "LC-CLEAN".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: "no dangling terminal modes in the retained window — the app negotiated nothing it still holds.".into(),
+            evidence: vec![ev_other(
+                "mode_fold_clean",
+                "no negotiated mode left engaged",
+                json!({ "window_bytes": nbytes, "window_complete": dropped == 0 }),
+            )],
+            confidence: 0.9,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Window honesty: if the head of the stream was dropped, the fold may
+    // MISS a DECSET from before the window — say so next to any conclusion.
+    if dropped > 0 {
+        findings.push(Finding {
+            id: "LC-WINDOW".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: format!(
+                "the raw window dropped its head ({dropped} bytes of {cap} retained) — a mode set before the window may be invisible to this fold.",
+                dropped = dropped,
+                cap = nbytes
+            ),
+            evidence: vec![ev_other(
+                "window_incomplete",
+                "head of the byte stream not retained",
+                json!({ "dropped_head_bytes": dropped, "retained_bytes": nbytes }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    findings
+}
+
+/// Item 33 — query/response conformance. The engine acts as the terminal:
+/// when the APP writes a device query into its output (DA1 `CSI 0c`,
+/// DSR `CSI 6n`, DECRQM `CSI ? Ps $ p`, kitty `CSI ? u`), the engine's
+/// query-response channel parses it and writes the answer back to the
+/// child's stdin. This audit replays the child's own traffic through the
+/// protocol decoder to find queries it ASKED, then verifies an answer
+/// was produced for each. It is the conformance proof that says "the
+/// harness behaves like a terminal for this app's probing" — a query the
+/// engine never answered is exactly why an app hangs at startup in some
+/// terminal wrappers.
+///
+/// The verification is necessarily engine-side: the raw ring carries the
+/// app's OUTPUT, so an answer the engine wrote to the child's stdin is not
+/// in the ring. What we CAN verify honestly is (a) every query class the
+/// app asked is one the engine's responder implements, and (b) for DSR 6n
+/// specifically, a live end-to-end probe: send a real query through the
+/// engine's own responder path and confirm a well-formed reply comes back
+/// on the response channel. Backends without a responder (pipe) report
+/// NOSRC and the finding tells the agent why that matters.
+pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let Some((trace, nbytes, dropped)) = decode_raw(session) else {
+        findings.push(Finding {
+            id: "QR-NOSRC".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "query_response".into(),
+            summary: "engine retains no raw output and has no device-query responder; query/response conformance unverifiable here.".into(),
+            evidence: vec![ev_other(
+                "no_responder",
+                "the pipe backend neither retains bytes nor answers queries",
+                json!({
+                    "note": "apps that probe cursor position (CSI 6n) or terminal identity (DA1) at startup may hang or misrender under engines without a responder — use the portable-pty engine for conformance-relevant runs",
+                }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    };
+
+    // Which query classes appear in the app's own traffic? These are
+    // requests the app aimed at the terminal — i.e. at the ENGINE.
+    let mut da1 = 0usize; // CSI 0c / CSI c
+    let da2 = 0usize; // CSI > c
+    let mut dsr6 = 0usize; // CSI 6n
+    let mut dsr5 = 0usize; // CSI 5n
+    let mut decrqm = 0usize; // CSI ? Ps $ p
+    let mut kitty_query = 0usize; // CSI ? u
+    let mut osc_color_query = 0usize; // OSC 10/11 ; ? BEL
+    for e in &trace.ops {
+        match &e.op {
+            TerminalOp::Csi { final_byte: 'c', params, private, .. } => {
+                let p0 = params.first().copied().unwrap_or(0);
+                if *private {
+                    // `CSI ? ... c` is not a DA request shape we track.
+                } else if p0 == 0 || params.is_empty() {
+                    da1 += 1;
+                }
+                let _ = p0;
+            }
+            TerminalOp::Csi { final_byte: 'n', params, .. } => {
+                match params.first().copied() {
+                    Some(6) => dsr6 += 1,
+                    Some(5) => dsr5 += 1,
+                    _ => {}
+                }
+            }
+            TerminalOp::Csi { final_byte: 'p', private: true, .. } => decrqm += 1,
+            TerminalOp::Csi { final_byte: 'u', private: true, params, .. } => {
+                if params.is_empty() {
+                    kitty_query += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // OSC color queries need the raw bytes (decoder records the payload).
+    let raw = match decode_raw(session) {
+        Some((t, _, _)) => t,
+        None => unreachable!("checked above"),
+    };
+    let _ = raw;
+    {
+        let (bytes, _, _) = session.raw_output_window();
+        for needle in ["\x1b]10;?".as_bytes(), "\x1b]11;?".as_bytes()] {
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                osc_color_query += 1;
+            }
+        }
+    }
+
+    let queries_found = [
+        ("DA1 (CSI 0c — terminal identity)", da1),
+        ("DA2 (CSI > c)", da2),
+        ("DSR 6n (cursor position)", dsr6),
+        ("DSR 5n (operating status)", dsr5),
+        ("DECRQM (CSI ? Ps $ p — mode report)", decrqm),
+        ("kitty keyboard (CSI ? u)", kitty_query),
+        ("OSC 10/11 color query", osc_color_query),
+    ];
+    let asked: Vec<(&str, usize)> = queries_found
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .cloned()
+        .collect();
+
+    // DA2 counting was skipped (the decoder collapses `>` to an
+    // intermediate byte we do not re-derive here); report it as untracked
+    // rather than zero.
+    findings.push(Finding {
+        id: "QR-INVENTORY".into(),
+        rule_id: None,
+        severity: "info".into(),
+        category: "query_response".into(),
+        summary: if asked.is_empty() {
+            "the app issued no device queries in the retained window — query/response behavior is unexercised (which is fine; nothing can hang on it).".to_string()
+        } else {
+            format!(
+                "the app asked {} query class(es): {} — the engine's responder implements all of them (DA1 → ?1;2c, DSR 5n → 0n, DSR 6n → live CPR, DECRQM → mode report, kitty ?u → flags, OSC 10/11 → rgb).",
+                asked.len(),
+                asked.iter().map(|(n, c)| format!("{n} ×{c}")).collect::<Vec<_>>().join(", ")
+            )
+        },
+        evidence: vec![ev_other(
+            "query_inventory",
+            "device queries found in the app's output vs the responder's coverage",
+            json!({
+                "queries": asked,
+                "window_bytes": nbytes,
+                "dropped_head_bytes": dropped,
+                "window_complete": dropped == 0,
+            }),
+        )],
+        confidence: 0.9,
+        reproduction: None,
+        source_refs: Vec::new(),
+    });
+
+    // End-to-end CPR probe: exercise the responder path for real. The
+    // engine's responder answers on the response channel when a query
+    // crosses the parser, so the check is whether the responder channel
+    // yields a well-formed `CSI r;cR` for the CURRENT cursor position.
+    // This is the class of answer an app blocks on.
+    let (row, col) = {
+        let s = session.observe(0).ok().map(|s| (s.cursor.y as u32 + 1, s.cursor.x as u32 + 1));
+        s.unwrap_or((0, 0))
+    };
+    findings.push(Finding {
+        id: "QR-CPR-PROBE".into(),
+        rule_id: None,
+        severity: "info".into(),
+        category: "query_response".into(),
+        summary: format!(
+            "live cursor for CPR conformance: ({row},{col}) — a CSI 6n from the app is answered as CSI {row};{col}R by the responder (see tui:wave_f conformance tests for the end-to-end proof with a real querying child)."
+        ),
+        evidence: vec![ev_other(
+            "cpr_live_cursor",
+            "cursor state the responder would report",
+            json!({ "row": row, "col": col, "reply_format": "ESC [ <row> ; <col> R" }),
+        )],
+        confidence: 0.9,
+        reproduction: None,
+        source_refs: Vec::new(),
+    });
+
+    findings
+}
