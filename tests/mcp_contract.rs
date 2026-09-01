@@ -960,11 +960,64 @@ fn tui_act_completion_field_resolves_to_policy() {
         "absent completion must resolve to the default (None => StableScreen downstream)"
     );
 
-    // A named-text completion maps to the appearance policy it declares.
-    let appears = r#"{"action":"type","text":"ok","completion":"text_appears"}"#;
+    // A named-text completion carries its text INSIDE the completion
+    // (re-review P0.1): the lossless spec form.
+    let appears = r#"{"action":"type","text":"ok","completion":{"type":"text_appears","text":"Saved"}}"#;
     let p3: TuiActRequest = serde_json::from_str(appears).expect("deserialize text-appears request");
+    assert!(
+        matches!(
+            p3.completion(),
+            Some(tui_lab::capture::CompletionPolicy::TextAppears(t)) if t == "Saved"
+        ),
+        "text_appears completion must carry the requested text into the policy"
+    );
+
+    // The old flat-string form for a parameterized completion is now a
+    // deserialization error — it used to silently become
+    // TextAppears(""), a policy that could never match.
+    let broken = r#"{"action":"type","text":"ok","completion":"text_appears"}"#;
+    assert!(
+        serde_json::from_str::<TuiActRequest>(broken).is_err(),
+        "bare 'text_appears' without its text must be rejected, not coerced to an empty policy"
+    );
+
+    // Parameterless strategies stay plain strings (backward compatible).
+    let silent = r#"{"action":"key","key":"f1","completion":"may_be_silent"}"#;
+    let p4: TuiActRequest = serde_json::from_str(silent).expect("deserialize may_be_silent");
     assert!(matches!(
-        p3.completion(),
-        Some(tui_lab::capture::CompletionPolicy::TextAppears(_))
+        p4.completion(),
+        Some(tui_lab::capture::CompletionPolicy::MayBeSilent)
+    ));
+
+    // stable_screen with its own quiet override resolves both the policy
+    // and the quiet window.
+    let stabled = r#"{"action":"resize","cols":60,"rows":20,"completion":{"type":"stable_screen","quiet_ms":400}}"#;
+    let p5: TuiActRequest = serde_json::from_str(stabled).expect("deserialize stable_screen spec");
+    assert!(
+        matches!(
+            p5.completion(),
+            Some(tui_lab::capture::CompletionPolicy::StableScreen)
+        ),
+        "stable_screen spec resolves to the settle policy"
+    );
+    assert_eq!(
+        p5.completion_quiet_ms(),
+        Some(400),
+        "the spec's quiet_ms must surface to the executor"
+    );
+    // The act handlers derive quiet as: explicit wait_ms, else the
+    // completion spec's quiet_ms, else the 150ms default.
+    assert_eq!(
+        p5.wait_ms().or_else(|| p5.completion_quiet_ms()),
+        Some(400),
+        "quiet override feeds the wait derivation when no explicit wait_ms is present"
+    );
+
+    // Resize/Signal participate in the completion system now (P0.10).
+    let sig = r#"{"action":"signal","signal":15,"completion":"process_exit"}"#;
+    let p6: TuiActRequest = serde_json::from_str(sig).expect("deserialize signal request");
+    assert!(matches!(
+        p6.completion(),
+        Some(tui_lab::capture::CompletionPolicy::ProcessExit)
     ));
 }

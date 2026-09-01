@@ -948,14 +948,20 @@ impl TuiLabServer {
         // (item 8) + honest settle reporting (item 9). The whole
         // act + ledger sequence runs inside the session's actor; run locks
         // happen on the actor thread and never span an await.
-        let quiet = p.wait_ms().unwrap_or(150);
+        // Quiet precedence (re-review P0.1): an explicit `wait_ms` wins,
+        // then a completion spec's own `quiet_ms` ({"type":"stable_screen",
+        // "quiet_ms":400} is self-contained), then the 150ms default.
+        let quiet = p
+            .wait_ms()
+            .or_else(|| p.completion_quiet_ms())
+            .unwrap_or(150);
         let selector = p.id().map(str::to_string);
         let run = self.run.clone();
-        // Review P0 rigidity #4: an agent may declare how "done" means for this
-        // action. A declared completion overrides the default "screen settles"
-        // so silent/exit/signal actions are classified honestly (never a false
-        // `settled=false`). `Resize`/`Signal` have no settle semantics and
-        // always resolve the default.
+        // Review P0 rigidity #4 + re-review P0.10: an agent may declare how
+        // "done" means for this action — EVERY canonical action, Resize and
+        // Signal included. A declared completion overrides the default
+        // "screen settles" so silent/exit/signal actions are classified
+        // honestly (never a false `settled=false`).
         let completion = p.completion().unwrap_or(crate::capture::CompletionPolicy::StableScreen);
         self.with_sess(selector.as_deref(), move |sess| {
             // Wave G item 76: a live human control lease blocks driving.
@@ -1010,18 +1016,50 @@ impl TuiLabServer {
                 // as Redacted(kind, byte_len), never verbatim.
                 run.record_interaction(&sid, &tx);
                 // Scenario capture (see block comment above): sensitive steps
-                // are recorded as redacted placeholders, never with the payload.
+                // are recorded as ${PARAM} references with the parameter
+                // declared on the scenario — never with the payload (re-review
+                // P0.3). The recorded step stays replayable: a caller that
+                // supplies the parameter gets an exact replay; one that
+                // doesn't gets a structured `unresolved_parameter` step
+                // failure instead of a corrupt scenario.
                 if sensitive {
-                    run.record_scenario_act(
-                        &sid,
-                        gen,
-                        json!({
-                            "kind": tx.name(),
-                            "sensitive": true,
-                            "redacted": true,
-                            "payload_bytes": tx.canonical().payload_len(),
-                        }),
-                    );
+                    // The canonical payload field for the two string-payload
+                    // actions; raw bytes are recorded as an opaque redacted
+                    // step (no string field to reference).
+                    let (payload_field, params_json) = match serde_json::to_value(&p) {
+                        Ok(v) => match tx.canonical() {
+                            crate::execution::CanonicalAction::Type { .. } => ("text".to_string(), v),
+                            crate::execution::CanonicalAction::Paste { .. } => ("paste".to_string(), v),
+                            _ => (String::new(), v),
+                        },
+                        Err(_) => (String::new(), json!({})),
+                    };
+                    if !payload_field.is_empty() {
+                        let byte_len = tx.canonical().payload_len();
+                        run.record_scenario_act_sensitive(
+                            &sid,
+                            gen,
+                            params_json,
+                            &payload_field,
+                            crate::scenario::model::SensitiveKind::Secret,
+                            byte_len,
+                        );
+                    } else {
+                        // Raw-bytes (or exotic) sensitive action: keep the
+                        // opaque redacted placeholder — structurally a valid
+                        // act step is impossible without the payload, and the
+                        // scenario declares it unreplayable-by-shape.
+                        run.record_scenario_act(
+                            &sid,
+                            gen,
+                            json!({
+                                "action": tx.name(),
+                                "sensitive": true,
+                                "redacted": true,
+                                "payload_bytes": tx.canonical().payload_len(),
+                            }),
+                        );
+                    }
                 } else {
                     run.record_scenario_act(
                         &sid,
