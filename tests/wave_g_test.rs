@@ -118,6 +118,10 @@ fn errors_audit_survives_burst_and_scans_screen() {
 
 #[test]
 fn errors_audit_catches_on_screen_error_text() {
+    // Wave 4 item 39: "Error:" alone is a WEAK marker (matches log viewers
+    // and docs too) — the audit reports it as ERR-TEXT-HINT at info, not a
+    // fabricated crash verdict. Strong markers (panic/traceback) stay
+    // ERR-ON-SCREEN at error. Both tiers must name the offending line.
     let mut mgr = tui_lab::session::SessionManager::new();
     let id = mgr
         .start(
@@ -138,20 +142,57 @@ fn errors_audit_catches_on_screen_error_text() {
     let findings = tui_lab::audit::driver::errors_audit(sess, 5);
     let f = findings
         .iter()
-        .find(|f| f.id == "ERR-ON-SCREEN")
-        .expect("on-screen error must be flagged");
+        .find(|f| f.id == "ERR-TEXT-HINT")
+        .expect("weak marker must surface as a hint, not silence");
+    assert_eq!(f.severity, "info", "weak markers stay informational");
     assert!(
-        f.summary.contains("error:"),
+        f.summary.contains("error"),
         "marker named in summary: {:?}",
         f.summary
     );
-    let lines = f.evidence[0].detail["lines"].as_array().expect("lines");
+    let weak = f.evidence[0].detail["weak_markers"].as_array().expect("weak");
     assert!(
-        lines
+        weak.iter().any(|m| m.as_str() == Some("error:")),
+        "error: listed among weak markers: {weak:?}"
+    );
+    mgr.stop(&id).ok();
+}
+
+#[test]
+fn errors_audit_strong_markers_stay_errors() {
+    // A strong app-failure marker (panic text) keeps the ERR-ON-SCREEN
+    // error verdict.
+    let mut mgr = tui_lab::session::SessionManager::new();
+    let id = mgr
+        .start(
+            "python3",
+            &[
+                "-c".to_string(),
+                "print('panicked at src/main.rs:1'); input()".to_string(),
+            ],
+            None,
+            &[],
+            80,
+            24,
+            "auto",
+            "local",
+        )
+        .expect("start");
+    let sess = mgr.resolve_mut(Some(&id)).unwrap();
+    let findings = tui_lab::audit::driver::errors_audit(sess, 5);
+    let f = findings
+        .iter()
+        .find(|f| f.id == "ERR-ON-SCREEN")
+        .expect("strong marker must stay an error-severity finding");
+    assert_eq!(f.severity, "error");
+    let strong = f.evidence[0].detail["strong_markers"]
+        .as_array()
+        .expect("strong");
+    assert!(
+        strong
             .iter()
-            .any(|l| l.as_str().unwrap_or("").contains("disk full")),
-        "offending line captured as evidence: {:?}",
-        lines
+            .any(|m| m.as_str() == Some("panicked at")),
+        "panic marker recorded: {strong:?}"
     );
     mgr.stop(&id).ok();
 }
@@ -238,6 +279,7 @@ async fn audit_label_and_compare_flow() {
                 "profile": "keyboard",
                 "label": "pass-one",
                 "id": id,
+                "allow_mutation": true,
             })))
             .await,
         "audit pass one",
@@ -259,6 +301,7 @@ async fn audit_label_and_compare_flow() {
                 "profile": "keyboard",
                 "compare_to": "pass-one",
                 "id": id,
+                "allow_mutation": true,
             })))
             .await,
         "audit pass two",
@@ -445,11 +488,11 @@ async fn lease_blocks_driving_and_allows_observing() {
         ),
         (
             "tui_audit",
-            serde_json::json!({ "profile": "keyboard", "id": id }),
+            serde_json::json!({ "profile": "keyboard", "id": id, "allow_mutation": true }),
         ),
         (
             "tui_audit",
-            serde_json::json!({ "profile": "full", "id": id }),
+            serde_json::json!({ "profile": "full", "id": id, "allow_mutation": true }),
         ),
         (
             "tui_record",

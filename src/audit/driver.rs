@@ -120,27 +120,60 @@ pub fn keyboard_audit(
         }
         last_id = sem_after.focus.control_id.clone();
 
-        // Detect Tab trap: focus didn't change
+        // Detect Tab trap: focus didn't change. NOT a defect when the
+        // screen legitimately holds ≤1 focusable control (Wave 4 item 39 —
+        // a single-button app re-tabs to itself forever); the focusable
+        // count from the fused frame decides whether this is a trap or the
+        // expected degenerate case.
         if focus_before == focus_after {
-            findings.push(Finding {
-                id: "KB-TRAP".into(),
-                rule_id: None,
-                severity: "warn".into(),
-                category: "keyboard".into(),
-                summary: format!("Tab at step {} did not change focus", i),
-                evidence: vec![ev_other(
-                    "tab_trap",
-                    "focus did not change after Tab",
-                    json!({
-                        "step": i,
-                        "focus": focus_after,
-                        "hash": after.structure_hash,
-                    }),
-                )],
-                confidence: 0.8,
-                reproduction: None,
-                source_refs: Vec::new(),
-            });
+            let focusable_count = sem_before.controls.iter().filter(|c| c.focusable).count();
+            if focusable_count > 1 {
+                findings.push(Finding {
+                    id: "KB-TRAP".into(),
+                    rule_id: None,
+                    severity: "warn".into(),
+                    category: "keyboard".into(),
+                    summary: format!(
+                        "Tab at step {} did not change focus although {} focusable controls are visible",
+                        i, focusable_count
+                    ),
+                    evidence: vec![ev_other(
+                        "tab_trap",
+                        "focus did not change after Tab with multiple focusable controls",
+                        json!({
+                            "step": i,
+                            "focus": focus_after,
+                            "focusable_controls": focusable_count,
+                            "hash": after.structure_hash,
+                        }),
+                    )],
+                    confidence: 0.85,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                });
+            } else {
+                findings.push(Finding {
+                    id: "KB-SINGLE-FOCUSABLE".into(),
+                    rule_id: None,
+                    severity: "info".into(),
+                    category: "keyboard".into(),
+                    summary: format!(
+                        "Tab at step {} did not move focus: {} focusable control(s) visible — not a trap",
+                        i, focusable_count
+                    ),
+                    evidence: vec![ev_other(
+                        "single_focusable",
+                        "focus static because the screen has ≤1 focusable control",
+                        json!({
+                            "step": i,
+                            "focusable_controls": focusable_count,
+                        }),
+                    )],
+                    confidence: 0.9,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                });
+            }
         }
 
         // Detect cycle
@@ -895,10 +928,12 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
     for ctrl in &clickable {
         let cx = ctrl.bounds.x.saturating_add(ctrl.bounds.width / 2);
         let cy = ctrl.bounds.y.saturating_add(ctrl.bounds.height / 2);
-        let before = match session.observe(30) {
-            Ok(s) => s,
-            Err(_) => break,
-        };
+        // Warm the frame cache so the transaction's before-frame is fresh
+        // (the executor captures its own baseline; this read also surfaces
+        // observe failures before the click).
+        if session.observe(30).is_err() {
+            break;
+        }
         let tx = match execute_act(
             session,
             &CanonicalAction::MouseClick {
@@ -931,12 +966,29 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             }
         };
         clicked += 1;
-        let before_sem = semantic::analyze(&before);
-        let after_sem = semantic::analyze(tx.after());
-        let focus_moved = before_sem.focus.control != after_sem.focus.control;
-        let structure_changed = before.structure_hash != tx.after().structure_hash;
-        if focus_moved || structure_changed {
-            responded.push(ctrl.label.clone());
+        // Wave 4 item 38: "responded" is decided by the transaction's own
+        // causal evidence, not by structure-hash equality alone. A control
+        // that flashes a selection highlight (visual change, same
+        // structure), moves only native focus, or produces observable
+        // activity (settle Met) has RESPONDED — the old focus-or-structure
+        // test labeled such legitimate responses "unresponsive".
+        let focus_moved = tx.focus_before.and_then(|f| f.0.clone()) != tx.focus_after.and_then(|f| f.0.clone());
+        let structure_changed = tx.transition.before_structure_hash != tx.transition.after_structure_hash;
+        let visual_changed = tx.transition.before_visual_hash != tx.transition.after_visual_hash;
+        let observable_activity = tx.settle == crate::execution::SettleStatus::Met;
+        if focus_moved || structure_changed || visual_changed || observable_activity {
+            let how = [
+                ("focus", focus_moved),
+                ("structure", structure_changed),
+                ("visual", visual_changed),
+                ("activity", observable_activity),
+            ]
+            .iter()
+            .filter(|(_, hit)| *hit)
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>()
+            .join("+");
+            responded.push(format!("{} ({})", ctrl.label, how));
             // Record the click edge into evidence via one finding per
             // responsive control is too noisy; they are summarized below.
         } else {
@@ -974,7 +1026,8 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
                     "clicked": clicked,
                     "responded": responded,
                     "unresponsive": unresponsive,
-                    "note": "unresponsive = neither focus nor structure hash changed within the settle budget; the control may still act non-visibly",
+                    "response_tests": ["focus moved", "structure changed", "visual hash changed", "settle met (observable activity)"],
+                    "note": "unresponsive = no focus/structure/visual change AND no observable activity within the settle budget",
                 }),
             )],
             confidence: 0.8,
@@ -1304,14 +1357,16 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
         }
     };
 
-    // (1) Crash resistance: a bounded burst of safe keys.
+    // (1) Crash resistance: a bounded burst of navigation-only keys.
+    // Wave 4 item 39: Escape is NOT in this set — it can cancel a form,
+    // close a dialog, discard state, or abort a workflow, which makes it
+    // a mutation, not a probe. Tab/arrows only.
     let safe_keys = [
         KeyCode::Tab,
         KeyCode::Left,
         KeyCode::Right,
         KeyCode::Up,
         KeyCode::Down,
-        KeyCode::Escape,
     ];
     let mut seed = 0x5eed_u64;
     let mut next = move || {
@@ -1356,7 +1411,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 json!({
                     "keys_sent": sent,
                     "burst_requested": burst,
-                    "key_classes": "tab/shift+tab/arrows/escape",
+                    "key_classes": "tab/shift+tab/arrows (escape excluded: it can mutate state)",
                     "exit_state": after.as_ref().ok().map(|s| &s.process),
                 }),
             )],
@@ -1373,28 +1428,37 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
     if let Ok(s) = after {
         let joined = s.viewport_text.join("\n");
         let lowered = joined.to_lowercase();
-        let mut markers: Vec<&str> = Vec::new();
-        for m in [
+        // Wave 4 item 39: marker strength is tiered. Strong markers
+        // (panic/traceback/segfault) are app-failure evidence on their
+        // own. Weak markers ("error:", "fatal:", "exception:") also match
+        // log viewers, docs, and compiler-output panels, so alone they are
+        // a low-confidence hint — never an `error`-severity verdict.
+        let strong_markers = [
             "panicked at",
             "traceback (most recent call last)",
             "unhandled exception",
             "segmentation fault",
-            "error:",
-            "fatal:",
-            "exception:",
-        ] {
-            if lowered.contains(m) {
-                markers.push(m);
-            }
-        }
-        if !markers.is_empty() {
+        ];
+        let weak_markers = ["error:", "fatal:", "exception:"];
+        let strong: Vec<&str> = strong_markers
+            .iter()
+            .filter(|m| lowered.contains(*m))
+            .cloned()
+            .collect();
+        let weak: Vec<&str> = weak_markers
+            .iter()
+            .filter(|m| lowered.contains(*m))
+            .cloned()
+            .collect();
+        if !strong.is_empty() {
             // Pull the offending lines as evidence (bounded).
             let lines: Vec<String> = s
                 .viewport_text
                 .iter()
                 .filter(|l| {
                     let ll = l.to_lowercase();
-                    markers.iter().any(|m| ll.contains(m))
+                    strong.iter().any(|m| ll.contains(m))
+                        || weak.iter().any(|m| ll.contains(m))
                 })
                 .take(5)
                 .cloned()
@@ -1405,20 +1469,44 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 severity: "error".into(),
                 category: "errors".into(),
                 summary: format!(
-                    "Error text visible on screen: {} marker(s) found ({})",
-                    markers.len(),
-                    markers.join(", ")
+                    "App-failure text visible on screen: strong marker(s) found ({})",
+                    strong.join(", ")
                 ),
                 evidence: vec![ev_other(
                     "error_text_on_screen",
-                    "viewport lines matching error-shaped markers",
+                    "viewport lines matching strong app-failure markers",
                     json!({
-                        "markers": markers,
+                        "strong_markers": strong,
+                        "weak_markers": weak,
                         "lines": lines,
                         "structure_hash": s.structure_hash,
                     }),
                 )],
-                confidence: 0.85,
+                confidence: 0.9,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        } else if !weak.is_empty() {
+            findings.push(Finding {
+                id: "ERR-TEXT-HINT".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "errors".into(),
+                summary: format!(
+                    "error-shaped text visible ({}) with NO strong app-failure marker — could be a log viewer, docs, or compiler output; verify against process state before treating it as a crash.",
+                    weak.join(", ")
+                ),
+                evidence: vec![ev_other(
+                    "weak_error_markers",
+                    "weak text markers without strong failure evidence",
+                    json!({
+                        "weak_markers": weak,
+                        "process_running": s.process.running,
+                        "structure_hash": s.structure_hash,
+                        "note": "text markers alone are secondary evidence; unexpected exit/signal/panic is the primary signal",
+                    }),
+                )],
+                confidence: 0.4,
                 reproduction: None,
                 source_refs: Vec::new(),
             });

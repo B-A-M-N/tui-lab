@@ -176,6 +176,87 @@ impl AuditProfile {
     fn wants_static_composite(&self) -> bool {
         matches!(self, AuditProfile::Full)
     }
+
+    /// Wave 4 item 34: how much this profile can change the app under
+    /// test. The orchestrator uses this to decide restart-replay gaps
+    /// (item 35) and the safe-only default (item 36); the MCP layer
+    /// surfaces it so a caller sees WHY a profile was withheld.
+    pub fn risk(&self) -> MutationRisk {
+        match self {
+            // Reads frames/rings only. Sends nothing.
+            AuditProfile::Discoverability
+            | AuditProfile::Color
+            | AuditProfile::Unicode
+            | AuditProfile::Controls
+            | AuditProfile::TerminalModes
+            | AuditProfile::Rendering
+            | AuditProfile::InputProtocol
+            | AuditProfile::ShellCli
+            | AuditProfile::Lifecycle => MutationRisk::Observational,
+            // Writes one device query to the child's stdin; no UI
+            // semantics change. The reply is engine-generated.
+            AuditProfile::QueryResponse => MutationRisk::Observational,
+            // Contract conformance drives the app through its own checks;
+            // treat it as at-least-reversible.
+            AuditProfile::Contract => MutationRisk::Reversible,
+            // These drive the app but restore what they touch: Tab-walks
+            // end with Shift+Tab reversals, resize restores the original
+            // geometry, performance samples settle back, keyboard/focus/
+            // navigation leave the focus graph intact. Residue is detected
+            // by AuditTransaction, not assumed away.
+            AuditProfile::Keyboard
+            | AuditProfile::Focus
+            | AuditProfile::Resize
+            | AuditProfile::Layout
+            | AuditProfile::Clipping
+            | AuditProfile::Navigation
+            | AuditProfile::Performance => MutationRisk::Reversible,
+            // Clicks land on REAL controls (Save, Submit, Connect …) and
+            // key/error bursts type into the app: external state can
+            // change with no undo. These are the ones the safe-only
+            // default gates.
+            AuditProfile::Mouse | AuditProfile::States | AuditProfile::Errors => {
+                MutationRisk::PotentiallyMutating
+            }
+            // The composite inherits the strongest member risk.
+            AuditProfile::Full => MutationRisk::PotentiallyMutating,
+        }
+    }
+}
+
+/// Wave 4 item 34: audit mutation-risk classes. The taxonomy the
+/// orchestrator and the safe-only default (item 36) are built on:
+///
+/// ```text
+/// Observational        reads frames/rings; sends nothing to the app
+/// Reversible           drives the app but restores what it touches
+/// RestartRequired      needs a fresh process to be safe (deep-audit mode)
+/// PotentiallyMutating  can change external/app state with no undo
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MutationRisk {
+    Observational,
+    Reversible,
+    RestartRequired,
+    PotentiallyMutating,
+}
+
+impl MutationRisk {
+    /// Stable wire name (surfaced in audit responses and refusals).
+    pub fn name(&self) -> &'static str {
+        match self {
+            MutationRisk::Observational => "observational",
+            MutationRisk::Reversible => "reversible",
+            MutationRisk::RestartRequired => "restart_required",
+            MutationRisk::PotentiallyMutating => "potentially_mutating",
+        }
+    }
+
+    /// Anything above Observational touches the app and is gated by the
+    /// safe-only default for sessions that cannot be replayed.
+    pub fn is_invasive(&self) -> bool {
+        *self != MutationRisk::Observational
+    }
 }
 
 /// Result of one orchestrated profile run.
@@ -196,17 +277,120 @@ pub struct ProfileReport {
 /// `contract` feeds `profile=contract` (Wave E item 49); other profiles
 /// ignore it.
 pub fn run_profile(session: &mut Session, profile_name: &str) -> Result<ProfileReport, String> {
-    run_profile_with_contract(session, profile_name, None)
+    run_profile_checked(session, profile_name, None, SafetyPolicy::AllowMutation)
 }
 
-/// Contract-armed variant: `profile=contract` requires the loaded contract.
+/// Wave 4 items 36/37: how much the orchestrator may touch the app.
+///
+/// ```text
+/// SafeOnly       observational profiles run; anything invasive is
+///                withheld with an ORCH-GATED finding naming why —
+///                the default for sessions we did not launch
+/// AllowMutation  all profiles run (the historical behavior; explicit)
+/// DeepIsolation  AllowMutation plus restart-replay between
+///                PotentiallyMutating drivers so each sees a fresh app
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyPolicy {
+    SafeOnly,
+    AllowMutation,
+    DeepIsolation,
+}
+
+impl SafetyPolicy {
+    /// Whether this profile may run at all under the policy.
+    fn allows(&self, profile: &AuditProfile) -> bool {
+        match self {
+            SafetyPolicy::AllowMutation | SafetyPolicy::DeepIsolation => true,
+            SafetyPolicy::SafeOnly => !profile.risk().is_invasive(),
+        }
+    }
+}
+
+/// The gated entry point (Wave 4 item 36). Everything the MCP layer calls
+/// goes through here so the safe-only default is engine policy, not a
+/// caller-side convention.
+pub fn run_profile_checked(
+    session: &mut Session,
+    profile_name: &str,
+    contract: Option<&crate::design::ProjectContract>,
+    policy: SafetyPolicy,
+) -> Result<ProfileReport, String> {
+    let profile = AuditProfile::parse(profile_name)?;
+    if !policy.allows(&profile) {
+        let risk = profile.risk();
+        return Ok(ProfileReport {
+            profile: profile.clone(),
+            mode: "withheld",
+            findings: vec![Finding {
+                id: "ORCH-GATED".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "orchestration".into(),
+                summary: format!(
+                    "profile '{}' was not run: it is {} ({}), and this session runs under the safe-only default. Pass allow_mutation=true (or attach a restartable launch) to permit it.",
+                    profile.name(),
+                    risk.name(),
+                    risk_summary(&profile),
+                ),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "safe_only_gate",
+                    "invasive profile withheld under safe-only policy",
+                )
+                .with_detail(json!({
+                    "profile": profile.name(),
+                    "risk": risk.name(),
+                    "policy": "safe_only",
+                    "how_to_allow": "tui_audit allow_mutation=true, or launch the session through tui_session so restart-replay can isolate it",
+                }))],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            }],
+            focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+        });
+    }
+    run_profile_inner(session, profile, contract, policy)
+}
+
+/// One-line "because it does X" for the gate message.
+fn risk_summary(profile: &AuditProfile) -> &'static str {
+    match profile {
+        AuditProfile::Mouse => "it clicks real controls",
+        AuditProfile::States => "it tabs through and activates the live UI",
+        AuditProfile::Errors => "it sends key bursts into the app",
+        AuditProfile::Full => "its members include mouse/states/errors, which drive the live UI",
+        _ => "it sends input or resizes the terminal",
+    }
+}
+
+/// Internal: policy already checked.
+fn run_profile_inner(
+    session: &mut Session,
+    profile: AuditProfile,
+    contract: Option<&crate::design::ProjectContract>,
+    policy: SafetyPolicy,
+) -> Result<ProfileReport, String> {
+    run_profile_with_contract_impl(session, profile, contract, policy)
+}
+
+/// Contract-armed variant with the default (permissive-for-launched) policy.
 pub fn run_profile_with_contract(
     session: &mut Session,
     profile_name: &str,
     contract: Option<&crate::design::ProjectContract>,
 ) -> Result<ProfileReport, String> {
     let profile = AuditProfile::parse(profile_name)?;
+    run_profile_with_contract_impl(session, profile, contract, SafetyPolicy::AllowMutation)
+}
 
+fn run_profile_with_contract_impl(
+    session: &mut Session,
+    profile: AuditProfile,
+    contract: Option<&crate::design::ProjectContract>,
+    policy: SafetyPolicy,
+) -> Result<ProfileReport, String> {
     // Contract profile: conformance results folded into findings.
     if profile == AuditProfile::Contract {
         let Some(contract) = contract else {
@@ -278,6 +462,83 @@ pub fn run_profile_with_contract(
         })
     };
 
+    // Wave 4 item 35: restart-replay between PotentiallyMutating drivers.
+    // Under DeepIsolation, before each mutating driver the session is
+    // restarted from its LaunchSpec so the driver sees a fresh app and
+    // leaves nothing behind for the next one — order dependence is removed
+    // at the orchestration layer instead of assumed away per driver.
+    // Without a LaunchSpec (attached brownfield), DeepIsolation degrades to
+    // AllowMutation and says so once, honestly.
+    let deep = policy == SafetyPolicy::DeepIsolation && session.launch().is_some();
+    let mut orchestration_notes: Vec<Finding> = Vec::new();
+    if policy == SafetyPolicy::DeepIsolation && !deep {
+        orchestration_notes.push(Finding {
+            id: "ORCH-NO-RESTART".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "orchestration".into(),
+            summary: "deep isolation requested but this session has no launch spec (attached brownfield) — running in place; mutating drivers share app state.".to_string(),
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Other,
+                "deep_isolation_unavailable",
+                "restart-replay needs a recorded LaunchSpec",
+            )
+            .with_detail(json!({ "profile": profile.name() }))],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+    let restart_between = deep;
+    let mut restarts = 0u32;
+    // Restart helper: only used when a launch spec exists (checked above).
+    let do_restart = |session: &mut Session, before: &str, after: &str| -> Option<Finding> {
+        match session.restart() {
+            Ok(()) => {
+                // Give the fresh process a moment to render its first frame.
+                let _ = session.observe(150);
+                Some(Finding {
+                    id: "ORCH-RESTART".into(),
+                    rule_id: None,
+                    severity: "info".into(),
+                    category: "orchestration".into(),
+                    summary: format!(
+                        "session restarted between {before} and {after} (deep isolation): each driver sees a fresh app"
+                    ),
+                    evidence: vec![EvidenceRef::point(
+                        EvidenceKind::Other,
+                        "restart_replay",
+                        "LaunchSpec replay for driver isolation",
+                    )
+                    .with_detail(json!({
+                        "before": before,
+                        "after": after,
+                        "generation": session.generation,
+                    }))],
+                    confidence: 1.0,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                })
+            }
+            Err(e) => Some(Finding {
+                id: "ORCH-RESTART-FAILED".into(),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "orchestration".into(),
+                summary: format!("restart between {before} and {after} failed: {e} — continuing on the live app"),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "restart_failed",
+                    "session.restart returned Err",
+                )
+                .with_detail(json!({ "before": before, "after": after, "error": e.to_string() }))],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            }),
+        }
+    };
+
     let active_findings = match profile {
         AuditProfile::Full => {
             let mut fs = crate::audit::driver::keyboard_audit(session, 20, &mut graph);
@@ -287,9 +548,27 @@ pub fn run_profile_with_contract(
             fs.extend(crate::audit::driver::navigation_audit(
                 session, 20, &mut graph,
             ));
+            if restart_between {
+                if let Some(f) = do_restart(session, "navigation", "mouse") {
+                    restarts += 1;
+                    fs.push(f);
+                }
+            }
             fs.extend(tx(session, &|s| crate::audit::driver::mouse_audit(s, 8)));
             fs.extend(crate::audit::driver::performance_audit(session, 5));
+            if restart_between {
+                if let Some(f) = do_restart(session, "performance", "states") {
+                    restarts += 1;
+                    fs.push(f);
+                }
+            }
             fs.extend(tx(session, &|s| crate::audit::driver::states_audit(s, 6)));
+            if restart_between {
+                if let Some(f) = do_restart(session, "states", "errors") {
+                    restarts += 1;
+                    fs.push(f);
+                }
+            }
             fs.extend(tx(session, &|s| crate::audit::driver::errors_audit(s, 12)));
             fs.extend(crate::audit::driver::color_audit(session));
             fs.extend(crate::audit::driver::terminal_modes_audit(session));
@@ -298,6 +577,26 @@ pub fn run_profile_with_contract(
             fs.extend(crate::audit::driver::shell_cli_audit(session));
             fs.extend(crate::audit::driver::lifecycle_audit(session));
             fs.extend(crate::audit::driver::query_response_audit(session));
+            if restarts > 0 {
+                fs.push(Finding {
+                    id: "ORCH-DEEP-SUMMARY".into(),
+                    rule_id: None,
+                    severity: "info".into(),
+                    category: "orchestration".into(),
+                    summary: format!(
+                        "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
+                    ),
+                    evidence: vec![EvidenceRef::point(
+                        EvidenceKind::Other,
+                        "deep_isolation_summary",
+                        "restart count for this composite run",
+                    )
+                    .with_detail(json!({ "restarts": restarts }))],
+                    confidence: 1.0,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                });
+            }
             fs
         }
         AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
@@ -320,6 +619,7 @@ pub fn run_profile_with_contract(
         AuditProfile::QueryResponse => crate::audit::driver::query_response_audit(session),
         _ => unreachable!("non-active profiles returned above"),
     };
+    findings.extend(orchestration_notes);
     findings.extend(active_findings);
 
     let mode = if profile.wants_static_composite() {
@@ -692,6 +992,187 @@ mod tests {
             report2.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
         );
         pool2.stop(&id2).await.ok();
+    }
+
+    /// Wave 4 item 34: the risk taxonomy is complete and ordered — every
+    /// parseable profile classifies, `full` inherits the strongest member
+    /// risk, and the observational set is exactly the non-driving +
+    /// frame-level set.
+    #[test]
+    fn every_profile_has_a_risk_class() {
+        let profiles = [
+            "full", "keyboard", "focus", "resize", "layout", "clipping",
+            "discoverability", "navigation", "contract", "color", "performance",
+            "mouse", "states", "errors", "unicode", "controls", "terminal_modes",
+            "rendering", "input_protocol", "shell_cli", "lifecycle",
+            "query_response",
+        ];
+        for name in profiles {
+            let p = AuditProfile::parse(name).expect(name);
+            let r = p.risk();
+            // Wire names are stable and non-empty.
+            assert!(!r.name().is_empty(), "{name} risk names itself");
+        }
+        // full inherits the strongest member.
+        assert_eq!(AuditProfile::Full.risk(), MutationRisk::PotentiallyMutating);
+        // The observational set: exactly the profiles that never drive UI.
+        for name in [
+            "discoverability",
+            "color",
+            "unicode",
+            "controls",
+            "terminal_modes",
+            "rendering",
+            "input_protocol",
+            "shell_cli",
+            "lifecycle",
+            "query_response",
+        ] {
+            let p = AuditProfile::parse(name).unwrap();
+            assert_eq!(
+                p.risk(),
+                MutationRisk::Observational,
+                "{name} must be observational"
+            );
+        }
+        // The mutating set: clicks and bursts that can change app state.
+        for name in ["mouse", "states", "errors"] {
+            let p = AuditProfile::parse(name).unwrap();
+            assert_eq!(
+                p.risk(),
+                MutationRisk::PotentiallyMutating,
+                "{name} must be potentially mutating"
+            );
+        }
+    }
+
+    /// Wave 4 item 36: SafeOnly runs observational profiles and withholds
+    /// invasive ones with an ORCH-GATED finding that names the escape
+    /// hatch — the withheld profile never touches the app.
+    #[tokio::test]
+    async fn safe_only_withholds_invasive_profiles() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "print('safe-only'); input()".to_string()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        // mouse is PotentiallyMutating: gated.
+        let report = pool
+            .with_session(Some(&id), |s| {
+                run_profile_checked(s, "mouse", None, SafetyPolicy::SafeOnly)
+            })
+            .await
+            .expect("actor run")
+            .expect("gated report");
+        assert_eq!(report.mode, "withheld");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].id, "ORCH-GATED");
+        let detail = serde_json::to_value(&report.findings[0].evidence).unwrap();
+        assert_eq!(detail[0]["detail"]["risk"], "potentially_mutating");
+
+        // unicode is Observational: runs normally under the same policy.
+        let report = pool
+            .with_session(Some(&id), |s| {
+                run_profile_checked(s, "unicode", None, SafetyPolicy::SafeOnly)
+            })
+            .await
+            .expect("actor run")
+            .expect("static report");
+        assert_eq!(report.mode, "static");
+        pool.stop(&id).await.ok();
+    }
+
+    /// Wave 4 items 35+37: deep isolation inserts restart-replay gaps
+    /// between the composite's mutating drivers (each ORCH-RESTART names
+    /// the pair it isolated), and the run still completes.
+    #[tokio::test]
+    async fn deep_isolation_restarts_between_mutating_drivers() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "print('deep-iso'); input()".to_string()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        let report = pool
+            .with_session(Some(&id), |s| {
+                run_profile_checked(s, "full", None, SafetyPolicy::DeepIsolation)
+            })
+            .await
+            .expect("actor run")
+            .expect("deep full");
+        let restarts: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.id == "ORCH-RESTART")
+            .collect();
+        assert!(
+            restarts.len() >= 3,
+            "mouse/states/errors gaps must each restart: {:?}",
+            restarts.iter().map(|f| f.summary.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.id == "ORCH-DEEP-SUMMARY"),
+            "the run summarizes its restart count"
+        );
+        pool.stop(&id).await.ok();
+    }
+
+    /// Wave 4 item 39: a screen with a single focusable control re-tabs to
+    /// itself — that is the expected degenerate case (KB-SINGLE-FOCUSABLE,
+    /// info), NOT a KB-TRAP warning.
+    #[tokio::test]
+    async fn single_focusable_screen_is_not_a_trap() {
+        let pool = crate::session::SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "print('single-focus'); input()".to_string()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        let report = pool
+            .with_session(Some(&id), |s| {
+                run_profile_checked(s, "keyboard", None, SafetyPolicy::AllowMutation)
+            })
+            .await
+            .expect("actor run")
+            .expect("keyboard run");
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"KB-TRAP"),
+            "a plain echo screen has ≤1 focusable control — no trap: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"KB-SINGLE-FOCUSABLE"),
+            "the static-focus case must be named as info, not warn: {ids:?}"
+        );
+        pool.stop(&id).await.ok();
     }
 
     #[tokio::test]

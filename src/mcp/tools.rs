@@ -2331,6 +2331,24 @@ impl TuiLabServer {
             .map(|p| p.is_active())
             .unwrap_or(false);
 
+        // Wave 4 items 34/36/37: the mutation-safety policy. Default is
+        // safe-only (observational profiles run, invasive ones are
+        // withheld with an ORCH-GATED finding naming how to allow them);
+        // allow_mutation=true lifts it; deep_isolation=true additionally
+        // restart-replays between mutating drivers. The engine applies the
+        // policy — the MCP layer only picks which one and surfaces the
+        // risk class in the response.
+        let policy = if p.deep_isolation.unwrap_or(false) {
+            crate::audit::orchestrator::SafetyPolicy::DeepIsolation
+        } else if p.allow_mutation.unwrap_or(false) {
+            crate::audit::orchestrator::SafetyPolicy::AllowMutation
+        } else {
+            crate::audit::orchestrator::SafetyPolicy::SafeOnly
+        };
+        let risk = crate::audit::orchestrator::AuditProfile::parse(&profile)
+            .map(|ap| ap.risk().name().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
         // The audit ENGINE owns the static-vs-active decision (re-review
         // P0 fix 2): `full` is the composite (static + every active driver),
         // and no profile is weaker than its members. The MCP layer only
@@ -2347,14 +2365,16 @@ impl TuiLabServer {
                 }
             }
             let contract = run.lock().unwrap().contract().cloned();
-            let report = match crate::audit::orchestrator::run_profile_with_contract(
-                sess,
-                &profile,
-                contract.as_ref(),
-            ) {
-                Ok(r) => r,
-                Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
-            };
+            let report =
+                match crate::audit::orchestrator::run_profile_checked(
+                    sess,
+                    &profile,
+                    contract.as_ref(),
+                    policy,
+                ) {
+                    Ok(r) => r,
+                    Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
+                };
 
             // Findings accumulate in the run context (composition root) so a
             // later audit/coverage query can see prior evidence. Driven focus
@@ -2409,6 +2429,12 @@ impl TuiLabServer {
             ok(json!({
                 "profile": profile_wire,
                 "mode": report.mode,
+                "risk": risk,
+                "policy": match policy {
+                    crate::audit::orchestrator::SafetyPolicy::SafeOnly => "safe_only",
+                    crate::audit::orchestrator::SafetyPolicy::AllowMutation => "allow_mutation",
+                    crate::audit::orchestrator::SafetyPolicy::DeepIsolation => "deep_isolation",
+                },
                 "finding_count": report.findings.len(),
                 "findings": report.findings,
                 "focus_graph": focus_summary,
