@@ -1,0 +1,26 @@
+# Hermes MCP configuration for tui-lab.
+# Copy the `tui_lab` block into your Hermes mcp_servers config
+# (~/.hermes/config.yaml or the profile config). Do NOT enable parallel tool
+# calls: the tools share one mutable terminal session.
+#
+# mcp_servers:
+#   tui_lab:
+#     command: "/home/USER/.local/bin/hermes-tui-lab"
+#     args: ["mcp"]
+#     supports_parallel_tool_calls: false
+#     tools:
+#       include:
+#         - tui_session
+#         - tui_observe
+#         - tui_act
+#         - tui_wait
+#         - tui_assert
+#         - tui_checkpoint
+#         - tui_scenario
+#         - tui_record
+#         - tui_explore
+#         - tui_audit
+#         - tui_coverage
+#         - tui_framework
+#     sampling:
+#       enabled: false
