@@ -134,8 +134,12 @@ canonical `screen::diff`, returning the same `Transition` shape as
 `search` scans viewport + scrollback (takes `text`/`query`); `command_state`
 reports OSC 133 shell-integration state or honest `null` when the session
 never emitted integration marks. When the app cooperates over
-`TUI_LAB_SEMANTIC`, `nodes` overlays the app's declared tree (native focus,
-enabled, labels win over inference) and `summary` reports `native.active`.
+`TUI_LAB_SEMANTIC`, the app's declared tree is **fused** into semantic truth
+itself — one cached detection pass builds both the flat semantic surface and
+the nodes tree, then the native overlay (focus, enabled, labels, values —
+`source: native`, confidence 1.0) is applied to both. `summary`, `semantic`,
+`tree`, `nodes`, and the `tui://` semantic resource all report the same
+verdict; `nodes` additionally names what matched and what was native-only.
 
 `tree` returns the hierarchical terminal-state tree: regions nested per
 containment, controls inside their regions with state flags, focus, and

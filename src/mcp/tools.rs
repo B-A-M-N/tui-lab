@@ -161,12 +161,13 @@ impl TuiLabServer {
                         None => s.observe(40).ok()?,
                     };
                     if matches!(session_view, SessionView::Semantic) {
-                        // Serve from the per-session semantic cache when the
-                        // frame is unchanged (same structure_hash); only a
-                        // genuinely new screen re-runs the seven detectors.
-                        let cached = s.analyze_frame();
-                        match cached {
-                            Some(cr) => Some(serde_json::to_string_pretty(&cr.sem).unwrap_or_default()),
+                        // Fused truth: the resource serves the SAME analysis
+                        // observe modes see — cached detection + native
+                        // overlay — never an inference-only view.
+                        match s.fused_frame() {
+                            Some((sem, _tree, _report)) => {
+                                Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
+                            }
                             None => {
                                 let sem = semantic::analyze(&screen);
                                 Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
@@ -538,7 +539,20 @@ impl TuiLabServer {
                 // Compact summary for agent consumption (spec 36). Avoids
                 // returning the full viewport text (which could be 160x50).
                 // Use mode=screen for full text.
-                let sem = semantic::analyze(&screen);
+                //
+                // Fused semantic truth (re-review Wave-4): summary reports
+                // the SAME analysis every other semantic-bearing mode sees —
+                // one cached detection pass + native overlay — so `focus`
+                // here is the app's declared focus when it cooperates, not
+                // an inference-only verdict the nodes mode contradicts.
+                let (sem, _tree, _report) = match sess.fused_frame() {
+                    Some(t) => t,
+                    None => (
+                        semantic::analyze(&screen),
+                        semantic::build_tree(&screen),
+                        crate::semantic::native::NativeOverlayReport::default(),
+                    ),
+                };
                 let dialog_count = sem
                     .regions
                     .iter()
@@ -609,16 +623,35 @@ impl TuiLabServer {
             }
             OM::Semantic => {
                 let screen = cap!();
-                let sem = semantic::analyze(&screen);
+                // Fused truth: the flat semantic surface carries the native
+                // overlay too (focus rewrite, native enable/value/label on
+                // matched controls) — the same facts the nodes tree sees.
+                let (sem, _tree, _report) = match sess.fused_frame() {
+                    Some(t) => t,
+                    None => (
+                        semantic::analyze(&screen),
+                        semantic::build_tree(&screen),
+                        crate::semantic::native::NativeOverlayReport::default(),
+                    ),
+                };
                 ok(json!({ "semantic": sem }))
             }
             // The hierarchical rendering (re-review Wave-4): regions nested
             // per containment, controls inside their regions, focus and
             // screen-level components attached. This is the shape to compare
             // against an intended design without re-deriving containment.
+            // Built from the FUSED flat analysis, so a native focus
+            // declaration is reflected here, not just in nodes mode.
             OM::Tree => {
                 let screen = cap!();
-                let sem = semantic::analyze(&screen);
+                let (sem, _tree, _report) = match sess.fused_frame() {
+                    Some(t) => t,
+                    None => (
+                        semantic::analyze(&screen),
+                        semantic::build_tree(&screen),
+                        crate::semantic::native::NativeOverlayReport::default(),
+                    ),
+                };
                 let tree = semantic::build_state_tree(
                     screen.cols,
                     screen.rows,
@@ -638,8 +671,18 @@ impl TuiLabServer {
             // merge report names what matched.
             OM::Nodes => {
                 let screen = cap!();
-                let mut tree = semantic::build_tree(&screen);
-                let native_report = sess.overlay_native(&mut tree);
+                // Fused truth: the tree comes from the same cached detection
+                // pass (no second detector run) and the same native overlay
+                // as every other semantic-bearing mode.
+                let (sem, tree, native_report) = match sess.fused_frame() {
+                    Some(t) => t,
+                    None => (
+                        semantic::analyze(&screen),
+                        semantic::build_tree(&screen),
+                        crate::semantic::native::NativeOverlayReport::default(),
+                    ),
+                };
+                let _ = &sem;
                 ok(json!({
                     "tree": tree,
                     "rendered": tree.render(),

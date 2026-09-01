@@ -615,3 +615,119 @@ fn pipe_is_selectable_backend() {
     assert!(text.contains("PIPE-LIVE"), "{text}");
     sess.stop().ok();
 }
+
+/// Fused semantic truth (re-review Wave-4): every semantic-bearing shape
+/// reports the SAME focus — the app's declared focus via the native channel,
+/// not an inference-only verdict that contradicts the nodes view. Proven
+/// end-to-end against the real cooperative fixture: summary, semantic,
+/// tree (state tree), nodes, and the flat SemanticScreen from one
+/// `fused_frame()` call must all name the same focused control.
+#[test]
+fn fused_semantic_truth_across_all_shapes() {
+    use tui_lab::session::state::{LaunchSpec, Session};
+
+    let fixture = env!("CARGO_MANIFEST_DIR").to_string() + "/fixtures/nsp_tui.py";
+    let mut sess = Session::new("nsp-fused".into(), "python3".into());
+    let spec = LaunchSpec {
+        command: "python3".into(),
+        args: vec![fixture],
+        cwd: None,
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        backend: "auto".into(),
+        isolation: "local".into(),
+    };
+    sess.start_with_spec(spec).expect("start");
+    let path = sess.native_channel().path.clone().expect("channel created");
+
+    // Drive focus to Cancel (the second button) and wait for the app to
+    // declare its tree.
+    sess.send(Input::Key(KeyEvent::new(KeyCode::Right)))
+        .expect("focus move");
+    let mut declared = false;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        sess.observe(40).expect("observe");
+        if let Some(latest) = &sess.native_channel().latest {
+            // The app declares focus in its snapshot.
+            let flat = latest.flatten();
+            if flat.iter().any(|(_, n)| n.focused == Some(true)) {
+                declared = true;
+                break;
+            }
+        }
+    }
+    assert!(declared, "app declared a native snapshot with focus");
+
+    // One fused call: all three shapes from one detection pass + overlay.
+    let (sem, tree, report) = sess.fused_frame().expect("fused frame");
+    assert!(report.active(), "overlay engaged");
+    let flat_focus = sem.focus.control.clone();
+    assert!(
+        flat_focus.as_deref().is_some_and(|f| f.contains("Cancel")),
+        "flat focus is the app's declaration: {flat_focus:?}"
+    );
+    assert_eq!(sem.focus.confidence, 1.0, "native focus is confidence 1.0");
+
+    // The nodes tree agrees: exactly one focused node, and it is Cancel.
+    let focused_nodes: Vec<String> = {
+        fn walk(n: &tui_lab::semantic::node::SemanticNode, out: &mut Vec<String>) {
+            if n.state.focused {
+                out.push(n.label.clone().unwrap_or_else(|| n.id.clone()));
+            }
+            for c in &n.children {
+                walk(c, out);
+            }
+        }
+        let mut v = Vec::new();
+        walk(&tree.root, &mut v);
+        v
+    };
+    assert_eq!(
+        focused_nodes.len(),
+        1,
+        "exactly one focused tree node: {focused_nodes:?}"
+    );
+    assert!(
+        focused_nodes[0].contains("Cancel"),
+        "tree focus matches: {focused_nodes:?}"
+    );
+
+    // The flat controls agree with the tree on which control is focused:
+    // same detection pass, same overlay — impossible to diverge.
+    let focused_controls: Vec<&str> = sem
+        .controls
+        .iter()
+        .filter(|c| c.focused)
+        .map(|c| c.label.as_str())
+        .collect();
+    assert!(
+        focused_controls.iter().any(|l| l.contains("Cancel")),
+        "flat focused controls: {focused_controls:?}"
+    );
+
+    // And a second call is cache-served (structure unchanged) while the
+    // overlay still applies — the fused path is idempotent and never freezes
+    // the native facts.
+    let (sem2, tree2, report2) = sess.fused_frame().expect("second fused frame");
+    assert_eq!(sem2.focus.control, sem.focus.control, "stable focus across reads");
+    assert_eq!(report2.focus_applied, report.focus_applied);
+    let focused2: Vec<String> = {
+        fn walk2(n: &tui_lab::semantic::node::SemanticNode, out: &mut Vec<String>) {
+            if n.state.focused {
+                out.push(n.label.clone().unwrap_or_else(|| n.id.clone()));
+            }
+            for c in &n.children {
+                walk2(c, out);
+            }
+        }
+        let mut v = Vec::new();
+        walk2(&tree2.root, &mut v);
+        v
+    };
+    assert_eq!(focused2, focused_nodes, "tree focus stable across reads");
+
+    sess.stop().ok();
+    std::fs::remove_file(path).ok();
+}

@@ -696,6 +696,25 @@ impl Session {
         Some(self.semantic_cache.borrow_mut().analyze(screen))
     }
 
+    /// The fused semantic truth for the last settled frame (re-review
+    /// Wave-4): one cached detection pass producing both shapes, then the
+    /// native overlay applied fresh. Every semantic-bearing observe mode
+    /// (summary / semantic / tree / nodes) and the `tui://` semantic
+    /// resource routes through here, so they cannot disagree with each
+    /// other. Returns `None` when no observation has happened yet.
+    pub fn fused_frame(
+        &self,
+    ) -> Option<(
+        crate::semantic::SemanticScreen,
+        crate::semantic::node::SemanticTree,
+        crate::semantic::native::NativeOverlayReport,
+    )> {
+        let screen = self.last()?;
+        let (sem, tree, report) =
+            crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        Some((sem, tree, report))
+    }
+
     /// Send input. When recording, the backend has already delivered the exact
     /// encoded bytes to the recording hook, so the cast shows the real bytes
     /// (audit item 25).
