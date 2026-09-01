@@ -163,6 +163,7 @@ impl ContractReport {
             );
             out.push(Finding {
                 id: id.to_string(),
+                rule_id: None,
                 severity: severity.into(),
                 category: format!("contract/{}", r.group),
                 summary: format!("[{}] {}: {}", r.verdict.as_str(), r.name, r.detail),

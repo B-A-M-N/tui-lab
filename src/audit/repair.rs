@@ -128,6 +128,7 @@ mod tests {
     fn finding_with(repro: Option<&str>, refs: Vec<crate::semantic::source_ref::SourceRef>) -> crate::audit::Finding {
         crate::audit::Finding {
             id: "CLIP-001".into(),
+            rule_id: None,
             severity: "error".into(),
             category: "layout".into(),
             summary: "Save button clipped at right edge".into(),

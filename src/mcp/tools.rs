@@ -1697,6 +1697,7 @@ impl TuiLabServer {
             let mut run = self.run.lock().unwrap();
             run.extend_findings(vec![crate::audit::Finding {
                 id: format!("EXPLORE-CRASH-{}", exit.action_index),
+                rule_id: None,
                 severity: "warn".into(),
                 category: "exploration".into(),
                 summary: format!(
@@ -1742,6 +1743,7 @@ impl TuiLabServer {
             run.save_scenario(scenario);
             run.extend_findings(vec![crate::audit::Finding {
                 id: format!("EXPLORE-CRASH-{}", exit.action_index),
+                rule_id: None,
                 severity: "error".into(),
                 category: "exploration".into(),
                 summary: format!(
@@ -2783,6 +2785,7 @@ impl TuiLabServer {
                                 .iter()
                                 .map(|(name, before, after)| crate::audit::Finding {
                                     id: "CONTRACT-REGRESSION".into(),
+                                    rule_id: None,
                                     severity: "error".into(),
                                     category: "contract/compare".into(),
                                     summary: format!(

@@ -68,6 +68,12 @@ pub struct NativeNode {
     pub focused: Option<bool>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Where this widget lives in the app's source (re-review P1 item 27):
+    /// framework adapters can name `file`, `line`, `symbol`, and a
+    /// framework id — the strongest bridge from a rendered problem to a
+    /// source edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::semantic::source_ref::SourceRef>,
     /// Nested children.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<NativeNode>,
@@ -490,6 +496,25 @@ fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &Native
     if let Some(value) = &node.value {
         n.value = Some(value.clone());
     }
+    // Identity join (item 28): a matched node keeps its semantic id and
+    // gains the native id + source locus, so a finding on the rendered node
+    // can point at the app's code. Later frames refresh `source_refs` in
+    // place — adapters can sharpen a locus over time.
+    if n.identity.is_none() {
+        n.identity = Some(crate::semantic::source_ref::ComponentIdentity::semantic(n.id.clone()));
+    }
+    if let Some(identity) = &mut n.identity {
+        identity.native_id = Some(node.id.clone());
+        if let Some(src) = &node.source {
+            if !identity
+                .source_refs
+                .iter()
+                .any(|r| r == src)
+            {
+                identity.source_refs.push(src.clone());
+            }
+        }
+    }
 }
 
 /// Map a native role slug onto the semantic [`Role`] vocabulary. Unknown
@@ -601,6 +626,14 @@ fn native_to_semantic_node(
         },
         children: Vec::new(),
         affordances: Vec::new(),
+        // Native-only insertion (item 28): the identity is native from
+        // birth — semantic id and native id coincide, and any source locus
+        // the adapter declared joins directly.
+        identity: Some(
+            crate::semantic::source_ref::ComponentIdentity::semantic(native.id.clone())
+                .with_native(native.id.clone())
+                .with_source_refs(native.source.iter().cloned().collect()),
+        ),
         confidence: crate::semantic::Confidence::native(),
     }
 }
@@ -872,6 +905,7 @@ mod tests {
             bounds: None,
             actions: vec![],
             focusable: None,
+            source: None,
             focused: None,
             enabled: None,
             children: vec![NativeNode {
@@ -882,6 +916,7 @@ mod tests {
                 bounds: None,
                 actions: vec![],
                 focusable: None,
+                source: None,
                 focused: None,
                 enabled: None,
                 children: vec![NativeNode {
@@ -892,6 +927,7 @@ mod tests {
                     bounds: None,
                     actions: vec!["activate".into()],
                     focusable: Some(true),
+                    source: None,
                     focused: None,
                     enabled: Some(false),
                     children: vec![],

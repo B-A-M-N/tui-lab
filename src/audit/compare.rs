@@ -103,6 +103,7 @@ mod tests {
     fn finding(id: &str, category: &str, target: &str) -> Finding {
         Finding {
             id: id.into(),
+            rule_id: None,
             severity: "warn".into(),
             category: category.into(),
             summary: format!("{} in {}", id, category),

@@ -208,6 +208,7 @@ pub fn run_profile_with_contract(
         run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
             vec![Finding {
                 id: "AUDIT-TX-ERR".into(),
+                rule_id: None,
                 severity: "error".into(),
                 category: "audit".into(),
                 summary: format!("audit transaction failed: {}", e),
@@ -273,6 +274,7 @@ pub fn run_profile_with_contract(
 fn orchestration_error(profile: &str, summary: String) -> Finding {
     Finding {
         id: format!("AUDIT-ERR-{}", profile.to_uppercase()),
+        rule_id: None,
         severity: "error".into(),
         category: "audit".into(),
         summary,
