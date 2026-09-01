@@ -222,14 +222,15 @@ selector_enum!(
 
 selector_enum!(
     /// `tui_audit` profile. `layout` is a documented alias of `resize`;
-    /// `contract` (Wave E) folds conformance into findings.
+    /// `contract` (Wave E) folds conformance into findings. `unicode` and
+    /// `controls` (Wave 3) are static subsystem audits over one fused frame.
     AuditProfile;
     [
         Full => "full", Keyboard => "keyboard", Focus => "focus", Resize => "resize",
         Layout => "layout", Clipping => "clipping", Discoverability => "discoverability",
         Navigation => "navigation", Contract => "contract", Color => "color",
         Performance => "performance", Mouse => "mouse", States => "states",
-        Errors => "errors",
+        Errors => "errors", Unicode => "unicode", Controls => "controls",
     ]
 );
 
