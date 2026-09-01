@@ -2624,8 +2624,11 @@ mod tests {
         );
         assert_eq!(restored.findings().len(), 1);
         // IDs persist with their instance discriminator (Finding::instance
-        // at record time), so the restored id is the instanced form.
-        assert_eq!(restored.findings()[0].id, "RESTORE-ME@96ce2a8a");
+        // at record time), so the restored id is the instanced form. The
+        // discriminator is the versioned-BLAKE3 finding:v1 hash of
+        // (rule, target) — the old SipHash value was process-random and
+        // this one is durable across runs and releases.
+        assert_eq!(restored.findings()[0].id, "RESTORE-ME@1491868b");
         assert_eq!(restored.focus_transitions().len(), 1);
         // Scenario listable + loadable by id (name index rebuilt). The list
         // is keyed by id; the unambiguous name resolves to the same thing.

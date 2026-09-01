@@ -98,49 +98,65 @@ pub fn analyze(screen: &ScreenState) -> SemanticScreen {
 /// per action on the before-frame, then on candidate after-frames), and
 /// caching risks exactly the staleness this exists to prevent.
 pub fn semantic_identity(screen: &ScreenState) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let sem = analyze(screen);
-    let mut h = DefaultHasher::new();
+    // Durable identity: versioned BLAKE3 over a length-prefixed canonical
+    // serialization (the DefaultHasher this replaced is seeded per process,
+    // so the identity it produced was never comparable across runs — the
+    // ":v1:" tag was a claim the hash could not keep).
+    let mut h = blake3::Hasher::new();
+    h.update(b"semantic-id:v1:");
+    fn part(h: &mut blake3::Hasher, bytes: &[u8]) {
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    // Optional strings hash as: present = 0x01 + bytes, absent = 0x00 (the
+    // "None" case must be distinguishable from the empty-string case).
+    fn part_opt(h: &mut blake3::Hasher, s: &Option<String>) {
+        match s {
+            Some(v) => {
+                h.update(&[0x01]);
+                part(h, v.as_bytes());
+            }
+            None => {
+                h.update(&[0x00]);
+            }
+        }
+    }
     // Layout skeleton (normalized — volatile text already scrubbed).
-    screen.structure_hash.hash(&mut h);
+    part(&mut h, screen.structure_hash.as_bytes());
     // Semantic content over that skeleton: what the controls ARE.
     for c in &sem.controls {
-        c.id.hash(&mut h);
-        format!("{:?}", c.kind).hash(&mut h);
-        c.label.hash(&mut h);
-        c.value.hash(&mut h);
-        c.bounds.x.hash(&mut h);
-        c.bounds.y.hash(&mut h);
-        c.bounds.width.hash(&mut h);
-        c.bounds.height.hash(&mut h);
-        c.focusable.hash(&mut h);
-        c.focused.hash(&mut h);
-        c.enabled.hash(&mut h);
-        c.selected.hash(&mut h);
-        c.checked.hash(&mut h);
+        part(&mut h, c.id.as_bytes());
+        part(&mut h, format!("{:?}", c.kind).as_bytes());
+        part(&mut h, c.label.as_bytes());
+        part_opt(&mut h, &c.value);
+        part(&mut h, &c.bounds.x.to_le_bytes());
+        part(&mut h, &c.bounds.y.to_le_bytes());
+        part(&mut h, &c.bounds.width.to_le_bytes());
+        part(&mut h, &c.bounds.height.to_le_bytes());
+        part(&mut h, &[c.focusable as u8, c.focused as u8, c.enabled as u8, c.selected as u8, c.checked as u8]);
     }
     for r in &sem.regions {
-        r.id.hash(&mut h);
-        format!("{:?}", r.kind).hash(&mut h);
-        r.title.hash(&mut h);
-        r.bounds.x.hash(&mut h);
-        r.bounds.y.hash(&mut h);
-        r.bounds.width.hash(&mut h);
-        r.bounds.height.hash(&mut h);
-        format!("{:?}", r.clipping_state).hash(&mut h);
+        part(&mut h, r.id.as_bytes());
+        part(&mut h, format!("{:?}", r.kind).as_bytes());
+        part_opt(&mut h, &r.title);
+        part(&mut h, &r.bounds.x.to_le_bytes());
+        part(&mut h, &r.bounds.y.to_le_bytes());
+        part(&mut h, &r.bounds.width.to_le_bytes());
+        part(&mut h, &r.bounds.height.to_le_bytes());
+        part(&mut h, format!("{:?}", r.clipping_state).as_bytes());
     }
     for a in &sem.affordances {
-        a.action.hash(&mut h);
-        a.control_id.hash(&mut h);
-        format!("{:?}", a.invocation).hash(&mut h);
-        format!("{:?}", a.visibility).hash(&mut h);
+        part(&mut h, a.action.as_bytes());
+        part_opt(&mut h, &a.control_id);
+        part(&mut h, format!("{:?}", a.invocation).as_bytes());
+        part(&mut h, format!("{:?}", a.visibility).as_bytes());
     }
     // Focus is part of semantic truth: Tab between two controls with
     // identical text changes the identity.
-    sem.focus.control_id.hash(&mut h);
-    sem.focus.control.hash(&mut h);
-    format!("semantic-id:v1:{:016x}", h.finish())
+    part_opt(&mut h, &sem.focus.control_id);
+    part_opt(&mut h, &sem.focus.control);
+    format!("semantic-id:v1:{}", h.finalize().to_hex())
 }
 
 /// Versioned BLAKE3 identity over the fused semantic screen + tree.
