@@ -61,6 +61,30 @@ fn pty_backend(script: &str) -> PortablePtyBackend {
 
 // ── Items 50–51: PtyLineBackend ─────────────────────────────────────────
 
+/// W1b: resize on the line backend is a REAL winsize push (the backend is a
+/// genuine PTY). The child must observe the new COLUMNS via TIOCGWINSZ —
+/// the old synthetic-only resize never delivered WINCH, so a resize-aware
+/// child kept rendering at the old width forever.
+#[test]
+fn line_cli_resize_delivers_winsize_to_child() {
+    let mut b = cli_backend(
+        "import sys, struct, termios, fcntl, time\n\
+         def cols():\n\
+         \x20   return struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\x00'*8))[1]\n\
+         sys.stdout.write(f'C0-{cols()}\\n'); sys.stdout.flush()\n\
+         time.sleep(2.0)\n\
+         sys.stdout.write(f'C1-{cols()}\\n'); sys.stdout.flush()\n\
+         time.sleep(1)",
+    );
+    let _ = b.wait(WaitCond::Text("C0-".into()), Duration::from_secs(5));
+    b.resize(110, 30).expect("resize");
+    let out = b
+        .wait(WaitCond::Text("C1-110".into()), Duration::from_secs(5))
+        .expect("wait post-resize cols");
+    assert!(out.met, "child must see 110 cols after real resize");
+    b.stop().ok();
+}
+
 #[test]
 fn line_cli_output_becomes_lines_with_scrollback() {
     let mut b = cli_backend(

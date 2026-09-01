@@ -528,11 +528,22 @@ impl TerminalBackend for PtyLineBackend {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> BackendResult<()> {
-        // Synthetic re-dimension only; the child is not signalled (a pipe
-        // has no winsize). Honest: no WINCH can be delivered because there
-        // is no pty.
         self.cols = cols;
         self.rows = rows;
+        // This backend IS a real PTY (W1b): push the new winsize so the
+        // kernel delivers SIGWINCH and TIOCGWINSZ reports it — the child
+        // actually re-renders. The old comment ("a pipe has no winsize")
+        // described the pipe backend, not this one.
+        if let Some(master) = self.master.as_ref() {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| BackendError::Spawn(e.to_string()))?;
+        }
         self.notify(|hook| hook.on_resize(cols, rows));
         Ok(())
     }
