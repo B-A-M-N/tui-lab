@@ -201,7 +201,7 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(names, declared, "tools/list == capability registry");
     assert_eq!(
         names.len(),
-        15,
+        16,
         "registry count matches the wire: {names:?}"
     );
     for expected in [
@@ -209,6 +209,7 @@ fn stdio_e2e_full_lifecycle() {
         "tui_observe",
         "tui_act",
         "tui_wait",
+        "tui_probe",
         "tui_assert",
         "tui_checkpoint",
         "tui_scenario",
@@ -306,6 +307,45 @@ fn stdio_e2e_full_lifecycle() {
         serde_json::json!({ "action": "type", "text": "echo e2e", "id": session }),
     );
     assert_eq!(act["category"], "success", "type failed: {act}");
+
+    // --- probe: the Wave-2 troubleshooting primitive over the wire ---
+    // A drift probe (no stimulus) must return an envelope with the exact
+    // provenance string, an honest settle, and the anomaly/transition shape.
+    let probe = mcp.tool(
+        "tui_probe",
+        serde_json::json!({
+            "stimulus": { "kind": "none" },
+            "completion": "stable",
+            "budget_ms": 3000,
+            "id": session,
+        }),
+    );
+    assert_eq!(probe["category"], "success", "probe failed: {probe}");
+    assert_eq!(
+        probe["data"]["action"], "no stimulus (drift)",
+        "drift probe provenance: {probe}"
+    );
+    assert_eq!(probe["data"]["settle"], "Skipped", "drift settle: {probe}");
+    assert!(
+        probe["data"]["anomalies"].is_array() && probe["data"]["transition"].is_object(),
+        "probe carries anomalies + transition: {probe}"
+    );
+
+    // A stimulated probe reports the exact canonical signature.
+    let probe2 = mcp.tool(
+        "tui_probe",
+        serde_json::json!({
+            "stimulus": { "kind": "key", "key": "x" },
+            "completion": "may_be_silent",
+            "budget_ms": 3000,
+            "id": session,
+        }),
+    );
+    assert_eq!(probe2["category"], "success", "probe2 failed: {probe2}");
+    assert_eq!(
+        probe2["data"]["action"], "x",
+        "key probe provenance is the exact signature: {probe2}"
+    );
 
     // --- wait: screen stable after the action ---
     let wait = mcp.tool(

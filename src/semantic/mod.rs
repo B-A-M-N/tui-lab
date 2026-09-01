@@ -159,6 +159,23 @@ pub fn semantic_identity(screen: &ScreenState) -> String {
     format!("semantic-id:v1:{}", h.finalize().to_hex())
 }
 
+/// Convenience for probe/report consumers: `(control_id, label)` when the
+/// analysis resolved any focus, else `None`.
+pub trait FocusOption {
+    fn focus_for_option(&self) -> Option<(Option<String>, Option<String>)>;
+}
+
+impl FocusOption for SemanticScreen {
+    fn focus_for_option(&self) -> Option<(Option<String>, Option<String>)> {
+        let f = &self.focus;
+        if f.control_id.is_none() && f.control.is_none() {
+            None
+        } else {
+            Some((f.control_id.clone(), f.control.clone()))
+        }
+    }
+}
+
 /// Versioned BLAKE3 identity over the fused semantic screen + tree.
 /// Uses a canonical JSON serialization of roles, labels, bounds, focus,
 /// enabled/state fields so native overlays and inference changes are both

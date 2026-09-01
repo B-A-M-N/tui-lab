@@ -932,6 +932,156 @@ impl TuiLabServer {
         .unwrap_or_else(|e| e)
     }
 
+    /// The troubleshooting primitive (re-review Wave-2): run one small
+    /// experiment and report EVERYTHING materially different — causal
+    /// events, the settled frame, the transition, watched anomalies.
+    #[tool(
+        name = "tui_probe",
+        description = "Run one small experiment against the terminal and get everything materially different: baseline vs settled after-frame, causal terminal events inside the probe window, screen/semantic transition, watched anomalies (cursor/focus/controls/regions/style/process). stimulus {kind:none} = drift probe."
+    )]
+    pub async fn tui_probe(&self, p: Parameters<TuiProbeParams>) -> rmcp::model::CallToolResult {
+        let p = p.0;
+        // Completion: known names compile to the canonical policy; unknown
+        // names are answered with the accepted list.
+        let completion = match p.completion.as_ref() {
+            None => crate::capture::CompletionPolicy::StableScreen,
+            Some(Known::Known(pc)) => match pc.to_policy(p.text.as_deref()) {
+                Some(c) => c,
+                None => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "completion '{}' requires the 'text' parameter",
+                            pc.as_str()
+                        ),
+                    )
+                }
+            },
+            Some(Known::Other(other)) => {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown completion '{}' (expected one of: {})",
+                        other,
+                        crate::mcp::params::ProbeCompletion::VARIANTS.join(", ")
+                    ),
+                )
+            }
+        };
+        let watch: Vec<crate::diagnostic::ProbeWatch> = match &p.watch {
+            None => crate::diagnostic::default_watch(),
+            Some(sel) => {
+                let mut out = Vec::new();
+                for w in sel {
+                    match w {
+                        Known::Known(w) => out.push(w.to_watch()),
+                        Known::Other(other) => {
+                            return err(
+                                ErrorCategory::InvalidRequest,
+                                format!(
+                                    "unknown watch aspect '{}' (expected one of: {})",
+                                    other,
+                                    crate::mcp::params::ProbeWatchParam::VARIANTS.join(", ")
+                                ),
+                            )
+                        }
+                    }
+                }
+                out
+            }
+        };
+        let stimulus = match &p.stimulus {
+            None | Some(crate::mcp::params::ProbeStimulus::None) => None,
+            Some(s) => match s.to_action() {
+                Some(a) => Some(a),
+                None => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "unrecognized key name in stimulus (use a named key like 'enter'/'tab'/'up' or a single character)",
+                    )
+                }
+            },
+        };
+        let quiet_ms = p.quiet_ms.unwrap_or(120);
+        let budget_ms = p.budget_ms.unwrap_or(5000);
+        let selector = p.id.clone();
+        let run = self.run.clone();
+        self.with_sess(selector.as_deref(), move |sess| {
+            match crate::diagnostic::run_probe(
+                sess,
+                stimulus,
+                completion,
+                &watch,
+                quiet_ms,
+                budget_ms,
+            ) {
+                Ok(result) => {
+                    {
+                        let (sid, gen) = (sess.id.clone(), sess.generation);
+                        let mut run = run.lock().unwrap();
+                        run.record_event(&sid, "probe");
+                        run.record_scenario_wait(
+                            &sid,
+                            gen,
+                            serde_json::to_value(&p).unwrap_or_default(),
+                        );
+                    }
+                    let events = result
+                        .terminal_events
+                        .iter()
+                        .map(|ev| {
+                            json!({
+                                "seq": ev.seq,
+                                "kind": ev.kind.name(),
+                                "detail": format!("{:?}", ev.kind),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let anomalies = result.anomalies.clone();
+                    ok(json!({
+                        "action": result.action,
+                        "settle": format!("{:?}", result.settle),
+                        "changed": result.has_changes(),
+                        "timing_ms": result.timing_ms,
+                        "events": events,
+                        "anomalies": anomalies,
+                        "transition": {
+                            "structure_changed": result.transition.before_structure_hash != result.transition.after_structure_hash,
+                            "changed_cells": result.transition.screen_diff.changed_cells,
+                            "style_changes": result.transition.screen_diff.style_changes,
+                            "controls_added": result.transition.semantic_diff.controls_added,
+                            "controls_removed": result.transition.semantic_diff.controls_removed,
+                            "focus_before": result.transition.semantic_diff.focus_before,
+                            "focus_after": result.transition.semantic_diff.focus_after,
+                        },
+                        "before": {
+                            "structure_hash": result.before.structure_hash,
+                            "visual_hash": result.before.visual_hash,
+                        },
+                        "after": {
+                            "structure_hash": result.after.structure_hash,
+                            "visual_hash": result.after.visual_hash,
+                            "viewport_text": result.after.viewport_text,
+                            "focus": {
+                                "control_id": result.after_focus.as_ref().and_then(|f| f.0.clone()),
+                                "label": result.after_focus.as_ref().and_then(|f| f.1.clone()),
+                                "cursor": { "x": result.after.cursor.x, "y": result.after.cursor.y, "visible": result.after.cursor.visible },
+                            },
+                            "process": {
+                                "running": result.after.process.running,
+                                "exit_code": result.after.process.exit_code,
+                            },
+                        },
+                        "frames_captured": result.frames.len(),
+                    }))
+                }
+                Err(e) => err(ErrorCategory::BackendError, e.to_string()),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| e)
+    }
+
     /// Wait for a state condition without fixed sleeps.
     #[tool(
         name = "tui_wait",

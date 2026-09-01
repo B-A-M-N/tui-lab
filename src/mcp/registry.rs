@@ -47,6 +47,11 @@ pub const TOOLS: &[ToolCapability] = &[
         selector: Some(("condition", <crate::mcp::params::WaitCondition as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
+        name: "tui_probe",
+        summary: "Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched anomalies. stimulus {kind:none} = drift probe.",
+        selector: Some(("completion", <crate::mcp::params::ProbeCompletion as EnumVariants>::VARIANTS)),
+    },
+    ToolCapability {
         name: "tui_assert",
         summary: "Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.",
         selector: Some(("assertion", <crate::mcp::params::AssertAssertion as EnumVariants>::VARIANTS)),

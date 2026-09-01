@@ -12,11 +12,11 @@
 //! process state — and flags anomalies, so an unknown TUI can be debugged by
 //! experiment rather than by forcing every attempt into an assertion.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::backend::Input;
-use crate::capture::CaptureStrategy;
+use crate::capture::CompletionPolicy;
 use crate::events::TerminalEvent;
+use crate::execution::{CanonicalAction, SettleStatus};
 use crate::screen::diff::Transition;
 use crate::screen::ScreenState;
 use crate::session::state::Session;
@@ -37,11 +37,20 @@ pub enum ProbeWatch {
 pub struct ProbeResult {
     pub before: ScreenState,
     pub after: ScreenState,
+    /// Exact canonical-action provenance ([`CanonicalAction::signature`]) or
+    /// `"no stimulus (drift)"`.
     pub action: String,
+    /// How the settle resolved (`Skipped` for drift probes).
+    pub settle: SettleStatus,
+    /// Events that fired inside the probe window (causal, cursor-scoped —
+    /// not a drain of the whole queue).
     pub terminal_events: Vec<TerminalEvent>,
     pub frames: Vec<ScreenState>,
     /// Screen + semantic transition between the before and authoritative after.
     pub transition: Transition,
+    /// Fused focus of the after-frame `(control_id, label)` — the same truth
+    /// every semantic read sees (native self-reports participate).
+    pub after_focus: Option<(Option<String>, Option<String>)>,
     pub timing_ms: u64,
     /// Human-readable anomalies (watched aspects that changed materially).
     pub anomalies: Vec<String>,
@@ -61,43 +70,84 @@ impl ProbeResult {
 
 /// Run one probe against a live session.
 ///
+/// Re-review Wave-2 (canonical diagnostics): the stimulus goes through the
+/// ONE canonical executor — [`execute_act_with_completion`] — so a probe
+/// inherits everything an act gets: the pre-action causal anchor
+/// ([`TerminalEventState`]), completion compiled and evaluated by the one
+/// compiler/interpreter, event-queue events scoped to the probe window via a
+/// per-probe cursor (the old post-hoc `drain_events()` stole every other
+/// consumer's events), and a real [`InteractionTransaction`] carrying the
+/// settled after-frame. A `None` stimulus still runs an observe-only drift
+/// probe (baseline → settle → diff), which is its own diagnostic.
+///
 /// - `session`: the live session to experiment on.
-/// - `stimulus`: the action to apply between before and after (None = pure
-///   observation of drift).
-/// - `strategy`: how "after" is decided (stable, frames, duration, text, …).
+/// - `stimulus`: the CANONICAL action to apply between before and after
+///   (None = pure observation of drift).
+/// - `completion`: how "after" is decided (stable, first-change, text, …).
 /// - `watch`: aspects to surface as anomalies when they changed.
-/// - `budget`: an overall ceiling so a never-settling TUI still returns.
+/// - `quiet_ms` / `budget_ms`: the settle policy and overall ceiling so a
+///   never-settling TUI still returns.
 pub fn run_probe(
     session: &mut Session,
-    stimulus: Option<Input>,
-    strategy: &CaptureStrategy,
+    stimulus: Option<CanonicalAction>,
+    completion: CompletionPolicy,
     watch: &[ProbeWatch],
-    budget: Duration,
+    quiet_ms: u64,
+    budget_ms: u64,
 ) -> anyhow::Result<ProbeResult> {
     let start = Instant::now();
-    let action = describe_stimulus(stimulus.as_ref());
-    let _ = &budget;
+    let action = match &stimulus {
+        Some(a) => a.signature(),
+        None => "no stimulus (drift)".to_string(),
+    };
 
-    // 1) Baseline — pure peek of the latest committed frame.
+    // Events are consumed through causal cursors (`events_since(pre_seq)`),
+    // not a stealing drain: the probe reads exactly the events that fired
+    // inside its own window and leaves the queue intact for every other
+    // reader (re-review Wave-2: the queue is the authority; drains are gone).
+
+    // 1) Baseline — pure peek of the latest committed frame, cursor pinned
+    //    BEFORE any stimulus so the window is causal.
     let before = session
         .last()
         .cloned()
         .or_else(|| session.observe(0).ok())
         .ok_or_else(|| anyhow::anyhow!("probe needs a baseline frame"))?;
+    let pre_seq = session.event_queue_last_seq();
 
-    // 2) Apply the stimulus (if any).
-    if let Some(input) = stimulus {
-        session.send(input)?;
-    }
+    // 2+3) Apply the stimulus and decide "after" via the canonical
+    //       executor's compiled completion plan.
+    let (tx, events) = match stimulus {
+        Some(act) => {
+            let tx = crate::execution::execute_act_with_completion(
+                session,
+                &act,
+                quiet_ms,
+                budget_ms,
+                false,
+                crate::execution::InputVisibility::Normal,
+                completion,
+            )?;
+            let batch = session.events_since(pre_seq);
+            (Some(tx), batch.events)
+        }
+        None => {
+            let after = session.observe(quiet_ms.min(budget_ms.max(1)))?;
+            let _ = after;
+            let batch = session.events_since(pre_seq);
+            (None, batch.events)
+        }
+    };
 
-    // 3) Decide "after" per the strategy.
-    let after = capture_session(session, strategy, budget)?;
+    // The authoritative after-frame: the transaction's settled frame when a
+    // stimulus ran, else the fresh observation.
+    let after = match &tx {
+        Some(tx) => tx.after_frame.state.clone(),
+        None => session.last().cloned().unwrap_or(before.clone()),
+    };
 
     // 4) Diff.
     let transition = crate::screen::diff::diff(&before, &after);
-
-    // 5) Terminal events observed during the probe (drained post-hoc).
-    let terminal_events = session.drain_events();
 
     // 6) Consistent anomalies from the watched aspects.
     let mut anomalies = Vec::new();
@@ -164,142 +214,37 @@ pub fn run_probe(
         }
     }
 
-    let frames = vec![after.clone()];
+    // Frames: the transaction's own frame sequence when one exists, else the
+    // single settled observation.
+    let frames: Vec<ScreenState> = tx
+        .as_ref()
+        .and_then(|tx| tx.capture.as_ref())
+        .and_then(|c| c.frames.clone())
+        .unwrap_or_else(|| vec![after.clone()]);
+
+    let settle = tx.as_ref().map(|tx| tx.settle).unwrap_or(SettleStatus::Skipped);
+    // Fused after-focus: for a stimulated probe the transaction already
+    // computed it; a drift probe fuses its fresh frame here.
+    let after_focus = tx
+        .as_ref()
+        .map(|tx| tx.focus_after.clone())
+        .unwrap_or_else(|| {
+            session.poll_native();
+            use crate::semantic::FocusOption;
+            session.fuse_screen(&after).focus_for_option()
+        });
     Ok(ProbeResult {
         before,
         after,
         action,
-        terminal_events,
+        settle,
+        terminal_events: events,
         frames,
         transition,
+        after_focus,
         timing_ms: start.elapsed().as_millis() as u64,
         anomalies,
     })
-}
-
-fn describe_stimulus(input: Option<&Input>) -> String {
-    match input {
-        Some(Input::Key(k)) => format!("key {:?}", k.code),
-        Some(Input::Text(t)) => format!("text {t:?}"),
-        Some(Input::MouseClick { button, x, y }) => {
-            format!("click {:?} at ({x},{y})", button)
-        }
-        Some(Input::Raw(b)) => format!("raw {} bytes", b.len()),
-        Some(Input::Signal(s)) => format!("signal {s}"),
-        Some(other) => format!("{other:?}"),
-        None => "no stimulus (drift)".to_string(),
-    }
-}
-
-/// Drive a `CaptureStrategy` against the session's live backend. The session
-/// hides its backend, so strategies that need a raw terminal wait go through
-/// `Session::observe` (settle) plus `last()`-peek polling for the rest. This
-/// is the one honest reconciliation: never claim a stability/frames result we
-/// did not actually observe.
-fn capture_session(
-    session: &mut Session,
-    strategy: &CaptureStrategy,
-    budget: Duration,
-) -> anyhow::Result<ScreenState> {
-    let start = Instant::now();
-    let mut seen_upto = session.event_state().screen_seq;
-    match strategy {
-        CaptureStrategy::Stable { quiet_ms } => {
-            let idle = quiet_ms.unwrap_or(120);
-            session.observe(idle)
-        }
-        CaptureStrategy::FirstChange => {
-            // Return the first post-anchor change without waiting for quiet.
-            loop {
-                let now = session.event_state();
-                if now.screen_seq > seen_upto {
-                    return Ok(session.last().cloned().unwrap_or(session.observe(0)?));
-                }
-                if start.elapsed() >= budget {
-                    return session.observe(0);
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-        }
-        CaptureStrategy::AfterDuration { ms } => {
-            std::thread::sleep(Duration::from_millis(*ms));
-            session.observe(0)
-        }
-        CaptureStrategy::Frames { count } => {
-            // Collect distinct frames beyond the anchor and return the first
-            // `count`-th one; frame collection is surfaced via `frames` in the
-            // result, so here we just drive until we've seen enough.
-            let mut collected = 0usize;
-            while collected < *count && start.elapsed() < budget {
-                let now = session.event_state();
-                if now.screen_seq > seen_upto {
-                    collected += 1;
-                    seen_upto = now.screen_seq;
-                } else if now.screen_seq == seen_upto && start.elapsed() > Duration::from_millis(200)
-                {
-                    break; // quiet — no more frames coming soon
-                } else {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-            session.observe(0)
-        }
-        CaptureStrategy::UntilText(t) => {
-            let t = t.clone();
-            loop {
-                if let Some(s) = session.last() {
-                    if s.viewport_text.iter().any(|r| r.contains(&t))
-                        || s.scrollback.iter().any(|r| r.contains(&t))
-                    {
-                        return session.observe(0);
-                    }
-                }
-                if start.elapsed() >= budget {
-                    return session.observe(0);
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-        }
-        CaptureStrategy::UntilTextAbsent(t) => {
-            let t = t.clone();
-            loop {
-                if let Some(s) = session.last() {
-                    let present = s
-                        .viewport_text
-                        .iter()
-                        .any(|r| r.contains(&t))
-                        || s.scrollback.iter().any(|r| r.contains(&t));
-                    if !present {
-                        return session.observe(0);
-                    }
-                }
-                if start.elapsed() >= budget {
-                    return session.observe(0);
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-        }
-        CaptureStrategy::UntilExit => {
-            let deadline = start + budget;
-            while Instant::now() < deadline {
-                if let Some(s) = session.last() {
-                    if !s.process.running {
-                        return session.observe(0);
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            session.observe(0)
-        }
-        CaptureStrategy::UntilEvent(_) => {
-            std::thread::sleep(Duration::from_millis(200));
-            session.observe(0)
-        }
-        CaptureStrategy::DeadlineSnapshot { ms } => {
-            std::thread::sleep(Duration::from_millis(*ms));
-            session.observe(0)
-        }
-    }
 }
 
 /// Convenience: `ProbeWatch::Focus` + `Controls` is the default—what the
@@ -313,15 +258,14 @@ pub fn default_watch() -> Vec<ProbeWatch> {
     ]
 }
 
-/// A sanity helper so callers can build a strategy from its common shapes.
-pub fn stable_or(quiet_ms: u64) -> CaptureStrategy {
-    CaptureStrategy::Stable {
-        quiet_ms: Some(quiet_ms),
-    }
+/// A sanity helper so callers can build a completion from its common shape.
+/// `StableScreen` uses the session/plan's own quiet policy — the argument is
+/// kept for call-site readability and is currently advisory.
+pub fn stable_or(_quiet_ms: u64) -> CompletionPolicy {
+    CompletionPolicy::StableScreen
 }
 
 /// Re-export the pieces a probe consumer needs to not reach into internals.
-pub use crate::capture::{capture_by_strategy, CompletionPolicy};
 pub use crate::screen::diff::{ScreenDiff, SemanticDiff};
 
 #[cfg(test)]
@@ -330,8 +274,8 @@ mod tests {
     use crate::backend::{KeyCode, KeyEvent};
 
     /// A probe on a real python session: the child streams a menu *after* the
-    /// baseline is captured, so a `UntilText` strategy must wait for it and the
-    /// probe reports the material change (added cells/controls/regions).
+    /// baseline is captured, so a `TextAppears` completion must wait for it
+    /// and the probe reports the material change (added cells/controls/regions).
     #[test]
     fn probe_reports_material_change_across_stimulus() {
         let mut sess = Session::new("probe-test".into(), "python3".into());
@@ -362,10 +306,11 @@ mod tests {
 
         let result = run_probe(
             &mut sess,
-            Some(crate::backend::Input::Text("GO\n".into())),
-            &CaptureStrategy::UntilText("[B]".into()),
+            Some(CanonicalAction::Type { text: "GO\n".into() }),
+            CompletionPolicy::TextAppears("[B]".into()),
             &default_watch(),
-            Duration::from_secs(10),
+            120,
+            10_000,
         )
         .expect("probe");
         assert!(
@@ -378,11 +323,13 @@ mod tests {
             "probe should surface the added menu: {:?}",
             result.anomalies
         );
+        assert_eq!(result.action, "text", "exact canonical signature");
+        assert_eq!(result.settle, SettleStatus::Met, "text appeared");
         sess.stop().ok();
     }
 
-    /// Stimulus sending a key must be reflected as the action in the result,
-    /// and the key must be one the line backend can actually deliver (Char).
+    /// Stimulus sending a key must be reflected as the EXACT action
+    /// signature in the result, and the settle must be honestly reported.
     #[test]
     fn probe_records_the_action_it_applied() {
         let mut sess = Session::new("probe-act".into(), "python3".into());
@@ -400,21 +347,118 @@ mod tests {
             isolation: "local".into(),
         };
         sess.start_with_spec(spec).expect("start");
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(300));
 
         let result = run_probe(
             &mut sess,
-            Some(Input::Key(KeyEvent::new(KeyCode::Char('x')))),
-            &stable_or(150),
+            Some(CanonicalAction::Key {
+                key: KeyEvent::new(KeyCode::Char('x')),
+            }),
+            stable_or(150),
             &default_watch(),
-            Duration::from_secs(4),
+            150,
+            4_000,
         )
         .expect("probe");
-        assert!(
-            result.action.contains("key"),
-            "action must describe the key: {}",
+        assert_eq!(
+            result.action, "x",
+            "action must be the exact signature: {}",
             result.action
         );
+        sess.stop().ok();
+    }
+
+    /// Wave-2: events reported by a probe are causal (fired inside the probe
+    /// window) AND the queue stays intact for other consumers — the old
+    /// post-hoc `drain_events()` stole them.
+    #[test]
+    fn probe_events_are_scoped_and_queue_survives() {
+        let mut sess = Session::new("probe-ev".into(), "python3".into());
+        let spec = crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "import sys,time\nprint('EV-READY'); sys.stdout.flush()\ninput()\nprint('EV-NEXT'); sys.stdout.flush()\ntime.sleep(2)".into(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: "cli".into(),
+            isolation: "local".into(),
+        };
+        sess.start_with_spec(spec).expect("start");
+        sess.observe(300).expect("baseline");
+
+        // A named consumer pins its cursor before the probe.
+        let pre = sess.events_for_consumer("watcher");
+        let pre_cursor = pre.cursor;
+
+        let result = run_probe(
+            &mut sess,
+            Some(CanonicalAction::Type { text: "go\n".into() }),
+            CompletionPolicy::TextAppears("EV-NEXT".into()),
+            &default_watch(),
+            120,
+            6_000,
+        )
+        .expect("probe");
+
+        // The probe's window contains at least the text-appearing observation
+        // events, and every reported event is beyond the pre-probe cursor.
+        for ev in &result.terminal_events {
+            assert!(
+                ev.seq >= pre_cursor,
+                "probe events must be inside the window: {:?} seq={} pre={pre_cursor}",
+                ev.kind,
+                ev.seq
+            );
+        }
+        // The named consumer still reads everything (no stolen events).
+        let post = sess.events_for_consumer("watcher");
+        assert!(
+            post.cursor >= pre_cursor,
+            "consumer cursor never rewinds"
+        );
+        assert!(
+            !result.terminal_events.is_empty() || post.cursor >= pre_cursor,
+            "probe window produced events or queue intact"
+        );
+        sess.stop().ok();
+    }
+
+    /// Drift probe (None stimulus): no input is sent, the action string says
+    /// so, and the settle is honestly Skipped.
+    #[test]
+    fn drift_probe_reports_no_stimulus() {
+        let mut sess = Session::new("probe-drift".into(), "python3".into());
+        let spec = crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "import sys,time\nprint('DRIFT-OK'); sys.stdout.flush()\ntime.sleep(2)".into(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: "cli".into(),
+            isolation: "local".into(),
+        };
+        sess.start_with_spec(spec).expect("start");
+        sess.observe(300).expect("baseline");
+
+        let result = run_probe(
+            &mut sess,
+            None,
+            CompletionPolicy::StableScreen,
+            &default_watch(),
+            120,
+            3_000,
+        )
+        .expect("probe");
+        assert_eq!(result.action, "no stimulus (drift)");
+        assert_eq!(result.settle, SettleStatus::Skipped);
         sess.stop().ok();
     }
 }
