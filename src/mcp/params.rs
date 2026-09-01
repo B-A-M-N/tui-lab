@@ -293,8 +293,11 @@ pub struct TuiSessionParams {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Engine selector (re-review P0): typed as `Known<BackendParam>` so an
+    /// unknown name still reaches the envelope as `invalid_request` with the
+    /// accepted list, matching the isolation param's contract.
     #[serde(default)]
-    pub backend: Option<String>,
+    pub backend: Option<Known<BackendParam>>,
     /// Isolation profile (Wave G item 77): `local` | `clean` | `strict`.
     /// Typed as Known<IsolationParam> so an unknown name still reaches the
     /// envelope as invalid_request with the accepted list.
@@ -308,6 +311,69 @@ pub struct TuiSessionParams {
     /// lease: time-to-live in milliseconds (default 300000 = 5 min).
     #[serde(default)]
     pub ttl_ms: Option<u64>,
+}
+
+/// Engine vocabulary (re-review P0: exact engine selection). `auto` resolves
+/// to the portable PTY engine for screen programs; `cli` and `pipe` pick the
+/// line/pipe transports honestly instead of routing everything through the
+/// one boolean-ish "backend" string the handler matched ad hoc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub enum BackendParam {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "portable_vt100")]
+    PortableVt100,
+    #[serde(rename = "cli")]
+    Cli,
+    #[serde(rename = "line_cli")]
+    LineCli,
+    #[serde(rename = "pipe")]
+    Pipe,
+}
+
+impl EnumVariants for BackendParam {
+    const VARIANTS: &'static [&'static str] = &["auto", "portable_vt100", "cli", "line_cli", "pipe"];
+}
+
+impl BackendParam {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackendParam::Auto => "auto",
+            BackendParam::PortableVt100 => "portable_vt100",
+            BackendParam::Cli => "cli",
+            BackendParam::LineCli => "line_cli",
+            BackendParam::Pipe => "pipe",
+        }
+    }
+
+    /// Resolve to the engine kind (`auto` → portable PTY).
+    pub fn to_kind(self) -> crate::session::state::BackendKind {
+        match self {
+            BackendParam::Auto | BackendParam::PortableVt100 => {
+                crate::session::state::BackendKind::PortableVt
+            }
+            BackendParam::Cli | BackendParam::LineCli => crate::session::state::BackendKind::PtyLine,
+            BackendParam::Pipe => crate::session::state::BackendKind::Pipe,
+        }
+    }
+}
+
+impl std::str::FromStr for BackendParam {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(BackendParam::Auto),
+            "portable_vt100" => Ok(BackendParam::PortableVt100),
+            "cli" => Ok(BackendParam::Cli),
+            "line_cli" => Ok(BackendParam::LineCli),
+            "pipe" => Ok(BackendParam::Pipe),
+            other => Err(format!(
+                "unknown backend '{}' (expected one of: {})",
+                other,
+                Self::VARIANTS.join(", ")
+            )),
+        }
+    }
 }
 
 /// Isolation profile vocabulary (Wave G item 77).

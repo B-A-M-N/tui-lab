@@ -35,15 +35,18 @@ pub enum BackendKind {
 
 impl BackendKind {
     /// Parse the agent-facing LaunchSpec/MCP name. Unknown names are an
-    /// error, never a silent fallback.
+    /// error, never a silent fallback. Accepts BOTH the agent-facing aliases
+    /// (`auto`, `portable_vt100`, `cli`) and this enum's own `display()`
+    /// / serde names — a round-trip through the launch layer (typed kind →
+    /// display name → spec → parse) must never fail to re-parse itself.
     pub fn parse(name: &str) -> anyhow::Result<Self> {
         Ok(match name {
-            "auto" | "portable_vt100" => BackendKind::PortableVt,
-            "cli" | "line_cli" => BackendKind::PtyLine,
+            "auto" | "portable_vt100" | "portable-pty+vt100" => BackendKind::PortableVt,
+            "cli" | "line_cli" | "line-cli+lines" => BackendKind::PtyLine,
             "pipe" => BackendKind::Pipe,
             other => {
                 return Err(anyhow::anyhow!(
-                    "unknown backend '{other}' (supported: auto, portable_vt100, cli, pipe)"
+                    "unknown backend '{other}' (supported: auto, portable_vt100, cli, line_cli, pipe)"
                 ))
             }
         })
