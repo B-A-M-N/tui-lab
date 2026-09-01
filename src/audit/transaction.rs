@@ -65,6 +65,11 @@ impl StateResidue {
 /// appended when restoration was incomplete. A failed pre-state capture
 /// surfaces as `Err` — the caller reports an engine error rather than
 /// running an audit it cannot verify.
+///
+/// Item 49: the driver and verify phases are timed and the numbers ride on
+/// the last evidence ref (`metrics: {driver_ms, verify_ms, total_ms}`) so
+/// "the audit was slow" is distinguishable from "the app was slow to
+/// respond" without re-running anything.
 pub fn run_verified<F>(
     session: &mut Session,
     profile: &str,
@@ -73,14 +78,58 @@ pub fn run_verified<F>(
 where
     F: FnOnce(&mut Session) -> Vec<Finding>,
 {
+    let started = std::time::Instant::now();
     let pre = PreState::capture(session)?;
+    let driver_started = std::time::Instant::now();
     let mut findings = driver(session);
+    let driver_ms = driver_started.elapsed().as_millis() as u64;
+    let verify_started = std::time::Instant::now();
     let residue = verify(session, &pre);
+    let verify_ms = verify_started.elapsed().as_millis() as u64;
+    let total_ms = started.elapsed().as_millis() as u64;
 
     if let Some(residue) = residue {
         if residue.has_residue() {
             findings.push(residue_finding(profile, &pre, &residue));
         }
+    }
+    // Stamp the metrics onto the LAST finding's evidence (the residue
+    // finding when present, else the driver's final finding). Audits that
+    // produced nothing still report timing via a dedicated info finding so
+    // the numbers are never lost.
+    let metrics = json!({
+        "profile": profile,
+        "driver_ms": driver_ms,
+        "verify_ms": verify_ms,
+        "total_ms": total_ms,
+    });
+    if let Some(last) = findings.last_mut() {
+        if let Some(ev) = last.evidence.last_mut() {
+            if ev.detail.is_null() {
+                ev.detail = json!({});
+            }
+            ev.detail["audit_metrics"] = metrics;
+        }
+    } else {
+        findings.push(Finding {
+            id: "AUDIT-METRICS".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "audit".into(),
+            summary: format!(
+                "audit '{}' found nothing in {}ms (driver {}ms, verify {}ms)",
+                profile, total_ms, driver_ms, verify_ms
+            ),
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Other,
+                "audit_timing",
+                "clean run timing",
+            )
+            .with_detail(json!({ "audit_metrics": metrics }))],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
     }
     Ok(findings)
 }

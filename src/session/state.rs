@@ -102,6 +102,34 @@ impl LaunchSpec {
     }
 }
 
+/// The reactive fused commit memo (re-review item 52): a computed fused
+/// triple plus the frame identity it is a function of. The identity
+/// covers every input the fused pipeline reads — structure (hash),
+/// interaction state (visual hash + cursor + process state), and the
+/// native channel's absorbed position (a fresh declare must invalidate).
+#[derive(Clone)]
+struct FusedMemo {
+    key: String,
+    sem: crate::semantic::SemanticScreen,
+    tree: crate::semantic::node::SemanticTree,
+    report: crate::semantic::native::NativeOverlayReport,
+}
+
+/// Frame identity key for the fused memo: structure hash (text/layout),
+/// visual hash + cursor + process state (interaction), and the count of
+/// native events absorbed so far (native overlay input). Two frames with
+/// the same key are, by construction, the same input to `fuse`.
+fn fused_key(screen: &crate::screen::ScreenState, native_seq: u64) -> String {
+    format!(
+        "{}/{}/{:?}/{:?}/{}",
+        screen.structure_hash,
+        screen.visual_hash,
+        (screen.cursor.x, screen.cursor.y, screen.cursor.visible),
+        screen.process.running,
+        native_seq,
+    )
+}
+
 /// Rows whose cell text differs between two frames (Wave B item 12:
 /// `ScreenChanged.dirty_rows` derived at the only place with both frames).
 /// Compares viewport text per row — cheap, and matches what an incremental
@@ -161,6 +189,18 @@ pub struct Session {
     /// instead of re-running all seven detectors. Interior-mutated by the
     /// read-only `analyze_frame` path.
     semantic_cache: std::cell::RefCell<crate::semantic::SemanticCache>,
+    /// Reactive fused commit (re-review item 52): the last frame's FULL
+    /// fused result (structure + interaction + native overlay), keyed on
+    /// the frame's complete identity — structure_hash + visual_hash +
+    /// cursor + native events absorbed. An unchanged frame identity
+    /// returns the memoized triple without re-running the interaction pass
+    /// or the overlay; any input (new structure, new visual state, fresh
+    /// native events) invalidates it. This is the "reactive" half: the
+    /// fused result is a function of the frame identity, computed when the
+    /// identity changes, not on every read.
+    fused_memo: std::cell::RefCell<Option<FusedMemo>>,
+    /// How many fused reads the memo served (evidence for the audit).
+    fused_memo_hits: std::cell::Cell<u64>,
     /// Wave F items 58–63: the NativeSemanticProtocol side channel. The
     /// session creates it at start and injects `TUI_LAB_SEMANTIC` into the
     /// child's env; cooperative apps write their real semantic tree there
@@ -222,6 +262,8 @@ impl Session {
             events: crate::events::TerminalEventQueue::new(),
             cursors: std::collections::HashMap::new(),
             semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
+            fused_memo: std::cell::RefCell::new(None),
+            fused_memo_hits: std::cell::Cell::new(0),
             native: crate::semantic::native::NativeChannel::default(),
             native_events_absorbed_seq: 0,
             lease: crate::session::lease::LeaseState::default(),
@@ -899,6 +941,14 @@ impl Session {
     /// (summary / semantic / tree / nodes) and the `tui://` semantic
     /// resource routes through here, so they cannot disagree with each
     /// other. Returns `None` when no observation has happened yet.
+    ///
+    /// Item 52 (reactive FrameCommit): the fused result is memoized on
+    /// the frame's full identity (structure + interaction + native
+    /// position). Unchanged identity → the memo serves all three shapes
+    /// without re-running the interaction pass or the overlay; any
+    /// invalidating input recomputes once. `fuse_screen` bypasses the
+    /// memo (arbitrary frames stay pure), and `poll_native`/observe
+    /// invalidate through the key change.
     pub fn fused_frame(
         &self,
     ) -> Option<(
@@ -907,9 +957,37 @@ impl Session {
         crate::semantic::native::NativeOverlayReport,
     )> {
         let screen = self.last()?;
+        let key = fused_key(screen, self.native_events_absorbed_seq);
+        if let Some(memo) = self.fused_memo.borrow().as_ref() {
+            if memo.key == key {
+                self.fused_memo_hits.set(self.fused_memo_hits.get() + 1);
+                return Some((memo.sem.clone(), memo.tree.clone(), memo.report.clone()));
+            }
+        }
         let (sem, tree, report) =
             crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        *self.fused_memo.borrow_mut() = Some(FusedMemo {
+            key,
+            sem: sem.clone(),
+            tree: tree.clone(),
+            report: report.clone(),
+        });
         Some((sem, tree, report))
+    }
+
+    /// How many fused reads the memo served without recompute (item 52
+    /// evidence, surfaced next to the structural cache stats).
+    pub fn fused_memo_hits(&self) -> u64 {
+        self.fused_memo_hits.get()
+    }
+
+    /// Drop the fused memo. Callers that change fused inputs OUTSIDE the
+    /// frame identity (currently none — the key covers structure,
+    /// interaction, and native position) would use this; kept as the
+    /// explicit invalidation hook so the reactive contract has a manual
+    /// escape hatch.
+    pub fn invalidate_fused(&self) {
+        *self.fused_memo.borrow_mut() = None;
     }
 
     /// Fused analysis of an ARBITRARY frame owned by a transaction (re-view

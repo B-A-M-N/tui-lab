@@ -43,6 +43,42 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// (re-review P0 fix 5).
 const MAX_TRANSACTION_RECORDS: usize = 512;
 
+/// How many hot frame records the run retains (re-review item 51). Sized
+/// like the transaction ring: enough to answer "what was frame:N?" for a
+/// whole session's working set, bounded so a long soak cannot grow the
+/// ledger without limit. Eviction is declared (`frame_hot_evicted`), and
+/// the cold half of the split — the full grid — was never here to begin
+/// with (it lives in `frames.jsonl` for persistent runs).
+pub const FRAME_HOT_RING: usize = 512;
+
+/// The HOT half of the frame storage split (re-review item 51): the
+/// identity + projection facts of one committed frame, queryable in
+/// memory by citable id. Deliberately NO cell grid — the cold half
+/// (full `ScreenState`) stays with the frame's owner and the
+/// `frames.jsonl` log; this record is what "frame:N" means to the run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrameRecord {
+    /// Citable id (`frame:N` without the prefix).
+    pub frame_id: u64,
+    /// Session the frame was captured from, when known at commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Session generation at capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+    pub screen_seq: u64,
+    pub output_seq: u64,
+    pub structure_hash: String,
+    pub visual_hash: String,
+    /// Semantic identity at commit (crate::semantic::semantic_identity).
+    pub semantic_identity: String,
+    /// Unix-millis commit time.
+    pub committed_at: u64,
+    /// How long the commit pipeline took (micros) — item 49's cost
+    /// visibility applied to the frame path.
+    pub commit_us: u64,
+}
+
 /// One settled interaction transaction, at evidence level.
 ///
 /// This is the reconstructable record the run previously lacked (it could
@@ -196,6 +232,17 @@ pub struct RunContext {
     /// Per-run frame id allocator (Wave B item 11): every CanonicalFrame
     /// registered with the run gets a citable `frame:N` identity.
     next_frame_id: u64,
+    /// FrameAnalysis storage (re-review item 51): a bounded HOT ring of
+    /// per-frame records — ids, sequences, hashes, capture time, commit
+    /// timing — queryable by citable id without touching the filesystem.
+    /// The COLD half (the full `ScreenState` grid) never lives here: it
+    /// stays with the frame's owner (session/transaction) and, for
+    /// persistent runs, in `frames.jsonl`. Ring eviction is FIFO past
+    /// [`FRAME_HOT_RING`] entries; evicted ids remain resolvable through
+    /// the cold log, and the ring reports its own eviction count so a
+    /// miss is diagnosable, not silent.
+    frame_hot: std::collections::VecDeque<FrameRecord>,
+    frame_hot_evicted: u64,
     /// Artifact registry (Wave B item 15): typed references to every large
     /// artifact the run produced (recordings, event logs). Tools return an
     /// [`ArtifactRef`] instead of inlining multi-kilobyte payloads.
@@ -296,6 +343,8 @@ impl RunContext {
             transaction_count: 0,
             event_count: 0,
             next_frame_id: 0,
+            frame_hot: std::collections::VecDeque::new(),
+            frame_hot_evicted: 0,
             artifacts: Vec::new(),
             ledger_flushed_upto: 0,
             journal: None,
@@ -1588,6 +1637,13 @@ impl RunContext {
             "closed": self.closed,
             "primary_session_cwd": self.primary_session_cwd().map(str::to_string),
             "counts": self.counts(),
+            // FrameAnalysis storage (re-review item 51): hot ring health —
+            // what's resident, what was evicted to the cold log.
+            "frames": {
+                "hot_resident": self.frame_hot.len(),
+                "hot_evicted": self.frame_hot_evicted,
+                "next_frame_id": self.next_frame_id,
+            },
             "contract": self.contract.as_ref().map(|c| json!({
                 "name": c.schema.name,
                 "version": c.schema.version,
@@ -1841,6 +1897,25 @@ impl RunContext {
         id
     }
 
+    /// Recall one committed frame's HOT record by citable id (item 51).
+    /// `None` means not in the hot ring — either never committed to this
+    /// run, or evicted (check [`Self::frame_hot_evicted`]); the cold log
+    /// (`frames.jsonl`, persistent runs) still resolves it.
+    pub fn frame_record(&self, frame_id: u64) -> Option<&FrameRecord> {
+        self.frame_hot.iter().find(|r| r.frame_id == frame_id)
+    }
+
+    /// The hot frame ring, oldest first (item 51 storage split: hot ids +
+    /// hashes here, full grids only in the cold log).
+    pub fn frame_hot_records(&self) -> impl Iterator<Item = &FrameRecord> {
+        self.frame_hot.iter()
+    }
+
+    /// How many hot records have been evicted past the ring bound.
+    pub fn frame_hot_evicted(&self) -> u64 {
+        self.frame_hot_evicted
+    }
+
     /// The frame commit pipeline (re-review item 40): the ONE path a
     /// captured frame takes from raw capture to citable evidence.
     ///
@@ -1858,9 +1933,34 @@ impl RunContext {
         frame: &mut crate::backend::CanonicalFrame,
         session: Option<&str>,
     ) -> u64 {
+        let started = std::time::Instant::now();
         let id = self.register_frame(frame);
         if frame.session_id.is_none() {
             frame.session_id = session.map(str::to_string);
+        }
+        // HOT half of the storage split (item 51): the projection facts
+        // land in the bounded ring even for ephemeral runs — a citable
+        // frame id that answers no questions would be a number, not
+        // evidence.
+        let record = FrameRecord {
+            frame_id: id,
+            session: frame.session_id.clone(),
+            generation: frame.generation,
+            screen_seq: frame.screen_seq,
+            output_seq: frame.output_seq,
+            structure_hash: frame.state.structure_hash.clone(),
+            visual_hash: frame.state.visual_hash.clone(),
+            semantic_identity: crate::semantic::semantic_identity(&frame.state),
+            committed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            commit_us: started.elapsed().as_micros() as u64,
+        };
+        self.frame_hot.push_back(record);
+        while self.frame_hot.len() > FRAME_HOT_RING {
+            self.frame_hot.pop_front();
+            self.frame_hot_evicted += 1;
         }
         if let Some(dir) = self.run_dir.as_ref() {
             let line = serde_json::json!({

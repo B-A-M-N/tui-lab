@@ -659,6 +659,10 @@ impl TuiLabServer {
                         "misses": sess.semantic_cache_misses(),
                         "hit_rate": sess.semantic_cache_hit_rate(),
                     },
+                    // Reactive fused commit (re-review item 52): how many
+                    // fused reads the memo served — the interaction pass +
+                    // native overlay did not re-run for these.
+                    "fused_memo_hits": sess.fused_memo_hits(),
                 }))
             }
             OM::Screen => {
