@@ -506,7 +506,15 @@ impl TerminalBackend for PtyLineBackend {
             }
             Input::Key(kev) => {
                 // Single key: encode the character itself, Enter as newline —
-                // a pipe has no key semantics beyond bytes.
+                // a pipe has no key semantics beyond bytes. A MODIFIED key
+                // (ctrl/alt/shift) cannot be expressed here: silently
+                // sending the base character would deliver the wrong byte
+                // (ctrl+c as 'c'), so it is rejected instead.
+                if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                    return Err(BackendError::Unsupported(format!(
+                        "line CLI backend cannot encode modified keys (got {kev:?}); use portable_vt100 for full key semantics"
+                    )));
+                }
                 match kev.code {
                     crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
                     crate::backend::KeyCode::Char(c) => {
@@ -524,6 +532,11 @@ impl TerminalBackend for PtyLineBackend {
             }
             Input::Keys(keys) => {
                 for kev in keys {
+                    if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                        return Err(BackendError::Unsupported(format!(
+                            "line CLI backend cannot encode modified keys (got {kev:?}); use portable_vt100 for full key semantics"
+                        )));
+                    }
                     match kev.code {
                         crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
                         crate::backend::KeyCode::Char(c) => {

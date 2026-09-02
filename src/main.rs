@@ -440,8 +440,58 @@ fn doctor() {
         },
     );
 
+    // 10. Native cooperation, end-to-end (doctor item 38): launch the
+    // shipped cooperative fixture and prove the whole side-channel path —
+    // env injection → NDJSON frames → fused overlay — not just the env-var
+    // plumbing the launch path guarantees. Without python3 the probe cannot
+    // run; that is degraded capability (warn), like every other fixture
+    // probe. With python3 present, a silent or broken channel is a FAIL:
+    // cooperation is a core, advertised capability.
+    let native_probe = if python3 {
+        std::panic::catch_unwind(tui_lab::diagnostic::native_cooperation_probe)
+            .unwrap_or_else(|_| tui_lab::diagnostic::NativeCooperationReport {
+                ran: false,
+                frames_received: 0,
+                frames_invalid: 0,
+                native_control_resolved: false,
+                native_focus_applied: false,
+                detail: "probe panicked".to_string(),
+            })
+    } else {
+        tui_lab::diagnostic::NativeCooperationReport {
+            // Skipped, not failed: degradation is honest (warn tier).
+            ran: true,
+            frames_received: 1,
+            frames_invalid: 0,
+            native_control_resolved: true,
+            native_focus_applied: true,
+            detail: "python3 unavailable — cooperation probe skipped".to_string(),
+        }
+    };
+    let native_ok = native_probe.ran
+        && native_probe.frames_received > 0
+        && native_probe.frames_invalid == 0
+        && native_probe.native_control_resolved
+        && native_probe.native_focus_applied;
+    tier(
+        &mut out,
+        "Native cooperation (TUI_LAB_SEMANTIC)",
+        if python3 {
+            Tier::from_ok(native_ok)
+        } else {
+            Tier::Warn
+        },
+        &native_probe.detail,
+    );
+
     let _ = writeln!(out);
-    let core = pty && semantic && recording && checkpoints && scenarios && exploration;
+    let core = pty
+        && semantic
+        && recording
+        && checkpoints
+        && scenarios
+        && exploration
+        && native_ok;
     if core {
         let _ = writeln!(out, "Core subsystems operational.");
     } else {

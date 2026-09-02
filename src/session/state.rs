@@ -844,7 +844,27 @@ impl Session {
                 ))
             }
         };
+        // Record the old generation's death BEFORE the backend drops the
+        // child: without this, a process killed by a restart vanishes from
+        // the event ledger with no death record — indistinguishable from
+        // "still running" and a provenance gap exactly like the un-recorded
+        // failed-launch case this function already guards against. If the
+        // process was already dead, `process()` carries its real code or
+        // signal; if it was alive, the stop below terminates it (SIGTERM is
+        // stop()'s mechanism), and the record says so.
+        let old_state = self.backend.process();
         self.backend.stop().ok();
+        if old_state.running {
+            self.push_event(crate::events::TerminalEventKind::ProcessExited {
+                exit_code: None,
+                exit_signal: Some("Terminated".to_string()),
+            });
+        } else {
+            self.push_event(crate::events::TerminalEventKind::ProcessExited {
+                exit_code: old_state.exit_code,
+                exit_signal: old_state.exit_signal,
+            });
+        }
         // Reserve the NEW generation BEFORE the launch: scratch dirs, the
         // native channel reset, ProcessStarted, and isolation evidence are
         // all keyed on generation at start time. The old order launched N+1
