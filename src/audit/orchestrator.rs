@@ -166,6 +166,13 @@ impl AuditProfile {
                 | AuditProfile::Performance
                 | AuditProfile::States
                 | AuditProfile::Errors
+                // Color is an active-side, non-driving read of the live
+                // session (raw ring + fused frame), same class as
+                // TerminalModes. Its omission here made profile=color
+                // unreachable: the orchestrator routed it to the static
+                // branch, which errors "no static checks" — the real
+                // driver existed but no caller could reach it.
+                | AuditProfile::Color
                 // Needs the session (raw ring + fused frame), not just one
                 // frame — same "active-side, non-driving" class as Color.
                 | AuditProfile::TerminalModes

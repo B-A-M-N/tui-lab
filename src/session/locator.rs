@@ -119,14 +119,45 @@ impl ManifestAt {
 
 /// Detect an enclosing VCS marker. Independent of the manifest walk — this is
 /// an *additional* provenance signal, never the discovery driver.
+///
+/// The marker must look like a real repository, not just exist: a hollow
+/// `.git` DIRECTORY (no HEAD — some tools create one as a scratch marker;
+/// observed in the wild on /tmp) would otherwise brand a bare tree with a
+/// false `git` provenance. A `.git` FILE is accepted directly — that is how
+/// worktrees and submodules point at their real gitdir.
 fn detect_vcs(root: &Path) -> Option<String> {
     for (marker, name) in [(".git", "git"), (".hg", "hg"), (".svn", "svn")] {
-        if root.join(marker).exists() {
+        let marker_path = root.join(marker);
+        let looks_real = if marker == ".git" {
+            if marker_path.is_file() {
+                // Worktree/submodule pointer file.
+                std::fs::read_to_string(&marker_path)
+                    .map(|s| s.starts_with("gitdir:"))
+                    .unwrap_or(false)
+            } else {
+                marker_path.join("HEAD").exists()
+            }
+        } else {
+            marker_path.exists()
+        };
+        if looks_real {
             return Some(name.to_string());
         }
         // Manifest sits in a subdir of the VCS root (e.g. `src/<crate>/`).
         if let Some(parent) = root.parent() {
-            if parent.join(marker).exists() {
+            let parent_marker = parent.join(marker);
+            let parent_real = if marker == ".git" {
+                if parent_marker.is_file() {
+                    std::fs::read_to_string(&parent_marker)
+                        .map(|s| s.starts_with("gitdir:"))
+                        .unwrap_or(false)
+                } else {
+                    parent_marker.join("HEAD").exists()
+                }
+            } else {
+                parent_marker.exists()
+            };
+            if parent_real {
                 return Some(name.to_string());
             }
         }
@@ -188,7 +219,31 @@ mod tests {
     fn detects_git_boundary_beside_manifest() {
         let dir = tmp_project_with("Cargo.toml");
         std::fs::create_dir(dir.path().join(".git")).expect("git marker");
+        std::fs::write(dir.path().join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("HEAD");
         let loc = ProjectLocator::locate(None, dir.path().to_str().unwrap());
         assert_eq!(loc.vcs.as_deref(), Some("git"));
+    }
+
+    /// A hollow `.git` DIRECTORY (no HEAD — a scratch marker some tools
+    /// leave behind) is NOT provenance: the bare tree stays unknown.
+    #[test]
+    fn hollow_git_marker_is_not_provenance() {
+        let dir = tmp_project_with("Cargo.toml");
+        std::fs::create_dir(dir.path().join(".git")).expect("hollow marker");
+        let loc = ProjectLocator::locate(None, dir.path().to_str().unwrap());
+        assert_eq!(
+            loc.vcs, None,
+            "a .git dir without HEAD must not claim git provenance"
+        );
+        // A worktree-style pointer file IS a real repo marker.
+        let wt = tmp_project_with("Cargo.toml");
+        std::fs::write(
+            wt.path().join(".git"),
+            "gitdir: /somewhere/else/.git/worktrees/x\n",
+        )
+        .expect("pointer file");
+        let loc2 = ProjectLocator::locate(None, wt.path().to_str().unwrap());
+        assert_eq!(loc2.vcs.as_deref(), Some("git"));
     }
 }

@@ -290,6 +290,138 @@ pub fn run_probe_with_guard(
     })
 }
 
+/// The result of the native-cooperation readiness probe (doctor item 38).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NativeCooperationReport {
+    /// The probe RAN: the fixture spawned, the channel existed, frames were
+    /// awaited. `false` means the environment cannot even attempt it
+    /// (python3 missing) — a skip, not a cooperation verdict.
+    pub ran: bool,
+    /// The app wrote ≥1 VALID frame (the cooperation claim, from the same
+    /// counters `adapter_status` reports — one authority, no drift).
+    pub frames_received: u64,
+    pub frames_invalid: u64,
+    /// The declared native tree resolved: the Save control carries native
+    /// provenance in the FUSED semantics (not just in the raw channel).
+    pub native_control_resolved: bool,
+    /// The app's focus declaration (`#cancel` focused) overrode inference
+    /// in the fused semantics — the overlay actually merged.
+    pub native_focus_applied: bool,
+    /// Human-readable detail for the doctor line (what failed, when it did).
+    pub detail: String,
+}
+
+/// Doctor item 38 (native cooperation, end-to-end): launch the SHIPPED
+/// cooperative fixture (`fixtures/nsp_tui.py`, the same app the wave tests
+/// drive) under a real session, let it declare its tree through the
+/// `TUI_LAB_SEMANTIC` channel, and prove three facts about the *whole*
+/// path — env-var injection, NDJSON frame parsing, fused overlay — not the
+/// configuration alone the old env-var check verified:
+///
+/// 1. frames actually LAND (`frames_received > 0`, zero invalid);
+/// 2. the declared control resolves in the FUSED semantics with native
+///    provenance (inference alone would never call that screen "native");
+/// 3. the app's focus declaration overrides inference (the one thing the
+///    side channel exists to say).
+///
+/// Shared by `doctor` and the integration suite, so doctor verifies with
+/// exactly the code the harness runs.
+pub fn native_cooperation_probe() -> NativeCooperationReport {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/nsp_tui.py");
+    let report = NativeCooperationReport {
+        ran: false,
+        frames_received: 0,
+        frames_invalid: 0,
+        native_control_resolved: false,
+        native_focus_applied: false,
+        detail: String::new(),
+    };
+    let seed = report.clone();
+    let closure_seed = seed.clone();
+    let result = std::panic::catch_unwind(move || -> anyhow::Result<NativeCooperationReport> {
+        let mut report = closure_seed;
+        let mut sess = Session::new("doctor-native".into(), "python3".into());
+        let spec = crate::session::state::LaunchSpec {
+            command: "python3".into(),
+            args: vec![fixture.to_string()],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        };
+        sess.start_with_spec(spec)?;
+        // Pump observations until the app's first declaration lands (the
+        // fixture declares immediately after drawing), bounded so a silent
+        // channel fails the probe in seconds instead of hanging doctor.
+        let mut latest = None;
+        for _ in 0..30 {
+            let _ = sess.observe(60);
+            sess.poll_native();
+            if sess.native_channel().latest.is_some() {
+                latest = sess.native_channel().latest.clone();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let status = sess.adapter_status();
+        report.frames_received = status.frames_received;
+        report.frames_invalid = status.frames_invalid;
+
+        // Facts 2+3 come from the FUSED analysis — the same authority every
+        // subsystem reads — not from peeking at the raw channel.
+        let analysis = sess.analyze_last();
+        if let Some(a) = analysis {
+            report.native_control_resolved = a
+                .semantic
+                .controls
+                .iter()
+                .any(|c| c.source == "native" && c.label == "Save");
+            report.native_focus_applied = a
+                .semantic
+                .focus
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("native-focus:"));
+        }
+        let _ = latest;
+        sess.stop().ok();
+
+        report.ran = true;
+        if status.frames_received == 0 {
+            report.detail = if status.frames_invalid > 0 {
+                format!(
+                    "channel active but all {} frame(s) invalid — emitter broken",
+                    status.frames_invalid
+                )
+            } else {
+                "channel silent — the app never wrote a frame".to_string()
+            };
+        } else if status.frames_invalid > 0 {
+            report.detail = format!("{} invalid frame(s) among {}", status.frames_invalid, status.frames_received);
+        } else if !report.native_control_resolved {
+            report.detail = "frames landed but the declared control did not resolve in fused semantics".to_string();
+        } else if !report.native_focus_applied {
+            report.detail = "frames landed but the native focus declaration did not apply".to_string();
+        } else {
+            report.detail = format!("fixture declared its tree ({} frames); fused semantics carry native truth", status.frames_received);
+        }
+        Ok(report)
+    });
+    match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => NativeCooperationReport {
+            detail: format!("probe failed: {e}"),
+            ..seed
+        },
+        Err(_) => NativeCooperationReport {
+            detail: "probe panicked".to_string(),
+            ..seed
+        },
+    }
+}
+
 /// Convenience: `ProbeWatch::Focus` + `Controls` is the default—what the
 /// probe most reliably surfaces for an unknown TUI.
 pub fn default_watch() -> Vec<ProbeWatch> {

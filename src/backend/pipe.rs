@@ -496,7 +496,17 @@ impl TerminalBackend for PipeBackend {
         }
         match input {
             Input::Text(t) | Input::Paste(t) => self.write_input(t.as_bytes())?,
-            Input::Key(kev) => match kev.code {
+            Input::Key(kev) => {
+                // A pipe has no key semantics beyond bytes: a MODIFIED
+                // keypress cannot be expressed (ctrl+c would silently
+                // degrade to the letter 'c' — the exact dishonesty the
+                // backend contract prohibits), so it is rejected.
+                if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                    return Err(BackendError::Unsupported(format!(
+                        "pipe backend cannot encode modified keys (got {kev:?}); use the portable engine for full key semantics"
+                    )));
+                }
+                match kev.code {
                 crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
                 crate::backend::KeyCode::Char(c) => {
                     let mut s = String::new();
@@ -509,9 +519,15 @@ impl TerminalBackend for PipeBackend {
                             .into(),
                     ))
                 }
-            },
+                }
+            }
             Input::Keys(keys) => {
                 for kev in keys {
+                    if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                        return Err(BackendError::Unsupported(format!(
+                            "pipe backend cannot encode modified keys (got {kev:?}); use the portable engine for full key semantics"
+                        )));
+                    }
                     match kev.code {
                         crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
                         crate::backend::KeyCode::Char(c) => {
