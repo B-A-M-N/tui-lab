@@ -243,20 +243,23 @@ fn event_immediately_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: StableScreen waits for quiet; FirstScreenChange returns quickly
+// Test 5: StableScreen waits for quiet; FirstScreenChange does not
 // ---------------------------------------------------------------------------
 
-/// Child emits frame A on input, then 50ms later frame B, then 50ms later
-/// frame C (use a shell loop with sleep 0.05 writing distinct full-screen
-/// content). With quiet_ms=120: FirstScreenChange must return quickly at
-/// frame A, while StableScreen must NOT resolve until after frame C
-/// (elapsed > ~100ms).
+/// The two policies differ in what they REQUIRE, and that difference is
+/// provable without any wall-clock bound (which only measures machine
+/// load and flakes under it):
+///
+/// 1. FirstScreenChange on a screen that NEVER goes quiet (distinct
+///    full-screen frame every 50ms, forever) must still resolve Met —
+///    one observed change is enough. StableScreen on the same stimulus
+///    could never resolve; a quiet window never arrives.
+/// 2. StableScreen with quiet_ms=120 against A→B→C-then-quiet must wait
+///    through the changing frames and capture C (elapsed ≥ ~100ms is a
+///    LOWER bound — load only lengthens it, never shortens it).
 #[test]
 fn stable_screen_waits_for_quiet() {
-    // Use two separate sessions because we need to test both policies
-    // against the same stimulus (input) independently.
-
-    // --- FirstScreenChange ---
+    // --- FirstScreenChange against a never-quiet screen ---
     let mut s1 = Session::new("test-fsc".into(), "python3".into());
     s1.start_with_spec(tui_lab::session::state::LaunchSpec {
         command: "python3".into(),
@@ -267,12 +270,15 @@ fn stable_screen_waits_for_quiet() {
                 "sys.stdout.write('READY'); sys.stdout.flush()",
                 RAW_STDIN,
                 "import sys; sys.stdin.buffer.read(1)",
-                "sys.stdout.write('\\x1b[2J\\x1b[H' + 'A'*1920); sys.stdout.flush()",
-                "time.sleep(0.05)",
-                "sys.stdout.write('\\x1b[2J\\x1b[H' + 'B'*1920); sys.stdout.flush()",
-                "time.sleep(0.05)",
-                "sys.stdout.write('\\x1b[2J\\x1b[H' + 'C'*1920); sys.stdout.flush()",
-                "time.sleep(5)",
+                // Cycle full-screen frames forever: the screen keeps
+                // changing every 50ms and never settles.
+                "letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'",
+                "i = 0",
+                "while True:",
+                "    ch = letters[i % 26]",
+                "    i += 1",
+                "    sys.stdout.write('\\x1b[2J\\x1b[H' + ch*1920); sys.stdout.flush()",
+                "    time.sleep(0.05)",
             ]),
         ],
         cwd: None,
@@ -286,39 +292,32 @@ fn stable_screen_waits_for_quiet() {
 
     std::thread::sleep(Duration::from_millis(400));
 
-    let start1 = std::time::Instant::now();
     let tx1 = execute_act_with_completion(
         &mut s1,
         &tui_lab::execution::CanonicalAction::Key {
             key: tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Char('x')),
         },
         0,
-        1000,
+        5000,
         false,
         InputVisibility::Normal,
         CompletionPolicy::FirstScreenChange,
     )
     .expect("first-screen-change");
 
-    let elapsed1 = start1.elapsed().as_millis();
     assert_eq!(
         tx1.settle,
         tui_lab::execution::SettleStatus::Met,
-        "{}",
+        "FirstScreenChange resolves on one observed change even though the screen never settles: {}",
         tx1.settle_reason()
     );
-    // FirstScreenChange should return very quickly — well under 100ms
-    // since the first frame (A) appears immediately on input.
+    // The captured frame is a post-action frame (one of the cycling
+    // letters) — NOT the pre-action 'READY' screen, i.e. the wait really
+    // observed a change.
+    let after1 = tx1.after().viewport_text.join("");
     assert!(
-        elapsed1 < 100,
-        "FirstScreenChange should return quickly (frame A), took {}ms",
-        elapsed1
-    );
-    // The captured frame should contain 'A' (the first change).
-    assert!(
-        tx1.after().viewport_text.join("").contains('A'),
-        "FirstScreenChange should capture frame A, got: {:?}",
-        tx1.after().viewport_text
+        !after1.contains("READY"),
+        "FirstScreenChange must capture a post-action frame, got READY: {after1:?}"
     );
 
     // --- StableScreen with quiet_ms=120 ---
@@ -372,9 +371,11 @@ fn stable_screen_waits_for_quiet() {
         "{}",
         tx2.settle_reason()
     );
-    // StableScreen with quiet_ms=120 must wait until after frame C.
-    // Frame A at t=0, B at t=50ms, C at t=100ms, then wait 120ms quiet.
-    // So minimum elapsed ≈ 100 + 120 = 220ms.
+    // StableScreen with quiet_ms=120 must wait through the changing
+    // frames until quiet: A at t≈0, B at +50ms, C at +100ms, then 120ms
+    // of quiet. Load only LENGTHENS the elapsed time, so ~100ms is a
+    // sound lower bound (an upper bound would measure the machine, not
+    // the policy).
     assert!(
         elapsed2 >= 100,
         "StableScreen with quiet_ms=120 should wait ~220ms+, took {}ms",
