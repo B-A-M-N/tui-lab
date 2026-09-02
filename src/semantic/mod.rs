@@ -590,3 +590,240 @@ mod interaction_cache_tests {
         assert!(!save_node.state.enabled.value, "tree agrees: dim is disabled");
     }
 }
+
+/// Single semantic-authority gate (review P0.4).
+///
+/// There is ONE fused semantic truth (cached detection + native overlay),
+/// produced only by `crate::semantic::fuse` through a `Session`. The bare
+/// `semantic::analyze` inference floor is reserved for (a) the semantic core
+/// itself, (b) explicit black-box fallback when NO live session is at hand,
+/// and (c) test fixtures. A live-session driver that calls `semantic::analyze`
+/// *directly* silently drops native focus/state facts and makes its verdict
+/// disagree with every observe mode — a "second truth".
+///
+/// This test mechanically guards the invariant by scanning the live-driver
+/// sources: any `semantic::analyze(` line that is not a comment, not inside a
+/// test region, and not the documented fused-frame fallback
+/// (`fused_frame().unwrap_or_else(|| semantic::analyze(...))` or a
+/// `fused_frame()` `None => (` arm) fails the build. The full set of `fuse`
+/// producers is the allowlist; everything else must route through them.
+#[cfg(test)]
+mod authority_gate_tests {
+    /// Files whose whole job runs against a LIVE session and therefore must
+    /// never bare-re-infer. Adding a file here is a commitment that its
+    /// `semantic::analyze` calls are all fused-fallback.
+    const LIVE_DRIVER_FILES: &[&str] = &[
+        "src/audit/driver.rs",
+        "src/execution/mod.rs",
+        "src/mcp/tools.rs",
+        "src/mcp/helpers.rs",
+        "src/exploration/semantic.rs",
+        "src/exploration/state_graph.rs",
+        "src/design/oracle.rs",
+        "src/design/conformance.rs",
+        "src/screen/diff.rs",
+        "src/run/mod.rs",
+    ];
+
+    /// True when `line` (containing `semantic::analyze`) is allowed:
+    /// a `//` comment, a doc comment, or the documented FUSED fallback shape.
+    fn is_allowed(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        // Comments / docs.
+        if trimmed.starts_with("//") || trimmed.starts_with("///") || trimmed.starts_with("//!") {
+            return true;
+        }
+        // The fuse-first fallback: `unwrap_or_else(|| semantic::analyze(` on
+        // the SAME line (the listen/observe handlers and audit risk filter
+        // all use this shape and always guard it with `session.fused_frame()`).
+        if trimmed.contains("unwrap_or_else(|| semantic::analyze(")
+            || trimmed.contains("unwrap_or_else(|| crate::semantic::analyze(")
+        {
+            return true;
+        }
+        // The `None => (` arm of a `match sess.fused_frame()` fallback.
+        // The analysis call sits on a following line; we accept it when the
+        // line itself is a bare `semantic::analyze`/`build_tree` inside a
+        // `None => (` tuple that follows a `fused_frame()` match. We catch
+        // that by requiring the call be inside a `semantic::fuse` production
+        // context is too lenient, so the ALLOWLIST below handles helpers.
+        false
+    }
+
+    /// The helper functions that intentionally analyze a bare frame with no
+    /// session in reach (the review's permitted "explicit black-box fallback
+    /// construction"): these take only `&ScreenState` and document why.
+    /// Scan one source file for a bare direct `semantic::analyze` call.
+    /// Returns a human-readable description of the first violation.
+    ///
+    /// Tracking: we maintain a function-name stack via brace depth, skip
+    /// `#[cfg(test)]`/`mod tests` regions, and remember when we are inside a
+    /// `match …fused_frame()` `None => (`/`None => {` arm (the documented
+    /// fallback). Bare calls are violations unless in a comment, in a known
+    /// black-box helper, under a `fused_frame()` fallback arm, or under a
+    /// `fuse_screen`/`fused_frame`-producing expression we're re-reading.
+    /// First pass: drop `#[cfg(test)] mod tests { … }` regions from a
+    /// source, preserving line alignment (replaced with blank lines) so the
+    /// second pass can still report meaningful line numbers. Returns the
+    /// cleaned source with test bodies blanked out.
+    fn strip_test_regions(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let t = lines[i].trim();
+            // A test module opens with `#[cfg(test)]` on its own (or inline).
+            let opens_here = t.contains("mod tests") && t.contains('{');
+            if opens_here || t.starts_with("#[cfg(test)]") {
+                // Find the `mod tests {` opener line (may be this line or the
+                // next if `#[cfg(test)]` is on its own line).
+                let mut j = i;
+                if !t.contains("mod tests") {
+                    // advance to `mod tests {`
+                    while j < lines.len() && !lines[j].contains("mod tests") {
+                        out[j] = String::new();
+                        j += 1;
+                    }
+                }
+                if j >= lines.len() {
+                    break;
+                }
+                // Blank the opener, then continue blanking lines until the
+                // module's brace balance returns to zero (the module `}`).
+                out[j] = String::new();
+                let mut depth: i64 = (lines[j].matches('{').count() - lines[j].matches('}').count())
+                    as i64;
+                let mut k = j + 1;
+                while k < lines.len() {
+                    let lk = lines[k];
+                    depth += lk.matches('{').count() as i64 - lk.matches('}').count() as i64;
+                    out[k] = String::new();
+                    if depth <= 0 {
+                        break;
+                    }
+                    k += 1;
+                }
+                i = k + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out.join("\n")
+    }
+
+    /// Second pass over cleaned (tests/comment-stripped) production source:
+    /// find a bare direct `semantic::analyze` that is not the documented
+    /// fused-fallback and not inside a known black-box helper.
+    fn find_violation(path: &str, src: &str) -> Option<String> {
+        let mut fcns: Vec<String> = Vec::new();
+        let mut fallback_arm_scope: Option<usize> = None;
+        let mut depth: usize = 0;
+        // Frame-only black-box fallback helpers: each takes bare `&ScreenState`
+        // (or two) and has NO live session in reach, so the inference floor is
+        // the honest ceiling. Documented as the review's permitted "explicit
+        // black-box fallback construction."
+        let known_bare_helpers = [
+            "fused_for",             // assertion fallback for session-less callers
+            "control_label_exists", // pure screen helper
+            "diff",                  // frame-only transition util
+            "compute_semantic_diff", // frame-only semantic diff
+        ];
+
+        for (idx, raw) in src.lines().enumerate() {
+            let line = raw;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_allowed(line) {
+                continue;
+            }
+
+            // Function entry.
+            if let Some(name) = fn_name(trimmed) {
+                fcns.push(name.to_string());
+            }
+
+            // A `fused_frame()` `None => (`/`None => {` arm entering: the
+            // fallback's bare `semantic::analyze` lines live under it. Track
+            // the brace depth at which the arm sits so we can exit it.
+            if trimmed.starts_with("None => (")
+                || trimmed.starts_with("None => {")
+                || trimmed.starts_with("None => ")
+            {
+                fallback_arm_scope = Some(depth);
+            }
+
+            if line.contains("semantic::analyze") {
+                // Under a fused `None =>` fallback arm → permitted.
+                if let Some(a) = fallback_arm_scope {
+                    if depth >= a {
+                        continue;
+                    }
+                }
+                // Inside a known black-box helper (bare frame, no session).
+                if fcns
+                    .last()
+                    .map(|n| known_bare_helpers.contains(&n.as_str()))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                return Some(format!(
+                    "{path}:{}: bare `semantic::analyze` outside the fused truth (line: {line:?})",
+                    idx + 1
+                ));
+            }
+
+            // Brace accounting + function stack exit.
+            let opens = trimmed.matches('{').count();
+            let closes = trimmed.matches('}').count();
+            if closes > 0 {
+                let net = closes.min(fcns.len());
+                for _ in 0..net {
+                    fcns.pop();
+                }
+            }
+            let d = depth as i64 + opens as i64 - closes as i64;
+            depth = d.max(0) as usize;
+            // Left the fallback arm's scope.
+            if let Some(a) = fallback_arm_scope {
+                if depth < a {
+                    fallback_arm_scope = None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the function name from a line that begins a function, or None.
+    fn fn_name(trimmed: &str) -> Option<&str> {
+        // Match `pub fn name(`, `fn name(`, `async fn name(`, `pub async fn name(`.
+        let body = trimmed
+            .strip_prefix("pub async fn ")
+            .or_else(|| trimmed.strip_prefix("pub fn "))
+            .or_else(|| trimmed.strip_prefix("async fn "))
+            .or_else(|| trimmed.strip_prefix("fn "))?;
+        let name: &str = body.split(['(', ' ', '<']).next()?;
+        Some(name)
+    }
+
+    #[test]
+    fn live_drivers_never_bare_re_infer() {
+        for file in LIVE_DRIVER_FILES {
+            let src = std::fs::read_to_string(file)
+                .unwrap_or_else(|e| panic!("gate cannot read {file}: {e}"));
+            let cleaned = strip_test_regions(&src);
+            if let Some(violation) = find_violation(file, &cleaned) {
+                panic!(
+                    "single-semantic-authority gate failed: {violation}\n\
+                     A live-session driver must fuse through `session.fused_frame()`/\n\
+                     `session.fuse_screen()` (same truth observe modes see). A bare\n\
+                     `semantic::analyze` here silently drops native focus/state facts.\n\
+                     Use the fused path first with the documented fallback, or move the\n\
+                     bare call into a test or an explicit black-box helper."
+                );
+            }
+        }
+    }
+}

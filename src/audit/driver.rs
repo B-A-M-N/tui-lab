@@ -111,7 +111,11 @@ pub fn keyboard_audit(
         };
         successful_tabs += 1;
         let after = tx.after().clone();
-        let sem_after = semantic::analyze(&after);
+        // FUSED analysis through the live session (review P0.4): a bare
+        // `semantic::analyze` here would drop native focus facts and let the
+        // audit disagree with what `tui_observe semantic` reports for the
+        // same pixel state.
+        let sem_after = session.fuse_screen(&after);
         let focus_after = sem_after.focus.control.clone();
 
         // ID-keyed graph edge with Tab provenance (item 36).
@@ -221,8 +225,11 @@ pub fn keyboard_audit(
         );
         match r {
             Ok(tx) => {
-                let sem_b = semantic::analyze(tx.before());
-                let sem_a = semantic::analyze(tx.after());
+                // FUSED through the live session (review P0.4) so the focus
+                // graph sees the same native-aware truth every observe mode
+                // reports.
+                let sem_b = session.fuse_screen(tx.before());
+                let sem_a = session.fuse_screen(tx.after());
                 if let (Some(f), Some(t)) = (&sem_b.focus.control_id, &sem_a.focus.control_id) {
                     graph.record_edge(f, t, "shift+tab", sem_a.focus.control.as_deref());
                 }
@@ -368,7 +375,9 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             Err(_) => return findings,
         };
         let after = tx.after().clone();
-        let sem_after = semantic::analyze(&after);
+        // FUSED through the live session (review P0.4) — native focus wins
+        // when the app cooperates, matching every observe mode's truth.
+        let sem_after = session.fuse_screen(&after);
 
         if sem_after.focus.control.as_ref() == Some(&focus_before) {
             findings.push(Finding {
@@ -1307,7 +1316,9 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                 Ok(t) => t,
                 Err(_) => break,
             };
-            let sem_after = semantic::analyze(tx.after());
+            // FUSED through the live session (review P0.4) so a native focus
+            // self-report is never lost to bare re-inference.
+            let sem_after = session.fuse_screen(tx.after());
             if let (Some(id), Some(_label)) = (
                 sem_after.focus.control_id.as_deref(),
                 sem_after.focus.control.as_deref(),
@@ -3068,7 +3079,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 Ok(t) => t,
                 Err(_) => break,
             };
-            let sem_after = semantic::analyze(tx.after());
+            let sem_after = session.fuse_screen(tx.after());
             let after_id = sem_after.focus.control_id.clone();
             focus_walk.push(after_id.clone());
             if let (Some(f), Some(t)) = (&before_id, &after_id) {
@@ -3098,7 +3109,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             ) else {
                 break;
             };
-            let sem_after = semantic::analyze(tx.after());
+            let sem_after = session.fuse_screen(tx.after());
             let after_id = sem_after.focus.control_id.clone();
             if let (Some(f), Some(t)) = (&before_id, &after_id) {
                 graph.record_edge(f, t, class.inverse_via, sem_after.focus.control.as_deref());
