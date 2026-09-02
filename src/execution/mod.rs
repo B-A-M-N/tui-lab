@@ -951,10 +951,17 @@ fn execute_act_inner(
         .unwrap_or((Default::default(), None));
     // The ONE compiler runs on the pre-action frame before it moves into
     // the transaction evidence (re-review P0).
-    let plan = crate::capture::compile_completion(&completion, &baseline, &before, pre_event_seq, quiet_ms, Some(before_fused_identity));
+    let plan = crate::capture::compile_completion(&completion, &baseline, &before, pre_event_seq, quiet_ms, Some(before_fused_identity.clone()));
     let mut before_frame = CanonicalFrame::new(before, 0, baseline.output_seq);
     before_frame.session_id = Some(session.id.clone());
     before_frame.generation = Some(session.generation);
+    // Carry the FUSED identity established at capture time (review P0.5):
+    // evidence persistence serializes truth, never recomputes it. `None`
+    // here (an unfused capture) is a valid signal to fall back to the bare
+    // grid identity at commit time.
+    if !before_fused_identity.is_empty() {
+        before_frame.semantic_identity = Some(before_fused_identity);
+    }
 
     // Sensitive payloads bypass the recording hook for the WHOLE transaction
     // window (leak fix): the send is gated on input, and the settle wait's
@@ -1118,11 +1125,22 @@ fn execute_act_inner(
     // required for the same reason: the settle's last observe can race the
     // app's post-action declare, and a non-polling read would fuse the
     // after-frame against the PRE-action native snapshot.
-    let focus_after;
+    let (focus_after, after_fused_identity);
     {
         let sess = window.sess();
         sess.poll_native();
         focus_after = frame_focus(sess, &after_frame.state);
+        // FUSED identity of the settled frame (review P0.5): computed here
+        // through the session (same cache + native overlay as every observe
+        // mode) and attached to the frame so persist/commit never re-infer
+        // bare truth from cells.
+        after_fused_identity = sess
+            .fuse_frame_full(&after_frame.state)
+            .map(|(sem, tree)| crate::semantic::semantic_identity_fused(&sem, &tree))
+            .unwrap_or_default();
+    }
+    if !after_fused_identity.is_empty() {
+        after_frame.semantic_identity = Some(after_fused_identity);
     }
 
     // Sensitive window closed: the settled frame has been captured, so the

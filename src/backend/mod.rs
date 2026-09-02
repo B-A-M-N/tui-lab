@@ -727,6 +727,16 @@ pub struct CanonicalFrame {
     /// Unix-millis capture time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<u64>,
+    /// The FUSED semantic identity established at capture time (review P0.5):
+    /// structure + interaction + native overlay, as reported by the observed
+    /// session. Evidence persistence must serialize established truth, never
+    /// recompute it — `commit_frame` uses this instead of re-inferring a bare
+    /// identity from the cell grid, which would silently drop native-only
+    /// state changes (pixels unchanged, focus moved) from persisted evidence.
+    /// `None` when the capture path did not fuse the frame (then consumers
+    /// fall back to the bare grid identity, which is the pre-P0.5 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_identity: Option<String>,
 }
 
 impl CanonicalFrame {
@@ -741,6 +751,7 @@ impl CanonicalFrame {
             session_id: None,
             generation: None,
             captured_at: None,
+            semantic_identity: None,
         }
     }
 

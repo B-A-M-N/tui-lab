@@ -330,6 +330,17 @@ pub struct RunContext {
     /// Per-consumer event cursors (re-review P1): exactly-once ingestion
     /// positions for coverage folding and other event-derived ledgers.
     pub event_cursors: std::collections::HashMap<String, u64>,
+    /// Monotonic coverage sequence (review P0.7). Incremented on every
+    /// ledger insert/update so a real `delta` cursor exists. Defaults to 0
+    /// (pre-P0.7 persisted runs) — every target then reads as "new" on the
+    /// first delta after upgrade, which is honest.
+    pub coverage_seq: u64,
+    /// The caller's last `delta` cursor (review P0.7): the `coverage_seq`
+    /// value from the previous delta. Targets with `first_seq > ` this are
+    /// newly-reported since the previous delta. Without more state we cannot
+    /// represent per-caller cursors; this is the single process-wide cursor
+    /// the MCP tool advances on each delta call and reports in the response.
+    pub coverage_delta_cursor: u64,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
 }
@@ -346,6 +357,17 @@ pub struct CoverageEntry {
     pub first_seen: u64,
     /// Unix-millis of the last report.
     pub last_seen: u64,
+    /// Monotonic per-run sequence when this target was FIRST seen. Delta
+    /// compares this against a caller cursor: targets whose `first_seq`
+    /// exceeds the cursor are "new since your last delta" (review P0.7 —
+    /// replaces the old fabricated `delta` that ran the same tuicov command
+    /// as every other action). Defaulted for persisted runs written before
+    /// this field existed (they read as seq 0 → all "new" on first delta).
+    #[serde(default)]
+    pub first_seq: u64,
+    /// Monotonic per-run sequence of the MOST RECENT hit.
+    #[serde(default)]
+    pub last_seq: u64,
     /// Wave 5 item 41: source loci the app itself declared for the
     /// component this target names (from the same NativeSemanticProtocol
     /// channel — both facts are app-attested, so the join is exact, not
@@ -394,6 +416,8 @@ impl RunContext {
             finding_baselines: HashMap::new(),
             coverage_ledger: std::collections::BTreeMap::new(),
             event_cursors: std::collections::HashMap::new(),
+            coverage_seq: 0,
+            coverage_delta_cursor: 0,
             closed: false,
         }
     }
@@ -1356,6 +1380,10 @@ impl RunContext {
             return Ok(());
         }
         let now = now_ms();
+        // Monotonic coverage sequence (review P0.7): each hit advances it so
+        // delta can tell "new since my last delta" from "hit again".
+        self.coverage_seq = self.coverage_seq.saturating_add(1);
+        let seq = self.coverage_seq;
         let entry = self
             .coverage_ledger
             .entry(target.to_string())
@@ -1364,10 +1392,13 @@ impl RunContext {
                 sessions: Vec::new(),
                 first_seen: now,
                 last_seen: now,
+                first_seq: seq,
+                last_seq: seq,
                 source_refs: Vec::new(),
             });
         entry.hits += 1;
         entry.last_seen = now;
+        entry.last_seq = seq;
         if !entry.sessions.iter().any(|s| s == session) {
             entry.sessions.push(session.to_string());
         }
@@ -2051,7 +2082,14 @@ impl RunContext {
         // HOT half of the storage split (item 51): the projection facts
         // land in the bounded ring even for ephemeral runs — a citable
         // frame id that answers no questions would be a number, not
-        // evidence.
+        // evidence. The semantic identity is the ESTABLISHED fused truth when
+        // the capture stamped it (review P0.5) — evidence persistence
+        // serializes truth and never recomputes it — falling back to the bare
+        // grid identity only for frames captured before fused stamping.
+        let semantic_identity = frame
+            .semantic_identity
+            .clone()
+            .unwrap_or_else(|| crate::semantic::semantic_identity(&frame.state));
         let record = FrameRecord {
             frame_id: id,
             session: frame.session_id.clone(),
@@ -2060,7 +2098,7 @@ impl RunContext {
             output_seq: frame.output_seq,
             structure_hash: frame.state.structure_hash.clone(),
             visual_hash: frame.state.visual_hash.clone(),
-            semantic_identity: crate::semantic::semantic_identity(&frame.state),
+            semantic_identity,
             committed_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -2082,7 +2120,7 @@ impl RunContext {
                 "output_seq": frame.output_seq,
                 "structure_hash": frame.state.structure_hash,
                 "visual_hash": frame.state.visual_hash,
-                "semantic_identity": crate::semantic::semantic_identity(&frame.state),
+                "semantic_identity": frame.semantic_identity.clone().unwrap_or_else(|| crate::semantic::semantic_identity(&frame.state)),
             });
             let path = dir.join("frames.jsonl");
             let body = format!("{line}\n");
@@ -3327,5 +3365,51 @@ mod source_ref_tests {
         let _ = run.extend_findings_with_source_refs(vec![finding_pointing_at("button/other/1,1")]);
         let f2 = run.findings().last().unwrap();
         assert!(f2.source_refs.is_empty(), "no locus without coverage");
+    }
+
+    /// P0.7: delta reads real accumulated evidence via a cursor — targets
+    /// first seen after the caller's last delta are "new"; re-hits of an
+    /// already-seen target are not re-reported as new, but advance the
+    /// sequence and cursor. The old `delta` that ran the same tuicov command
+    /// as every other action is gone.
+    #[test]
+    fn coverage_delta_uses_real_cursor_and_sequence() {
+        let mut run = RunContext::ephemeral();
+        // First two targets arrive.
+        let _ = run.record_coverage_event("s1", "src/a.rs");
+        let _ = run.record_coverage_event("s1", "src/b.rs");
+        assert!(run.coverage_seq >= 2);
+
+        // Delta from cursor 0 reports both as new and advances the cursor.
+        let cur = run.coverage_delta_cursor;
+        let new: Vec<String> = run
+            .coverage_ledger
+            .iter()
+            .filter(|(_, e)| e.first_seq > cur)
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(new.len(), 2);
+        run.coverage_delta_cursor = run.coverage_seq;
+
+        // A re-hit of an existing target must NOT reappear as new on the next
+        // delta, because its first_seq is unchanged.
+        let _ = run.record_coverage_event("s1", "src/a.rs");
+        let new2: Vec<String> = run
+            .coverage_ledger
+            .iter()
+            .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor)
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(new2.len(), 0, "re-hitting a known target is not 'new coverage'");
+
+        // A genuinely new target after the cursor IS new.
+        let _ = run.record_coverage_event("s1", "src/c.rs");
+        let new3: Vec<String> = run
+            .coverage_ledger
+            .iter()
+            .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor)
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(new3, vec!["src/c.rs".to_string()]);
     }
 }

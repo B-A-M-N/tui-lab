@@ -321,11 +321,18 @@ selector_enum!(
 
 selector_enum!(
     /// `tui_coverage` action.
+    ///
+    /// Coverage is collected **continuously** (NativeSemanticProtocol
+    /// `coverage` events fold into the run ledger on arrival); there is no
+    /// instrumentation on/off phase, so `start`/`stop` deliberately do NOT
+    /// exist — the review flagged the old no-op pair as theater. The run
+    /// ledger views (`ledger`, `summary`, `collect`, `delta`) read accumulated
+    /// evidence; `uncovered` is honestly `unsupported` until a denominator
+    /// source exists.
     CoverageAction;
     [
         Detect => "detect", Summary => "summary", Collect => "collect",
         Delta => "delta", Uncovered => "uncovered", Ledger => "ledger",
-        Start => "start", Stop => "stop",
     ]
 );
 

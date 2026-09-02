@@ -1313,6 +1313,25 @@ impl Session {
         sem
     }
 
+    /// Fused analysis of an ARBITRARY frame, returning the FULL result
+    /// (semantic screen + tree + identity inputs, not just the screen). Same
+    /// cache + native overlay as `fuse_screen`/`fused_frame`, so a frame's
+    /// identity computed here matches what `tui_observe semantic` reports.
+    /// Used by the execution path to stamp `CanonicalFrame.semantic_identity`
+    /// at capture time (review P0.5: evidence serializes truth, never
+    /// recomputes it).
+    pub fn fuse_frame_full(
+        &self,
+        screen: &crate::screen::ScreenState,
+    ) -> Option<(
+        crate::semantic::SemanticScreen,
+        crate::semantic::node::SemanticTree,
+    )> {
+        let (sem, tree, _report) =
+            crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        Some((sem, tree))
+    }
+
     /// Observe, then return the fused analysis of the fresh frame (re-review
     /// Wave-2 item 16: THE way subsystems read semantics — no direct
     /// `semantic::analyze` above the frame pipeline). Structural detection
