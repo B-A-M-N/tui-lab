@@ -40,7 +40,16 @@ enum Mail {
     Job(Job),
     /// Stop the actor thread after draining (session stop dropped the last
     /// handle, or an explicit shutdown).
-    Shutdown,
+    ///
+    /// Acknowledged (review P0.3): the actor signals the sender once it has
+    /// actually stopped and torn down the child, so `shutdown` can await
+    /// a bounded completion instead of racing a best-effort notification.
+    /// Carries a `&str` filter plus the oneshot ack when a caller asks for a
+    /// specific session.
+    Shutdown {
+        session_filter: Option<String>,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 /// One session's actor: a cloneable sender plus a join handle.
@@ -54,6 +63,9 @@ pub struct SessionActor {
     tx: tokio::sync::mpsc::Sender<Mail>,
     /// Reader thread join handle, taken by `shutdown`.
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set once shutdown is requested (review P0.3): new `send`/`send_sync`
+    /// reject immediately rather than enqueuing work behind a dying actor.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 impl Clone for SessionActor {
@@ -62,6 +74,9 @@ impl Clone for SessionActor {
             id: self.id.clone(),
             tx: self.tx.clone(),
             join: Mutex::new(None),
+            closing: std::sync::atomic::AtomicBool::new(
+                self.closing.load(std::sync::atomic::Ordering::SeqCst),
+            ),
         }
     }
 }
@@ -84,19 +99,66 @@ impl SessionActor {
                 while let Some(mail) = rx.blocking_recv() {
                     match mail {
                         Mail::Job(job) => job(&mut session),
-                        Mail::Shutdown => break,
+                        // Ack-based shutdown: tear the child down, signal the
+                        // caller we're done, then break. The sender is still
+                        // alive (it's awaiting our ack), so we MUST break and
+                        // exit rather than wait on the channel closing —
+                        // otherwise we'd deadlock against join() (review
+                        // P0.3).
+                        Mail::Shutdown {
+                            session_filter,
+                            ack,
+                        } => {
+                            if session_filter.as_deref().is_none_or(|w| session.id == w) {
+                                session.stop().ok();
+                                let _ = ack.send(());
+                                break;
+                            }
+                            // A filter that doesn't match this session means
+                            // the shutdown was for a different actor (a coarse
+                            // shared channel case unused today); keep draining.
+                            drop(ack);
+                        }
                     }
                 }
-                // Draining shutdown: stop the child so nothing outlives the
-                // actor.
-                session.stop().ok();
             })
             .expect("spawn session actor");
         SessionActor {
             id,
             tx,
             join: Mutex::new(Some(join)),
+            closing: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Drive shutdown to completion, ack-based (review P0.3). Returns once
+    /// the actor thread has actually exited and torn down the child, or an
+    /// error when it was already gone.
+    ///
+    /// The mailbox is bounded, so we do NOT rely on `try_send` landing the
+    /// Shutdown mail (it can be dropped when full). Instead we set `closing`
+    /// (which atomically rejects new work), enqueue Shutdown with a oneshot
+    /// ack under `send(...).await` backpressure (which CANNOT fail while the
+    /// actor drains — awaiting releases the caller's slot), wait for the
+    /// ack, then drop our own sender so the actor's `blocking_recv` can
+    /// return `None` and the thread join is attainable.
+    async fn shutdown_ack(&self) -> Result<(), ActorError> {
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        // Backpressured send: if the mailbox is full this awaits the actor
+        // draining a slot, so the Shutdown mail always gets in (review P0.3
+        // deadlock fix — never a dropped notification).
+        self.tx
+            .send(Mail::Shutdown {
+                session_filter: Some(self.id.clone()),
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
+        ack_rx
+            .await
+            .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
+        Ok(())
     }
 
     pub fn id(&self) -> &str {
@@ -112,6 +174,9 @@ impl SessionActor {
         R: Send + 'static,
         F: FnOnce(&mut Session) -> R + Send + 'static,
     {
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ActorError::ActorGone(self.id.clone()));
+        }
         let (rtx, rrx) = tokio::sync::oneshot::channel::<R>();
         let job: Job = Box::new(move |session: &mut Session| {
             let _ = rtx.send(job(session));
@@ -136,6 +201,9 @@ impl SessionActor {
         R: Send + 'static,
         F: FnOnce(&mut Session) -> R + Send + 'static,
     {
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ActorError::ActorGone(self.id.clone()));
+        }
         let (rtx, rrx) = tokio::sync::oneshot::channel::<R>();
         let job: Job = Box::new(move |session: &mut Session| {
             let _ = rtx.send(job(session));
@@ -151,12 +219,64 @@ impl SessionActor {
         }
     }
 
-    /// Ask the actor to stop the session and exit. Idempotent per handle.
+    /// Ask the actor to stop the session and exit completely before
+    /// returning. Idempotent per handle.
+    ///
+    /// This is the ack-based shutdown (review P0.3) for plain-thread callers:
+    /// it drives delivery with `try_send` and a small retry loop instead of
+    /// `blocking_send` (which would panic or block inside a tokio runtime),
+    /// then waits on the ack under a hard deadline. `SessionPool::stop` (the
+    /// async path) uses `shutdown_ack` instead; this stays as a bounded
+    /// fire-and-join option for non-async contexts.
     pub fn shutdown(&self) {
-        // Non-blocking: this may be called from a context that cannot await.
-        // A failed try_send (full mailbox or closed) is fine — the actor
-        // drains and exits either way once the channel closes.
-        let _ = self.tx.try_send(Mail::Shutdown);
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
+        // Retry `try_send` until it lands or the mailbox proves closed. A full
+        // mailbox means the actor is draining; it will free a slot, so we
+        // never give up on healthily-busy actors. We sleep between attempts to
+        // keep `closing` visible and avoid a tight spin.
+        let mail = Mail::Shutdown {
+            session_filter: Some(self.id.clone()),
+            ack: ack_tx,
+        };
+        let mut sent = false;
+        let mut mail = mail;
+        for _ in 0..100_000 {
+            match self.tx.try_send(mail) {
+                Ok(()) => {
+                    sent = true;
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(full_mail)) => {
+                    mail = full_mail;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // Closed: the actor already exited (blocking_recv returned
+                // None). Nothing to signal; join below is a no-op.
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+        if sent {
+            // Hard-bounded ack wait so a wedged actor (a runaway job) cannot
+            // hang this thread forever. `closing=true` means the actor will
+            // break on Shutdown regardless of remaining queued jobs.
+            use tokio::sync::oneshot::error::TryRecvError;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match ack_rx.try_recv() {
+                    Ok(()) | Err(TryRecvError::Closed) => break,
+                    Err(TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
+        }
+        // Drop our sender so no keep-alive remains; the actor's blocking_recv
+        // then returns None if it hadn't already. Then join.
         if let Ok(mut j) = self.join.lock() {
             if let Some(handle) = j.take() {
                 let _ = handle.join();
@@ -403,9 +523,10 @@ impl SessionPool {
             return Ok(());
         };
         // Stop synchronously inside the actor FIRST (flushes backend state),
-        // then shut the actor down and drop it from the directory.
+        // then shut the actor down (ack-awaited, so a full mailbox can never
+        // wedge us — review P0.3) and drop it from the directory.
         let _ = actor.send(|s: &mut Session| s.stop()).await;
-        actor.shutdown();
+        actor.shutdown_ack().await?;
         if let Ok(mut d) = self.directory.write() {
             d.remove(id);
         }
@@ -443,10 +564,16 @@ impl Drop for SessionPool {
     fn drop(&mut self) {
         if let Ok(d) = self.directory.read() {
             for actor in d.values() {
-                // try_send: Drop cannot await. When it fails (full or closed)
-                // the mailbox will close once these Senders drop, and the
-                // actor's blocking_recv returns None, so it still exits.
-                let _ = actor.tx.try_send(Mail::Shutdown);
+                // Drop cannot await, so we signal the actor to cease with a
+                // no-ack Shutdown (review P0.3): the mailbox closing on these
+                // Senders dropping IS the fallback that unblocks the actor's
+                // blocking_recv. We never join here — Drop can run inside an
+                // async runtime where joining would block.
+                let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel::<()>();
+                let _ = actor.tx.try_send(Mail::Shutdown {
+                    session_filter: Some(actor.id.clone()),
+                    ack: ack_tx,
+                });
             }
         }
         // Do not join here: the pool can drop inside an async runtime where
@@ -569,5 +696,91 @@ mod tests {
             .expect_err("no such session");
         assert!(matches!(err, ActorError::ActorGone(_)));
         assert_eq!(err.category(), crate::error::ErrorCategory::NoSession);
+    }
+
+    /// P0.3 stress test: flood the 64-entry mailbox with jobs that never
+    /// reply, then demand a stop. The ack protocol must complete within a
+    /// bounded deadline — the old try_send(Shutdown)+join could wedge on a
+    /// full mailbox. We run this many times to shake out the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_ack_under_full_mailbox_completes_within_budget() {
+        for _round in 0..50 {
+            let pool = std::sync::Arc::new(SessionPool::new());
+            let id = pool
+                .start(
+                    "python3",
+                    &["-c".into(), "input()".into()],
+                    None,
+                    &[],
+                    80,
+                    24,
+                    "auto",
+                    "local",
+                )
+                .await
+                .expect("start");
+
+            let actor = pool.resolve(Some(&id)).expect("actor present");
+            // Asynchronously saturate the mailbox ahead of the stop. Each
+            // job parks on the actor thread, so queued jobs back up behind
+            // it — exactly the full-mailbox precondition.
+            let flood = {
+                tokio::spawn(async move {
+                    let mut sent = 0;
+                    for _ in 0..200 {
+                        if actor.send(|_s: &mut Session| {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }).await.is_err() {
+                            break;
+                        }
+                        sent += 1;
+                    }
+                    sent
+                })
+            };
+            // Let the flood fill the bounded mailbox before we try to stop.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            let start = std::time::Instant::now();
+            let res = pool.stop(&id).await;
+            let elapsed = start.elapsed();
+            res.expect("stop must succeed even with a full mailbox");
+            let _ = flood.await;
+            assert!(
+                elapsed < std::time::Duration::from_millis(15000),
+                "stop must complete within budget under a full mailbox (took {elapsed:?})"
+            );
+            assert!(!pool.contains(&id));
+        }
+    }
+
+    /// P0.3: after shutdown is requested, new work is rejected rather than
+    /// enqueued behind a dying actor.
+    #[tokio::test]
+    async fn work_is_rejected_after_shutdown_requested() {
+        let pool = SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        let actor = pool.resolve(Some(&id)).expect("actor present");
+        actor.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = actor
+            .send(|_s: &mut Session| 1)
+            .await
+            .expect_err("post-closing send must fail");
+        assert!(matches!(err, ActorError::ActorGone(_)));
+        // Restore so the pool can clean up normally.
+        actor.closing.store(false, std::sync::atomic::Ordering::SeqCst);
+        pool.stop(&id).await.ok();
     }
 }
