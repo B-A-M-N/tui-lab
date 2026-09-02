@@ -135,6 +135,14 @@ pub trait TerminalBackend: Send {
         (0, 0)
     }
 
+    /// The absolute byte range the retained raw-output window covers in the
+    /// child's output stream: `(start, end_exclusive)`. `(0, 0)` when the
+    /// engine retains no raw bytes (re-review item 19: transaction-citable
+    /// protocol ranges survive head eviction).
+    fn raw_window_range(&mut self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Downcast hook for engine-specific capability surfaces (the pipe
     /// backend's stdout/stderr separation). Engines return `self`.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;

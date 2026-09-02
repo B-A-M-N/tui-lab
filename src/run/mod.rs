@@ -124,6 +124,24 @@ pub struct TransactionRecord {
     /// in the ledger. Skipped for non-interaction ledger entries ("wait").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persisted_action: Option<crate::execution::PersistedAction>,
+    /// Causal render evidence (re-review item 19): the action's protocol
+    /// byte range, op count, first-byte latency. The op LIST stays in the
+    /// live transaction (bounded there); the ledger carries the citation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<RenderSummary>,
+}
+
+/// Ledger-sized summary of a [`crate::execution::RenderTransaction`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RenderSummary {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub complete: bool,
+    pub op_count: usize,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_byte_ms: Option<u64>,
+    pub dirty_cells: usize,
 }
 
 impl TransactionRecord {
@@ -161,6 +179,15 @@ impl TransactionRecord {
             send_ms: tx.send_ms,
             settle_ms: tx.settle_ms,
             persisted_action,
+            render: tx.render.as_ref().map(|r| RenderSummary {
+                range_start: r.range_start,
+                range_end: r.range_end,
+                complete: r.complete,
+                op_count: r.op_count,
+                bytes: r.bytes,
+                first_byte_ms: r.first_byte_ms,
+                dirty_cells: r.dirty_cells,
+            }),
         }
     }
 }
@@ -1547,6 +1574,7 @@ impl RunContext {
             send_ms: 0,
             settle_ms: 0,
             persisted_action: None,
+            render: None,
         });
     }
 

@@ -242,6 +242,7 @@ fn event_text(ev: &crate::events::TerminalEvent) -> Option<String> {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join(" "),
+        K::QueryAnswered { class } => class.clone(),
         K::Bell | K::VisualChanged | K::FocusChanged { .. } | K::ProcessStarted
         | K::ProcessExited { .. } | K::SemanticChanged => return None,
     })

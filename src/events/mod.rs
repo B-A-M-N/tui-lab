@@ -95,6 +95,14 @@ pub enum TerminalEventKind {
         /// The node id / coverage target the event names.
         target: String,
     },
+    /// Item 22: the engine's device-query responder answered a query the
+    /// app sent — measured evidence of a real query/response round trip.
+    /// Emitted when the answer bytes are written back to the PTY.
+    QueryAnswered {
+        /// Query class: `da1`, `da2`, `da3`, `dsr_cpr`, `dsr_status`,
+        /// `decrqm`, `kitty_flags`, `osc_color`.
+        class: String,
+    },
 }
 
 impl TerminalEventKind {
@@ -113,6 +121,7 @@ impl TerminalEventKind {
             TerminalEventKind::ProcessExited { .. } => "process_exited",
             TerminalEventKind::SemanticChanged => "semantic_changed",
             TerminalEventKind::NativeEvent { .. } => "native_event",
+            TerminalEventKind::QueryAnswered { .. } => "query_answered",
         }
     }
 }
@@ -248,6 +257,12 @@ impl TerminalEventQueue {
 }
 
 fn now_ms() -> u64 {
+    unix_ms()
+}
+
+/// Unix-millis timestamp (public: transaction latency math shares the event
+/// queue's clock so input→first-byte is measured on ONE timeline).
+pub fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

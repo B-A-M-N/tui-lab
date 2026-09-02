@@ -224,6 +224,9 @@ pub struct Session {
     /// must be a real per-session counter, not a hardcoded 0). Allocated by
     /// [`Session::next_anchor`]; shared by every executor path.
     next_anchor_seq: u64,
+    /// Item 22: the answered counter last folded into the event queue —
+    /// dedup anchor for `absorb_query_answers`.
+    last_query_answered_seq: u64,
     /// Per-session terminal event queue (Wave B item 12): every observe,
     /// send, resize, and process-state change appends here. Waits, audits,
     /// incremental observation, and run persistence all read this one
@@ -350,6 +353,7 @@ impl Session {
             pending_ingest: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             hook_recorder: std::sync::Arc::new(std::sync::Mutex::new(None)),
             next_anchor_seq: 0,
+            last_query_answered_seq: 0,
             events: crate::events::TerminalEventQueue::new(),
             cursors: std::collections::HashMap::new(),
             semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
@@ -380,6 +384,14 @@ impl Session {
         self.backend.set_recording_hook(self.recording_slot.clone());
     }
 
+    /// Public absorb for latency measurement (re-review item 26): the
+    /// executor folds pending reader-thread byte facts before reading the
+    /// event queue, so input→first-byte is computed on complete data.
+    pub fn absorb_ingest_now(&mut self) {
+        self.absorb_pending_ingest();
+        self.absorb_query_answers();
+    }
+
     /// Drain the reader thread's pending byte/resize facts into the event
     /// queue. Called from `observe()` so absorption is synchronous with the
     /// parse that consumed the same bytes.
@@ -396,6 +408,29 @@ impl Session {
                 Ingest::Resize(c, r) => {
                     self.push_event(crate::events::TerminalEventKind::Resize { cols: c, rows: r })
                 }
+            }
+        }
+    }
+
+    /// Item 22: fold the backend responder's newly-delivered answers into
+    /// the event queue as measured `QueryAnswered` events. Deduplicated by
+    /// the monotonic answered counter, so repeated calls between pumps are
+    /// idempotent. `None` from engines without a responder changes nothing.
+    fn absorb_query_answers(&mut self) {
+        // Downcast through the one engine shape that answers queries; other
+        // engines honestly never report answers.
+        let any = self.backend.as_any_mut();
+        let Some(port) = any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>()
+        else {
+            return;
+        };
+        let (class, answered_seq) = port.last_query_answer();
+        if let Some(class) = class {
+            if answered_seq > self.last_query_answered_seq {
+                self.last_query_answered_seq = answered_seq;
+                self.push_event(crate::events::TerminalEventKind::QueryAnswered {
+                    class: class.to_string(),
+                });
             }
         }
     }
@@ -855,6 +890,10 @@ impl Session {
         let s = self
             .backend
             .observe(std::time::Duration::from_millis(idle_ms))?;
+        // The parse inside observe() may have queued responder answers; the
+        // pump that drains them runs within that same call, so fold them now
+        // (item 22: measured query/response evidence lands in the stream).
+        self.absorb_query_answers();
         // Take the previous last ONCE: it becomes both the diff base for
         // event emission and the new `previous`. (A second `take()` on the
         // now-empty slot returned `None` every time — emit_frame_events was
@@ -928,6 +967,37 @@ impl Session {
         let bytes = self.backend.recent_raw_output().unwrap_or_default();
         let (cap, dropped) = self.backend.raw_output_stats();
         (bytes, cap, dropped)
+    }
+
+    /// The absolute byte offset of the child's output stream at this instant
+    /// (re-review item 19) — snapshot before and after an action to bracket
+    /// its exact protocol bytes. `(0, 0)` from engines without raw capture.
+    pub fn raw_window_range(&mut self) -> (u64, u64) {
+        self.backend.raw_window_range()
+    }
+
+    /// Item 22: the responder's most recent delivered answer —
+    /// `(class, answered_counter)`; `(None, 0)` from engines without a
+    /// responder. Measured at the `write_input` that delivered the bytes.
+    pub fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
+        let any = self.backend.as_any_mut();
+        match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
+            Some(port) => port.last_query_answer(),
+            None => (None, 0),
+        }
+    }
+
+    /// Item 22: measured conformance probe — feed `query` through the same
+    /// parser the child's output uses and return the responder's exact
+    /// answer bytes `(class, answer)`. Nothing reaches the child; nothing
+    /// enters the output ring. `(None, empty)` from engines without a
+    /// responder.
+    pub fn probe_query_response(&mut self, query: &[u8]) -> (Option<&'static str>, Vec<u8>) {
+        let any = self.backend.as_any_mut();
+        match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
+            Some(port) => port.probe_query_response(query),
+            None => (None, Vec::new()),
+        }
     }
 
     /// Wave-2 (streams): the pipe engine's genuine stdout/stderr line

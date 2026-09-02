@@ -444,7 +444,9 @@ pub struct ObservationAnchor {
 ///   [`ScreenState`] reachable through `.state`;
 /// - the capture outcome is the single record of *why* the after-frame is
 ///   authoritative (matching-frame capture), never optional for a settled
-///   act.
+///   act;
+/// - the causal render evidence lives in [`Self::render`] (re-review item
+///   19): the exact protocol byte range the action produced, decoded.
 #[derive(Debug, Clone)]
 pub struct InteractionTransaction {
     /// The action envelope: canonical action + visibility policy.
@@ -480,6 +482,132 @@ pub struct InteractionTransaction {
     /// time. Together they answer "was the app slow, or were we?"
     pub send_ms: u64,
     pub settle_ms: u64,
+    /// Causal render evidence (re-review item 19): the action's exact
+    /// protocol byte range, the operations it produced, the cells/rows those
+    /// operations dirtied, and the input→first-output latency. `None` when
+    /// the engine cannot retain raw bytes (the honest answer is "no protocol
+    /// evidence", not an empty trace).
+    pub render: Option<RenderTransaction>,
+}
+
+/// The causal render record of ONE action (re-review item 19): "pressing
+/// Down caused this exact ED 2, followed by N cell writes, which dirtied
+/// these rows". Everything here is measured between the raw-byte offsets
+/// bracketing the action — never inferred from a rolling window.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenderTransaction {
+    /// The action's signature (`key:Down`, `mouse:left:click:20:8`, ...).
+    pub action: String,
+    /// Absolute byte range in the child's output stream the action's
+    /// response occupied: `[range_start, range_end)`. Both survive raw-ring
+    /// head eviction, so the citation remains valid after the bytes are gone.
+    pub range_start: u64,
+    pub range_end: u64,
+    /// Whether the response bytes were still retained when decoded (false =
+    /// the ring evicted them; `ops` is then empty and the range is the only
+    /// honest evidence).
+    pub complete: bool,
+    /// Number of decoded protocol operations in the response.
+    pub op_count: usize,
+    /// The operations, described one-per-entry (`at` = offset relative to
+    /// `range_start`). Bounded — a firehose response is truncated with
+    /// `ops_truncated`.
+    pub ops: Vec<RenderOp>,
+    /// Cells/rows the before→after transition dirtied (the screen-level
+    /// half of the causal pair).
+    pub dirty_cells: usize,
+    pub dirty_rows: Vec<u16>,
+    /// Input→first-response-byte latency in milliseconds (the app's own
+    /// reaction time, not the settle time).
+    pub first_byte_ms: Option<u64>,
+    /// Total response bytes.
+    pub bytes: u64,
+}
+
+/// One protocol operation inside a render transaction's response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenderOp {
+    /// Offset relative to [`RenderTransaction::range_start`].
+    pub at: u64,
+    /// The op's one-line description (`csi 2J`, `text "MENU"`, ...).
+    pub describe: String,
+}
+
+/// Sampling cap for stored ops (the full trace stays decodable from the
+/// raw window when retained; the transaction keeps a bounded view).
+const RENDER_OP_SAMPLE_CAP: usize = 256;
+
+/// Build the render transaction for a completed act by decoding the raw
+/// bytes between the bracketing stream offsets. `bytes_total_after` is the
+/// absolute stream end at settle time; `captured_at` is the monotonic
+/// instant the action was sent (for first-byte latency).
+fn build_render_transaction(
+    session: &mut Session,
+    action_sig: &str,
+    offset_before: u64,
+    offset_after: u64,
+    first_byte_ms: Option<u64>,
+    before_state: &crate::screen::ScreenState,
+    after_state: &crate::screen::ScreenState,
+) -> Option<RenderTransaction> {
+    // Rows with any changed cell text (the screen-level half of the causal
+    // pair — same derivation as the event queue's dirty_rows).
+    let dirty_rows: Vec<u16> = (0..after_state.rows)
+        .filter(|&y| {
+            let b = before_state.viewport_text.get(y as usize).map(String::as_str);
+            let a = after_state.viewport_text.get(y as usize).map(String::as_str);
+            b != a
+        })
+        .collect();
+    let (window_start, window_end) = session.raw_window_range();
+    if window_end == 0 {
+        // Engine retains no raw bytes: no protocol evidence, honestly none.
+        return None;
+    }
+    let (bytes, _cap, _dropped) = session.raw_output_window();
+    let lo = offset_before.max(window_start) as usize;
+    let hi = offset_after.min(window_end) as usize;
+    let complete = window_start <= offset_before && offset_after <= window_end;
+    let (op_count, ops) = if complete && lo < hi && hi <= bytes.len() + window_start as usize {
+        let slice = &bytes[lo - window_start as usize..hi - window_start as usize];
+        let trace = crate::protocol::ProtocolTrace::decode(slice);
+        let op_count = trace.ops.len();
+        let ops: Vec<RenderOp> = trace
+            .ops
+            .iter()
+            .take(RENDER_OP_SAMPLE_CAP)
+            .map(|e| RenderOp {
+                at: e.at as u64,
+                describe: e.op.describe(),
+            })
+            .collect();
+        (op_count, ops)
+    } else {
+        (0, Vec::new())
+    };
+    Some(RenderTransaction {
+        action: action_sig.to_string(),
+        range_start: offset_before,
+        range_end: offset_after,
+        complete,
+        op_count,
+        ops,
+        dirty_cells: before_state
+            .viewport_text
+            .iter()
+            .zip(after_state.viewport_text.iter())
+            .filter(|(b, a)| b != a)
+            .map(|(b, a)| b.chars().zip(a.chars()).filter(|(x, y)| x != y).count())
+            .sum::<usize>()
+            + before_state
+                .viewport_text
+                .len()
+                .abs_diff(after_state.viewport_text.len())
+                * after_state.cols as usize,
+        dirty_rows,
+        first_byte_ms,
+        bytes: offset_after.saturating_sub(offset_before),
+    })
 }
 
 /// Action + persistence policy as one unit (leak fix): the executor always
@@ -809,6 +937,11 @@ fn execute_act_inner(
     );
     let mut window = ActTransactionGuard::begin(session, sensitive_window);
     let send_start = std::time::Instant::now();
+    // Causal render bracket (re-review item 19): the absolute output-stream
+    // offset at send time — everything the child emits from here to the
+    // matching offset after settle IS this action's protocol response.
+    let protocol_offset_before = window.sess().raw_window_range().1;
+    let sent_at_unix_ms = crate::events::unix_ms();
     // Canonical mutation dispatch (re-review P0): Resize is a SESSION
     // mutation, not a byte write — it must go through Session::resize() so
     // the stored LaunchSpec follows the real viewport and the Session resize
@@ -861,8 +994,40 @@ fn execute_act_inner(
         )
     };
     let settle_ms = settle_start.elapsed().as_millis() as u64;
+    // Input→first-byte latency (re-review item 26): the event queue records
+    // Output events with unix-ms timestamps (fed by the reader thread), so
+    // the first Output event at/after the pre-action cursor gives the
+    // measured reaction time. `None` when the action produced no output.
+    let first_byte_ms: Option<u64> = {
+        let sess = window.sess();
+        // Fold the reader thread's pending byte facts first — output that
+        // arrived during the settle wait is still in `pending_ingest` until
+        // the next observe() drains it; reading the queue without this
+        // under-reports latency (None) even when bytes arrived.
+        sess.absorb_ingest_now();
+        sess.events_since(pre_event_seq)
+            .events
+            .iter()
+            .find(|ev| {
+                matches!(
+                    ev.kind,
+                    crate::events::TerminalEventKind::Output { .. }
+                )
+            })
+            .map(|ev| ev.at.saturating_sub(sent_at_unix_ms))
+    };
+    let protocol_offset_after = window.sess().raw_window_range().1;
 
     let transition = crate::screen::diff(&before_frame.state, &after_state);
+    let render = build_render_transaction(
+        window.sess(),
+        &action.signature(),
+        protocol_offset_before,
+        protocol_offset_after,
+        first_byte_ms,
+        &before_frame.state,
+        &after_state,
+    );
     let mut after_frame = CanonicalFrame::new(
         after_state,
         after_screen_seq.unwrap_or(0),
@@ -907,6 +1072,7 @@ fn execute_act_inner(
         elapsed_ms,
         send_ms,
         settle_ms,
+        render,
     })
 }
 

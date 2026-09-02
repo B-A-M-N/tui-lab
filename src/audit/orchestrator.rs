@@ -70,6 +70,11 @@ pub enum AuditProfile {
     /// Lifecycle subsystem (Wave 3c item 29): terminal modes negotiated but
     /// not restored — the broken-terminal-after-crash trap.
     Lifecycle,
+    /// Item 21: lifecycle EXIT test — drives the app to a clean exit,
+    /// verifies the final stream restores every engaged mode, then relaunch
+    /// and probes SIGINT/SIGTERM teardown. Kills and restarts the target, so
+    /// it is classified RestartRequired, not observational like `lifecycle`.
+    LifecycleExit,
     /// Query/response conformance (Wave 3c item 33): DSR 6n replayed and
     /// the CPR answer verified against the live cursor.
     QueryResponse,
@@ -101,6 +106,7 @@ impl AuditProfile {
             "input_protocol" => Ok(AuditProfile::InputProtocol),
             "shell_cli" => Ok(AuditProfile::ShellCli),
             "lifecycle" => Ok(AuditProfile::Lifecycle),
+            "lifecycle_exit" => Ok(AuditProfile::LifecycleExit),
             "query_response" => Ok(AuditProfile::QueryResponse),
             other => Err(format!(
                 "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls",
@@ -133,6 +139,7 @@ impl AuditProfile {
             AuditProfile::InputProtocol => "input_protocol",
             AuditProfile::ShellCli => "shell_cli",
             AuditProfile::Lifecycle => "lifecycle",
+            AuditProfile::LifecycleExit => "lifecycle_exit",
             AuditProfile::QueryResponse => "query_response",
         }
     }
@@ -166,6 +173,10 @@ impl AuditProfile {
                 | AuditProfile::InputProtocol
                 | AuditProfile::ShellCli
                 | AuditProfile::Lifecycle
+                // Item 21: the exit test needs the live session (raw ring,
+                // restart); it is active-side even though it is a terminal
+                // lifecycle read in spirit.
+                | AuditProfile::LifecycleExit
                 // Sends one device query (CSI 6n) — still observational,
                 // but it writes to the child, so it stays in the active class.
                 | AuditProfile::QueryResponse
@@ -193,6 +204,9 @@ impl AuditProfile {
             | AuditProfile::InputProtocol
             | AuditProfile::ShellCli
             | AuditProfile::Lifecycle => MutationRisk::Observational,
+            // Kills and relaunches the target — the strongest possible
+            // mutation. Never eligible for safe-only sessions.
+            AuditProfile::LifecycleExit => MutationRisk::RestartRequired,
             // Writes one device query to the child's stdin; no UI
             // semantics change. The reply is engine-generated.
             AuditProfile::QueryResponse => MutationRisk::Observational,
@@ -548,6 +562,7 @@ fn run_profile_with_contract_impl(
             fs.extend(crate::audit::driver::navigation_audit(
                 session, 20, &mut graph,
             ));
+            fs.extend(crate::audit::driver::navigation_keys_audit(session, 6));
             if restart_between {
                 if let Some(f) = do_restart(session, "navigation", "mouse") {
                     restarts += 1;
@@ -603,7 +618,11 @@ fn run_profile_with_contract_impl(
         AuditProfile::Focus => crate::audit::driver::focus_audit(session),
         AuditProfile::Resize | AuditProfile::Layout => crate::audit::driver::resize_audit(session),
         AuditProfile::Clipping => crate::audit::driver::clipping_audit(session),
-        AuditProfile::Navigation => crate::audit::driver::navigation_audit(session, 20, &mut graph),
+        AuditProfile::Navigation => {
+            let mut fs = crate::audit::driver::navigation_audit(session, 20, &mut graph);
+            fs.extend(crate::audit::driver::navigation_keys_audit(session, 6));
+            fs
+        }
         AuditProfile::Mouse => tx(session, &|s| crate::audit::driver::mouse_audit(s, 12)),
         AuditProfile::Performance => crate::audit::driver::performance_audit(session, 7),
         AuditProfile::States => tx(session, &|s| crate::audit::driver::states_audit(s, 10)),
@@ -616,6 +635,9 @@ fn run_profile_with_contract_impl(
         AuditProfile::InputProtocol => crate::audit::driver::input_protocol_audit(session),
         AuditProfile::ShellCli => crate::audit::driver::shell_cli_audit(session),
         AuditProfile::Lifecycle => crate::audit::driver::lifecycle_audit(session),
+        // Item 21: consumes the app (clean exit + signal probes). No audit
+        // transaction — the app is deliberately terminated and relaunched.
+        AuditProfile::LifecycleExit => crate::audit::driver::lifecycle_exit_audit(session),
         AuditProfile::QueryResponse => crate::audit::driver::query_response_audit(session),
         _ => unreachable!("non-active profiles returned above"),
     };
