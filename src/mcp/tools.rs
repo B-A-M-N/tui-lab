@@ -985,14 +985,37 @@ impl TuiLabServer {
                     );
                 }
                 let trace = crate::protocol::ProtocolTrace::decode(&bytes);
+                // Tri-state fold (re-review item 20): an incomplete window
+                // (dropped head) seeds Unknown — "no DECSET in the retained
+                // bytes" is not evidence a mode is off. A complete history
+                // seeds Disabled honestly.
+                let complete = dropped == 0;
+                let states =
+                    crate::protocol::fold_mode_states(&trace.modes, complete);
+                let states_json: serde_json::Map<String, serde_json::Value> = states
+                    .iter()
+                    .map(|(m, st)| {
+                        (
+                            m.to_string(),
+                            json!({
+                                "state": st,
+                                "unverified": *st == crate::protocol::KnownModeState::Unknown,
+                            }),
+                        )
+                    })
+                    .collect();
                 ok(json!({
                     "window": {
                         "bytes": bytes.len(),
                         "ring_capacity": cap,
                         "dropped_head_bytes": dropped,
-                        "complete": dropped == 0,
+                        "complete": complete,
                     },
                     "modes": trace.modes,
+                    "states": states_json,
+                    "note": if complete { "" } else {
+                        "the raw ring dropped its head: modes never seen in the window are UNKNOWN, not disabled — audits treat them as unverified"
+                    },
                 }))
             }
         }
@@ -1163,6 +1186,24 @@ impl TuiLabServer {
                 }
                 serde_json::json!({ "before": format!("frame:{b}"), "after": format!("frame:{a}") })
             };
+            // Causal render evidence (re-review item 19): the exact
+            // protocol bytes the action produced, decoded — the answer to
+            // "pressing Down caused WHICH escape sequences?".
+            let render = tx.render.as_ref().map(|r| {
+                json!({
+                    "action": r.action,
+                    "protocol_range": { "start": r.range_start, "end": r.range_end, "bytes": r.bytes },
+                    "complete": r.complete,
+                    "op_count": r.op_count,
+                    "ops": r.ops.iter().map(|o| json!({ "at": o.at, "op": o.describe })).collect::<Vec<_>>(),
+                    "first_byte_ms": r.first_byte_ms,
+                    "dirty_cells": r.dirty_cells,
+                    "dirty_rows": r.dirty_rows,
+                    "note": if r.complete { "" } else {
+                        "the raw ring evicted this action's bytes; the range is the citable evidence, ops are unavailable"
+                    },
+                })
+            });
             ok(json!({
                 "action": tx.name(),
                 "settled": tx.settled(),
@@ -1175,6 +1216,7 @@ impl TuiLabServer {
                 } else {
                     vec!["screen did not reach the requested stability within the settle budget".to_string()]
                 },
+                "render": render,
                 "transition": tx.transition,
             }))
         })

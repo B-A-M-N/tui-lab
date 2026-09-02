@@ -1944,21 +1944,43 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
 
     // Synchronized-update discipline: if 2026 is used, it must be balanced
     // (every Begin must end). Unbalanced leaves the terminal frozen.
+    // Incomplete-window rule (re-review item 20): when the raw ring dropped
+    // its head, an imbalance inside this window is NOT proof — the matching
+    // end may have scrolled out. Such a verdict becomes `unverified`.
     if sync_on > 0 && sync_on != sync_off {
+        let (severity, summary, confidence) = if dropped > 0 {
+            (
+                "info",
+                format!(
+                    "synchronized-update begin/end mismatch in the retained window ({sync_on} begins vs {sync_off} ends) — window is incomplete, so this is UNVERIFIED, not proof of an unbalanced pair."
+                ),
+                0.4,
+            )
+        } else {
+            (
+                "error",
+                format!(
+                    "synchronized-update begin/end mismatch: {sync_on} begins vs {sync_off} ends in the retained window — an unbalanced pair freezes the terminal."
+                ),
+                0.85,
+            )
+        };
         findings.push(Finding {
             id: "REND-SYNC-UNBALANCED".into(),
             rule_id: None,
-            severity: "error".into(),
+            severity: severity.into(),
             category: "rendering".into(),
-            summary: format!(
-                "synchronized-update begin/end mismatch: {sync_on} begins vs {sync_off} ends in the retained window — an unbalanced pair freezes the terminal."
-            ),
+            summary,
             evidence: vec![ev_other(
                 "sync_imbalance",
                 "CSI ?2026 h without matching l",
-                json!({ "begins": sync_on, "ends": sync_off, "window_bytes": nbytes }),
+                json!({
+                    "begins": sync_on, "ends": sync_off, "window_bytes": nbytes,
+                    "dropped_head_bytes": dropped,
+                    "verdict": if dropped > 0 { "unverified" } else { "error" },
+                }),
             )],
-            confidence: 0.85,
+            confidence,
             reproduction: None,
             source_refs: Vec::new(),
         });
@@ -1966,21 +1988,42 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
 
     // Cursor-hiding discipline: hidden N times, shown fewer → cursor can
     // stay invisible after exit (the classic "where did my cursor go").
+    // Incomplete-window rule (re-review item 20): a dropped head makes this
+    // unverified — the matching show may predate the window.
     if hide_cursor > show_cursor {
+        let (severity, summary, confidence) = if dropped > 0 {
+            (
+                "info",
+                format!(
+                    "cursor hidden {hide_cursor}× but shown {show_cursor}× in the window — window is incomplete, so this is UNVERIFIED."
+                ),
+                0.4,
+            )
+        } else {
+            (
+                "warn",
+                format!(
+                    "cursor hidden {hide_cursor}× but shown {show_cursor}× in the window — the app may exit leaving the cursor invisible."
+                ),
+                0.7,
+            )
+        };
         findings.push(Finding {
             id: "REND-CURSOR-LEAK".into(),
             rule_id: None,
-            severity: "warn".into(),
+            severity: severity.into(),
             category: "rendering".into(),
-            summary: format!(
-                "cursor hidden {hide_cursor}× but shown {show_cursor}× in the window — the app may exit leaving the cursor invisible."
-            ),
+            summary,
             evidence: vec![ev_other(
                 "cursor_visibility_imbalance",
                 "DECTCEM hides without matching shows",
-                json!({ "hide": hide_cursor, "show": show_cursor }),
+                json!({
+                    "hide": hide_cursor, "show": show_cursor,
+                    "dropped_head_bytes": dropped,
+                    "verdict": if dropped > 0 { "unverified" } else { "warn" },
+                }),
             )],
-            confidence: 0.7,
+            confidence,
             reproduction: None,
             source_refs: Vec::new(),
         });
@@ -2534,29 +2577,654 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
         source_refs: Vec::new(),
     });
 
-    // End-to-end CPR probe: exercise the responder path for real. The
-    // engine's responder answers on the response channel when a query
-    // crosses the parser, so the check is whether the responder channel
-    // yields a well-formed `CSI r;cR` for the CURRENT cursor position.
-    // This is the class of answer an app blocks on.
-    let (row, col) = {
-        let s = session.observe(0).ok().map(|s| (s.cursor.y as u32 + 1, s.cursor.x as u32 + 1));
-        s.unwrap_or((0, 0))
+    // End-to-end CPR probe — MEASURED (item 22), not narrated: feed a real
+    // `CSI 6n` through the SAME parser the child's output flows through and
+    // capture the exact answer bytes the responder composed. The probe also
+    // verifies the CPR answer against the live cursor at probe time, and
+    // measures how long the answer composition took. Nothing reaches the
+    // child; nothing enters the output ring — this measures the ENGINE's
+    // conformance, which is the question an app's life depends on.
+    let probe_started = std::time::Instant::now();
+    let (class, answer) = session.probe_query_response(b"\x1b[6n");
+    let probe_ms = probe_started.elapsed().as_millis() as u64;
+    let answered = class == Some("dsr_cpr") && !answer.is_empty();
+
+    // Cross-check: the answered cursor must equal the live cursor at probe
+    // time (1-based). Decode `ESC [ row ; col R` out of the answer bytes.
+    let answered_cursor = decode_cpr(&answer);
+    let live = session.observe(0).ok().map(|s| (s.cursor.y as u32 + 1, s.cursor.x as u32 + 1));
+    let cursor_matches = match (answered_cursor, live) {
+        (Some((r, c)), Some((lr, lc))) => r == lr && c == lc,
+        _ => false,
+    };
+
+    // A real (app-issued) answer recorded in the event stream — measured
+    // evidence the round trip also works when the CHILD asks.
+    let child_asked_events: Vec<u64> = session
+        .all_events()
+        .into_iter()
+        .filter(|e| matches!(&e.kind,
+            crate::events::TerminalEventKind::QueryAnswered { class } if class == "dsr_cpr"))
+        .map(|e| e.seq)
+        .collect();
+
+    let mut detail = json!({
+        "probe": "CSI 6n fed through the live parser; responder's answer captured",
+        "answered_class": class,
+        "answered": answered,
+        "answer_bytes": String::from_utf8_lossy(&answer).to_string(),
+        "probe_elapsed_ms": probe_ms,
+        "answered_cursor": answered_cursor,
+        "live_cursor": live,
+        "cursor_matches_live": cursor_matches,
+        "child_issued_dsr_cpr_answer_events": child_asked_events,
+    });
+    if !answered {
+        detail["note"] = json!("engines without a responder cannot be probed; apps that block on cursor position would hang under them");
+    }
+
+    let (id, sev, conf) = if answered && cursor_matches {
+        ("QR-CPR-PROBE", "info", 0.95)
+    } else if answered {
+        // Answered but the reported cursor disagrees with the live one —
+        // that is a real conformance defect in the responder.
+        ("QR-CPR-MISMATCH", "error", 0.95)
+    } else {
+        ("QR-CPR-UNANSWERED", "warn", 0.9)
+    };
+    let summary = if answered && cursor_matches {
+        format!(
+            "measured CPR conformance: probe `CSI 6n` → `{:?}` (row,col)={answered_cursor:?} matches the live cursor; composed in {probe_ms} ms.",
+            String::from_utf8_lossy(&answer)
+        )
+    } else if answered {
+        format!(
+            "measured CPR DEFECT: probe `CSI 6n` → `{:?}` reports {answered_cursor:?} but the live cursor is {live:?} — an app positioning on this answer lands in the wrong cell.",
+            String::from_utf8_lossy(&answer)
+        )
+    } else {
+        "probe `CSI 6n` got no measured answer — this engine has no device-query responder; apps that block on cursor position would hang under it.".to_string()
     };
     findings.push(Finding {
-        id: "QR-CPR-PROBE".into(),
+        id: id.into(),
+        rule_id: None,
+        severity: sev.into(),
+        category: "query_response".into(),
+        summary,
+        evidence: vec![ev_other(
+            if answered { "cpr_probe_measured" } else { "cpr_probe_missing" },
+            "measured device-query round trip",
+            detail,
+        )],
+        confidence: conf,
+        reproduction: None,
+        source_refs: Vec::new(),
+    });
+
+    findings
+}
+
+/// Item 21 — lifecycle EXIT test. The standing audit's dangling-mode
+/// finding can misread a healthy full-screen app: holding alt-screen,
+/// hidden cursor, and mouse reporting WHILE RUNNING is what a TUI is
+/// supposed to do. What matters is teardown at exit. This probe consumes a
+/// RESTARTABLE session:
+///
+/// 1. observe the running app's active mode set (the baseline);
+/// 2. drive the normal exit (`quit`-style action supplied by the caller —
+///    here: EOF on stdin, the most universal clean-exit stimulus);
+/// 3. wait for the process to die and verify the final raw bytes RESTORE
+///    every mode the app engaged (alt-screen leave, cursor show, mouse off,
+///    paste off);
+/// 4. relaunch and deliver SIGINT, then SIGTERM, recording whether each
+///    teardown happened (a crash-path that leaves modes engaged is the
+///    classic broken-terminal report).
+///
+/// Distinguishes the two outcomes the old audit conflated: "the APP
+/// restored the terminal" (the final stream contains the resets) vs "the
+/// PTY was destroyed so the HOST is fine but the app never cleaned up"
+/// (no resets in the stream — the app failed its teardown duty even though
+/// the user sees no damage).
+pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    // ── Phase 1: the running app's engaged modes ──────────────────────────
+    let Some((baseline_trace, _n, _d)) = decode_raw(session) else {
+        findings.push(Finding {
+            id: "LCX-NOSRC".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: "engine retains no raw output; exit teardown evidence unavailable".into(),
+            evidence: vec![ev_other(
+                "raw_ring_absent",
+                "the backend does not retain the child's raw bytes",
+                json!({ "note": "the exit test needs the portable-pty engine" }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    };
+    let engaged: Vec<&'static str> = baseline_trace
+        .modes
+        .iter()
+        // cursor_visible ENGAGED means the app HID the cursor (set=false);
+        // its healthy teardown is a show. Every other engaged mode is a
+        // set=true and its teardown is a reset. Pairing them here keeps the
+        // cursor case in the verification set instead of silently dropping
+        // it (a hidden-never-shown cursor is the classic invisible-cursor
+        // bug after exit).
+        .filter(|m| m.set || m.mode == "cursor_visible")
+        .map(|m| m.mode)
+        .collect();
+
+    // ── Phase 2/3: normal exit + teardown verification ────────────────────
+    // `quit\n` exits the cooperative fixture; any app whose exit stimulus is
+    // typing works the same. The verification is on the FINAL byte range.
+    let _ = session.send(crate::backend::Input::Text("quit\n".into()));
+    let exit_wait = session.wait(crate::backend::WaitCond::ProcessExit, 5000);
+    let exited = exit_wait.map(|o| o.met).unwrap_or(false);
+    if !exited {
+        findings.push(Finding {
+            id: "LCX-NOEXIT".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: "the app did not exit on the probe stimulus (quit + EOF); exit teardown untested — the standing dangling-mode audit still applies".into(),
+            evidence: vec![ev_other(
+                "exit_timeout",
+                "process still running after the exit stimulus",
+                json!({ "stimulus": "text quit + newline, 5s budget" }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    }
+
+    let (final_bytes, _cap, dropped) = {
+        // The reader thread parked the exit bytes in pending ingest; wait()
+        // does not drain it.
+        session.absorb_ingest_now();
+        session.raw_output_window()
+    };
+    let final_trace = crate::protocol::ProtocolTrace::decode(&final_bytes);
+    // Teardown map: for each engaged mode, did the final stream contain the
+    // reset AFTER the app engaged it?
+    let window_complete = dropped == 0;
+    let mut restored: Vec<&str> = Vec::new();
+    let mut unrestored: Vec<&str> = Vec::new();
+    for mode in &engaged {
+        if *mode == "cursor_visible" {
+            // engaged hidden (set=false recorded as engaged-off); the
+            // healthy teardown is a SHOW (set=true) after the hide.
+            let showed = final_trace
+                .modes
+                .iter()
+                .any(|m| m.mode == "cursor_visible" && m.set);
+            if showed {
+                restored.push(mode);
+            } else {
+                unrestored.push(mode);
+            }
+            continue;
+        }
+        let reset = final_trace.modes.iter().any(|m| m.mode == *mode && !m.set);
+        if reset {
+            restored.push(mode);
+        } else {
+            unrestored.push(mode);
+        }
+    }
+
+    if !unrestored.is_empty() {
+        findings.push(Finding {
+            id: "LCX-TEARDOWN-MISSING".into(),
+            rule_id: None,
+            severity: "error".into(),
+            category: "lifecycle".into(),
+            summary: format!(
+                "on clean exit the app did NOT restore {} engaged mode(s): {} — the app failed its teardown duty. (The host may still look fine because the PTY was destroyed; that is the host's mercy, not the app's correctness.)",
+                unrestored.len(),
+                unrestored.join(", ")
+            ),
+            evidence: vec![ev_other(
+                "exit_teardown_missing",
+                "engaged modes without a reset in the final stream",
+                json!({
+                    "engaged": engaged,
+                    "restored": restored,
+                    "unrestored": unrestored,
+                    "final_stream_bytes": final_bytes.len(),
+                    "window_complete": window_complete,
+                }),
+            )],
+            confidence: if window_complete { 0.95 } else { 0.6 },
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    } else if !engaged.is_empty() {
+        findings.push(Finding {
+            id: "LCX-TEARDOWN-OK".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: format!(
+                "clean exit restored every engaged mode: {} — the app performed its own terminal restoration.",
+                engaged.join(", ")
+            ),
+            evidence: vec![ev_other(
+                "exit_teardown_complete",
+                "every engaged mode has a reset in the final stream",
+                json!({
+                    "engaged": engaged,
+                    "restored": restored,
+                    "app_restored_terminal": true,
+                    "window_complete": window_complete,
+                }),
+            )],
+            confidence: if window_complete { 0.95 } else { 0.6 },
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    } else {
+        findings.push(Finding {
+            id: "LCX-NOTHING-ENGAGED".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: "the app engaged no restorable terminal modes during its run; exit teardown is trivially satisfied.".into(),
+            evidence: vec![ev_other(
+                "no_modes_engaged",
+                "no DECSET-mode was engaged in the observed window",
+                json!({ "window_complete": window_complete }),
+            )],
+            confidence: 0.9,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // ── Phase 4: signals, on the relaunched app ───────────────────────────
+    // SIGINT/SIGTERM behavior is a separate lifecycle: a cooperative app
+    // traps them and restores; a naive one dies leaving modes engaged. We
+    // can only report what happened — a signal kill with no resets in the
+    // stream is reported as an app-side observation, severity info when the
+    // app never opted to handle signals.
+    let eng_by_signal: Vec<serde_json::Value> = Vec::new();
+    for sig in [2, 15] {
+        if session.restart().is_err() {
+            findings.push(Finding {
+                id: "LCX-NORESTART".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "lifecycle".into(),
+                summary: format!(
+                    "session is not restartable; signal {sig} teardown untested (relaunch failed)"
+                ),
+                evidence: vec![ev_other(
+                    "restart_failed",
+                    "the session could not relaunch the target",
+                    json!({ "signal": sig }),
+                )],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            break;
+        }
+        let _ = session.observe(200);
+        let _ = session.send(crate::backend::Input::Signal(sig));
+        let died = session
+            .wait(crate::backend::WaitCond::ProcessExit, 3000)
+            .map(|o| o.met)
+            .unwrap_or(false);
+        if !died {
+            findings.push(Finding {
+                id: "LCX-SIGNAL-IGNORED".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "lifecycle".into(),
+                summary: format!(
+                    "the app survived SIG{sig} — it traps the signal (a full-screen TUI commonly ignores or handles it). Not a defect; recorded as observed behavior."
+                ),
+                evidence: vec![ev_other(
+                    "signal_survived",
+                    "process alive 3s after signal delivery",
+                    json!({ "signal": sig }),
+                )],
+                confidence: 0.9,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            // Stop the relaunched app so the session is not left running.
+            let _ = session.stop();
+            continue;
+        }
+        let (bytes_s, _c, dropped_s) = {
+            session.absorb_ingest_now();
+            session.raw_output_window()
+        };
+        let trace_s = crate::protocol::ProtocolTrace::decode(&bytes_s);
+        let resets = trace_s.modes.iter().filter(|m| !m.set).count();
+        findings.push(Finding {
+            id: "LCX-SIGNAL-EXIT".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "lifecycle".into(),
+            summary: format!(
+                "SIG{sig} terminated the app; the final stream contained {resets} mode reset(s). No resets means the signal path skipped terminal restoration (common for untrapped default handlers)."
+            ),
+            evidence: vec![ev_other(
+                "signal_exit",
+                "signal-driven exit teardown evidence",
+                json!({
+                    "signal": sig,
+                    "mode_resets_in_final_stream": resets,
+                    "window_complete": dropped_s == 0,
+                    "eng_by_signal": eng_by_signal,
+                }),
+            )],
+            confidence: 0.8,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    findings
+}
+
+/// Decode a CPR answer `ESC [ row ; col R` (1-based) into `(row, col)`.
+fn decode_cpr(answer: &[u8]) -> Option<(u32, u32)> {
+    let s = std::str::from_utf8(answer).ok()?;
+    let rest = s.strip_prefix("\x1b[")?.strip_suffix('R')?;
+    let mut parts = rest.split(';');
+    let row = parts.next()?.parse::<u32>().ok()?;
+    let col = parts.next()?.parse::<u32>().ok()?;
+    Some((row, col))
+}
+
+/// Item 24 — navigation BEYOND Tab. The Tab audit proves the Tab cycle and
+/// its Shift+Tab inverse; real TUIs navigate with arrows, Home/End and
+/// PageUp/PageDown too, and each of those has its own reverse-consistency
+/// contract (Left↔Right, Up↔Down, Home↔End, PageUp↔PageDown). This driver
+/// walks each key class through the canonical executor, records its edges
+/// in the shared focus graph, and reports per class:
+///
+/// - coverage (how many transitions the class produced);
+/// - trap: the key never moved focus although several focusable controls
+///   were visible;
+/// - reverse consistency: the class's inverse key must retrace the
+///   forward walk (proved edge-for-edge on stable IDs, like Shift+Tab).
+///
+/// Key classes and their inverses:
+///   left ↔ right, up ↔ down, home ↔ end, pageup ↔ pagedown.
+pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec<Finding> {
+    use crate::backend::KeyCode;
+
+    /// One navigation class: forward key, inverse key, graph `via` names.
+    struct KeyClass {
+        name: &'static str,
+        forward: KeyEvent,
+        inverse: KeyEvent,
+        forward_via: &'static str,
+        inverse_via: &'static str,
+    }
+
+    let classes = [
+        KeyClass {
+            name: "left/right",
+            forward: KeyEvent::new(KeyCode::Right),
+            inverse: KeyEvent::new(KeyCode::Left),
+            forward_via: "right",
+            inverse_via: "left",
+        },
+        KeyClass {
+            name: "up/down",
+            forward: KeyEvent::new(KeyCode::Down),
+            inverse: KeyEvent::new(KeyCode::Up),
+            forward_via: "down",
+            inverse_via: "up",
+        },
+        KeyClass {
+            name: "home/end",
+            forward: KeyEvent::new(KeyCode::End),
+            inverse: KeyEvent::new(KeyCode::Home),
+            forward_via: "end",
+            inverse_via: "home",
+        },
+        KeyClass {
+            name: "pageup/pagedown",
+            forward: KeyEvent::new(KeyCode::PageDown),
+            inverse: KeyEvent::new(KeyCode::PageUp),
+            forward_via: "pagedown",
+            inverse_via: "pageup",
+        },
+    ];
+
+    let mut findings = Vec::new();
+    let mut graph = crate::semantic::focus_graph::FocusGraph::new();
+
+    for class in &classes {
+        let mut moved = 0u32;
+        let mut focus_walk: Vec<Option<String>> = Vec::new();
+        let mut trapped_at: Option<u32> = None;
+        for i in 0..steps_per_class {
+            let (_, sem_before, _, _) = match session.observe_fused(30) {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            let focusable = sem_before.controls.iter().filter(|c| c.focusable).count();
+            let before_id = sem_before.focus.control_id.clone();
+            let tx = match execute_act(
+                session,
+                &CanonicalAction::Key { key: class.forward },
+                60,
+                400,
+                false,
+            ) {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            let sem_after = semantic::analyze(tx.after());
+            let after_id = sem_after.focus.control_id.clone();
+            focus_walk.push(after_id.clone());
+            if let (Some(f), Some(t)) = (&before_id, &after_id) {
+                graph.record_edge(f, t, class.forward_via, sem_after.focus.control.as_deref());
+            }
+            if before_id != after_id && before_id.is_some() {
+                moved += 1;
+            } else if focusable > 1 && trapped_at.is_none() {
+                trapped_at = Some(i);
+            }
+        }
+
+        // Reverse walk: the inverse key should retrace the forward edges.
+        let mut retraced = 0u32;
+        for _ in 0..moved.max(1) {
+            let (_, sem_before, _, _) = match session.observe_fused(30) {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            let before_id = sem_before.focus.control_id.clone();
+            let Ok(tx) = execute_act(
+                session,
+                &CanonicalAction::Key { key: class.inverse },
+                60,
+                400,
+                false,
+            ) else {
+                break;
+            };
+            let sem_after = semantic::analyze(tx.after());
+            let after_id = sem_after.focus.control_id.clone();
+            if let (Some(f), Some(t)) = (&before_id, &after_id) {
+                graph.record_edge(f, t, class.inverse_via, sem_after.focus.control.as_deref());
+            }
+            if before_id != after_id {
+                retraced += 1;
+            }
+        }
+
+        // Per-class findings.
+        if moved == 0 {
+            findings.push(Finding {
+                id: format!("NAV-{}-UNUSED", class.name.to_uppercase().replace('/', "-")),
+                rule_id: None,
+                severity: "info".into(),
+                category: "navigation".into(),
+                summary: format!(
+                    "{} navigation produced no focus transitions in {} steps — either the app does not use these keys or focus does not visibly track them.",
+                    class.name, steps_per_class
+                ),
+                evidence: vec![ev_other(
+                    "nav_class_unused",
+                    "no focus change from this key class",
+                    json!({ "class": class.name, "steps": steps_per_class }),
+                )],
+                confidence: 0.7,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(step) = trapped_at {
+            findings.push(Finding {
+                id: format!("NAV-{}-TRAP", class.name.to_uppercase().replace('/', "-")),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "navigation".into(),
+                summary: format!(
+                    "{} stopped changing focus at step {} although multiple focusable controls are visible — a navigation trap for this key class.",
+                    class.name, step
+                ),
+                evidence: vec![ev_other(
+                    "nav_class_trap",
+                    "focus stopped moving under a non-degenerate screen",
+                    json!({ "class": class.name, "step": step, "walk": focus_walk }),
+                )],
+                confidence: 0.8,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+
+        // Reverse consistency edge-for-edge: every forward edge needs its
+        // inverse counterpart (same pairing rule as Shift+Tab vs Tab).
+        let gaps: Vec<(String, String)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.via == class.forward_via)
+            .filter(|e| {
+                !graph
+                    .edges
+                    .iter()
+                    .any(|r| r.from == e.to && r.to == e.from && r.via == class.inverse_via)
+            })
+            .map(|e| (e.to.clone(), e.from.clone()))
+            .collect();
+        if gaps.is_empty() {
+            findings.push(Finding {
+                id: format!("NAV-{}-REVERSE-OK", class.name.to_uppercase().replace('/', "-")),
+                rule_id: None,
+                severity: "info".into(),
+                category: "navigation".into(),
+                summary: format!(
+                    "{} navigation is reversible: {} forward transition(s) and each has its {} inverse.",
+                    class.name, moved, class.inverse_via
+                ),
+                evidence: vec![ev_other(
+                    "nav_class_reverse_ok",
+                    "edge-for-edge inverse holds",
+                    json!({ "class": class.name, "forward_moves": moved, "inverse_moves": retraced }),
+                )],
+                confidence: 0.85,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        } else {
+            findings.push(Finding {
+                id: format!("NAV-{}-REVERSE-GAP", class.name.to_uppercase().replace('/', "-")),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "navigation".into(),
+                summary: format!(
+                    "{} navigation is not reversible: {} forward edge(s) lack a {} inverse — keyboard users navigating back land elsewhere.",
+                    class.name, gaps.len(), class.inverse_via
+                ),
+                evidence: vec![ev_other(
+                    "nav_class_reverse_gaps",
+                    "forward edges without their inverse counterpart (stable IDs)",
+                    json!({ "class": class.name, "gaps": gaps }),
+                )],
+                confidence: 0.85,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+
+        // Unreachable controls: focusable controls the class never reached.
+        let (_, sem_now, _, _) = match session.observe_fused(30) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let reached: std::collections::HashSet<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.via == class.forward_via || e.via == class.inverse_via)
+            .flat_map(|e| [e.from.as_str(), e.to.as_str()])
+            .collect();
+        let unreachable: Vec<String> = sem_now
+            .controls
+            .iter()
+            .filter(|c| c.focusable)
+            .filter(|c| !reached.contains(c.id.as_str()))
+            .map(|c| c.id.clone())
+            .collect();
+        if !unreachable.is_empty() && moved > 0 {
+            findings.push(Finding {
+                id: format!("NAV-{}-UNREACHABLE", class.name.to_uppercase().replace('/', "-")),
+                rule_id: None,
+                severity: "info".into(),
+                category: "navigation".into(),
+                summary: format!(
+                    "{} focusable control(s) were never reached by {} navigation: {} — reachable by other means (Tab/mouse) or genuinely stranded.",
+                    unreachable.len(), class.name, unreachable.join(", ")
+                ),
+                evidence: vec![ev_other(
+                    "nav_class_unreachable",
+                    "focusable controls outside this class's visited set",
+                    json!({ "class": class.name, "unreachable": unreachable }),
+                )],
+                confidence: 0.7,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+    }
+
+    // Merge the class graph into the session-scoped one the caller owns?
+    // This driver owns a private graph because its via-names are class-
+    // specific; return the merged view in evidence for cross-run queries.
+    findings.push(Finding {
+        id: "NAV-KEYS-SUMMARY".into(),
         rule_id: None,
         severity: "info".into(),
-        category: "query_response".into(),
+        category: "navigation".into(),
         summary: format!(
-            "live cursor for CPR conformance: ({row},{col}) — a CSI 6n from the app is answered as CSI {row};{col}R by the responder (see tui:wave_f conformance tests for the end-to-end proof with a real querying child)."
+            "extended navigation coverage: {} edge(s) recorded across arrows/home-end/pageup-pagedown classes.",
+            graph.edges.len()
         ),
         evidence: vec![ev_other(
-            "cpr_live_cursor",
-            "cursor state the responder would report",
-            json!({ "row": row, "col": col, "reply_format": "ESC [ <row> ; <col> R" }),
+            "nav_keys_graph",
+            "per-class focus edges (stable IDs)",
+            json!({ "graph": graph.summary() }),
         )],
-        confidence: 0.9,
+        confidence: 1.0,
         reproduction: None,
         source_refs: Vec::new(),
     });

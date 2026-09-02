@@ -224,37 +224,51 @@ fn conformance_title_tracked_via_osc() {
     );
 }
 
+/// Item 23 — byte verification, not representation: the child reads its
+/// raw stdin (post `tty.setraw`) and prints the hex, so the assertion is on
+/// the BYTES that crossed the PTY, never on the typed event we intended to
+/// send. Ctrl+C must arrive as ETX (0x03) with no CR translation.
 #[test]
 fn conformance_ctrl_c_emits_etx_byte() {
-    // encode_key is internal; exercise it through send_input capture by
-    // asserting the resulting key event round-trips to 0x03 for ctrl+c.
-    // We test the public KeyEvent -> bytes path indirectly: a session actor
-    // would encode it; here we assert the documented invariant by mirroring
-    // the encoder contract via the typed API.
-    let kev = KeyEvent::with_modifiers(KeyCode::Char('c'), KeyModifiers::CTRL);
-    // The encoder lives in the backend; we validate the contract by checking
-    // the modifier/code combination produces the C0 control byte when sent.
-    // (Direct byte assertion is covered by the backend unit path; this ensures
-    // the typed representation is what we expect.)
-    assert!(kev.modifiers.ctrl());
-    assert_eq!(kev.code, KeyCode::Char('c'));
+    let mut b = spawn_py("import time\ntime.sleep(0.3)\nimport sys,tty\ntty.setraw(0)\ndata=sys.stdin.buffer.read(1)\nprint('HEX:'+data.hex(),flush=True)");
+    std::thread::sleep(Duration::from_millis(500));
+    b.send_input(Input::Key(KeyEvent::with_modifiers(
+        KeyCode::Char('c'),
+        KeyModifiers::CTRL,
+    )))
+    .expect("send ctrl+c");
+    let out = b
+        .wait(WaitCond::Text("HEX:03".into()), Duration::from_secs(5))
+        .expect("wait for hex readback");
+    assert!(
+        out.met,
+        "ctrl+c must cross the PTY as byte 0x03, screen={:?}",
+        out.state.viewport_text.join("|")
+    );
+    b.stop().expect("stop");
 }
 
+/// Same fixture, full sequence: Tab, Tab, Enter must arrive as 0x09 0x09
+/// 0x0d — the complete sequence crosses the wire, nothing dropped.
 #[test]
 fn conformance_keys_sends_full_sequence() {
-    // The session actor executes the complete Input::Keys sequence. We verify
-    // the typed representation carries every key (the pre-fix code dropped all
-    // but the first).
-    let seq = vec![
+    let mut b = spawn_py("import time\ntime.sleep(0.3)\nimport sys,tty\ntty.setraw(0)\ndata=sys.stdin.buffer.read(3)\nprint('HEX:'+data.hex(),flush=True)");
+    std::thread::sleep(Duration::from_millis(500));
+    b.send_input(Input::Keys(vec![
         KeyEvent::new(KeyCode::Tab),
         KeyEvent::new(KeyCode::Tab),
         KeyEvent::new(KeyCode::Enter),
-    ];
-    let input = Input::Keys(seq);
-    match input {
-        Input::Keys(keys) => assert_eq!(keys.len(), 3, "keys must preserve the full sequence"),
-        _ => panic!("expected Input::Keys"),
-    }
+    ]))
+    .expect("send keys");
+    let out = b
+        .wait(WaitCond::Text("HEX:09090d".into()), Duration::from_secs(5))
+        .expect("wait for hex readback");
+    assert!(
+        out.met,
+        "Tab,Tab,Enter must arrive as 09090d, screen={:?}",
+        out.state.viewport_text.join("|")
+    );
+    b.stop().expect("stop");
 }
 
 #[test]

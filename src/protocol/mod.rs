@@ -274,6 +274,63 @@ fn mode_name(n: u16) -> Option<&'static str> {
     })
 }
 
+/// Tri-state terminal-mode state (re-review item 20): a mode whose history
+/// is incomplete is **Unknown**, not disabled. "The raw ring starts halfway
+/// through the app's lifetime" means an absent mouse-ON record says nothing
+/// about whether mouse tracking is on — audits must propagate that instead
+/// of misreading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownModeState {
+    /// No evidence in the retained window: the mode's state cannot be known.
+    Unknown,
+    Enabled,
+    Disabled,
+}
+
+/// The tri-state view of every named mode after replaying a mode-event
+/// timeline. When `history_complete` is false the fold starts from
+/// [`KnownModeState::Unknown`] for every mode (an observed set/reset moves a
+/// mode to Enabled/Disabled; modes never seen stay Unknown). When the
+/// history IS complete, absent modes are honestly `Disabled` — a full
+/// transcript with no DECSET means the mode was never turned on.
+pub fn fold_mode_states(
+    events: &[TerminalModeEvent],
+    history_complete: bool,
+) -> std::collections::BTreeMap<&'static str, KnownModeState> {
+    let mut out: std::collections::BTreeMap<&'static str, KnownModeState> =
+        std::collections::BTreeMap::new();
+    let seed = if history_complete {
+        KnownModeState::Disabled
+    } else {
+        KnownModeState::Unknown
+    };
+    // Seed every mode the vocabulary names, so the map is total.
+    const KNOWN_MODES: &[&str] = &[
+        "application_cursor_keys",
+        "cursor_visible",
+        "alt_screen",
+        "mouse_press_release",
+        "mouse_button_motion",
+        "mouse_any_motion",
+        "mouse_sgr_encoding",
+        "bracketed_paste",
+        "synchronized_update",
+    ];
+    for m in KNOWN_MODES {
+        out.insert(*m, seed);
+    }
+    for ev in events {
+        // Only insert modes the vocabulary names (mode_name already filters).
+        out.insert(ev.mode, if ev.set {
+            KnownModeState::Enabled
+        } else {
+            KnownModeState::Disabled
+        });
+    }
+    out
+}
+
 // ── Incremental decoder ────────────────────────────────────────────────────
 
 /// Intermediate state while decoding a chunk stream (CSI/OSC may span a chunk

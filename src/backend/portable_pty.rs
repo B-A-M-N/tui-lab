@@ -62,11 +62,27 @@ struct BackendCallbacks {
     command_running: bool,
     last_command_exit: Option<i32>,
     command_phase: &'static str,
+    /// Item 22: query/answer bookkeeping. When the responder queues an
+    /// answer, it records the class here; `pump()` promotes the pending
+    /// class to `last_query` at the moment it actually writes the answer
+    /// bytes back to the PTY — that write is the measured "answer sent at".
+    /// Monotonic counters (one per answered query) let the session layer
+    /// diff "answers since last observe" into terminal events.
+    answered_seq: u64,
+    pending_class: Option<&'static str>,
 }
 
 impl BackendCallbacks {
     fn queue_response(&mut self, bytes: &[u8]) {
         self.query_responses.extend_from_slice(bytes);
+    }
+
+    /// Item 22: name the query class this answer belongs to and bump the
+    /// answer counter. Called by every responder arm right before (or right
+    /// after) queueing the reply bytes.
+    fn note_answer(&mut self, class: &'static str) {
+        self.answered_seq += 1;
+        self.pending_class = Some(class);
     }
 }
 
@@ -161,6 +177,7 @@ impl vt100::Callbacks for BackendCallbacks {
                     (0x00, 0x00, 0x00)
                 };
                 let which = if fg { 10 } else { 11 };
+                self.note_answer("osc_color");
                 self.queue_response(
                     format!("\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x07", which, r, g, b).as_bytes(),
                 );
@@ -218,6 +235,7 @@ impl vt100::Callbacks for BackendCallbacks {
             }
             if i1 == Some(b'?') {
                 // Query: report the currently active flags.
+                self.note_answer("kitty_flags");
                 self.queue_response(format!("\x1b[?{}u", self.kitty_flags).as_bytes());
                 return;
             }
@@ -227,23 +245,28 @@ impl vt100::Callbacks for BackendCallbacks {
         match (i1, c) {
             // DA1: `CSI c` or `CSI 0 c` → VT100 with AVO (`?1;2c`).
             (None, 'c') | (Some(b'0'), 'c') => {
+                self.note_answer("da1");
                 self.queue_response(b"\x1b[?1;2c");
             }
             // Secondary DA: `CSI > c` → vt220, version 1, no ROM.
             (Some(b'>'), 'c') => {
+                self.note_answer("da2");
                 self.queue_response(b"\x1b[>0;1;0c");
             }
             // Tertiary DA: `CSI = c` → unit id 0.
             (Some(b'='), 'c') => {
+                self.note_answer("da3");
                 self.queue_response(b"\x1bP!|0000\x1b\\");
             }
             // DSR — cursor position: `CSI 6n` → `CSI row ; col R` (1-based).
             (None, 'n') if params.first().and_then(|p| p.first()).copied() == Some(6) => {
                 let (row, col) = _screen.cursor_position();
+                self.note_answer("dsr_cpr");
                 self.queue_response(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
             }
             // DSR — operating status: `CSI 5n` → OK.
             (None, 'n') if params.first().and_then(|p| p.first()).copied() == Some(5) => {
+                self.note_answer("dsr_status");
                 self.queue_response(b"\x1b[0n");
             }
             // DECRQM: `CSI ? Ps $ p` → DECSET report; `CSI Ps $ p` → ANSI report.
@@ -260,6 +283,7 @@ impl vt100::Callbacks for BackendCallbacks {
                     1049 => _screen.alternate_screen(),
                     _ => false,
                 };
+                self.note_answer("decrqm");
                 self.queue_response(format!("\x1b[?{};{}$y", mode, set as u8).as_bytes());
             }
             _ => {}
@@ -297,6 +321,11 @@ pub struct PortablePtyBackend {
     content_seq: u64,
     bell_seq: u64,
     title_seq: u64,
+    /// Item 22: the most recent responder answer that was actually written
+    /// back to the PTY (class + its monotonic answer counter). Read by the
+    /// session layer after a pump to fold measured query/answer events.
+    last_query_class: Option<&'static str>,
+    last_query_answered_seq: u64,
     last_output_at_ms: u64,
     last_screen_change_at_ms: u64,
     // Monotonic Instants for fine-grained wait timing (monotonic clock,
@@ -323,6 +352,12 @@ pub struct PortablePtyBackend {
     raw_ring: std::collections::VecDeque<u8>,
     /// Bytes dropped off the raw ring's head (declared eviction).
     raw_dropped: u64,
+    /// Total raw bytes EVER absorbed (re-review item 19): the absolute
+    /// stream position of the next byte. The CURRENT window covers absolute
+    /// offsets `[raw_bytes_total - raw_ring.len(), raw_bytes_total)`, so a
+    /// transaction can cite its exact byte range in the child's output
+    /// stream even after head eviction.
+    raw_bytes_total: u64,
 }
 
 impl PortablePtyBackend {
@@ -345,6 +380,8 @@ impl PortablePtyBackend {
             content_seq: 0,
             bell_seq: 0,
             title_seq: 0,
+            last_query_class: None,
+            last_query_answered_seq: 0,
             last_output_at_ms: 0,
             last_screen_change_at_ms: 0,
             child_pid: None,
@@ -355,6 +392,7 @@ impl PortablePtyBackend {
             scrollback_seen: false,
             raw_ring: std::collections::VecDeque::new(),
             raw_dropped: 0,
+            raw_bytes_total: 0,
         }
     }
 
@@ -403,6 +441,16 @@ impl PortablePtyBackend {
             // write_input forwards to the PTY; fall back silently when no
             // session is attached (callbacks can fire during parser tests).
             let _ = self.write_input(&drained);
+            // Item 22: the answer just left for the app — that instant is
+            // the measurable "responded at". Promote the pending class so
+            // the session layer can fold a measured query/answer event.
+            {
+                let cb = self.parser.callbacks_mut();
+                if let Some(class) = cb.pending_class.take() {
+                    self.last_query_class = Some(class);
+                    self.last_query_answered_seq = cb.answered_seq;
+                }
+            }
         }
         let after_contents = self.parser.screen().contents();
         let after_fp = self.interaction_fingerprint();
@@ -509,6 +557,7 @@ impl PortablePtyBackend {
     /// ring, declaring head eviction. Bounded at [`RAW_RING_CAPACITY`] so a
     /// firehose child cannot grow memory without limit.
     fn absorb_raw(&mut self, bytes: &[u8]) {
+        self.raw_bytes_total += bytes.len() as u64;
         for &b in bytes {
             if self.raw_ring.len() >= RAW_RING_CAPACITY {
                 self.raw_ring.pop_front();
@@ -526,6 +575,50 @@ impl PortablePtyBackend {
             RAW_RING_CAPACITY,
             self.raw_dropped,
         )
+    }
+
+    /// The absolute byte range the retained window covers in the child's
+    /// output stream: `(start_offset, end_offset_exclusive)`. Offsets survive
+    /// head eviction, so a transaction's protocol range is citable even when
+    /// the ring has wrapped (re-review item 19).
+    pub fn raw_window_range(&mut self) -> (u64, u64) {
+        let _ = self.pump();
+        let end = self.raw_bytes_total;
+        let start = end.saturating_sub(self.raw_ring.len() as u64);
+        (start, end)
+    }
+
+    /// The absolute stream position at this instant — the offset the NEXT
+    /// byte will get. Snapshot before and after an action to bracket it.
+    pub fn raw_bytes_total(&mut self) -> u64 {
+        let _ = self.pump();
+        self.raw_bytes_total
+    }
+
+    /// Item 22: the responder's most recent answer actually written back to
+    /// the PTY — `(class, answered_counter)` — or `None` when nothing was
+    /// answered since start/reset. Measured, not narrated: the counter only
+    /// bumps at the `write_input` that delivered the bytes.
+    pub fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
+        let _ = self.pump();
+        (self.last_query_class, self.last_query_answered_seq)
+    }
+
+    /// Item 22: measured conformance probe. Feed `query` through the SAME
+    /// parser the child's output flows through (so the same responder
+    /// handles it), then return the exact answer bytes the responder
+    /// composed for the app. Nothing is written to the child and nothing
+    /// enters the output ring — the probe measures the ENGINE's reply to a
+    /// query class, which is precisely what conformance means here.
+    pub fn probe_query_response(&mut self, query: &[u8]) -> (Option<&'static str>, Vec<u8>) {
+        self.parser.process(query);
+        // The callbacks queue the reply; drain WITHOUT writing it to the
+        // PTY (this is a probe, not app traffic).
+        let drained = std::mem::take(&mut self.parser.callbacks_mut().query_responses);
+        let class = self.parser.callbacks_mut().pending_class.take();
+        // pending_class was set by the LAST answering arm in `query`; for a
+        // single-query probe it is exactly the answer's class.
+        (class, drained)
     }
 
     fn interaction_fingerprint(&self) -> String {
@@ -622,6 +715,10 @@ impl TerminalBackend for PortablePtyBackend {
     fn raw_output_stats(&mut self) -> (usize, u64) {
         let (_bytes, cap, dropped) = self.raw_output_window();
         (cap, dropped)
+    }
+
+    fn raw_window_range(&mut self) -> (u64, u64) {
+        PortablePtyBackend::raw_window_range(self)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -750,6 +847,8 @@ impl TerminalBackend for PortablePtyBackend {
         self.content_seq = 0;
         self.bell_seq = 0;
         self.title_seq = 0;
+        self.last_query_class = None;
+        self.last_query_answered_seq = 0;
         self.last_output_at_ms = 0;
         self.last_screen_change_at_ms = 0;
         self.scrollback_cache.clear();
