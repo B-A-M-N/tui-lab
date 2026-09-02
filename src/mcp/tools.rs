@@ -2938,10 +2938,12 @@ impl TuiLabServer {
             .action
             .clone()
             .unwrap_or(crate::mcp::params::Known::Known(CV::Summary));
-        // The run-ledger views are answered here (session-scoped); the
-        // rest delegates to the provider module.
+        // The run-ledger views (summary/collect/delta/ledger) are answered
+        // here against the REAL accumulated evidence; un-covered is an honest
+        // unsupported until a denominator source exists (review P0.7). detect
+        // and the optional tuicov snapshot delegate to the provider module.
         match action.known() {
-            Some(CV::Ledger) => {
+            Some(CV::Ledger) | Some(CV::Summary) => {
                 let run = self.run.lock().unwrap();
                 let entries: Vec<serde_json::Value> = run
                     .coverage_ledger
@@ -2951,17 +2953,94 @@ impl TuiLabServer {
                             "target": target,
                             "hits": e.hits,
                             "sessions": e.sessions,
+                            "first_seq": e.first_seq,
+                            "last_seq": e.last_seq,
                             "first_seen": e.first_seen,
                             "last_seen": e.last_seen,
+                            "source_refs": e.source_refs,
                         })
                     })
                     .collect();
+                let total_hits: u64 = run.coverage_ledger.values().map(|e| e.hits).sum();
+                let sessions_seen = run.coverage_seq > 0;
                 ok(json!({
-                    "entries": entries,
+                    "ledger": entries,
                     "targets": entries.len(),
-                    "note": if entries.is_empty() { Some("no native coverage events yet; cooperative apps send coverage events over TUI_LAB_SEMANTIC".to_string()) } else { None },
+                    "total_hits": total_hits,
+                    "provider": "native-events",
+                    "mode": "continuous",
+                    "probe": json!({
+                        "tuicov": crate::coverage::tuicov::is_available(),
+                        "note": "tuicov is an optional snapshot executable; the run ledger is the source of truth for accumulated evidence",
+                    }),
+                    "note": if entries.is_empty() {
+                        Some("no native coverage events yet; cooperative apps send coverage events over TUI_LAB_SEMANTIC".to_string())
+                    } else if !sessions_seen {
+                        Some("run restored from a pre-cursor manifest; counts are intact but sequence order reflects live events since reopen".to_string())
+                    } else { None },
                 }))
             }
+            Some(CV::Collect) => {
+                // Collection is CONTINUOUS — there is nothing to trigger.
+                // This honestly reports that, plus what has accumulated, and
+                // never pretends a silent no-op "collected" (review P0.7).
+                let run = self.run.lock().unwrap();
+                let targets = run.coverage_ledger.len();
+                let total_hits: u64 = run.coverage_ledger.values().map(|e| e.hits).sum();
+                ok(json!({
+                    "mode": "continuous",
+                    "provider": "native-events",
+                    "note": "native coverage is collected continuously into the run ledger as events arrive; no explicit collect needed",
+                    "targets_collected_so_far": targets,
+                    "total_hits_so_far": total_hits,
+                }))
+            }
+            Some(CV::Delta) => {
+                // Real delta against the accumulated ledger (review P0.7):
+                // targets first seen after the caller's last cursor. The
+                // process-wide cursor advances by this call. A pre-cursor
+                // persisted run (seq stays 0) reads every live target as new,
+                // which is honest on upgrade.
+                let mut run = self.run.lock().unwrap();
+                let cur = run.coverage_delta_cursor;
+                let mut new_targets = Vec::new();
+                let mut hits_since: u64 = 0;
+                for (target, e) in &run.coverage_ledger {
+                    if e.first_seq > cur {
+                        new_targets.push(json!({
+                            "target": target,
+                            "hits": e.hits,
+                            "first_seq": e.first_seq,
+                        }));
+                        hits_since += e.hits;
+                    }
+                }
+                new_targets.sort_by(|a, b| {
+                    a["first_seq"].as_u64().cmp(&b["first_seq"].as_u64())
+                });
+                let new_cursor = run.coverage_seq;
+                run.coverage_delta_cursor = new_cursor;
+                ok(json!({
+                    "new_targets": new_targets,
+                    "new_target_count": new_targets.len(),
+                    "hits_since_last_delta": hits_since,
+                    "cursor_was": cur,
+                    "cursor_now": new_cursor,
+                    "exhausted": new_targets.is_empty(),
+                }))
+            }
+            Some(CV::Uncovered) => {
+                // HONEST unsupported: without a denominator (what the app
+                // COULD cover) we cannot say what is uncovered. Inventing one
+                // would be theater, so this is an explicit refusal (review
+                // P0.7). Native coverage only knows what was hit.
+                err(
+                    ErrorCategory::Unsupported,
+                    "coverage action 'uncovered' is unsupported: tui-lab has no denominator of what the app *could* cover, so it reports hits honestly and refuses to fabricate a gap; use delta (what changed since the last read) instead",
+                )
+            }
+            // detect (and anything unexpected) dispatches through the
+            // provider module, which knows what the tuicov executable offers.
             _ => match crate::coverage::tuicov::handle(&p) {
                 Ok(s) => crate::mcp::helpers::ok_from_json(&s),
                 Err(e) => err(ErrorCategory::BackendError, e.to_string()),

@@ -9,7 +9,10 @@
 *.apng
 *.gif
 *.mp4
-coverage/
+# Root-level coverage OUTPUT directory (e.g. llvm-cov html/). MUST be
+# anchored: the unanchored `coverage/` was matching `src/coverage/` — the
+# crate's own coverage module — silently untracking ALL of it.
+/coverage/
 
 # IDE
 .idea/
