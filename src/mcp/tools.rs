@@ -152,9 +152,7 @@ impl TuiLabServer {
                     if let SessionView::TerminalProfile = session_view {
                         // Evidence-backed capability report, no screen settle.
                         let profile = s.terminal_profile();
-                        return Some(
-                            serde_json::to_string_pretty(&profile).unwrap_or_default(),
-                        );
+                        return Some(serde_json::to_string_pretty(&profile).unwrap_or_default());
                     }
                     // Passive resource read: consume the latest COMMITTED
                     // frame without triggering a settle cycle and WITHOUT
@@ -431,15 +429,14 @@ impl TuiLabServer {
             // process predates TUI-Lab and belongs to the user. TUI-Lab
             // never kills the pane on detach.
             A::Attach => {
-                let target = match p.target.as_deref() {
-                    Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    _ => {
-                        return err(
+                let target =
+                    match p.target.as_deref() {
+                        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                        _ => return err(
                             ErrorCategory::InvalidRequest,
                             "attach requires 'target' (tmux session:window.pane, e.g. 'main:0.0')",
-                        )
-                    }
-                };
+                        ),
+                    };
                 let cols = p.cols.unwrap_or(80);
                 let rows = p.rows.unwrap_or(24);
                 let id = match self.sessions.attach_tmux(&target, cols, rows).await {
@@ -461,7 +458,12 @@ impl TuiLabServer {
                     Ok(f) => f,
                     Err(e) => return e,
                 };
-                if let Some(spec) = self.with_sess(Some(&id), |s| s.launch().cloned()).await.ok().flatten() {
+                if let Some(spec) = self
+                    .with_sess(Some(&id), |s| s.launch().cloned())
+                    .await
+                    .ok()
+                    .flatten()
+                {
                     self.run.lock().unwrap().set_launch_spec(&id, spec);
                 }
                 let run_id = self.run.lock().unwrap().id.clone();
@@ -1144,7 +1146,9 @@ impl TuiLabServer {
         // Signal included. A declared completion overrides the default
         // "screen settles" so silent/exit/signal actions are classified
         // honestly (never a false `settled=false`).
-        let completion = p.completion().unwrap_or(crate::capture::CompletionPolicy::StableScreen);
+        let completion = p
+            .completion()
+            .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
         self.with_sess(selector.as_deref(), move |sess| {
             // Wave G item 76: a live human control lease blocks driving.
             if let Some(refused) = lease_refused(sess) {
@@ -1327,10 +1331,7 @@ impl TuiLabServer {
                 None => {
                     return err(
                         ErrorCategory::InvalidRequest,
-                        format!(
-                            "completion '{}' requires the 'text' parameter",
-                            pc.as_str()
-                        ),
+                        format!("completion '{}' requires the 'text' parameter", pc.as_str()),
                     )
                 }
             },
@@ -2861,7 +2862,23 @@ impl TuiLabServer {
                     crate::audit::orchestrator::SafetyPolicy::AllowMutation => "allow_mutation",
                     crate::audit::orchestrator::SafetyPolicy::DeepIsolation => "deep_isolation",
                 },
+                // Info-split (review P1 item 9): `finding_count` has always
+                // counted every row, but many are informational orchestration
+                // records (ORCH-RESTART, AUDIT-METRICS, DISC-001…) — counting
+                // them as "findings" makes a clean run look defect-heavy. The
+                // breakdown separates defects from bookkeeping; the totals
+                // stay as they were so nothing downstream changes shape.
                 "finding_count": report.findings.len(),
+                "findings_by_severity": {
+                    "error": report.findings.iter().filter(|f| f.severity == "error").count(),
+                    "warn": report.findings.iter().filter(|f| f.severity == "warn").count(),
+                    "info": report.findings.iter().filter(|f| f.severity == "info").count(),
+                },
+                "defect_count": report
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity != "info")
+                    .count(),
                 "findings": report.findings,
                 "focus_graph": focus_summary,
                 "labeled_as": label,
@@ -2879,7 +2896,10 @@ impl TuiLabServer {
         name = "tui_explain",
         description = "Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities the finding is conditional on."
     )]
-    pub async fn tui_explain(&self, p: Parameters<TuiExplainParams>) -> rmcp::model::CallToolResult {
+    pub async fn tui_explain(
+        &self,
+        p: Parameters<TuiExplainParams>,
+    ) -> rmcp::model::CallToolResult {
         let p = p.0;
         let run = self.run.clone();
 
@@ -2919,7 +2939,11 @@ impl TuiLabServer {
             Some(id) => self
                 .with_sess(Some(&id), move |sess| {
                     let profile = sess.terminal_profile();
-                    crate::terminal::explain::explain_finding(&finding_for_job, None, Some(&profile))
+                    crate::terminal::explain::explain_finding(
+                        &finding_for_job,
+                        None,
+                        Some(&profile),
+                    )
                 })
                 .await
                 .unwrap_or_else(|_e| {
@@ -3023,9 +3047,7 @@ impl TuiLabServer {
                         hits_since += e.hits;
                     }
                 }
-                new_targets.sort_by(|a, b| {
-                    a["first_seq"].as_u64().cmp(&b["first_seq"].as_u64())
-                });
+                new_targets.sort_by(|a, b| a["first_seq"].as_u64().cmp(&b["first_seq"].as_u64()));
                 let new_cursor = run.coverage_seq;
                 run.coverage_delta_cursor = new_cursor;
                 ok(json!({
@@ -3508,27 +3530,29 @@ impl TuiLabServer {
                 // The packet for THIS finding (pure join; packets read run
                 // state and never mutate it).
                 let (packets, _skipped) = run.repair_packets();
-                let packet = packets
-                    .into_iter()
-                    .find(|p| p.finding.id == finding_id);
+                let packet = packets.into_iter().find(|p| p.finding.id == finding_id);
                 // The before/after verdicts from the labeled baseline.
                 let baseline = run.finding_baseline(&compare_label);
-                let (verdicts, before, regressions): (serde_json::Value, serde_json::Value, Vec<serde_json::Value>) = match baseline {
-                    None => (
-                        serde_json::Value::Null,
-                        serde_json::Value::Null,
-                        Vec::new(),
-                    ),
-                    Some(base) => {
-                        // REGRESSED reachable (review P1 item 12): a finding
-                        // seen in an earlier pass but absent from this
-                        // baseline is a regression when it reappears.
-                        let resolved = crate::audit::compare::Resolved(
-                            run.resolved_finding_fingerprints(&compare_label),
-                        );
-                        let compared =
-                            crate::audit::compare::compare_with_resolved(base, run.findings(), &resolved);
-                        let this = compared
+                let (verdicts, before, regressions): (
+                    serde_json::Value,
+                    serde_json::Value,
+                    Vec<serde_json::Value>,
+                ) =
+                    match baseline {
+                        None => (serde_json::Value::Null, serde_json::Value::Null, Vec::new()),
+                        Some(base) => {
+                            // REGRESSED reachable (review P1 item 12): a finding
+                            // seen in an earlier pass but absent from this
+                            // baseline is a regression when it reappears.
+                            let resolved = crate::audit::compare::Resolved(
+                                run.resolved_finding_fingerprints(&compare_label),
+                            );
+                            let compared = crate::audit::compare::compare_with_resolved(
+                                base,
+                                run.findings(),
+                                &resolved,
+                            );
+                            let this = compared
                             .iter()
                             .find(|c| c.finding.id == finding_id)
                             .map(|c| json!({
@@ -3540,34 +3564,31 @@ impl TuiLabServer {
                                 "verdict": "fixed",
                                 "note": "the bundled finding no longer appears in the current set",
                             }));
-                        // The regression guard: every OTHER finding whose
-                        // verdict moved the wrong way between the passes.
-                        let others: Vec<serde_json::Value> = compared
-                            .iter()
-                            .filter(|c| c.finding.id != finding_id)
-                            .filter(|c| c.verdict == "new" || c.verdict == "regressed")
-                            .map(|c| json!({
-                                "id": c.finding.id,
-                                "category": c.finding.category,
-                                "summary": c.finding.summary,
-                                "verdict": c.verdict,
-                            }))
-                            .collect();
-                        let before_f = base
-                            .iter()
-                            .find(|b| b.id == finding_id)
-                            .map(|b| json!({
-                                "id": b.id,
-                                "summary": b.summary,
-                                "severity": b.severity,
-                            }));
-                        (
-                            this,
-                            before_f.unwrap_or(serde_json::Value::Null),
-                            others,
-                        )
-                    }
-                };
+                            // The regression guard: every OTHER finding whose
+                            // verdict moved the wrong way between the passes.
+                            let others: Vec<serde_json::Value> = compared
+                                .iter()
+                                .filter(|c| c.finding.id != finding_id)
+                                .filter(|c| c.verdict == "new" || c.verdict == "regressed")
+                                .map(|c| {
+                                    json!({
+                                        "id": c.finding.id,
+                                        "category": c.finding.category,
+                                        "summary": c.finding.summary,
+                                        "verdict": c.verdict,
+                                    })
+                                })
+                                .collect();
+                            let before_f = base.iter().find(|b| b.id == finding_id).map(|b| {
+                                json!({
+                                    "id": b.id,
+                                    "summary": b.summary,
+                                    "severity": b.severity,
+                                })
+                            });
+                            (this, before_f.unwrap_or(serde_json::Value::Null), others)
+                        }
+                    };
                 ok(json!({
                     "finding_id": finding_id,
                     "rule_id": finding.rule_id,
@@ -3850,7 +3871,9 @@ impl TuiLabServer {
                     .with_sess(selector.as_deref(), |sess| {
                         let (screen, sem, _tree, _report) =
                             sess.observe_fused(60).map_err(|e| e.to_string())?;
-                        Ok::<_, String>(crate::design::ProjectContract::scaffold_from(&screen, &sem))
+                        Ok::<_, String>(crate::design::ProjectContract::scaffold_from(
+                            &screen, &sem,
+                        ))
                     })
                     .await;
                 let contract = match scaffolded {
@@ -3946,7 +3969,9 @@ impl TuiLabServer {
                 if let Some(refused) = lease_refused(sess) {
                     return Err(refused);
                 }
-                Ok(crate::design::check_contract_with_mode(sess, &contract, mode))
+                Ok(crate::design::check_contract_with_mode(
+                    sess, &contract, mode,
+                ))
             })
             .await
         {
@@ -3986,7 +4011,9 @@ impl TuiLabServer {
                 if let Some(refused) = lease_refused(sess) {
                     return Err(refused);
                 }
-                Ok(crate::design::check_contract_with_mode(sess, &contract, mode))
+                Ok(crate::design::check_contract_with_mode(
+                    sess, &contract, mode,
+                ))
             })
             .await
         {

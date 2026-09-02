@@ -434,7 +434,9 @@ fn run_profile_with_contract_impl(
     // the Wave-3 subsystem audits (unicode, controls).
     if !profile.is_active() {
         // Fused truth (re-review Wave-2 item 16).
-        let (screen, sem, _, _) = session.observe_fused(40).map_err(|e| format!("observe failed: {e}"))?;
+        let (screen, sem, _, _) = session
+            .observe_fused(40)
+            .map_err(|e| format!("observe failed: {e}"))?;
         let name = profile.name();
         return Ok(ProfileReport {
             profile,
@@ -453,7 +455,9 @@ fn run_profile_with_contract_impl(
     let mut findings = Vec::new();
     if profile.wants_static_composite() {
         // Fused truth (re-review Wave-2 item 16).
-        let (screen, sem, _, _) = session.observe_fused(40).map_err(|e| format!("observe failed: {e}"))?;
+        let (screen, sem, _, _) = session
+            .observe_fused(40)
+            .map_err(|e| format!("observe failed: {e}"))?;
         findings.extend(crate::audit::run("full", &screen, &sem).map_err(|e| e.to_string())?);
     }
 
@@ -462,7 +466,7 @@ fn run_profile_with_contract_impl(
     // residue it leaves becomes an honest AUDIT-RESIDUE finding instead of
     // silent session mutation (the old Tab-walk-left-focus-dirty bug).
     use crate::audit::transaction::run_verified;
-    let tx = |s: &mut Session, f: &dyn Fn(&mut Session) -> Vec<Finding>| -> Vec<Finding> {
+    let tx = |s: &mut Session, f: &mut dyn FnMut(&mut Session) -> Vec<Finding>| -> Vec<Finding> {
         run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
             vec![Finding {
                 id: "AUDIT-TX-ERR".into(),
@@ -546,7 +550,9 @@ fn run_profile_with_contract_impl(
                 rule_id: None,
                 severity: "warn".into(),
                 category: "orchestration".into(),
-                summary: format!("restart between {before} and {after} failed: {e} — continuing on the live app"),
+                summary: format!(
+                    "restart between {before} and {after} failed: {e} — continuing on the live app"
+                ),
                 evidence: vec![EvidenceRef::point(
                     EvidenceKind::Other,
                     "restart_failed",
@@ -562,36 +568,54 @@ fn run_profile_with_contract_impl(
 
     let active_findings = match profile {
         AuditProfile::Full => {
-            let mut fs = crate::audit::driver::keyboard_audit(session, 20, &mut graph);
-            fs.extend(crate::audit::driver::focus_audit(session));
-            fs.extend(crate::audit::driver::resize_audit(session));
-            fs.extend(crate::audit::driver::clipping_audit(session));
-            fs.extend(crate::audit::driver::navigation_audit(
-                session, 20, &mut graph,
-            ));
-            fs.extend(crate::audit::driver::navigation_keys_audit(session, 6));
+            let mut fs = tx(session, &mut |s| {
+                let mut inner = crate::audit::driver::keyboard_audit(s, 20, &mut graph);
+                inner.extend(crate::audit::driver::focus_audit(s));
+                inner
+            });
+            fs.extend(tx(session, &mut |s| {
+                let mut inner = crate::audit::driver::resize_audit(s);
+                inner.extend(crate::audit::driver::resize_reflow_audit(s));
+                inner.extend(crate::audit::driver::clipping_audit(s));
+                inner
+            }));
+            fs.extend(tx(session, &mut |s| {
+                let mut inner = crate::audit::driver::navigation_audit(s, 20, &mut graph);
+                inner.extend(crate::audit::driver::navigation_keys_audit(s, 6));
+                inner
+            }));
             if restart_between {
                 if let Some(f) = do_restart(session, "navigation", "mouse") {
                     restarts += 1;
                     fs.push(f);
                 }
             }
-            fs.extend(tx(session, &|s| crate::audit::driver::mouse_audit(s, 8)));
-            fs.extend(crate::audit::driver::performance_audit(session, 5));
+            fs.extend(tx(session, &mut |s| {
+                crate::audit::driver::mouse_audit(s, 8)
+            }));
             if restart_between {
-                if let Some(f) = do_restart(session, "performance", "states") {
+                if let Some(f) = do_restart(session, "mouse", "states") {
                     restarts += 1;
                     fs.push(f);
                 }
             }
-            fs.extend(tx(session, &|s| crate::audit::driver::states_audit(s, 6)));
+            fs.extend(tx(session, &mut |s| {
+                crate::audit::driver::states_audit(s, 6)
+            }));
             if restart_between {
                 if let Some(f) = do_restart(session, "states", "errors") {
                     restarts += 1;
                     fs.push(f);
                 }
             }
-            fs.extend(tx(session, &|s| crate::audit::driver::errors_audit(s, 12)));
+            fs.extend(tx(session, &mut |s| {
+                crate::audit::driver::errors_audit(s, 12)
+            }));
+            fs.extend(tx(session, &mut |s| {
+                crate::audit::driver::performance_audit(s, 5)
+            }));
+            // Observational-only drivers: read rings/frames, send nothing —
+            // no transaction needed (their non-restoration is not residue).
             fs.extend(crate::audit::driver::color_audit(session));
             fs.extend(crate::audit::driver::terminal_modes_audit(session));
             fs.extend(crate::audit::driver::rendering_audit(session));
@@ -621,23 +645,27 @@ fn run_profile_with_contract_impl(
             }
             fs
         }
-        AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
-        AuditProfile::Focus => crate::audit::driver::focus_audit(session),
-        AuditProfile::Resize | AuditProfile::Layout => {
-            let mut fs = crate::audit::driver::resize_audit(session);
-            fs.extend(crate::audit::driver::resize_reflow_audit(session));
-            fs
-        }
-        AuditProfile::Clipping => crate::audit::driver::clipping_audit(session),
-        AuditProfile::Navigation => {
-            let mut fs = crate::audit::driver::navigation_audit(session, 20, &mut graph);
-            fs.extend(crate::audit::driver::navigation_keys_audit(session, 6));
-            fs
-        }
-        AuditProfile::Mouse => tx(session, &|s| crate::audit::driver::mouse_audit(s, 12)),
-        AuditProfile::Performance => crate::audit::driver::performance_audit(session, 7),
-        AuditProfile::States => tx(session, &|s| crate::audit::driver::states_audit(s, 10)),
-        AuditProfile::Errors => tx(session, &|s| crate::audit::driver::errors_audit(s, 15)),
+        AuditProfile::Keyboard => tx(session, &mut |s| {
+            crate::audit::driver::keyboard_audit(s, 20, &mut graph)
+        }),
+        AuditProfile::Focus => tx(session, &mut |s| crate::audit::driver::focus_audit(s)),
+        AuditProfile::Resize | AuditProfile::Layout => tx(session, &mut |s| {
+            let mut inner = crate::audit::driver::resize_audit(s);
+            inner.extend(crate::audit::driver::resize_reflow_audit(s));
+            inner
+        }),
+        AuditProfile::Clipping => tx(session, &mut |s| crate::audit::driver::clipping_audit(s)),
+        AuditProfile::Navigation => tx(session, &mut |s| {
+            let mut inner = crate::audit::driver::navigation_audit(s, 20, &mut graph);
+            inner.extend(crate::audit::driver::navigation_keys_audit(s, 6));
+            inner
+        }),
+        AuditProfile::Mouse => tx(session, &mut |s| crate::audit::driver::mouse_audit(s, 12)),
+        AuditProfile::Performance => tx(session, &mut |s| {
+            crate::audit::driver::performance_audit(s, 7)
+        }),
+        AuditProfile::States => tx(session, &mut |s| crate::audit::driver::states_audit(s, 10)),
+        AuditProfile::Errors => tx(session, &mut |s| crate::audit::driver::errors_audit(s, 15)),
         AuditProfile::Color => crate::audit::driver::color_audit(session),
         // Frame-level read of the raw ring: observes but sends nothing, so
         // it does not need a transaction (Wave G split, item 66).
@@ -866,7 +894,10 @@ mod tests {
             modes["mouse_press_release"], true,
             "DECSET 1000 must fold to on: {modes}"
         );
-        assert_eq!(modes["mouse_sgr_encoding"], true, "DECSET 1006 must fold to on");
+        assert_eq!(
+            modes["mouse_sgr_encoding"], true,
+            "DECSET 1006 must fold to on"
+        );
         assert!(
             report.findings.iter().any(|f| f.id == "MODE-MOUSE-HIDDEN"),
             "mouse negotiated with a plain print() screen = hidden affordances"
@@ -988,7 +1019,11 @@ mod tests {
             ids.contains(&"QR-CPR-PROBE"),
             "responder engine must produce the live CPR probe: {ids:?}"
         );
-        let inv = report.findings.iter().find(|f| f.id == "QR-INVENTORY").unwrap();
+        let inv = report
+            .findings
+            .iter()
+            .find(|f| f.id == "QR-INVENTORY")
+            .unwrap();
         let summary = &inv.summary;
         assert!(
             summary.contains("DA1") && summary.contains("DSR 6n"),
@@ -1017,12 +1052,13 @@ mod tests {
             .expect("actor run")
             .expect("query_response pipe");
         assert!(
+            report2.findings.iter().any(|f| f.id == "QR-NOSRC"),
+            "pipe engine has no responder and no ring — must say so: {:?}",
             report2
                 .findings
                 .iter()
-                .any(|f| f.id == "QR-NOSRC"),
-            "pipe engine has no responder and no ring — must say so: {:?}",
-            report2.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+                .map(|f| f.id.clone())
+                .collect::<Vec<_>>()
         );
         pool2.stop(&id2).await.ok();
     }
@@ -1034,10 +1070,27 @@ mod tests {
     #[test]
     fn every_profile_has_a_risk_class() {
         let profiles = [
-            "full", "keyboard", "focus", "resize", "layout", "clipping",
-            "discoverability", "navigation", "contract", "color", "performance",
-            "mouse", "states", "errors", "unicode", "controls", "terminal_modes",
-            "rendering", "input_protocol", "shell_cli", "lifecycle",
+            "full",
+            "keyboard",
+            "focus",
+            "resize",
+            "layout",
+            "clipping",
+            "discoverability",
+            "navigation",
+            "contract",
+            "color",
+            "performance",
+            "mouse",
+            "states",
+            "errors",
+            "unicode",
+            "controls",
+            "terminal_modes",
+            "rendering",
+            "input_protocol",
+            "shell_cli",
+            "lifecycle",
             "query_response",
         ];
         for name in profiles {
@@ -1158,13 +1211,13 @@ mod tests {
         assert!(
             restarts.len() >= 3,
             "mouse/states/errors gaps must each restart: {:?}",
-            restarts.iter().map(|f| f.summary.clone()).collect::<Vec<_>>()
+            restarts
+                .iter()
+                .map(|f| f.summary.clone())
+                .collect::<Vec<_>>()
         );
         assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.id == "ORCH-DEEP-SUMMARY"),
+            report.findings.iter().any(|f| f.id == "ORCH-DEEP-SUMMARY"),
             "the run summarizes its restart count"
         );
         pool.stop(&id).await.ok();
@@ -1231,5 +1284,75 @@ mod tests {
             .expect("run keyboard");
         assert_eq!(report.mode, "active");
         pool.stop(&id).await.ok();
+    }
+
+    /// Review P1 item 8 (audit transaction guarantees): every input-DRIVING
+    /// driver must be invoked through the audit transaction wrapper. This is
+    /// the mechanical gate — it reads this file's own source and fails if a
+    /// driving driver call appears bare (not inside `tx(...)`) inside the
+    /// dispatch. The observational drivers (color/terminal_modes/rendering/
+    /// input_protocol/shell_cli/lifecycle/query_response) are exempt: they
+    /// send nothing, so there is nothing to restore.
+    #[test]
+    fn driving_drivers_are_always_transaction_wrapped() {
+        let src = include_str!("orchestrator.rs");
+        // Slice to the dispatch: from the `tx` helper definition to the end
+        // of the active-findings match.
+        let start = src
+            .find("let active_findings = match profile {")
+            .expect("dispatch found");
+        let end = src[start..]
+            .find("_ => unreachable!")
+            .map(|e| start + e)
+            .expect("dispatch end");
+        let dispatch = &src[start..end];
+
+        let driving = [
+            "keyboard_audit",
+            "focus_audit",
+            "resize_audit",
+            "resize_reflow_audit",
+            "clipping_audit",
+            "navigation_audit",
+            "navigation_keys_audit",
+            "mouse_audit",
+            "performance_audit",
+            "states_audit",
+            "errors_audit",
+        ];
+        for driver in driving {
+            // Find each call site: `driver::NAME(`.
+            let mut idx = 0usize;
+            while let Some(rel) = dispatch[idx..].find(&format!("driver::{driver}(")) {
+                let site = idx + rel;
+                // The receiver argument tells wrapped from bare: a wrapped
+                // call runs inside the closure passed to `tx`, whose session
+                // parameter is named `s`; a bare call passes the outer
+                // `session` directly.
+                let call_start = site + format!("driver::{driver}").len();
+                let call_end = dispatch[call_start..]
+                    .find(')')
+                    .map(|e| call_start + e + 1)
+                    .unwrap_or(dispatch.len());
+                let call = &dispatch[site..call_end];
+                let first_arg = call
+                    .split('(')
+                    .nth(1)
+                    .unwrap_or("")
+                    .split(|c| c == ',' || c == ')')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                let wrapped = first_arg == "s";
+                assert!(
+                    wrapped,
+                    "driver `{}` invoked without an audit transaction (first arg \
+                     must be the closure's `s`, not the bare `session`):\n    {}",
+                    driver,
+                    call.trim()
+                );
+                idx = call_end;
+            }
+        }
     }
 }
