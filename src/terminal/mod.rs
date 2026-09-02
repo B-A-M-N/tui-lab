@@ -109,7 +109,7 @@ impl TerminalProfile {
     /// that's already supported.
     pub fn build(caps: Capabilities, evidence: &std::collections::HashMap<&'static str, String>) -> Self {
         // Per-capability: (id, name, flag, is_baseline, implications).
-        let rows: [(&'static str, &'static str, bool, bool, &'static str); 8] = [
+        let rows: [(&'static str, &'static str, bool, bool, &'static str); 9] = [
             (
                 "mouse",
                 "Mouse",
@@ -165,6 +165,13 @@ impl TerminalProfile {
                 cfg!(unix),
                 false,
                 "with it: ctrl+c / kill / SIGTERM are reliable; without: process teardown is best-effort",
+            ),
+            (
+                "protocol_capture",
+                "Raw protocol capture",
+                caps.protocol_capture,
+                false,
+                "with it: protocol-byte diagnosis is available; without (e.g. tmux attach): only rendered panes are observable",
             ),
         ];
 

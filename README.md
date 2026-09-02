@@ -104,11 +104,12 @@ honest `resource_not_found` errors naming what was accepted.
 
 ## MCP Tools
 
-14 tools over two resources surfaces (see "Run lifecycle" for `tui_run` and
-"MCP resources" for the `tui://` reads). The authoritative selector lists live
-in the capability registry (`tui_run action=context`) and the generated skill
-doc (`hermes-tui-lab skill`) — this section is prose, the registry is the
-contract.
+16 tools over two resources surfaces (see "Run lifecycle" for `tui_run` and
+"MCP resources" for the `tui://` reads; the count is registry-derived —
+`tui_run action=context` reports it, and a CI test pins the registry to the
+wire router. This prose is not the contract). The authoritative selector
+lists live in the capability registry and the generated skill doc —
+this section is prose, the registry is the contract.
 
 ### tui_session
 Manage TUI sessions: start, restart, stop, list, status, plus the human
@@ -367,7 +368,7 @@ integrated until the real MCP path can exercise it.
 | Semantic model | v3 (border graph + SemanticNode tree, modal layering, widget families, provenance-tracked enabled, OSC8 hyperlinks) |
 | Native semantic protocol | working (TUI_LAB_SEMANTIC NDJSON side-channel: app-declared trees overlay inference with source=native/confidence=1.0; adapters + `tui_framework action=adapter_snippet` for Ratatui/Textual/Python) |
 | Screen capture | working (SVG with style runs + PNG via dependency-free encoder; `tui_record format=svg\|png`) |
-| MCP surface | working (14 tools + tui:// resources, stdio E2E-proven; tool/resource docs generated from the capability registry) |
+| MCP surface | working (16 tools + tui:// resources, stdio E2E-proven; tool/resource docs generated from the capability registry, count pinned to the router by test) |
 | Human control lease | working (TTL grant, exclusive; every driving path refuses with control_leased, observation stays allowed) |
 | Isolation profiles | working (local/clean/strict with IsolationEvidence; strict wraps the child in unshare --net) |
 | Run lifecycle | working (ephemeral default, persist keeps identity, close, list, resume restores ledger/findings/checkpoints/scenarios/graphs — not sessions; tui://runs reads closed runs read-only) |

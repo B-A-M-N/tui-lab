@@ -25,6 +25,5 @@ pub mod screen;
 pub mod semantic;
 pub mod session;
 pub mod terminal;
-pub mod watch;
 
 pub const SKILL_DOC: &str = include_str!("../SKILL.md");

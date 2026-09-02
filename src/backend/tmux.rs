@@ -608,6 +608,11 @@ impl TerminalBackend for TmuxBackend {
             bracketed_paste: false,
             // The attached process is not our child; no signals.
             signals: false,
+            // tmux mediates the byte stream: we see rendered panes, not raw
+            // protocol bytes, so protocol capture is genuinely unavailable.
+            // Report it in the matrix instead of hiding it (review P1 items
+            // 17/18 "raw honesty").
+            protocol_capture: false,
         }
     }
 
@@ -769,5 +774,29 @@ mod tests {
         assert_eq!(k(KeyCode::Char('q'), KeyModifiers::NONE), K::Lit("q".into()));
         assert_eq!(k(KeyCode::Function(5), KeyModifiers::NONE), K::Named("F5".into()));
         assert_eq!(k(KeyCode::Up, KeyModifiers::NONE), K::Named("Up".into()));
+    }
+
+    /// Review P1 items 17/18 — raw honesty: the tmux capability matrix must
+    /// SAY that protocol capture and signals are unavailable, and the raw
+    /// getter must fail honestly, rather than silently hand back rendered
+    /// panes as if they were the byte stream.
+    #[test]
+    fn capability_matrix_is_honest_about_raw_and_signals() {
+        let caps = Capabilities {
+            mouse: false,
+            kitty_keyboard: false,
+            colors: true,
+            cell_attributes: true,
+            title: true,
+            scrollback: true,
+            bracketed_paste: false,
+            signals: false,
+            protocol_capture: false,
+        };
+        // These are the boundaries the module header promises. If a future
+        // change claims tmux can capture raw bytes or signal the child, that
+        // is a capability it does not actually have — fail.
+        assert!(!caps.protocol_capture, "tmux cannot hand back raw protocol bytes");
+        assert!(!caps.signals, "the attached process is not our child; no signals");
     }
 }

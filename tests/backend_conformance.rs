@@ -336,4 +336,11 @@ fn conformance_capabilities_honest_at_start() {
         !caps.mouse,
         "mouse must not be advertised unless the app negotiates it"
     );
+    // The portable engine backs this spawn and DOES retain the raw byte
+    // ring, so protocol capture is genuinely available up front (review P1
+    // items 17/18 raw honesty — never overclaim, never under-claim).
+    assert!(
+        caps.protocol_capture,
+        "portable engine must advertise raw protocol capture it actually provides"
+    );
 }

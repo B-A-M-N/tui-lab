@@ -723,6 +723,10 @@ impl TerminalBackend for PipeBackend {
             scrollback: true,
             bracketed_paste: false,
             signals: cfg!(unix),
+            // The pipe engine does not retain a raw byte ring
+            // (`recent_raw_output` stays on the trait default): nothing to
+            // capture, so say false rather than overclaim.
+            protocol_capture: false,
         }
     }
 

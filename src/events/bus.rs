@@ -223,8 +223,8 @@ impl EventBus {
     }
 
     /// Stamp a named marker/bookmark onto the timeline (review P1). Returns
-    /// the marker's global seq so a [`Watch`](crate::watch::WatchSpec) or later
-    /// analysis can reference this exact moment.
+    /// the marker's global seq so a later `since`/`of_source` analysis can
+    /// reference this exact moment.
     pub fn publish_marker(&mut self, session: &str, label: &str) -> u64 {
         self.publish(
             session,

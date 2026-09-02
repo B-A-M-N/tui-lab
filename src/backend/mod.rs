@@ -52,6 +52,14 @@ pub struct Capabilities {
     pub scrollback: bool,
     pub bracketed_paste: bool,
     pub signals: bool,
+    /// True when the backend can hand back the child's RAW protocol byte
+    /// stream (`recent_raw_output`). The tmux backend cannot — it sees
+    /// rendered panes, not the byte stream tmux mediates — and must say so
+    /// in its capability matrix rather than leave a caller to discover the
+    /// unavailability by calling and getting an error (review P1 items
+    /// 17/18 "raw honesty"). Portable/line backends that retain the raw
+    /// ring report true.
+    pub protocol_capture: bool,
 }
 
 impl Default for Capabilities {
@@ -65,6 +73,9 @@ impl Default for Capabilities {
             scrollback: false,      // promoted only when scrollback rows are actually captured
             bracketed_paste: false, // reported true once we can see the negotiation
             signals: cfg!(unix),    // arbitrary POSIX signals require killpg (Unix only)
+            // Conservative: promoted true only by backends that genuinely
+            // retain the raw ring. The default profile makes no claim.
+            protocol_capture: false,
         }
     }
 }
