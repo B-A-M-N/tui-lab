@@ -385,10 +385,6 @@ pub fn run_assertion_fused(
             // arithmetic nor panic on a non-char-boundary.
             match (&p.text, p.x, p.y) {
                 (Some(t), Some(x), Some(y)) => {
-                    let (x, y) = (
-                        u16::try_from(x).unwrap_or(u16::MAX),
-                        u16::try_from(y).unwrap_or(u16::MAX),
-                    );
                     let ok = screen.match_text_at(x, y, t);
                     // Diagnostic: the row's glyphs in column space (safe for
                     // any content and any coordinate). Uses the same cell
