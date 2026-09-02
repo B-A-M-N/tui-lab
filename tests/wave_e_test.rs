@@ -418,7 +418,7 @@ fn coverage_event_with_identity_attests_source_locus() {
     // Item 41: record_coverage_event_with_identity joins the app's own
     // locus; the ledger entry carries it and feeds the finding enricher.
     let mut run = tui_lab::run::RunContext::ephemeral();
-    run.record_coverage_event_with_identity(
+    let _ = run.record_coverage_event_with_identity(
         "s1",
         "#save.activate",
         tui_lab::semantic::SourceRef {
@@ -431,7 +431,7 @@ fn coverage_event_with_identity_attests_source_locus() {
             source: "native".into(),
         },
     );
-    run.record_coverage_event("s1", "#save.activate"); // plain hits still fold
+    let _ = run.record_coverage_event("s1", "#save.activate"); // plain hits still fold
     let entry = run.coverage_ledger.get("#save.activate").expect("entry");
     assert_eq!(entry.hits, 2);
     assert_eq!(entry.source_refs.len(), 1, "deduped by location");

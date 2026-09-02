@@ -868,14 +868,14 @@ fn frame_records_are_hot_queryable_and_bounded() {
     );
     f1.state.structure_hash = "w6-a".into();
     f1.state.visual_hash = "v-w6-a".into();
-    let id1 = run.commit_frame(&mut f1, Some("w6-sess"));
+    let id1 = run.commit_frame(&mut f1, Some("w6-sess")).expect("commit");
     let mut f2 = tui_lab::backend::CanonicalFrame::new(
         tui_lab::screen::ScreenState::new(80, 24),
         2,
         11,
     );
     f2.state.structure_hash = "w6-b".into();
-    let id2 = run.commit_frame(&mut f2, Some("w6-sess"));
+    let id2 = run.commit_frame(&mut f2, Some("w6-sess")).expect("commit");
 
     let r1 = run.frame_record(id1).expect("hot record for frame 1");
     assert_eq!(r1.session.as_deref(), Some("w6-sess"));
@@ -895,7 +895,7 @@ fn frame_records_are_hot_queryable_and_bounded() {
             0,
         );
         f.state.structure_hash = format!("w6-overflow-{i}");
-        run.commit_frame(&mut f, None);
+        run.commit_frame(&mut f, None).expect("commit");
     }
     assert!(
         run.frame_hot_evicted() >= 10,

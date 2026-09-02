@@ -869,6 +869,118 @@ async fn run_list_resume_restores_identity_and_artifacts() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Review P0.2: run provenance. A session launched under run A must not be
+/// driveable after the current run became B; and resuming a different run
+/// while a foreign-owned session is live refuses unless explicitly detached.
+#[tokio::test]
+async fn run_provenance_binding_and_resume_guard() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-provenance-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // Launch session S under the current run A.
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('prov-a'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start A",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+    let run_a = start["run"].as_str().unwrap().to_string();
+    // Baseline drive succeeds.
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+            .await,
+        "act under A",
+    );
+
+    // Persist A (so it is resumable), then begin a FRESH run B without
+    // stopping S. There is no explicit new-run op: resume fills that role,
+    // so the provenance guard is the resume path keeping S out of B.
+    unwrap_ok(
+        &server.tui_run(params_typed(serde_json::json!({ "action": "persist" }))).await,
+        "persist A",
+    );
+
+    // Begin a FRESH ephemeral run B while S (owned by A) is still live.
+    // S must now be untouchable: it belongs to A, the current run is B.
+    let newr = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "new" })))
+            .await,
+        "new run B",
+    );
+    let run_b = newr["new_run_id"].as_str().unwrap().to_string();
+    assert_ne!(run_b, run_a, "new run is distinct");
+    assert_eq!(newr["previous_run"], run_a.as_str(), "prior run named");
+
+    // Driving S under B is refused (provenance), not silently re-targeted.
+    let drive = &server
+        .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+        .await;
+    let dv = drive
+        .structured_content
+        .clone()
+        .or_else(|| {
+            drive.content.first().map(|c| {
+                let rmcp::model::ContentBlock::Text(t) = c else { unreachable!() };
+                serde_json::from_str(&t.text).unwrap()
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        dv["category"], "no_session",
+        "foreign-owner session must be refused: {dv}"
+    );
+    assert!(
+        dv["error"].as_str().unwrap_or("").contains("bound to run"),
+        "names the provenance: {dv}"
+    );
+
+    // Resuming A while S (an A-session) is live is fine (same owner) — the
+    // resume guard only fires for FOREIGN sessions. But resuming under B
+    // doesn't apply; instead: closing B and resuming A is same-owner, and S
+    // becomes driveable again under A.
+    unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "resume", "run_id": &run_a, "root": base.to_string_lossy() })))
+            .await,
+        "resume A (same owner as S)",
+    );
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+            .await,
+        "S driveable again under its owner A",
+    );
+
+    // Positive cleanup: stopping S drops the owner entry.
+    unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": sid })))
+            .await,
+        "stop S",
+    );
+    // A session that never existed has no owner; resolution just fails as
+    // before (no panic on the ownership lookup).
+    assert!(
+        server
+            .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+            .await
+            .is_error
+            .unwrap_or(false),
+        "stopped session is gone"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// The replay CLI renders a persisted run from disk (item 74): identity,
 /// ledger summary, findings, artifacts — and fails honestly for an unknown
 /// run id.

@@ -75,34 +75,52 @@ impl CellString {
         Self::from_text(&text.into())
     }
 
-    /// Build from arbitrary text, measuring each char's display width: a
-    /// wide char claims a continuation slot, a zero-width char attaches to
-    /// the previous slot as part of its text.
+    /// Build from arbitrary text, grouping it the way a terminal fills
+    /// cells: each base char starts one cell, and following zero-width
+    /// chars (combining marks, ZWJ joiners) ride that cell — vt100 stores
+    /// a cell as "one base char + zero-width chars", so a ZWJ family emoji
+    /// is ONE cell holding the whole sequence. Slot width comes from the
+    /// GROUP's total display width, so `👨‍👩‍👧‍👦` claims 2 columns,
+    /// not 8.
     pub fn from_text(text: &str) -> Self {
         let mut slots: Vec<CellSlot> = Vec::new();
         let mut col: u16 = 0;
+        let mut group = String::new();
+        let mut group_col = 0u16;
         for ch in text.chars() {
             let w = ch.width().unwrap_or(0);
-            if w == 0 {
-                // Combining mark / zero-width: lives inside the previous
-                // cell's text, or is dropped when it leads the row.
-                if let Some(last) = slots.last_mut() {
-                    last.text.push(ch);
-                }
+            if w == 0 && !group.is_empty() {
+                // Combining mark / ZWJ: extends the current cell.
+                group.push(ch);
                 continue;
             }
-            let continuation = (w as u16).saturating_sub(1);
+            // A new base char flushes the previous group.
+            if !group.is_empty() {
+                let continuation =
+                    (group.width() as u16).saturating_sub(1);
+                slots.push(CellSlot {
+                    col: group_col,
+                    text: std::mem::take(&mut group),
+                    continuation,
+                });
+                col = group_col + 1 + continuation;
+            }
+            if w == 0 {
+                // Leading zero-width char with nothing to attach to: dropped,
+                // matching the old behavior.
+                continue;
+            }
+            group_col = col;
+            group.push(ch);
+        }
+        if !group.is_empty() {
+            let continuation = (group.width() as u16).saturating_sub(1);
             slots.push(CellSlot {
-                col,
-                text: ch.to_string(),
+                col: group_col,
+                text: group,
                 continuation,
             });
-            col += w as u16;
-            // Wide glyph: the continuation column belongs to the same glyph.
-            if continuation > 0 {
-                // Represented by the slot's `continuation` field — no extra
-                // slot is emitted, keeping slots column-addressable.
-            }
+            col = group_col + 1 + continuation;
         }
         let cols = col;
         CellString { slots, cols }

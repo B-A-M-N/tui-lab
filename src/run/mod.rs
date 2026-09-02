@@ -465,6 +465,12 @@ impl RunContext {
         let mut out: Vec<(u64, serde_json::Value)> = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
+            // A missing runs directory means "no persisted runs yet" — an
+            // empty list, not a failure (the reviewer-facing semantic is
+            // "nothing here", not "the tool is broken").
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "cannot read runs directory {}: {e}",
@@ -834,12 +840,14 @@ impl RunContext {
         session_id: &str,
         generation: u32,
         params: serde_json::Value,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         for r in self.recorders.values_mut() {
             if r.matches(session_id, generation) {
                 r.record_act(params.clone());
             }
         }
+        Ok(())
     }
 
     /// Record a SENSITIVE act step into matching session-generation
@@ -854,12 +862,14 @@ impl RunContext {
         payload_field: &str,
         kind: crate::scenario::model::SensitiveKind,
         byte_len: usize,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         for r in self.recorders.values_mut() {
             if r.matches(session_id, generation) {
                 r.record_act_sensitive(action_params.clone(), payload_field, kind, byte_len);
             }
         }
+        Ok(())
     }
 
     /// Record a wait step into matching session-generation recordings.
@@ -868,12 +878,14 @@ impl RunContext {
         session_id: &str,
         generation: u32,
         params: serde_json::Value,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         for r in self.recorders.values_mut() {
             if r.matches(session_id, generation) {
                 r.record_wait(params.clone());
             }
         }
+        Ok(())
     }
 
     /// Record an assert step into matching session-generation recordings.
@@ -882,12 +894,14 @@ impl RunContext {
         session_id: &str,
         generation: u32,
         params: serde_json::Value,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         for r in self.recorders.values_mut() {
             if r.matches(session_id, generation) {
                 r.record_assert(params.clone());
             }
         }
+        Ok(())
     }
 
     /// Finish a recording by id: returns the completed scenario and stops
@@ -1115,12 +1129,14 @@ impl RunContext {
     }
 
     /// Append findings from an audit pass (typed; audit item 60's foundation).
-    pub fn extend_findings(&mut self, findings: Vec<crate::audit::Finding>) {
+    pub fn extend_findings(&mut self, findings: Vec<crate::audit::Finding>) -> anyhow::Result<()> {
+        self.ensure_open()?;
         // Instance-unique ids (re-review P1 item 31): rule stays in
         // `rule_id`, the instance id gains a stable (rule, target)
         // discriminator, so two findings from one rule can never collide.
         self.findings
             .extend(findings.into_iter().map(|f| f.instance()));
+        Ok(())
     }
 
     /// Ingest findings, attaching probable source loci (W2.10) where the
@@ -1130,7 +1146,11 @@ impl RunContext {
     /// us both facts, so joining them is app-attested evidence, not
     /// inference. Findings whose evidence names no covered control keep
     /// `source_refs` empty — a locus is carried, never guessed.
-    pub fn extend_findings_with_source_refs(&mut self, findings: Vec<crate::audit::Finding>) {
+    pub fn extend_findings_with_source_refs(
+        &mut self,
+        findings: Vec<crate::audit::Finding>,
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         // Coverage targets that are real file loci.
         let file_targets: Vec<&String> = self
             .coverage_ledger
@@ -1139,7 +1159,7 @@ impl RunContext {
             .collect();
         if file_targets.is_empty() {
             self.findings.extend(findings);
-            return;
+            return Ok(());
         }
         // Widget-ish targets (widget:<id>, #id, bare id) → the app declared
         // coverage for that component in the same channel.
@@ -1178,6 +1198,7 @@ impl RunContext {
             }
         }
         self.findings.extend(enriched);
+        Ok(())
     }
 
     /// Findings accumulated in this run.
@@ -1329,9 +1350,10 @@ impl RunContext {
     /// Wave F item 64: fold one native coverage event into the ledger.
     /// Target strings are app-declared (`src/main.rs:42`, `#save.activate`);
     /// the ledger only counts and correlates, never interprets.
-    pub fn record_coverage_event(&mut self, session: &str, target: &str) {
+    pub fn record_coverage_event(&mut self, session: &str, target: &str) -> anyhow::Result<()> {
+        self.ensure_open()?;
         if target.is_empty() {
-            return;
+            return Ok(());
         }
         let now = now_ms();
         let entry = self
@@ -1349,6 +1371,7 @@ impl RunContext {
         if !entry.sessions.iter().any(|s| s == session) {
             entry.sessions.push(session.to_string());
         }
+        Ok(())
     }
 
     /// Wave 5 item 41: fold one coverage event WITH the declaring
@@ -1362,10 +1385,10 @@ impl RunContext {
         session: &str,
         target: &str,
         source_ref: crate::semantic::source_ref::SourceRef,
-    ) {
-        self.record_coverage_event(session, target);
+    ) -> anyhow::Result<()> {
+        self.record_coverage_event(session, target)?;
         let Some(entry) = self.coverage_ledger.get_mut(target) else {
-            return;
+            return Ok(());
         };
         if !entry
             .source_refs
@@ -1374,6 +1397,7 @@ impl RunContext {
         {
             entry.source_refs.push(source_ref);
         }
+        Ok(())
     }
 
     /// Coverage ingestion from a raw native-event batch. Kept for tests and
@@ -1391,7 +1415,7 @@ impl RunContext {
         let mut n = 0;
         for ev in events {
             if ev.event == "coverage" {
-                self.record_coverage_event(session, &ev.target);
+                let _ = self.record_coverage_event(session, &ev.target);
                 n += 1;
             }
         }
@@ -1413,7 +1437,7 @@ impl RunContext {
         for ev in events.get(cursor..).unwrap_or(&[]) {
             if let crate::events::TerminalEventKind::NativeEvent { event, target } = &ev.kind {
                 if event == "coverage" {
-                    self.record_coverage_event(session, target);
+                    let _ = self.record_coverage_event(session, target);
                 }
             }
             cursor += 1;
@@ -1500,6 +1524,29 @@ impl RunContext {
         self.closed
     }
 
+    /// Refuse mutation on a closed run (review P0.1). A closed run is an
+    /// evidence bundle: post-close traffic from still-live sessions must
+    /// never land in it, or "closed" stops meaning final. Read paths
+    /// (replay, status, ledger) stay available on closed runs.
+    fn ensure_open(&self) -> anyhow::Result<()> {
+        if self.closed {
+            anyhow::bail!(
+                "current run {} is closed; create or resume an open run before recording evidence",
+                self.id
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-open a closed run so it accepts driving and evidence again. This
+    /// is the `tui_run resume` path: resuming a persisted run is the
+    /// designated way to make it live once more (review P0.1). A persisted
+    /// run that was closed on disk stays durable; reopen only flips the
+    /// in-memory gate so the resumed session can drive it.
+    pub fn reopen(&mut self) {
+        self.closed = false;
+    }
+
     /// Count one observation/wait event.
     pub fn bump_event(&mut self) {
         self.event_count += 1;
@@ -1523,7 +1570,8 @@ impl RunContext {
         &mut self,
         session: &str,
         tx: &crate::execution::InteractionTransaction,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         let seq = self.transaction_count;
         self.transaction_count += 1;
         let mut record = TransactionRecord::from_interaction(seq, session, tx);
@@ -1559,6 +1607,7 @@ impl RunContext {
                 ));
             }
         }
+        Ok(())
     }
 
     /// Record a non-frame interaction (wait/observe) at evidence level.
@@ -1567,7 +1616,8 @@ impl RunContext {
     /// and the old hardcoded `settled: true` (with empty hashes) was a lie.
     /// Same bounding + declared eviction as [`Self::record_interaction`]
     /// (P0 fix 5) — one bounded path, not one bounded and one unbounded.
-    pub fn record_event(&mut self, session: &str, action: &str) {
+    pub fn record_event(&mut self, session: &str, action: &str) -> anyhow::Result<()> {
+        self.ensure_open()?;
         let seq = self.transaction_count;
         self.transaction_count += 1;
         self.push_ledger(TransactionRecord {
@@ -1586,6 +1636,7 @@ impl RunContext {
             persisted_action: None,
             render: None,
         });
+        Ok(())
     }
 
     /// Shared bounded push with declared eviction (P0 fix 5).
@@ -1812,7 +1863,7 @@ impl RunContext {
                 Some(body.len() as u64),
                 Some(session),
                 format!("terminal event log, {} events", events.len()),
-            );
+            )?;
         }
         // Recordings held in memory (stopped while ephemeral).
         let rec_dir = dir.join("recordings");
@@ -1841,7 +1892,7 @@ impl RunContext {
                         Some(body.len() as u64),
                         None,
                         format!("screen capture ({format} format)"),
-                    );
+                    )?;
                 }
                 Err(_) => still_held_caps.push((name, body, format)),
             }
@@ -1990,7 +2041,8 @@ impl RunContext {
         &mut self,
         frame: &mut crate::backend::CanonicalFrame,
         session: Option<&str>,
-    ) -> u64 {
+    ) -> anyhow::Result<u64> {
+        self.ensure_open()?;
         let started = std::time::Instant::now();
         let id = self.register_frame(frame);
         if frame.session_id.is_none() {
@@ -2044,7 +2096,7 @@ impl RunContext {
                 Err(_) => self.persistence_unhealthy = true,
             }
         }
-        id
+        Ok(id)
     }
 
     /// Hold one session's drained terminal events for persistence (Wave B
@@ -2055,16 +2107,21 @@ impl RunContext {
     /// batch — so a crash loses at most the batch in flight, never the
     /// whole session history. `flush` then only handles the ephemeral-run
     /// backlog (whole-file write at close, the old contract).
-    pub fn hold_events(&mut self, session: &str, events: Vec<crate::events::TerminalEvent>) {
+    pub fn hold_events(
+        &mut self,
+        session: &str,
+        events: Vec<crate::events::TerminalEvent>,
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
         if events.is_empty() {
-            return;
+            return Ok(());
         }
         if let Some(dir) = self.run_dir.as_ref() {
             let ev_dir = dir.join("events");
             if std::fs::create_dir_all(&ev_dir).is_err() {
                 self.persistence_unhealthy = true;
                 self.held_events.push((session.to_string(), events));
-                return;
+                return Ok(());
             }
             let safe = sanitize(session);
             let path = ev_dir.join(format!("{}.jsonl", safe));
@@ -2095,10 +2152,11 @@ impl RunContext {
                             None,
                             Some(session.to_string()),
                             "terminal event log (incrementally persisted)",
-                        );
+                        )
+                        .ok();
                     }
                     self.event_count += events.len() as u64;
-                    return;
+                    return Ok(());
                 }
                 Err(_) => {
                     self.persistence_unhealthy = true;
@@ -2107,6 +2165,7 @@ impl RunContext {
             }
         }
         self.held_events.push((session.to_string(), events));
+        Ok(())
     }
 
     /// Register a produced artifact and get its typed ref (Wave B item 15).
@@ -2117,7 +2176,8 @@ impl RunContext {
         size: Option<u64>,
         session: Option<String>,
         summary: impl Into<String>,
-    ) -> ArtifactRef {
+    ) -> anyhow::Result<ArtifactRef> {
+        self.ensure_open()?;
         let n = self.artifacts.len() + 1;
         let r = ArtifactRef {
             id: format!("art-{}", n),
@@ -2128,7 +2188,7 @@ impl RunContext {
             summary: summary.into(),
         };
         self.artifacts.push(r.clone());
-        r
+        Ok(r)
     }
 
     /// All artifacts registered in this run.
@@ -2308,18 +2368,18 @@ mod tests {
         let id2 = run.begin_scenario_recording("demo", "sess-B", 1);
         assert_ne!(id1, id2);
         // Traffic for sess-A gen 1 lands ONLY in the sess-A recording.
-        run.record_scenario_act(
+        let _ = run.record_scenario_act(
             "sess-A",
             1,
             serde_json::json!({"action": "key", "key": "enter"}),
         );
-        run.record_scenario_assert(
+        let _ = run.record_scenario_assert(
             "sess-A",
             1,
             serde_json::json!({"assertion": "text", "text": "OK"}),
         );
         // sess-B's traffic never lands in sess-A's recording.
-        run.record_scenario_act(
+        let _ = run.record_scenario_act(
             "sess-B",
             1,
             serde_json::json!({"action": "key", "key": "escape"}),
@@ -2330,7 +2390,7 @@ mod tests {
         assert_eq!(b.step_count(), 1, "sess-B recording: {:?}", b.steps);
         // A stale generation (after restart) must not absorb traffic either.
         let id3 = run.begin_scenario_recording("stale", "sess-A", 2);
-        run.record_scenario_act(
+        let _ = run.record_scenario_act(
             "sess-A",
             7,
             serde_json::json!({"action": "key", "key": "enter"}),
@@ -2374,8 +2434,8 @@ mod tests {
         )
         .expect("execute");
 
-        run.record_interaction("ledger-sess", &tx);
-        run.record_event("ledger-sess", "wait");
+        let _ = run.record_interaction("ledger-sess", &tx);
+        let _ = run.record_event("ledger-sess", "wait");
 
         assert_eq!(run.transaction_total(), 2);
         let ledger = run.transactions();
@@ -2408,13 +2468,13 @@ mod tests {
         // the watermark instead of assuming synchronous append (the old
         // blocking append on the driving path is exactly what the
         // run-journal-writer audit item removed).
-        run.record_event("s1", "wait");
+        let _ = run.record_event("s1", "wait");
         let path = run.run_dir().expect("dir").join("transactions.jsonl");
         run.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(&path).expect("ledger exists pre-flush");
         assert_eq!(body.lines().count(), 1, "appended: {body}");
 
-        run.record_event("s1", "wait");
+        let _ = run.record_event("s1", "wait");
         run.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(&path).expect("reread");
         assert_eq!(body.lines().count(), 2, "second append: {body}");
@@ -2451,25 +2511,29 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut run = RunContext::persistent(tmp.path()).expect("run");
         let rel = std::path::PathBuf::from("recordings").join("s1-1.cast");
-        let a = run.register_artifact(
-            ArtifactKind::Recording,
-            Some(rel.clone()),
-            Some(123),
-            Some("s1".into()),
-            "test recording",
-        );
+        let a = run
+            .register_artifact(
+                ArtifactKind::Recording,
+                Some(rel.clone()),
+                Some(123),
+                Some("s1".into()),
+                "test recording",
+            )
+            .expect("register");
         assert_eq!(a.id, "art-1");
         assert_eq!(a.cite(), "art-1:recording");
         assert_eq!(run.artifacts().len(), 1);
 
         // Ephemeral registration (no path) still gets a ref.
-        let b = run.register_artifact(
-            ArtifactKind::EventLog,
-            None,
-            Some(456),
-            Some("s2".into()),
-            "held events",
-        );
+        let b = run
+            .register_artifact(
+                ArtifactKind::EventLog,
+                None,
+                Some(456),
+                Some("s2".into()),
+                "held events",
+            )
+            .expect("register");
         assert_eq!(b.id, "art-2");
         assert!(b.path.is_none());
 
@@ -2510,7 +2574,7 @@ mod tests {
             "first observation emits ProcessStarted"
         );
 
-        run.hold_events("ev-sess", drained);
+        let _ = run.hold_events("ev-sess", drained);
         run.flush().expect("flush");
         let log = std::fs::read_to_string(
             run.run_dir()
@@ -2546,7 +2610,7 @@ mod tests {
             generation: 0,
             kind: crate::events::TerminalEventKind::Bell,
         };
-        run.hold_events("incr-sess", vec![ev.clone(), ev.clone()]);
+        let _ = run.hold_events("incr-sess", vec![ev.clone(), ev.clone()]);
         // The batch must already be on disk (incremental, not held).
         assert!(
             run.held_events.is_empty(),
@@ -2571,7 +2635,7 @@ mod tests {
 
         // An ephemeral run keeps the old hold-for-flush contract.
         let mut eph = RunContext::ephemeral();
-        eph.hold_events("eph-sess", vec![ev.clone()]);
+        let _ = eph.hold_events("eph-sess", vec![ev.clone()]);
         assert_eq!(eph.held_events.len(), 1, "ephemeral holds for flush");
         assert_eq!(eph.counts()["events_held_for_flush"], 1);
     }
@@ -2604,7 +2668,7 @@ mod tests {
             let from = run.event_cursor(&cursor_key).unwrap_or(0);
             let batch = s.events_since(from);
             if !batch.events.is_empty() {
-                run.hold_events(&s.id, batch.events);
+                let _ = run.hold_events(&s.id, batch.events);
                 run.set_event_cursor(&cursor_key, batch.cursor);
             }
         };
@@ -2641,7 +2705,7 @@ mod tests {
             3,
             9,
         );
-        let id = run.commit_frame(&mut f, Some("cf-sess"));
+        let id = run.commit_frame(&mut f, Some("cf-sess")).expect("commit");
         assert_eq!(id, 1, "first committed frame gets id 1");
         assert_eq!(f.frame_id, Some(1));
         assert_eq!(f.run_id.as_deref(), Some(run.id.as_str()));
@@ -2659,7 +2723,11 @@ mod tests {
 
         let mut g =
             crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 4, 10);
-        assert_eq!(run.commit_frame(&mut g, Some("cf-sess")), 2, "ids monotonically increase");
+        assert_eq!(
+            run.commit_frame(&mut g, Some("cf-sess")).expect("commit"),
+            2,
+            "ids monotonically increase"
+        );
     }
 
     #[test]
@@ -2859,7 +2927,7 @@ mod tests {
             false,
         )
         .expect("execute");
-        run.record_interaction("fg-tx", &tx);
+        let _ = run.record_interaction("fg-tx", &tx);
 
         // The graph has at least one driven edge tagged with the EXACT
         // action identity (re-review P0): a Right keypress reads `right`,
@@ -2901,8 +2969,8 @@ mod tests {
             "sess-fix",
             crate::session::state::LaunchSpec::new("python3", 90, 26),
         );
-        run.record_event("sess-fix", "wait");
-        run.extend_findings(vec![crate::audit::Finding {
+        let _ = run.record_event("sess-fix", "wait");
+        let _ = run.extend_findings(vec![crate::audit::Finding {
             id: "RESTORE-ME".into(),
             rule_id: None,
             severity: "warn".into(),
@@ -3006,7 +3074,7 @@ mod tests {
         let run_id = root.file_name().unwrap().to_string_lossy().to_string();
 
         let mut restored = RunContext::restore(&root).expect("restore");
-        restored.record_event("sess-fix", "wait");
+        let _ = restored.record_event("sess-fix", "wait");
         // The new record streams through the journal writer to the SAME
         // ledger file (id preserved, no fork into a new run dir) — drain
         // before reading (the writer is asynchronous by design).
@@ -3105,6 +3173,83 @@ mod tests {
         assert!(restored.is_closed(), "closed flag is durable");
         assert_eq!(restored.status(Vec::new())["closed"], true);
     }
+
+    /// Review P0.1 regression: a closed run is a sealed evidence bundle.
+    /// Post-close traffic from still-live sessions must be REJECTED, not
+    /// silently absorbed — `tui_run close` can leave sessions running, and
+    /// a "closed" run that keeps growing was the defect.
+    #[test]
+    fn closed_run_rejects_all_mutation() {
+        let mut run = RunContext::ephemeral();
+        let screen = crate::screen::ScreenState::new(80, 24);
+        let mut frame = crate::backend::CanonicalFrame::new(screen.clone(), 1, 1);
+
+        run.close().expect("close");
+        assert!(run.is_closed());
+
+        // Every mutating surface refuses once closed.
+        let after = crate::screen::ScreenState::new(80, 24);
+        let tx = crate::execution::InteractionTransaction {
+            action: crate::execution::ActionEnvelope::new(
+                crate::execution::CanonicalAction::Type { text: "x".into() },
+                crate::execution::InputVisibility::Normal,
+            ),
+            anchor: crate::execution::ObservationAnchor::default(),
+            before_frame: crate::backend::CanonicalFrame::new(screen.clone(), 1, 1),
+            after_frame: crate::backend::CanonicalFrame::new(after.clone(), 1, 2),
+            settle: crate::execution::SettleStatus::Skipped,
+            transition: crate::screen::diff::diff(&screen, &after),
+            capture: None,
+            focus_before: None,
+            focus_after: None,
+            elapsed_ms: 0,
+            send_ms: 0,
+            settle_ms: 0,
+            render: None,
+        };
+        assert!(run.record_interaction("s", &tx).is_err());
+        assert!(run.record_event("s", "wait").is_err());
+        assert!(run.commit_frame(&mut frame, Some("s")).is_err());
+        assert!(run
+            .record_scenario_act("s", 0, serde_json::json!({}))
+            .is_err());
+        assert!(run.record_scenario_wait("s", 0, serde_json::json!({})).is_err());
+        assert!(run
+            .record_scenario_assert("s", 0, serde_json::json!({}))
+            .is_err());
+        assert!(run.record_coverage_event("s", "#save").is_err());
+        assert!(run.hold_events("s", Vec::new()).is_err());
+        assert!(run
+            .register_artifact(
+                ArtifactKind::Capture,
+                None,
+                None,
+                None,
+                "post-close"
+            )
+            .is_err());
+        assert!(run.extend_findings(Vec::new()).is_err());
+        assert!(run.extend_findings_with_source_refs(Vec::new()).is_err());
+
+        // And nothing actually landed.
+        assert_eq!(run.transaction_count, 0, "no post-close ledger entries");
+        assert_eq!(run.next_frame_id, 0, "no post-close frames");
+        assert!(run.findings().is_empty(), "no post-close findings");
+        assert!(run.artifacts().is_empty(), "no post-close artifacts");
+        assert!(run.coverage_ledger.is_empty(), "no post-close coverage");
+    }
+
+    /// The error names the run and the remedy (the agent-facing message).
+    #[test]
+    fn ensure_open_error_is_actionable() {
+        let mut run = RunContext::ephemeral();
+        run.close().expect("close");
+        let e = run.record_event("s", "wait").expect_err("closed");
+        let msg = format!("{e:#}");
+        assert!(msg.contains(&run.id), "names the run: {msg}");
+        assert!(msg.contains("closed"), ": {msg}");
+        assert!(msg.contains("resume"), "names the remedy: {msg}");
+    }
 }
 
 // W2.10 unit checks for the coverage→SourceRef join.
@@ -3169,9 +3314,9 @@ mod source_ref_tests {
     #[test]
     fn findings_get_app_declared_loci_when_control_is_covered() {
         let mut run = RunContext::ephemeral();
-        run.record_coverage_event("s1", "src/ui/settings.rs:184");
-        run.record_coverage_event("s1", "widget:#save.activate");
-        run.extend_findings_with_source_refs(vec![finding_pointing_at("button/save/40,12")]);
+        let _ = run.record_coverage_event("s1", "src/ui/settings.rs:184");
+        let _ = run.record_coverage_event("s1", "widget:#save.activate");
+        let _ = run.extend_findings_with_source_refs(vec![finding_pointing_at("button/save/40,12")]);
         let f = run.findings().last().unwrap();
         assert!(
             !f.source_refs.is_empty(),
@@ -3179,7 +3324,7 @@ mod source_ref_tests {
         );
         assert!(f.source_refs[0].is_actionable());
         // An uncovered control carries no locus — never guessed.
-        run.extend_findings_with_source_refs(vec![finding_pointing_at("button/other/1,1")]);
+        let _ = run.extend_findings_with_source_refs(vec![finding_pointing_at("button/other/1,1")]);
         let f2 = run.findings().last().unwrap();
         assert!(f2.source_refs.is_empty(), "no locus without coverage");
     }
