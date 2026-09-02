@@ -84,6 +84,54 @@ impl Role {
         let s = format!("{:?}", self).to_lowercase();
         s
     }
+
+    /// The unified control projection (re-review item 36): every Role
+    /// projects onto exactly one [`ControlKind`] — or `None` for roles
+    /// that are structure/annotation, not interactive controls. This is
+    /// the ONE mapping; `kind_from_slug` on the native path, the intent
+    /// resolver's `kind_role_slug`, and any future flat-shape consumer
+    /// derive from here so a role can never disagree with its own
+    /// control classification.
+    pub fn control_kind(&self) -> Option<crate::semantic::controls::ControlKind> {
+        use crate::semantic::controls::ControlKind as K;
+        Some(match self {
+            Role::Button => K::Button,
+            Role::Field | Role::TextArea => K::Field,
+            Role::Checkbox => K::Checkbox,
+            Role::Radio => K::Radio,
+            Role::Tab => K::Tab,
+            Role::List | Role::ListItem | Role::Select | Role::Dropdown => K::List,
+            Role::Menu | Role::MenuItem => K::MenuItem,
+            Role::Status => K::Status,
+            Role::Progress => K::Progress,
+            Role::Spinner => K::Spinner,
+            Role::Label => K::Label,
+            // Structure and annotation roles are not controls.
+            Role::Screen
+            | Role::Dialog
+            | Role::Panel
+            | Role::Toolbar
+            | Role::Footer
+            | Role::StatusLayer
+            | Role::Overlay
+            | Role::Table
+            | Role::TableHeader
+            | Role::TableRow
+            | Role::TableCell
+            | Role::Tree
+            | Role::TreeItem
+            | Role::ScrollableRegion
+            | Role::CommandPalette
+            | Role::SplitPane
+            | Role::Toast
+            | Role::Alert
+            | Role::Validation
+            | Role::Hyperlink
+            | Role::HelpOverlay
+            | Role::KeyHint
+            | Role::Unknown => return None,
+        })
+    }
 }
 
 /// Layer assignment (item 27): which interaction plane a subtree occupies.
@@ -502,5 +550,42 @@ mod tests {
         };
         assert!(e.at_start(), "no up content → at start");
         assert!(!e.at_end(), "down content → not at end");
+    }
+
+    /// Re-review item 36: the unified role→control projection. Every
+    /// interactive role projects onto its control kind; structure roles
+    /// project to None (they are not clickable things).
+    #[test]
+    fn control_kind_projection_is_total_and_total() {
+        use crate::semantic::controls::ControlKind as K;
+        assert_eq!(Role::Button.control_kind(), Some(K::Button));
+        assert_eq!(Role::TextArea.control_kind(), Some(K::Field));
+        assert_eq!(Role::Dropdown.control_kind(), Some(K::List));
+        assert_eq!(Role::MenuItem.control_kind(), Some(K::MenuItem));
+        // Structure is NOT a control.
+        assert_eq!(Role::Dialog.control_kind(), None);
+        assert_eq!(Role::Table.control_kind(), None);
+        assert_eq!(Role::Unknown.control_kind(), None);
+    }
+
+    /// The native slug path and the unified projection agree: any slug
+    /// role_from_slug accepts yields a control kind consistent with its
+    /// own Role (no drift between the two shapes).
+    #[test]
+    fn native_slug_paths_never_drift() {
+        use crate::semantic::native::{native_kind_for_test, native_role_for_test};
+        for slug in [
+            "button", "field", "textbox", "input", "checkbox", "radio", "tab", "list",
+            "listitem", "menu", "menuitem", "table", "tree", "dialog", "panel",
+            "progressbar", "spinner", "label", "hyperlink", "screen",
+        ] {
+            let role: Option<Role> = native_role_for_test(slug);
+            let kind = native_kind_for_test(slug);
+            assert_eq!(
+                role.and_then(|r| r.control_kind()),
+                kind,
+                "slug '{slug}': role projection and kind mapping must agree"
+            );
+        }
     }
 }

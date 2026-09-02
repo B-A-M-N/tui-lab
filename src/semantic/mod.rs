@@ -4,6 +4,7 @@
 //! ground truth. When a framework adapter supplies native info, source = "native"
 //! with confidence 1.0.
 
+pub mod adapter_status;
 pub mod affordance;
 pub mod cache;
 pub mod components;

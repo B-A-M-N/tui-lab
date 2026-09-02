@@ -23,6 +23,32 @@
 use crate::screen::ScreenState;
 use crate::semantic::SemanticScreen;
 
+/// The STRUCTURAL half of a frame's analysis (re-review item 37): what a
+/// structure-hash key can honestly serve — regions, controls-as-geometry,
+/// relationships, components. Focus/enabled/selection are deliberately
+/// ABSENT: they are interaction state and live in [`InteractionAnalysis`].
+#[derive(Debug, Clone)]
+pub struct StructuralAnalysis {
+    pub sem: SemanticScreen,
+    pub tree: crate::semantic::node::SemanticTree,
+}
+
+/// The INTERACTION half: re-derived fresh per frame over whatever
+/// structural skeleton is at hand, because its evidence (reverse video,
+/// cursor position, dim attributes) moves on keys the structure hash
+/// cannot see. Not cached — computed, and the stats say so.
+#[derive(Debug, Clone, Default)]
+pub struct InteractionAnalysis {
+    /// How many interaction re-derivations ran (every fused frame: this
+    /// pass is never served from cache, by design).
+    pub recomputations: u64,
+    /// Whether the last re-derivation changed any interaction field
+    /// relative to the structural skeleton it was applied to (evidence
+    /// that the split is doing work: a same-text Tab press shows
+    /// `interaction_only_change: true`).
+    pub interaction_only_change: bool,
+}
+
 /// Outcome of asking the cache for a frame's analysis.
 #[derive(Debug, Clone)]
 pub struct CacheResult {
@@ -44,6 +70,9 @@ pub struct SemanticCache {
     pub(crate) entries: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))>,
     hits: u64,
     misses: u64,
+    /// Item 37: the interaction half's ledger — recomputations and how
+    /// many of them actually moved interaction state.
+    pub interaction: InteractionAnalysis,
 }
 
 /// How many frames to remember. Sized for the realistic newline/spinner
@@ -56,6 +85,7 @@ impl SemanticCache {
             entries: Vec::new(),
             hits: 0,
             misses: 0,
+            interaction: InteractionAnalysis::default(),
         }
     }
 
@@ -146,6 +176,42 @@ impl SemanticCache {
     }
     pub fn misses(&self) -> u64 {
         self.misses
+    }
+
+    /// Item 37: the structural half, keyed by structure hash. Served from
+    /// the entry store when hot; the detectors run exactly once per
+    /// distinct structure otherwise. This is the ONLY path that caches.
+    pub fn structural(&mut self, screen: &ScreenState) -> (StructuralAnalysis, bool) {
+        let key = screen.structure_hash.clone();
+        if !key.is_empty() {
+            if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
+                self.hits += 1;
+                let (sem, tree) = self.entries[idx].1.clone();
+                return (StructuralAnalysis { sem, tree }, true);
+            }
+        }
+        self.misses += 1;
+        let (sem, tree) = crate::semantic::detect_frame(screen);
+        self.insert(key, (sem.clone(), tree.clone()));
+        (StructuralAnalysis { sem, tree }, false)
+    }
+
+    /// Item 37: the interaction half. NEVER cached — always recomputed
+    /// over the given structural skeleton via the same reapply pass the
+    /// fuse path uses, and the ledger records the work.
+    pub fn interaction_of(
+        &mut self,
+        screen: &ScreenState,
+        structural: &mut StructuralAnalysis,
+    ) -> InteractionAnalysis {
+        let changed =
+            crate::semantic::reapply_interaction(screen, &mut structural.sem, &mut structural.tree);
+        self.interaction.recomputations += 1;
+        self.interaction.interaction_only_change = changed;
+        InteractionAnalysis {
+            recomputations: self.interaction.recomputations,
+            interaction_only_change: changed,
+        }
     }
 }
 
@@ -251,5 +317,68 @@ mod tests {
         let _ = cache.analyze(&a);
         assert!(cache.hit_rate() > 0.0);
         assert!(cache.hit_rate() <= 1.0);
+    }
+}
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// Item 37: the split. A same-text Tab press changes the VISUAL frame
+    /// but not the structure hash: the structural half hits the cache
+    /// (detectors never re-run) while the interaction half recomputes and
+    /// reports that it moved focus.
+    #[test]
+    fn structural_hits_while_interaction_recomputes() {
+        let mut cache = SemanticCache::new();
+
+        // Frame A: two buttons. `ScreenState::new` leaves hashes empty (an
+        // unhashed frame is never cached, by design), so give both frames
+        // the SAME explicit structure hash — the test isolates the split,
+        // and the structural key must NOT distinguish the frames.
+        let mut a = ScreenState::new(20, 3);
+        a.viewport_text = vec!["[ Save ] [ Cancel ]".into(), "".into(), "".into()];
+        a.structure_hash = "split-test-hash".into();
+        let mut b = a.clone();
+        b.viewport_text = vec!["[ Save ] [CANCEL ]".into(), "".into(), "".into()];
+
+        let (s1, hit1) = cache.structural(&a);
+        assert!(!hit1, "first frame runs the detectors");
+        let i1 = {
+            let mut s1 = s1;
+            cache.interaction_of(&a, &mut s1)
+        };
+        assert_eq!(i1.recomputations, 1);
+
+        let (s2, hit2) = cache.structural(&b);
+        assert!(hit2, "same structure hash → structural half is cached");
+        let i2 = {
+            let mut s2 = s2;
+            cache.interaction_of(&b, &mut s2)
+        };
+        assert_eq!(
+            i2.recomputations,
+            i1.recomputations + 1,
+            "the interaction half NEVER caches: it recomputed"
+        );
+        // The structural ledger and the hit stats both moved coherently.
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+    }
+
+    /// The typed halves are distinct types: StructuralAnalysis carries no
+    /// focus decision of its own beyond the skeleton, and the interaction
+    /// pass is what stamps focus onto it (a caller using only `structural`
+    /// cannot accidentally read stale focus as fresh).
+    #[test]
+    fn halves_are_distinct_types() {
+        let mut cache = SemanticCache::new();
+        let a = ScreenState::new(20, 3);
+        let (s, _) = cache.structural(&a);
+        // StructuralAnalysis is a plain (sem, tree) pair — cloneable,
+        // serializable through the semantic types, and separate from the
+        // interaction ledger.
+        let cloned = s.clone();
+        let _i = cache.interaction_of(&a, &mut { cloned });
+        assert!(cache.interaction.recomputations >= 1);
     }
 }

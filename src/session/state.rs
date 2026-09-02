@@ -949,6 +949,28 @@ impl Session {
         &self.native
     }
 
+    /// Item 35: adapter AVAILABLE vs channel ACTIVE. These are different
+    /// facts and conflating them lies in both directions:
+    ///
+    /// * `adapter_available` — the harness DID its part (the channel file
+    ///   exists and `TUI_LAB_SEMANTIC` was injected into the launch env).
+    ///   The app may still never read it.
+    /// * `native_channel_active` — the app actually COOPERATED (≥1 valid
+    ///   frame accepted). An app that started but never wrote a frame
+    ///   keeps this false forever, by evidence.
+    /// * `frames_accepted` / `frames_invalid` — the health split: a
+    ///   channel receiving ONLY invalid frames is active-but-unhealthy,
+    ///   which is exactly the bug shape an agent needs to see.
+    pub fn adapter_status(&self) -> crate::semantic::adapter_status::AdapterStatus {
+        crate::semantic::adapter_status::AdapterStatus {
+            adapter_available: self.native.path.is_some(),
+            native_channel_active: self.native.frames_accepted > 0,
+            frames_received: self.native.frames_accepted,
+            frames_invalid: self.native.frames_invalid,
+            healthy: self.native.frames_accepted > 0 && self.native.frames_invalid == 0,
+        }
+    }
+
     /// Item 29: native coverage targets the app has reported so far this
     /// session (the `coverage` event stream). Empty for non-cooperative
     /// apps — the caller's novelty ledger just loses that dimension.
