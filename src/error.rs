@@ -30,6 +30,11 @@ pub enum ErrorCategory {
     /// The payload names expected vs actual so the agent can re-observe
     /// and re-decide — retrying blind would misdirect input.
     StaleState,
+    /// The current run is closed (`tui_run close`): driving tools refuse to
+    /// act and the run no longer accepts evidence. The agent can resume the
+    /// run or start a fresh one — retrying against the closed run would
+    /// corrupt it as an evidence bundle (review P0.1).
+    RunClosed,
 }
 
 impl ErrorCategory {
@@ -45,6 +50,7 @@ impl ErrorCategory {
             ErrorCategory::Unsupported => "unsupported",
             ErrorCategory::ControlLeased => "control_leased",
             ErrorCategory::StaleState => "stale_state",
+            ErrorCategory::RunClosed => "run_closed",
         }
     }
 }

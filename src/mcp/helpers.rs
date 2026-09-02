@@ -378,23 +378,45 @@ pub fn run_assertion_fused(
             )
         }
         A::Position => {
-            // Assert that text appears at a specific row/column.
+            // Assert that text renders at a specific (col,row) — addressed in
+            // terminal CELLS, never byte offsets (review P0.6): wide glyphs,
+            // combining marks, and out-of-range columns are all handled by
+            // ScreenState::match_text_at and can neither mismatch by byte
+            // arithmetic nor panic on a non-char-boundary.
             match (&p.text, p.x, p.y) {
                 (Some(t), Some(x), Some(y)) => {
-                    let row = screen.viewport_text.get(y as usize);
-                    let ok = row.is_some_and(|r| {
-                        r.get((x as usize)..(x as usize + t.len()))
-                            .is_some_and(|s| s == t)
-                    });
+                    let (x, y) = (
+                        u16::try_from(x).unwrap_or(u16::MAX),
+                        u16::try_from(y).unwrap_or(u16::MAX),
+                    );
+                    let ok = screen.match_text_at(x, y, t);
+                    // Diagnostic: the row's glyphs in column space (safe for
+                    // any content and any coordinate). Uses the same cell
+                    // source the match used, so the message reflects what was
+                    // actually tested.
+                    let actual = if y < screen.rows {
+                        if !screen.cells.is_empty() {
+                            screen
+                                .cells
+                                .iter()
+                                .filter(|c| c.y == y)
+                                .map(|c| c.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        } else {
+                            screen
+                                .viewport_text
+                                .get(y as usize)
+                                .map(String::as_str)
+                                .unwrap_or("")
+                                .to_string()
+                        }
+                    } else {
+                        format!("(no row {y}; screen has {} rows)", screen.rows)
+                    };
                     (
                         ok,
-                        format!(
-                            "expected '{}' at ({},{}), row={:?}",
-                            t,
-                            x,
-                            y,
-                            row.map(|r| &r[x as usize..])
-                        ),
+                        format!("expected '{}' at ({x},{y}), row cells = [{actual}]", t),
                         None,
                     )
                 }

@@ -344,6 +344,10 @@ selector_enum!(
         Status => "status", Persist => "persist", Close => "close",
         Context => "context", List => "list", Resume => "resume",
         Repair => "repair",
+        // Review P0.1/2: begin a fresh ephemeral run — the clean "next run"
+        // operation. Starts a new evidence bundle; any live sessions from
+        // the prior run become foreign owners (refused until stopped).
+        New => "new",
         // Wave 5 item 46: one finding's repair packet joined with the
         // finding-baseline diff (before/after) — the "did the fix hold
         // without regressing anything?" bundle.
@@ -1754,6 +1758,11 @@ pub struct TuiRunParams {
     /// fix is being verified against; from tui_audit label=...).
     #[serde(default)]
     pub compare_to: Option<String>,
+    /// resume: stop any live sessions that belong to a DIFFERENT run before
+    /// restoring? (default false — resume refuses when foreign sessions are
+    /// still live, to preserve run provenance; pass true to detach them).
+    #[serde(default)]
+    pub detach_existing_sessions: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]

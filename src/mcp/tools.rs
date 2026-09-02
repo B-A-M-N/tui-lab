@@ -33,6 +33,13 @@ use rmcp::handler::server::wrapper::Parameters;
 pub struct TuiLabServer {
     sessions: Arc<SessionPool>,
     run: Arc<std::sync::Mutex<crate::run::RunContext>>,
+    /// Which run each live session belongs to (review P0.2): session id →
+    /// the run id that launched it. A session is only usable while it
+    /// belongs to the CURRENT run; resuming a different run must not let a
+    /// stale session drive it and spill foreign evidence in (run
+    /// provenance). Populated at launch/attach, dropped when the session
+    /// stops.
+    session_owners: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 /// Which named view of a session a `tui://sessions/<id>/<view>` resource
@@ -50,6 +57,7 @@ impl TuiLabServer {
         TuiLabServer {
             sessions: Arc::new(SessionPool::new()),
             run: Arc::new(std::sync::Mutex::new(crate::run::RunContext::ephemeral())),
+            session_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -209,6 +217,14 @@ impl TuiLabServer {
     /// Run a closure against one session inside its actor, mapping actor
     /// failures to the envelope error channel. The closure runs to
     /// completion on the session's own thread.
+    ///
+    /// Review P0.1: a closed run must not accept new traffic. Every
+    /// session-driving tool funnels through here, so the guard lives once
+    /// at the choke point rather than in each handler — `tui_act`,
+    /// `tui_wait`, `tui_probe`, `tui_assert` et al. refuse while the
+    /// current run is closed, and the agent is told to resume or start a
+    /// fresh run. Read-only run surfaces (`tui_run status/list`, explain,
+    /// replay) do not go through this path and stay available.
     async fn with_sess<R, F>(
         &self,
         id: Option<&str>,
@@ -218,10 +234,58 @@ impl TuiLabServer {
         R: Send + 'static,
         F: FnOnce(&mut crate::session::Session) -> R + Send + 'static,
     {
+        if self.run.lock().unwrap().is_closed() {
+            let run_id = self.run.lock().unwrap().id.clone();
+            return Err(err(
+                ErrorCategory::RunClosed,
+                format!(
+                    "current run {run_id} is closed; resume it (tui_run action=resume) or start a fresh run before driving sessions"
+                ),
+            ));
+        }
+        // Review P0.2: a session resolves only while it belongs to the
+        // CURRENT run. A session launched under run A must never be driven
+        // after the current run became B (resume/`new`) — its traffic would
+        // spill foreign evidence into B. The owning run is bound at
+        // launch/attach; resolution against a non-owner fails loudly instead
+        // of silently re-targeting the process.
+        let cur_run = self.run.lock().unwrap().id.clone();
+        let target_id = match id {
+            Some(i) => Some(i.to_string()),
+            None => self.sessions.active_id(),
+        };
+        if let Some(sid) = target_id {
+            let bound = self
+                .session_owners
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&sid).cloned());
+            if let Some(own) = bound {
+                if own != cur_run {
+                    return Err(err(
+                        ErrorCategory::NoSession,
+                        format!(
+                            "session '{}' is bound to run {own}, not the current run {cur_run}; stop it and re-launch under the current run, or resume run {own}",
+                            sid
+                        ),
+                    ));
+                }
+            }
+        }
         self.sessions
             .with_session(id, job)
             .await
             .map_err(|e| err(e.category(), e.to_string()))
+    }
+
+    /// Bind a freshly launched session to the current run, and its owner on
+    /// the same short lock. Called right after start/attach succeeds.
+    fn bind_session_owner(&self, id: &str) {
+        let run_id = self.run.lock().unwrap().id.clone();
+        self.session_owners
+            .lock()
+            .expect("session owner lock")
+            .insert(id.to_string(), run_id);
     }
 }
 
@@ -325,6 +389,7 @@ impl TuiLabServer {
                     Ok(id) => id,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
+                self.bind_session_owner(&id);
                 // Read back the launch facts inside the actor (the session
                 // never crosses the boundary — only this summary does).
                 let facts = self
@@ -381,6 +446,7 @@ impl TuiLabServer {
                     Ok(id) => id,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
+                self.bind_session_owner(&id);
                 let facts = self
                     .with_sess(Some(&id), |s| {
                         let caps = s.capabilities();
@@ -442,7 +508,14 @@ impl TuiLabServer {
                     None => return err(ErrorCategory::NoSession, "no session"),
                 };
                 match self.sessions.stop(&id).await {
-                    Ok(()) => ok(json!({ "stopped": id })),
+                    Ok(()) => {
+                        // Session gone: drop its run ownership too.
+                        self.session_owners
+                            .lock()
+                            .expect("session owner lock")
+                            .remove(&id);
+                        ok(json!({ "stopped": id }))
+                    }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 }
             }
@@ -579,7 +652,7 @@ impl TuiLabServer {
                             let from = run.event_cursor(&cursor_key).unwrap_or(0);
                             let batch = s.events_since(from);
                             if !batch.events.is_empty() {
-                                run.hold_events(&s.id, batch.events);
+                                let _ = run.hold_events(&s.id, batch.events);
                                 run.set_event_cursor(&cursor_key, batch.cursor);
                             }
                         }
@@ -612,11 +685,14 @@ impl TuiLabServer {
                                         .native_source_for_widget(target)
                                         .filter(|_| !(target.starts_with("src/") || target.contains(".rs:") || target.contains('/')));
                                     match locus {
-                                        Some(sr) => run
-                                            .record_coverage_event_with_identity(
+                                        Some(sr) => {
+                                            let _ = run.record_coverage_event_with_identity(
                                                 &s.id, target, sr,
-                                            ),
-                                        None => run.record_coverage_event(&s.id, target),
+                                            );
+                                        }
+                                        None => {
+                                            let _ = run.record_coverage_event(&s.id, target);
+                                        }
                                     }
                                 }
                             }
@@ -1111,29 +1187,33 @@ impl TuiLabServer {
                 // Frame commit pipeline (re-review item 40): both frames go
                 // through the ONE commit path — id + provenance + incremental
                 // frames.jsonl append for persistent runs.
-                let b = run.commit_frame(
-                    &mut {
-                        let mut f = tx.before_frame.clone();
-                        f.session_id = Some(sid.clone());
-                        f.generation = Some(gen);
-                        f
-                    },
-                    Some(&sid),
-                );
-                let a = run.commit_frame(
-                    &mut {
-                        let mut f = tx.after_frame.clone();
-                        f.session_id = Some(sid.clone());
-                        f.generation = Some(gen);
-                        f
-                    },
-                    Some(&sid),
-                );
+                let b = run
+                    .commit_frame(
+                        &mut {
+                            let mut f = tx.before_frame.clone();
+                            f.session_id = Some(sid.clone());
+                            f.generation = Some(gen);
+                            f
+                        },
+                        Some(&sid),
+                    )
+                    .unwrap_or_default();
+                let a = run
+                    .commit_frame(
+                        &mut {
+                            let mut f = tx.after_frame.clone();
+                            f.session_id = Some(sid.clone());
+                            f.generation = Some(gen);
+                            f
+                        },
+                        Some(&sid),
+                    )
+                    .unwrap_or_default();
                 // Run ledger (Wave-2 item 15): the reconstructable transaction
                 // record, not just a counter. The ledger projects the action
                 // through the visibility policy — sensitive payloads are stored
                 // as Redacted(kind, byte_len), never verbatim.
-                run.record_interaction(&sid, &tx);
+                let _ = run.record_interaction(&sid, &tx);
                 // Scenario capture (see block comment above): sensitive steps
                 // are recorded as ${PARAM} references with the parameter
                 // declared on the scenario — never with the payload (re-review
@@ -1155,7 +1235,7 @@ impl TuiLabServer {
                     };
                     if !payload_field.is_empty() {
                         let byte_len = tx.canonical().payload_len();
-                        run.record_scenario_act_sensitive(
+                        let _ = run.record_scenario_act_sensitive(
                             &sid,
                             gen,
                             params_json,
@@ -1168,7 +1248,7 @@ impl TuiLabServer {
                         // opaque redacted placeholder — structurally a valid
                         // act step is impossible without the payload, and the
                         // scenario declares it unreplayable-by-shape.
-                        run.record_scenario_act(
+                        let _ = run.record_scenario_act(
                             &sid,
                             gen,
                             json!({
@@ -1180,7 +1260,7 @@ impl TuiLabServer {
                         );
                     }
                 } else {
-                    run.record_scenario_act(
+                    let _ = run.record_scenario_act(
                         &sid,
                         gen,
                         serde_json::to_value(&p).unwrap_or_default(),
@@ -1346,8 +1426,8 @@ impl TuiLabServer {
                     {
                         let (sid, gen) = (sess.id.clone(), sess.generation);
                         let mut run = run.lock().unwrap();
-                        run.record_event(&sid, "probe");
-                        run.record_scenario_wait(
+                        let _ = run.record_event(&sid, "probe");
+                        let _ = run.record_scenario_wait(
                             &sid,
                             gen,
                             serde_json::to_value(&p).unwrap_or_default(),
@@ -1519,8 +1599,8 @@ impl TuiLabServer {
                     {
                         let (sid, gen) = (sess.id.clone(), sess.generation);
                         let mut run = run.lock().unwrap();
-                        run.record_event(&sid, "wait");
-                        run.record_scenario_wait(
+                        let _ = run.record_event(&sid, "wait");
+                        let _ = run.record_scenario_wait(
                             &sid,
                             gen,
                             serde_json::to_value(&p).unwrap_or_default(),
@@ -1590,7 +1670,7 @@ impl TuiLabServer {
                     // Scoped to the resolved session generation (item 5).
                     let (sid, gen) = (sess.id.clone(), sess.generation);
                     let mut run = run.lock().unwrap();
-                    run.record_scenario_assert(
+                    let _ = run.record_scenario_assert(
                         &sid,
                         gen,
                         serde_json::json!({ "assertion": "oracle", "text": expr }),
@@ -1620,7 +1700,7 @@ impl TuiLabServer {
                     // Scoped to the resolved session generation (item 5).
                     let (sid, gen) = (sess.id.clone(), sess.generation);
                     let mut run = run.lock().unwrap();
-                    run.record_scenario_assert(
+                    let _ = run.record_scenario_assert(
                         &sid,
                         gen,
                         serde_json::to_value(&p).unwrap_or_default(),
@@ -1960,7 +2040,8 @@ impl TuiLabServer {
                     }
                     let report = crate::scenario::runner::ScenarioRunner::run(&scenario, sess);
                     let (sid, gen) = (sess.id.clone(), sess.generation);
-                    run.lock()
+                    let _ = run
+                        .lock()
                         .unwrap()
                         .record_event(&sid, &format!("scenario_run:{}", scenario.name));
                     if report.steps_failed == 0 {
@@ -2097,8 +2178,9 @@ impl TuiLabServer {
                                         Some(size),
                                         Some(sess.id.clone()),
                                         format!("pty recording, {} events", events),
-                                    );
-                                    (Some(file.to_string_lossy().to_string()), Some(r))
+                                    )
+                                    .ok();
+                                    (Some(file.to_string_lossy().to_string()), r)
                                 }
                                 Err(e) => {
                                     return err(
@@ -2118,8 +2200,9 @@ impl TuiLabServer {
                                 Some(size),
                                 Some(sess.id.clone()),
                                 format!("pty recording, {} events (held, ephemeral run)", events),
-                            );
-                            (None, Some(r))
+                            )
+                            .ok();
+                            (None, r)
                         }
                     }
                 };
@@ -2189,8 +2272,9 @@ impl TuiLabServer {
                                             "screen capture {}x{} ({} format)",
                                             screen.cols, screen.rows, ext
                                         ),
-                                    );
-                                    (Some(file.to_string_lossy().to_string()), Some(r))
+                                    )
+                                    .ok();
+                                    (Some(file.to_string_lossy().to_string()), r)
                                 }
                                 Err(e) => {
                                     return err(
@@ -2211,8 +2295,9 @@ impl TuiLabServer {
                                     "screen capture {}x{} ({} format, held, ephemeral run)",
                                     screen.cols, screen.rows, ext
                                 ),
-                            );
-                            (None, Some(r))
+                            )
+                            .ok();
+                            (None, r)
                         }
                     }
                 };
@@ -2286,7 +2371,7 @@ impl TuiLabServer {
             // Honest outcome: the trace did not reproduce on a clean
             // restart. Report the attempt; emit no reproduction finding.
             let mut run = self.run.lock().unwrap();
-            run.extend_findings(vec![crate::audit::Finding {
+            let _ = run.extend_findings(vec![crate::audit::Finding {
                 id: format!("EXPLORE-CRASH-{}", exit.action_index),
                 rule_id: None,
                 severity: "warn".into(),
@@ -2332,7 +2417,7 @@ impl TuiLabServer {
         let saved = {
             let mut run = self.run.lock().unwrap();
             run.save_scenario(scenario);
-            run.extend_findings(vec![crate::audit::Finding {
+            let _ = run.extend_findings(vec![crate::audit::Finding {
                 id: format!("EXPLORE-CRASH-{}", exit.action_index),
                 rule_id: None,
                 severity: "error".into(),
@@ -2723,7 +2808,7 @@ impl TuiLabServer {
                 run.focus_graph.merge(&report.focus_graph);
                 // W2.10: attach app-declared source loci where coverage
                 // evidence can name the finding's control.
-                run.extend_findings_with_source_refs(report.findings.clone());
+                let _ = run.extend_findings_with_source_refs(report.findings.clone());
                 if let Some(cmp_label) = compare_to.as_deref() {
                     match run.finding_baseline(cmp_label) {
                         Some(baseline) => {
@@ -3003,6 +3088,23 @@ impl TuiLabServer {
             unreachable!()
         };
         match run_action {
+            // Review P0.1/2: begin a fresh ephemeral run. This is the clean
+            // next-run operation — it does NOT touch sessions (they belong
+            // to whatever run launched them and become foreign owners under
+            // the new run, refused until stopped or re-launched).
+            RA::New => {
+                let mut guard = self.run.lock().unwrap();
+                let old_id = guard.id.clone();
+                *guard = crate::run::RunContext::ephemeral();
+                let new_id = guard.id.clone();
+                let mode = "ephemeral".to_string();
+                ok(json!({
+                    "new_run_id": new_id,
+                    "previous_run": old_id,
+                    "mode": mode,
+                    "note": "fresh ephemeral run begun; sessions from the previous run were not touched and now belong to a foreign run",
+                }))
+            }
             RA::Status => {
                 let sessions = self.sessions.list();
                 ok(self.run.lock().unwrap().status(
@@ -3058,7 +3160,7 @@ impl TuiLabServer {
                 // no close-path deadlock to avoid.
                 for sid in self.sessions.list() {
                     if let Ok(events) = self.sessions.drain_events(&sid).await {
-                        self.run.lock().unwrap().hold_events(&sid, events);
+                        let _ = self.run.lock().unwrap().hold_events(&sid, events);
                     }
                 }
                 let already;
@@ -3183,8 +3285,59 @@ impl TuiLabServer {
                         "resume requires 'run_id' (from tui_run action=list) or 'run_dir'",
                     );
                 };
+                // Review P0.2 provenance guard: sessions launched under a
+                // DIFFERENT run must not survive into the resumed run — their
+                // future traffic would land in the wrong evidence bundle. The
+                // default refuses; `detach_existing_sessions=true` stops them
+                // first. Sessions owned by the TARGET run carry over (they
+                // already belong to the run being resumed) — only sessions
+                // owned by neither the target nor the current run block.
+                let target_run = running_id(&run_dir);
+                let foreign: Vec<String> = {
+                    let owners = self.session_owners.lock().unwrap();
+                    self.sessions
+                        .list()
+                        .into_iter()
+                        .filter(|sid| {
+                            match owners.get(sid) {
+                                // Owned by the run we're resuming: fine.
+                                Some(o) => o != &target_run,
+                                // Unowned sessions: treat as foreign (must be
+                                // re-launched under the resumed run).
+                                None => true,
+                            }
+                        })
+                        .collect()
+                };
+                if !foreign.is_empty() {
+                    if !p.detach_existing_sessions.unwrap_or(false) {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                                "resume refused: {} live session(s) do not belong to target run {} ({:?}); stop them or pass detach_existing_sessions=true",
+                                foreign.len(),
+                                target_run,
+                                foreign
+                            ),
+                        );
+                    }
+                    for sid in &foreign {
+                        let _ = self.sessions.stop(sid).await;
+                        self.session_owners.lock().unwrap().remove(sid);
+                    }
+                }
                 let restored = match crate::run::RunContext::restore(&run_dir) {
-                    Ok(r) => r,
+                    Ok(mut r) => {
+                        // Resume is the designated re-open operation: a run
+                        // restored while `closed` becomes live again so the
+                        // resumed run can accept driving and new evidence
+                        // (review P0.1). Its own driving-refusal message says
+                        // "resume it ... before driving", so resume must do
+                        // exactly that — otherwise a persisted run could never
+                        // be driven again.
+                        r.reopen();
+                        r
+                    }
                     Err(e) => {
                         return err(
                             ErrorCategory::InvalidRequest,
@@ -3570,7 +3723,7 @@ impl TuiLabServer {
                                     source_refs: Vec::new(),
                                 })
                                 .collect();
-                            run.extend_findings(findings);
+                            let _ = run.extend_findings(findings);
                         }
                         ok(json!({
                             "baseline": baseline_label,
@@ -3712,7 +3865,7 @@ impl TuiLabServer {
                 let summary = report.summary();
                 let results = report.results.clone();
                 let mut run = run.lock().unwrap();
-                run.extend_findings_with_source_refs(findings);
+                let _ = run.extend_findings_with_source_refs(findings);
                 ok(json!({
                     "verdict": report.verdict.as_str(),
                     "summary": summary,
@@ -3877,4 +4030,14 @@ impl ServerHandler for TuiLabServer {
         let contents = self.resolve_resource(&uri).await?;
         Ok(ReadResourceResult::new(vec![ResourceContents::text(contents, uri)]).into())
     }
+}
+
+/// Read the declared run id out of a persisted run directory (review P0.2).
+/// Used to decide which live sessions legitimately belong to the run being
+/// resumed. The manifest is authoritative; a directory without one cannot
+/// be a valid resume target.
+fn running_id(run_dir: &std::path::Path) -> String {
+    crate::run::manifest::load(run_dir)
+        .map(|m| m.run_id)
+        .unwrap_or_default()
 }
