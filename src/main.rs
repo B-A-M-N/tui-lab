@@ -409,7 +409,7 @@ fn doctor() {
         let _ = std::fs::write(&manifest, "[dependencies]\nratatui = \"0.29\"\n");
         let det = tui_lab::framework::detect::detect(&dir.to_string_lossy());
         let _ = std::fs::remove_dir_all(&dir);
-        det.framework.as_deref() == Some("ratatui")
+        det.primary.as_ref().map(|c| c.name.as_str()) == Some("ratatui")
     })
     .unwrap_or(false);
     tier(

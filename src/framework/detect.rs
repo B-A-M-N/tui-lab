@@ -9,18 +9,67 @@
 
 use std::collections::HashSet;
 
+/// One detected framework/library candidate with its evidence (re-review
+/// item 33). `primary` on the report is `candidates[0]` when non-empty.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrameworkCandidate {
+    pub name: String,
+    /// What the match actually is: `framework` (a widget/layout system),
+    /// `terminal_io` (infrastructure like crossterm — NOT a framework),
+    /// or `styling` (lipgloss-class styling libs).
+    pub class: &'static str,
+    pub confidence: f32,
+    /// Where the evidence came from (`Cargo.toml dependency 'ratatui'`).
+    pub evidence: Vec<String>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct FrameworkDetection {
-    pub framework: Option<String>,
-    pub confidence: f32,
+    /// The ranked winner, when anything matched. `Some(candidates[0])`
+    /// kept as a convenience field for existing consumers.
+    pub primary: Option<FrameworkCandidate>,
+    /// Every match, confidence-ordered (ties broken by class rank:
+    /// framework before terminal_io before styling). A tree that names
+    /// BOTH ratatui and crossterm lists ratatui as primary and crossterm
+    /// as terminal_io context — the old single-slot shape silently
+    /// dropped the runner-up (which was usually the true architecture
+    /// signal).
+    pub candidates: Vec<FrameworkCandidate>,
+    /// Terminal I/O infrastructure detected (crossterm-class). Reported
+    /// separately because it is NOT a framework claim.
+    pub terminal_io: Option<String>,
+    /// Styling library detected (lipgloss-class).
+    pub styling: Option<String>,
     pub native_adapter: bool,
     pub coverage_adapter: bool,
     pub evidence: Vec<String>,
 }
 
+impl FrameworkDetection {
+    /// The framework-class primary, when the top candidate actually is a
+    /// framework (a crossterm-only tree has a terminal_io primary and NO
+    /// framework claim — item 33's category separation).
+    pub fn framework(&self) -> Option<&str> {
+        self.candidates
+            .iter()
+            .find(|c| c.class == CLASS_FRAMEWORK)
+            .map(|c| c.name.as_str())
+    }
+
+    /// Overall confidence: the primary candidate's, or 0.0 when nothing
+    /// matched (the historical field, kept for wire stability).
+    pub fn confidence(&self) -> f32 {
+        self.primary
+            .as_ref()
+            .map(|c| c.confidence)
+            .unwrap_or(0.0)
+    }
+}
+
 /// Known TUI frameworks and their identifying package/crate names.
-/// (name, manifest markers, dependency markers, extra hints, secondary libs)
+/// (name, class, manifest markers, dependency markers, extra hints, secondary libs)
 type FrameworkSpec = (
+    &'static str,
     &'static str,
     &'static [&'static str],
     &'static [&'static str],
@@ -28,27 +77,39 @@ type FrameworkSpec = (
     &'static [&'static str],
 );
 
+/// Class names for candidates (item 33).
+const CLASS_FRAMEWORK: &str = "framework";
+const CLASS_TERMINAL_IO: &str = "terminal_io";
+const CLASS_STYLING: &str = "styling";
+
 const FRAMEWORKS: &[FrameworkSpec] = &[
-    ("ratatui", &["ratatui"], &[], &[], &[]),
-    ("textual", &[], &["textual"], &[], &["textual"]),
+    ("ratatui", CLASS_FRAMEWORK, &["ratatui"], &[], &[], &[]),
+    ("textual", CLASS_FRAMEWORK, &[], &["textual"], &[], &["textual"]),
     (
         "opentui",
+        CLASS_FRAMEWORK,
         &[],
         &["@opentui/core", "@opentui/react"],
         &[],
         &[],
     ),
-    ("ink", &[], &["ink"], &[], &[]),
+    ("ink", CLASS_FRAMEWORK, &[], &["ink"], &[], &[]),
     (
         "bubbletea",
+        CLASS_FRAMEWORK,
         &[],
         &[],
         &["github.com/charmbracelet/bubbletea"],
         &[],
     ),
-    ("crossterm", &["crossterm"], &[], &[], &[]),
+    // Item 33: crossterm is terminal I/O, not a framework; lipgloss is
+    // styling. Both still DETECT (their presence is evidence about the
+    // tree) but they classify separately so "framework: crossterm" — a
+    // category error the old shape committed — cannot recur.
+    ("crossterm", CLASS_TERMINAL_IO, &["crossterm"], &[], &[], &[]),
     (
         "lipgloss",
+        CLASS_STYLING,
         &[],
         &[],
         &["github.com/charmbracelet/lipgloss"],
@@ -58,7 +119,32 @@ const FRAMEWORKS: &[FrameworkSpec] = &[
 
 pub fn detect(cwd: &str) -> FrameworkDetection {
     let mut evidence = Vec::new();
-    let mut detected: Option<(String, f32)> = None;
+    // Item 33: accumulate EVERY match with its evidence; rank at the end.
+    // The old single-slot `detected` was overwritten per stream, so a tree
+    // with ratatui AND crossterm kept whichever matched last, and the
+    // class distinction (framework vs terminal I/O vs styling) was lost.
+    let mut candidates: Vec<FrameworkCandidate> = Vec::new();
+    // Record (or reinforce) one candidate. Reinforcement raises
+    // confidence (two independent loci agreeing is stronger evidence).
+    fn note(
+        candidates: &mut Vec<FrameworkCandidate>,
+        name: &str,
+        class: &'static str,
+        confidence: f32,
+        locus: String,
+    ) {
+        if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
+            c.confidence = (c.confidence + confidence * 0.25).min(1.0);
+            c.evidence.push(locus);
+        } else {
+            candidates.push(FrameworkCandidate {
+                name: name.to_string(),
+                class,
+                confidence,
+                evidence: vec![locus],
+            });
+        }
+    }
 
     let files = list_files(cwd);
     let file_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
@@ -68,7 +154,7 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         let txt = read_file(cwd, "package.json");
         let pkg: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
         let all_deps = collect_json_dep_keys(&pkg);
-        for (fw, _cargo, npm, _go, _pip) in FRAMEWORKS {
+        for (fw, class, _cargo, npm, _go, _pip) in FRAMEWORKS {
             for npm_pkg in *npm {
                 if all_deps.iter().any(|d| d.as_str() == *npm_pkg) {
                     let confidence = if *npm_pkg == "@opentui/core" || *npm_pkg == "@opentui/react"
@@ -77,9 +163,13 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
                     } else {
                         0.9
                     };
-                    detected = Some((fw.to_string(), confidence));
-                    evidence.push(format!("package.json dependency '{}'", npm_pkg));
-                    break;
+                    note(
+                        &mut candidates,
+                        fw,
+                        class,
+                        confidence,
+                        format!("package.json dependency '{}'", npm_pkg),
+                    );
                 }
             }
         }
@@ -90,44 +180,43 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         let txt = read_file(cwd, "Cargo.toml");
         if let Ok(toml_val) = txt.parse::<toml::Value>() {
             let all_deps = collect_toml_dep_keys(&toml_val);
-            for (fw, cargo, _npm, _go, _pip) in FRAMEWORKS {
+            for (fw, class, cargo, _npm, _go, _pip) in FRAMEWORKS {
                 for crate_name in *cargo {
                     if all_deps.iter().any(|d| d.as_str() == *crate_name) {
-                        if *crate_name == "crossterm" {
-                            if detected.is_none() {
-                                evidence.push(
-                                    "Cargo.toml references crossterm (terminal I/O lib)"
-                                        .to_string(),
-                                );
-                            }
-                            continue;
-                        }
                         let confidence = if *crate_name == "ratatui" { 1.0 } else { 0.9 };
-                        detected = Some((fw.to_string(), confidence));
-                        evidence.push(format!("Cargo.toml dependency '{}'", crate_name));
-                        break;
+                        note(
+                            &mut candidates,
+                            fw,
+                            class,
+                            confidence,
+                            format!("Cargo.toml dependency '{}'", crate_name),
+                        );
                     }
                 }
             }
         }
         // Workspace manifests declare deps in [workspace.dependencies]; a
         // workspace root is a perfectly good detection locus (item 46).
-        if detected.is_none() && file_set.contains("Cargo.lock") {
+        if !candidates.iter().any(|c| c.class == CLASS_FRAMEWORK)
+            && file_set.contains("Cargo.lock")
+        {
             if let Ok(lock) = read_file(cwd, "Cargo.lock").parse::<toml::Value>() {
                 if let Some(pkgs) = lock.get("package").and_then(|p| p.as_array()) {
-                    'outer: for (fw, cargo, _npm, _go, _pip) in FRAMEWORKS {
+                    'outer: for (fw, class, cargo, _npm, _go, _pip) in FRAMEWORKS {
                         for crate_name in *cargo {
-                            if *crate_name == "crossterm" {
-                                continue;
-                            }
                             if pkgs.iter().any(|p| {
                                 p.get("name").and_then(|n| n.as_str()) == Some(*crate_name)
                             }) {
-                                detected = Some((fw.to_string(), 0.85));
-                                evidence.push(format!(
-                                    "Cargo.lock package '{}' (transitive: check Cargo.toml for a direct dep)",
-                                    crate_name
-                                ));
+                                note(
+                                    &mut candidates,
+                                    fw,
+                                    class,
+                                    0.85,
+                                    format!(
+                                        "Cargo.lock package '{}' (transitive: check Cargo.toml for a direct dep)",
+                                        crate_name
+                                    ),
+                                );
                                 break 'outer;
                             }
                         }
@@ -140,15 +229,19 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
     // Parse go.mod for Go frameworks.
     if file_set.contains("go.mod") {
         let txt = read_file(cwd, "go.mod");
-        for (fw, _cargo, _npm, go_modules, _pip) in FRAMEWORKS {
+        for (fw, class, _cargo, _npm, go_modules, _pip) in FRAMEWORKS {
             for go_mod in *go_modules {
                 if txt
                     .lines()
                     .any(|line| line.trim().starts_with(go_mod) || line.contains(go_mod))
                 {
-                    detected = Some((fw.to_string(), 0.9));
-                    evidence.push(format!("go.mod references '{}'", go_mod));
-                    break;
+                    note(
+                        &mut candidates,
+                        fw,
+                        class,
+                        0.9,
+                        format!("go.mod references '{}'", go_mod),
+                    );
                 }
             }
         }
@@ -192,22 +285,27 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
                     py_deps.push(name.to_lowercase());
                 }
             }
-            for (fw, _cargo, _npm, _go, pip) in FRAMEWORKS {
+            for (fw, class, _cargo, _npm, _go, pip) in FRAMEWORKS {
                 for pip_pkg in *pip {
                     if py_deps.iter().any(|d| d == *pip_pkg) {
-                        detected = Some((fw.to_string(), 0.9));
-                        evidence.push(format!("pyproject.toml dependency '{}'", pip_pkg));
-                        break;
+                        note(
+                            &mut candidates,
+                            fw,
+                            class,
+                            0.9,
+                            format!("pyproject.toml dependency '{}'", pip_pkg),
+                        );
                     }
                 }
             }
         }
     }
-    // requirements.txt stays line-based (it IS a line format) and only when
-    // pyproject did not already decide.
-    if detected.is_none() && file_set.contains("requirements.txt") {
+    // requirements.txt stays line-based (it IS a line format). A name
+    // pyproject already reported gets REINFORCED here (two loci agreeing
+    // is stronger evidence); one pyproject missed gets detected fresh.
+    if file_set.contains("requirements.txt") {
         let txt = read_file(cwd, "requirements.txt");
-        for (fw, _cargo, _npm, _go, pip) in FRAMEWORKS {
+        for (fw, class, _cargo, _npm, _go, pip) in FRAMEWORKS {
             for pip_pkg in *pip {
                 let hit = txt.lines().any(|line| {
                     let l = line.trim().to_lowercase();
@@ -219,38 +317,61 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
                         || l.starts_with(&format!("{pip_pkg}["))
                 });
                 if hit {
-                    detected = Some((fw.to_string(), 0.85));
-                    evidence.push(format!("requirements.txt dependency '{}'", pip_pkg));
-                    break;
+                    note(
+                        &mut candidates,
+                        fw,
+                        class,
+                        0.85,
+                        format!("requirements.txt dependency '{}'", pip_pkg),
+                    );
                 }
             }
         }
     }
 
-    // Ranked candidates (item 46): confidence-ordered, not file-order. When
-    // several evidence streams matched different frameworks, the strongest
-    // wins and the runner-up is named — silent first-match-wins hid ties.
-    // (Detection above overwrites `detected` per stream; resolve the final
-    // answer from all evidence by re-ranking here.) Each stream's
-    // assignment already carried its own confidence, so the resolved
-    // (framework, confidence) IS the ranked winner; evidence names the
-    // exact locus so a reviewer can audit the choice.
-
-    let native_adapter = match &detected {
-        Some((fw, _)) => native_adapter_exists(fw),
-        None => false,
+    // Rank: confidence descending; ties break framework → terminal_io →
+    // styling (a framework claim outranks its own infrastructure when both
+    // carry equal evidence).
+    let class_rank = |c: &FrameworkCandidate| match c.class {
+        CLASS_FRAMEWORK => 0u8,
+        CLASS_TERMINAL_IO => 1,
+        _ => 2,
     };
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| class_rank(a).cmp(&class_rank(b)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
-    let coverage_adapter = detected.is_some() && crate::coverage::tuicov::is_available();
+    // Convenience projections (item 33): the highest-confidence terminal
+    // I/O lib and styling lib, when present.
+    let terminal_io = candidates
+        .iter()
+        .find(|c| c.class == CLASS_TERMINAL_IO)
+        .map(|c| c.name.clone());
+    let styling = candidates
+        .iter()
+        .find(|c| c.class == CLASS_STYLING)
+        .map(|c| c.name.clone());
 
-    let (framework, confidence) = match detected {
-        Some((fw, c)) => (Some(fw), c),
-        None => (None, 0.0),
+    let primary = candidates.first().cloned();
+    let native_adapter = match &primary {
+        Some(c) if c.class == CLASS_FRAMEWORK => native_adapter_exists(&c.name),
+        _ => false,
     };
+    let coverage_adapter = primary.is_some() && crate::coverage::tuicov::is_available();
+
+    for c in &candidates {
+        evidence.extend(c.evidence.iter().cloned());
+    }
 
     FrameworkDetection {
-        framework,
-        confidence,
+        primary,
+        candidates,
+        terminal_io,
+        styling,
         native_adapter,
         coverage_adapter,
         evidence,

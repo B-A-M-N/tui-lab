@@ -292,6 +292,14 @@ selector_enum!(
 );
 
 selector_enum!(
+    /// `tui_contract` mode override (re-review item 32): a typed selector
+    /// so a typo'd mode (`"strcit"`) surfaces as envelope `invalid_request`
+    /// naming the accepted set, never as a silently-ignored string.
+    ContractModeParam;
+    [ Advisory => "advisory", Validation => "validation", Strict => "strict" ]
+);
+
+selector_enum!(
     /// `tui_audit` profile. `layout` is a documented alias of `resize`;
     /// `contract` (Wave E) folds conformance into findings. `unicode`,
     /// `controls`, `rendering`, `input_protocol`, `shell_cli`, `lifecycle`
@@ -347,7 +355,7 @@ selector_enum!(
     /// `tui_contract` action.
     ContractAction;
     [ Load => "load", Validate => "validate", Status => "status", Compare => "compare",
-      Scaffold => "scaffold" ]
+      Scaffold => "scaffold", Baseline => "baseline" ]
 );
 
 impl AuditProfile {
@@ -1842,10 +1850,10 @@ pub struct TuiContractParams {
     /// compare: label for the current run being compared (defaults to "current").
     #[serde(default)]
     pub label: Option<String>,
-    /// Check-time mode override (re-review item 33): advisory | validation
-    /// | strict. Overrides the contract document's `schema.mode` for this
-    /// check only — CI can run the same contract at both Validation (dev)
-    /// and Strict (gate) without editing it.
+    /// Check-time mode override (re-review item 33, typed per item 32):
+    /// advisory | validation | strict. Overrides the contract document's
+    /// `schema.mode` for this check only — CI can run the same contract at
+    /// both Validation (dev) and Strict (gate) without editing it.
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<Known<ContractModeParam>>,
 }

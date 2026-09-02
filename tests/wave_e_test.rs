@@ -461,3 +461,36 @@ fn coverage_event_with_identity_attests_source_locus() {
     );
     assert_eq!(joined.source_refs[0].file, "src/ui/save.rs");
 }
+
+/// Re-review item 30: conformance reports what it left behind. The modal
+/// fixture's check drives the app (opens a modal, escapes it) — the report
+/// must EVIDENCE that the session came back clean: session_mutated=false
+/// with an empty residue list, and the serialized summary carries both.
+#[test]
+fn conformance_reports_session_mutation_residue() {
+    let contract =
+        design::load_design_contract(std::path::Path::new("fixtures/modal_contract.yaml"))
+            .expect("fixture contract loads");
+
+    let mut mgr = SessionManager::new();
+    let id = start_modal(&mut mgr);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let sess = mgr.resolve_mut(Some(&id)).expect("session");
+    let report = design::check_contract(sess, &contract).expect("conformance runs");
+
+    assert!(
+        report.driven_actions > 0,
+        "this fixture drives the app; the mutation report must be earned, not defaulted"
+    );
+    assert!(
+        !report.session_mutated,
+        "the fixture restores its own state; residue would be a real defect: {:?}",
+        report.residue
+    );
+    assert!(report.residue.is_empty());
+
+    let v = serde_json::to_value(report.summary()).unwrap();
+    assert_eq!(v["session_mutated"], serde_json::json!(false));
+    assert!(v["residue"].is_array());
+}

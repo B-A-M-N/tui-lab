@@ -148,6 +148,15 @@ pub struct ContractReport {
     /// Number of app-driving actions the check performed (evidence for
     /// "this was proven, not assumed").
     pub driven_actions: u32,
+    /// Re-review item 30: what the check left behind. `session_mutated`
+    /// is RESIDUE-EVIDENCED (the same fused pre/post comparison
+    /// AuditTransaction uses), never assumed — a check that drove the app
+    /// and restored everything reports `false` with empty residue detail;
+    /// one that could not restore names what moved.
+    pub session_mutated: bool,
+    /// Residue detail when `session_mutated` is true (focus moved from →
+    /// to, size changed from → to). Empty when clean.
+    pub residue: Vec<String>,
 }
 
 impl ContractReport {
@@ -160,6 +169,9 @@ impl ContractReport {
             "verdict": self.verdict.as_str(),
             "driven_actions": self.driven_actions,
             "mode": self.mode.as_str(),
+            // Item 30: residue-evidenced session mutation.
+            "session_mutated": self.session_mutated,
+            "residue": self.residue,
             "pass": count(Verdict::Pass),
             "warn": count(Verdict::Warn),
             "fail": count(Verdict::Fail),
@@ -254,6 +266,11 @@ pub fn check_contract_with_mode(
 
     // Restore point: audits must leave the terminal as they found it.
     let (orig_cols, orig_rows) = (session.cols(), session.rows());
+    // Item 30: the SAME pre-state shape the audit transaction commits to
+    // restoring — captured through the fused authority so residue is
+    // judged on stable control ids, not renamable labels.
+    let pre = crate::audit::transaction::PreState::capture(session)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // 2. Components (static, current frame).
     results.extend(check_components(session, contract));
@@ -278,6 +295,20 @@ pub fn check_contract_with_mode(
         1500,
         false,
     );
+
+    // Item 30: residue verification — the check's honesty ledger. The same
+    // verify the audit transaction runs: focused-control ID (fused), size,
+    // structure (context only).
+    let residue = crate::audit::transaction::verify(session, &pre)
+        .unwrap_or_default();
+    let mut residue_detail = Vec::new();
+    if let Some((from, to)) = &residue.focus_moved {
+        residue_detail.push(format!("focus moved: {from:?} → {to:?}"));
+    }
+    if let Some((w, h)) = &residue.size_changed {
+        residue_detail.push(format!("size changed: {w}x{h} → {}x{}", orig_cols, orig_rows));
+    }
+    let session_mutated = residue.has_residue();
 
     // Overall verdict (item 33): the contract's mode decides how failures
     // and missing evidence bind. Advisory keeps the old shape (required
@@ -306,6 +337,8 @@ pub fn check_contract_with_mode(
         mode,
         results,
         driven_actions: driven,
+        session_mutated,
+        residue: residue_detail,
     })
 }
 
@@ -1266,6 +1299,8 @@ mod wave5_verdict_tests {
                 },
             ],
             driven_actions: 0,
+            session_mutated: false,
+            residue: Vec::new(),
         };
         let findings = report.findings();
         assert_eq!(findings.len(), 2);

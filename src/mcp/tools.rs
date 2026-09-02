@@ -793,6 +793,8 @@ impl TuiLabServer {
                     "layers": tree.layers,
                     "native": {
                         "active": native_report.active(),
+                        // Item 35: availability vs activity vs health.
+                        "adapter_status": sess.adapter_status(),
                         "framework": sess.native_channel().framework,
                         "app": sess.native_channel().app,
                         "matched": native_report.matched,
@@ -2905,6 +2907,11 @@ impl TuiLabServer {
         // no manifest is found, so no-manifest raw projects detect identically.
         let project = crate::session::ProjectLocator::locate(None, &cwd);
         let detect_cwd = project.root().to_string();
+        // Item 34: the project context — the package root AND the workspace
+        // root — rides on every detect/capabilities response so callers see
+        // both boundaries (lockfile/workspace evidence lives at the root,
+        // dependency evidence at the package; conflating them hides half).
+        let ctx = crate::framework::context::ProjectContext::resolve(&detect_cwd);
         let mut det = crate::framework::detect::detect(&detect_cwd);
         // Surface the resolved root as evidence so the agent sees *which*
         // directory the detection ran against (and can pass an explicit one).
@@ -2929,15 +2936,22 @@ impl TuiLabServer {
             unreachable!()
         };
         match fw_action {
-            FA::Detect => ok(json!({ "framework": det })),
+            FA::Detect => ok(json!({ "framework": det, "project_context": ctx })),
             FA::Capabilities => ok(
-                json!({ "framework": det, "note": "native probes invoke project-local tooling" }),
+                json!({ "framework": det, "project_context": ctx, "note": "native probes invoke project-local tooling" }),
             ),
             FA::AdapterSnippet => {
                 let fw = p
                     .source
                     .clone()
-                    .or_else(|| det.framework.clone())
+                    .or_else(|| {
+                        // Item 33: adapters exist for FRAMEWORKS; a terminal-I/O
+                        // or styling candidate is not an adapter target.
+                        det.primary
+                            .as_ref()
+                            .filter(|c| c.class == "framework")
+                            .map(|c| c.name.clone())
+                    })
                     .unwrap_or_else(|| "python".into());
                 match crate::framework::adapters::snippet_for(&fw.to_lowercase()) {
                     Some(code) => ok(json!({
@@ -3465,7 +3479,14 @@ impl TuiLabServer {
                             ),
                         }
                     };
-                self.check_contract_against(p.id.as_deref(), contract, p.mode.as_deref())
+                // Item 32: the mode selector is typed — a typo ("strcit")
+                // is an invalid_request naming the accepted set, never a
+                // silently-ignored override.
+                let mode_override = match contract_mode_override(&p.mode) {
+                    Ok(m) => m,
+                    Err(e) => return err(ErrorCategory::InvalidRequest, e),
+                };
+                self.check_contract_against(p.id.as_deref(), contract, mode_override)
                     .await
             }
             // ── compare: run conformance now, diff against the baseline ──
@@ -3481,8 +3502,12 @@ impl TuiLabServer {
                             ),
                         }
                     };
+                let mode_override = match contract_mode_override(&p.mode) {
+                    Ok(m) => m,
+                    Err(e) => return err(ErrorCategory::InvalidRequest, e),
+                };
                 let current = match self
-                    .check_contract_inner(p.id.as_deref(), contract.clone(), p.mode.as_deref())
+                    .check_contract_inner(p.id.as_deref(), contract.clone(), mode_override)
                     .await
                 {
                     Ok(Ok(r)) => r,
@@ -3601,6 +3626,56 @@ impl TuiLabServer {
                     "yaml": yaml,
                 }))
             }
+            // ── baseline (re-review item 31): run conformance NOW and
+            // store the report under an explicit label. The status action
+            // no longer silently overwrites "baseline" on every check —
+            // baselines are named on purpose, and compare diffs against
+            // the label the caller chose.
+            CT::Baseline => {
+                let contract =
+                    {
+                        let run = self.run.lock().unwrap();
+                        match run.contract() {
+                            Some(c) => c.clone(),
+                            None => return err(
+                                ErrorCategory::InvalidRequest,
+                                "no contract loaded; call tui_contract action=load path=... first",
+                            ),
+                        }
+                    };
+                let mode_override = match contract_mode_override(&p.mode) {
+                    Ok(m) => m,
+                    Err(e) => return err(ErrorCategory::InvalidRequest, e),
+                };
+                let report = match self
+                    .check_contract_inner(p.id.as_deref(), contract, mode_override)
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => return err(ErrorCategory::BackendError, e.to_string()),
+                    Err(e) => return e,
+                };
+                let label = p
+                    .baseline
+                    .clone()
+                    .or_else(|| p.label.clone())
+                    .unwrap_or_else(|| "baseline".into());
+                let verdict = report.verdict.as_str().to_string();
+                let summary = report.summary();
+                {
+                    let mut run = self.run.lock().unwrap();
+                    run.record_contract_baseline(&label, &report);
+                }
+                ok(json!({
+                    "action": "baseline",
+                    "label": label,
+                    "verdict": verdict,
+                    "summary": summary,
+                    "note": format!(
+                        "stored under '{label}'; tui_contract action=compare baseline={label} diffs against it"
+                    ),
+                }))
+            }
         }
     }
 
@@ -3609,11 +3684,11 @@ impl TuiLabServer {
         &self,
         id: Option<&str>,
         contract: crate::design::ProjectContract,
-        mode_override: Option<&str>,
+        mode_override: Option<crate::design::ContractMode>,
     ) -> rmcp::model::CallToolResult {
         let selector = id.map(str::to_string);
         let run = self.run.clone();
-        let mode = mode_override.and_then(parse_mode_override);
+        let mode = mode_override;
         match self
             .with_sess(selector.as_deref(), move |sess| {
                 // Conformance drives the app (declared keys, resizes,
@@ -3629,13 +3704,15 @@ impl TuiLabServer {
             .await
         {
             Ok(Ok(Ok(report))) => {
-                // Findings feed the run ledger (item 49).
+                // Findings feed the run ledger (item 49). Baselines are
+                // recorded ONLY by the explicit `action=baseline` (re-review
+                // item 31): a silent auto-record under "baseline" made every
+                // status check clobber the comparison point.
                 let findings = report.findings();
                 let summary = report.summary();
                 let results = report.results.clone();
                 let mut run = run.lock().unwrap();
                 run.extend_findings_with_source_refs(findings);
-                run.record_contract_baseline("baseline", &report);
                 ok(json!({
                     "verdict": report.verdict.as_str(),
                     "summary": summary,
@@ -3652,10 +3729,10 @@ impl TuiLabServer {
         &self,
         id: Option<&str>,
         contract: crate::design::ProjectContract,
-        mode_override: Option<&str>,
+        mode_override: Option<crate::design::ContractMode>,
     ) -> Result<anyhow::Result<crate::design::ContractReport>, rmcp::model::CallToolResult> {
         let selector = id.map(str::to_string);
-        let mode = mode_override.and_then(parse_mode_override);
+        let mode = mode_override;
         match self
             .with_sess(selector.as_deref(), move |sess| {
                 // Same lease rule as check_contract_against (item 76).
@@ -3676,12 +3753,21 @@ impl TuiLabServer {
 /// Parse the `mode` tool parameter; `None` means "use the contract's own
 /// mode". Unknown strings are `None` here because the typed enum surfaces
 /// them as invalid_request at the parameter layer.
-fn parse_mode_override(s: &str) -> Option<crate::design::ContractMode> {
-    match s.trim().to_lowercase().as_str() {
-        "advisory" => Some(crate::design::ContractMode::Advisory),
-        "validation" => Some(crate::design::ContractMode::Validation),
-        "strict" => Some(crate::design::ContractMode::Strict),
-        _ => None,
+/// Item 32: resolve the typed mode selector into the engine's mode
+/// override. `None` (absent) means "use the contract document's mode";
+/// `Known::Other` is the caller's typo and names the accepted set.
+fn contract_mode_override(
+    mode: &Option<crate::mcp::params::Known<crate::mcp::params::ContractModeParam>>,
+) -> Result<Option<crate::design::ContractMode>, String> {
+    use crate::mcp::params::{ContractModeParam as CMP, Known};
+    match mode {
+        None => Ok(None),
+        Some(Known::Known(CMP::Advisory)) => Ok(Some(crate::design::ContractMode::Advisory)),
+        Some(Known::Known(CMP::Validation)) => Ok(Some(crate::design::ContractMode::Validation)),
+        Some(Known::Known(CMP::Strict)) => Ok(Some(crate::design::ContractMode::Strict)),
+        Some(Known::Other(s)) => Err(format!(
+            "unknown mode '{s}': expected one of advisory, validation, strict"
+        )),
     }
 }
 

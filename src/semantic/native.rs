@@ -590,19 +590,24 @@ fn role_from_slug(slug: &str) -> Option<crate::semantic::node::Role> {
     })
 }
 
-/// The flat-shape counterpart of [`role_from_slug`].
+/// The flat-shape counterpart of [`role_from_slug`]. Derives from the
+/// unified Role→ControlKind projection (re-review item 36) — one
+/// vocabulary, no drift between the tree shape and the flat shape.
 fn kind_from_slug(slug: &str) -> Option<crate::semantic::controls::ControlKind> {
-    use crate::semantic::controls::ControlKind;
-    Some(match slug.to_lowercase().as_str() {
-        "button" => ControlKind::Button,
-        "field" | "textbox" | "input" => ControlKind::Field,
-        "checkbox" => ControlKind::Checkbox,
-        "radio" => ControlKind::Radio,
-        "tab" => ControlKind::Tab,
-        "list" => ControlKind::List,
-        "menuitem" | "menu_item" => ControlKind::MenuItem,
-        _ => return None,
-    })
+    role_from_slug(slug).and_then(|r| r.control_kind())
+}
+
+/// Test visibility for the drift check (item 36): the two slug paths must
+/// agree, so the tests exercise them directly.
+#[cfg(test)]
+pub fn native_role_for_test(slug: &str) -> Option<crate::semantic::node::Role> {
+    role_from_slug(slug)
+}
+
+/// Test visibility counterpart.
+#[cfg(test)]
+pub fn native_kind_for_test(slug: &str) -> Option<crate::semantic::controls::ControlKind> {
+    kind_from_slug(slug)
 }
 
 /// Re-review P0 (native-only insertion): place an unmatched native node into

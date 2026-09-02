@@ -32,9 +32,8 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, repair packets for every finding, repair bundle for ONE finding (reproduction + app-attested source loci + targeted verification recipe + regression check), and context (this registry as JSON).
   - action: status, persist, close, context, list, resume, repair, bundle
 - `tui_contract` — Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (regions become components, named controls become oracle assertions; carries the scaffold.inferred marker; edit from observation toward intent).
-  - action: load, validate, status, compare, scaffold
+  - action: load, validate, status, compare, scaffold, baseline
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
-
 ## Core principle: OBSERVE BEFORE ACTING, DIFF AFTER
 
 - Prefer `tui_observe` modes `summary` and `semantic` over `screen`. Never ask
