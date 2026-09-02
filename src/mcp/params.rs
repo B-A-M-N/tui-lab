@@ -1762,7 +1762,9 @@ pub struct TuiExploreParams {
     /// guided_candidates: highest risk class the caller accepts
     /// (`safe` < `mutating` < `destructive` < `external_side_effect`).
     /// Candidates above the allowance are filtered, never merely flagged
-    /// (Wave D item 33).
+    /// (Wave D item 33). Random/semantic exploration use it too (items
+    /// 27/28): pool actions above the class are excluded before any draw
+    /// — `mutating` (the default) keeps Escape (unknown) out of the pool.
     #[serde(default)]
     pub max_risk: Option<String>,
 }

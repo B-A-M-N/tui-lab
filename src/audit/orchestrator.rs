@@ -616,7 +616,11 @@ fn run_profile_with_contract_impl(
         }
         AuditProfile::Keyboard => crate::audit::driver::keyboard_audit(session, 20, &mut graph),
         AuditProfile::Focus => crate::audit::driver::focus_audit(session),
-        AuditProfile::Resize | AuditProfile::Layout => crate::audit::driver::resize_audit(session),
+        AuditProfile::Resize | AuditProfile::Layout => {
+            let mut fs = crate::audit::driver::resize_audit(session);
+            fs.extend(crate::audit::driver::resize_reflow_audit(session));
+            fs
+        }
         AuditProfile::Clipping => crate::audit::driver::clipping_audit(session),
         AuditProfile::Navigation => {
             let mut fs = crate::audit::driver::navigation_audit(session, 20, &mut graph);

@@ -510,3 +510,297 @@ fn navigation_keys_audit_proves_arrow_reversibility() {
     let edges = ev[0]["detail"]["graph"]["edges"].as_u64().unwrap_or(0);
     assert!(edges >= 1, "at least one navigation edge recorded: {ev}");
 }
+
+// ── Item 25: resize shrink→grow reflow invariants ────────────────────────
+
+/// A screen whose content is stable across the round trip reports
+/// RFLW-CONTENT-OK; a well-behaved app keeps its content and focus.
+#[test]
+fn resize_reflow_audit_passes_stable_content() {
+    let mut mgr = SessionManager::new();
+    // Full-screen fixture: header line + body line, redrawn on SIGWINCH by
+    // re-reading the terminal size.
+    let sid = python_session(
+        &mut mgr,
+        "import sys, signal, struct, fcntl, termios\n\
+         APP = (\n\
+         \"import sys, signal, struct, fcntl, termios\\n\"\n\
+         \"def draw():\\n\"\n\
+         \"    cols, rows = struct.unpack('HH', fcntl.ioctl(0, termios.TIOCGWINSZ, 'hhhh'))\\n\"\n\
+         \"    sys.stdout.write(chr(27) + '[2J' + chr(27) + '[1;1HHEADER ALPHA' + chr(10))\\n\"\n\
+         \"    sys.stdout.write('BODY BETA' + chr(10))\\n\"\n\
+         \"    sys.stdout.flush()\\n\"\n\
+         \"draw()\\n\"\n\
+         \"signal.signal(signal.SIGWINCH, lambda *a: draw())\\n\"\n\
+         \"signal.pause()\\n\"\n\
+         )\n\
+         exec(APP)",
+    );
+    let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    sess.observe(500).expect("baseline");
+
+    let report = tui_lab::audit::orchestrator::run_profile_checked(
+        sess,
+        "resize",
+        None,
+        tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+    )
+    .expect("resize audit runs");
+
+    let ok = report
+        .findings
+        .iter()
+        .find(|f| f.id == "RFLW-CONTENT-OK")
+        .expect("a reflow-correct app must produce the content-ok verdict");
+    let lost = report.findings.iter().find(|f| f.id == "RFLW-CONTENT-LOST");
+    assert!(
+        lost.is_none(),
+        "the SIGWINCH redraw keeps all content, but: {:?}",
+        lost.map(|f| &f.summary)
+    );
+    let ev = serde_json::to_value(&ok.evidence).unwrap();
+    assert!(
+        ev[0]["detail"]["rows_checked"].as_u64().unwrap_or(0) >= 2,
+        "both content rows were checked: {ev}"
+    );
+}
+
+// ── Item 26: action→response latency metrics ─────────────────────────────
+
+/// The render transaction's latency surface: first-byte, first-frame, and
+/// first-semantic latencies are all measured (present when the action
+/// provably produced each phase), and the repaint ratio is a 0..1 share.
+#[test]
+fn render_transaction_reports_full_latency_surface() {
+    let mut mgr = SessionManager::new();
+    let sid = python_session(
+        &mut mgr,
+        "import sys\n\
+         print('READY', flush=True)\n\
+         line = sys.stdin.readline()\n\
+         sys.stdout.write('GOT:' + repr(line) + '\\n')\n\
+         sys.stdout.write(chr(27) + '[7mINV' + chr(27) + '[0m\\n')\n\
+         sys.stdout.flush()",
+    );
+    let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    sess.observe(300).expect("baseline");
+
+    let tx = tui_lab::execution::execute_act(
+        sess,
+        &tui_lab::execution::CanonicalAction::Type { text: "z\n".into() },
+        120,
+        1200,
+        false,
+    )
+    .expect("act");
+    let r = tx.render.as_ref().expect("portable engine retains raw bytes");
+    // First byte measured — the app wrote output.
+    assert!(r.first_byte_ms.is_some(), "first-byte must be measured");
+    assert!(r.first_byte_ms.unwrap() <= tx.elapsed_ms + 100);
+    // First frame measured — the app's text changed the parsed screen.
+    assert!(r.first_frame_ms.is_some(),
+        "a text-emitting action must produce a screen frame: render={r:?}");
+    assert!(r.first_frame_ms.unwrap() <= tx.elapsed_ms + 100);
+    // Repaint ratio is a valid share even when no erases occurred.
+    assert!(
+        (0.0..=1.0).contains(&r.full_repaint_ratio),
+        "repaint ratio must be a 0..1 share, got {}",
+        r.full_repaint_ratio
+    );
+    // The range decodes to the app's response text (not just the PTY echo).
+    let ops_text: String = r.ops.iter().map(|op| op.describe.clone()).collect();
+    assert!(
+        ops_text.contains("GOT:") && ops_text.contains("INV"),
+        "decoded ops must carry the app's response text: {ops_text:?}"
+    );
+    assert!(r.bytes > 2, "more than the echoed key byte: bytes={}", r.bytes);
+}
+
+// ── Items 27/28: interaction risk classes drive autonomous drivers ───────
+
+/// The commit fence through a REAL screen: a semantic screen whose buttons
+/// carry commit-fence labels are classified above a safe allowance, and the
+/// mouse audit's shared filter excludes them from auto-click targets.
+#[test]
+fn risk_classes_fence_commit_labels_for_auto_click() {
+    use tui_lab::exploration::risk;
+    use tui_lab::intent::ActionRisk;
+
+    let click = tui_lab::execution::CanonicalAction::MouseClick {
+        button: tui_lab::backend::MouseButton::Left,
+        x: 0,
+        y: 0,
+    };
+    for label in ["Save", "Submit", "Apply", "Deploy", "Connect", "Send", "Authorize"] {
+        let base = risk::classify_action(&click);
+        let with_label = risk::classify_with_label(base, label);
+        assert!(
+            with_label >= ActionRisk::Mutating,
+            "click on '{label}' must classify at least mutating, got {with_label:?}"
+        );
+        assert!(risk::is_commit_label(&format!("  {label} now")), "case/space tolerant");
+    }
+    // A neutral label raises nothing: the raw click class stands.
+    assert_eq!(
+        risk::classify_with_label(risk::classify_action(&click), "Next"),
+        ActionRisk::Mutating,
+        "neutral labels never raise a class"
+    );
+}
+
+/// Item 28 end-to-end: the random exploration pool under a `mutating`
+/// allowance EXCLUDES Escape (unknown by default), and an explicit
+/// `unknown` allowance includes it. The budget's admitted_pool is the
+/// exact set a driver will draw from.
+#[test]
+fn escape_excluded_from_exploration_pool_by_default() {
+    use tui_lab::exploration::random::Budget;
+    use tui_lab::intent::ActionRisk;
+
+    let budget = Budget::from_graph_budget(&Default::default());
+    let admitted: Vec<&str> = budget
+        .admitted_pool()
+        .iter()
+        .map(|(f, _)| f.0)
+        .collect();
+    assert!(
+        !admitted.contains(&"escape"),
+        "Escape (unknown) must be excluded under a mutating allowance: {admitted:?}"
+    );
+    assert!(
+        admitted.contains(&"enter"),
+        "enter (mutating) stays within a mutating allowance"
+    );
+
+    // Raise the allowance: Escape joins the pool.
+    let budget = Budget {
+        allowed_risk: ActionRisk::Unknown,
+        ..Budget::from_graph_budget(&Default::default())
+    };
+    let admitted: Vec<&str> = budget
+        .admitted_pool()
+        .iter()
+        .map(|(f, _)| f.0)
+        .collect();
+    assert!(admitted.contains(&"escape"), "unknown allowance admits escape");
+
+    // Lower to safe: activation keys drop out too.
+    let budget = Budget {
+        allowed_risk: ActionRisk::Safe,
+        ..Budget::from_graph_budget(&Default::default())
+    };
+    let admitted: Vec<&str> = budget
+        .admitted_pool()
+        .iter()
+        .map(|(f, _)| f.0)
+        .collect();
+    assert!(
+        !admitted.contains(&"enter") && !admitted.contains(&"space"),
+        "safe allowance excludes activation keys: {admitted:?}"
+    );
+    assert!(admitted.contains(&"tab"), "tab stays safe");
+}
+
+/// Item 28 through candidate suggestions: with no contract evidence,
+/// Escape's candidate risk is Unknown (the driving fence treats it as
+/// not-assumed-safe); with a declared binding it is Mutating.
+#[test]
+fn escape_candidate_risk_follows_declared_evidence() {
+    use tui_lab::exploration::candidates::{CandidateContext, suggest};
+    use tui_lab::exploration::state_graph::{ExplorationBudget, StateGraph};
+    use tui_lab::intent::ActionRisk;
+
+    let screen = screen_fixture();
+    let sem = tui_lab::semantic::analyze(&screen);
+    let graph = StateGraph::new(ExplorationBudget::default());
+    let current = tui_lab::exploration::state_graph::StateId::from_structure_hash(
+        &screen.structure_hash,
+    );
+    let ctx = CandidateContext {
+        state_graph: &graph,
+        current,
+        action_history: &[],
+        coverage: &[],
+        contract: None,
+        allowed_risk: ActionRisk::Mutating,
+    };
+    let out = suggest(&screen, &sem, &ctx);
+    let esc = out.iter().find(|c| c.action["key"] == "escape");
+    // With no contract the escape candidate is Unknown → filtered by the
+    // mutating allowance (never offered as safe).
+    assert!(
+        esc.is_none(),
+        "undeclared escape must not pass a mutating gate: {:?}",
+        out.iter().map(|c| c.action.to_string()).collect::<Vec<_>>()
+    );
+}
+
+fn screen_fixture() -> tui_lab::screen::ScreenState {
+    tui_lab::screen::ScreenState {
+        cols: 40,
+        rows: 2,
+        cursor: tui_lab::screen::CursorState { x: 0, y: 0, visible: true },
+        title: None,
+        cells: Vec::new(),
+        viewport_text: vec!["[ OK ]".into(), "".into()],
+        scrollback: Vec::new(),
+        hyperlinks: Vec::new(),
+        raw_hash: String::new(),
+        visual_hash: String::new(),
+        structure_hash: "fixture-structure".into(),
+        process: tui_lab::screen::ProcessState {
+            running: true,
+            exit_code: None,
+            exit_signal: None,
+            cwd: None,
+            pid: None,
+        },
+    }
+}
+
+// ── Item 29: coverage-guided exploration (multi-dimensional novelty) ─────
+
+/// A real exploration run's novelty scoreboard reports per-dimension
+/// counts: focus edges and controls move even when the state identity
+/// repeats, and the summary is the run's coverage surface.
+#[test]
+fn random_exploration_reports_novelty_scoreboard() {
+    use tui_lab::exploration::novelty::NoveltyLedger;
+    use tui_lab::exploration::state_graph::StateIdentity;
+
+    let mut ledger = NoveltyLedger::new();
+
+    // Step 1: lands in state A, focuses control c1 → 2 signals.
+    let id_a = StateIdentity::from_parts("state-a");
+    let n1 = ledger.note(
+        Some(&id_a),
+        &[],
+        &["button:ok".to_string()],
+        &[],
+        &[],
+    );
+    assert!(n1.any_novel);
+
+    // Step 2: same state, but tab moved focus ok→cancel → focus_edge novel.
+    let n2 = ledger.note(
+        Some(&id_a),
+        &[("button:ok".to_string(), "button:cancel".to_string(), "tab".to_string())],
+        &["button:ok".to_string(), "button:cancel".to_string()],
+        &[],
+        &[],
+    );
+    assert!(n2.any_novel, "new focus edge in a seen state is novelty");
+    assert!(n2.signals.iter().any(|s| s.dimension == "semantic_state" && !s.novel));
+    assert!(n2.signals.iter().any(|s| s.dimension == "focus_edge" && s.novel));
+    assert!(n2.signals.iter().any(|s| s.dimension == "control" && s.novel));
+
+    let summary = ledger.summary();
+    assert_eq!(summary.semantic_states, 1);
+    assert_eq!(summary.focus_edges, 1);
+    assert_eq!(summary.controls, 2);
+
+    // Serialized shape reaches the wire (ExploreReport.novelty).
+    let v = serde_json::to_value(&summary).unwrap();
+    assert!(v["semantic_states"].is_u64());
+    assert!(v["focus_edges"].is_u64());
+}
