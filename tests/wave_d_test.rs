@@ -44,6 +44,9 @@ fn crash_minimization_produces_replayable_reproduction() {
         max_relaunches: 1,
         max_depth: 100,
         max_unique_states: 50,
+        // Items 27/28: the pool is risk-gated; the default (mutating) keeps
+        // Escape (unknown) out of the draw set.
+        allowed_risk: tui_lab::intent::ActionRisk::Mutating,
     };
     let report = random::run(sess, 9, budget, None).expect("explore");
 

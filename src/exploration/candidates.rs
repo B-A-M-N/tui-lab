@@ -124,6 +124,9 @@ pub fn suggest(
     let mut out: Vec<Candidate> = Vec::new();
 
     // ── 1) Traversal actions the graph has never seen from this state ──
+    // Risk comes from the shared interaction-risk classifier (items 27/28):
+    // Escape classifies Unknown (not safe by default), enter/classed keys
+    // follow the same evidence rules the driver layer uses.
     for (name, key_json) in [
         ("tab", json!({ "action": "key", "key": "tab" })),
         ("shift+tab", json!({ "action": "key", "key": "shift+tab" })),
@@ -136,17 +139,34 @@ pub fn suggest(
         // Only actions never taken from this state — that is the graph's
         // claim, verifiable from the edge list.
         if taken == 0 {
+            // App-declared context (contract / affordance) proves what the
+            // key does; bare traversal leaves Escape Unknown (item 28).
+            let declared = ctx
+                .contract
+                .map(|c| {
+                    c.keybindings.iter().any(|kb| kb.keys.iter().any(|k| k == name))
+                        || c
+                            .interactions
+                            .iter()
+                            .any(|i| i.keys.iter().any(|k| k == name))
+                })
+                .unwrap_or(false);
+            let key_code = match name {
+                "tab" => crate::backend::KeyCode::Tab,
+                "shift+tab" => crate::backend::KeyCode::Tab,
+                "down" => crate::backend::KeyCode::Down,
+                "up" => crate::backend::KeyCode::Up,
+                "enter" => crate::backend::KeyCode::Enter,
+                "escape" => crate::backend::KeyCode::Escape,
+                _ => crate::backend::KeyCode::Function(0),
+            };
             out.push(Candidate {
                 action: key_json,
                 reasons: vec![Evidence::graph(
                     format!("'{name}' has never been executed from this state"),
                     json!({ "times_taken_from_state": 0, "state": ctx.current.as_str() }),
                 )],
-                risk: if name == "enter" {
-                    ActionRisk::Mutating
-                } else {
-                    ActionRisk::Safe
-                },
+                risk: crate::exploration::risk::classify_key_with(&key_code, declared),
                 control_id: None,
             });
         }

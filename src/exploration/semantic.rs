@@ -38,6 +38,8 @@ pub struct SemanticExploreReport {
     /// Focus-graph edges accumulated during this exploration (stable IDs).
     pub focus_edges: usize,
     pub states_seen: usize,
+    /// Item 29: per-dimension novelty scoreboard.
+    pub novelty: crate::exploration::novelty::NoveltySummary,
     pub elapsed_ms: u64,
 }
 
@@ -83,6 +85,8 @@ pub fn run_with_contract(
     let mut steps: Vec<SemanticStep> = Vec::new();
     let mut identities: Vec<StateIdentity> = Vec::new();
     let mut reason = ExplorationCompletionReason::CleanExit;
+    // Item 29: multi-dimensional novelty scoreboard.
+    let mut novelty_ledger = crate::exploration::novelty::NoveltyLedger::new();
 
     for seq in 0..max_actions {
         if started.elapsed().as_millis() as u64 >= budget.max_runtime_ms {
@@ -170,6 +174,30 @@ pub fn run_with_contract(
             );
         }
 
+        // Item 29: feed the novelty ledger from what this step evidenced.
+        {
+            let control_ids: Vec<String> =
+                after_sem.controls.iter().map(|c| c.id.clone()).collect();
+            let focus_edge_list: Vec<(String, String, String)> =
+                match (sem.focus.control_id.as_ref(), after_sem.focus.control_id.as_ref()) {
+                    (Some(f), Some(t)) => vec![(
+                        f.clone(),
+                        t.clone(),
+                        candidate_name(&action).to_string(),
+                    )],
+                    _ => Vec::new(),
+                };
+            let coverage_targets = session.native_coverage_targets();
+            let mode_states = super::random::current_mode_states_pub(session);
+            novelty_ledger.note(
+                Some(&after_identity),
+                &focus_edge_list,
+                &control_ids,
+                &coverage_targets,
+                &mode_states,
+            );
+        }
+
         let changed = identity.id() != after_identity.id();
         steps.push(SemanticStep {
             motive,
@@ -196,6 +224,7 @@ pub fn run_with_contract(
         completion_reason: reason,
         focus_edges: focus_graph.edges.len(),
         states_seen: identities.len(),
+        novelty: novelty_ledger.summary(),
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }

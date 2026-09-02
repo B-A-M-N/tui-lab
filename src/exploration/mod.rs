@@ -1,7 +1,9 @@
 pub mod candidates;
+pub mod novelty;
 pub mod random;
 pub mod repro;
 pub mod repro_minimizer;
+pub mod risk;
 pub mod semantic;
 pub mod state_graph;
 

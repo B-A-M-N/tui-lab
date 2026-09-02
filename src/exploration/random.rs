@@ -82,6 +82,9 @@ pub struct ExploreReport {
     pub relaunches: u32,
     pub exits: Vec<ProcessExit>,
     pub novel_transitions: u32,
+    /// Item 29: per-dimension novelty scoreboard — WHAT the run explored,
+    /// not just how many steps ran.
+    pub novelty: crate::exploration::novelty::NoveltySummary,
     pub terminated_early: bool,
     pub elapsed_ms: u64,
     pub recording_path: Option<String>,
@@ -155,6 +158,12 @@ pub struct Budget {
     pub max_relaunches: u32,
     pub max_depth: u32,
     pub max_unique_states: u32,
+    /// Highest interaction-risk class the autonomous driver may execute
+    /// (re-review items 27/28). Pool actions whose class exceeds this are
+    /// excluded before any draw — Escape (Unknown by default) is absent
+    /// from a `mutating`-allowance run, and a `safe` allowance additionally
+    /// drops enter/space.
+    pub allowed_risk: crate::intent::ActionRisk,
 }
 
 impl Budget {
@@ -167,7 +176,21 @@ impl Budget {
             max_relaunches: b.max_relaunches,
             max_depth: b.max_depth,
             max_unique_states: b.max_unique_states,
+            // Autonomous default: the driving-risk fence — Unknown is
+            // excluded unless the caller proves otherwise (item 28).
+            allowed_risk: crate::intent::ActionRisk::Mutating,
         }
+    }
+
+    /// The pool actions this budget's risk allowance admits, with their
+    /// classified classes (item 27: every driver-visible action names its
+    /// class). Deterministic order (pool order).
+    pub fn admitted_pool(&self) -> Vec<(ActionFactory, crate::intent::ActionRisk)> {
+        ACTION_POOL
+            .iter()
+            .map(|f| (*f, crate::exploration::risk::classify_action(&(f.1)())))
+            .filter(|(_, r)| *r <= self.allowed_risk)
+            .collect()
     }
 }
 
@@ -188,6 +211,8 @@ pub fn run(
     let mut last_id: Option<crate::exploration::state_graph::StateId> = None;
     let mut relaunches = 0u32;
     let mut terminated_early = false;
+    // Item 29: multi-dimensional novelty scoreboard, fed after every step.
+    let mut novelty_ledger = crate::exploration::novelty::NoveltyLedger::new();
 
     // The completion reason when the loop exits naturally after the last
     // action. Overridden by whichever budget (or failure) actually stops us.
@@ -213,7 +238,17 @@ pub fn run(
             break;
         }
 
-        let (name, mk) = ACTION_POOL.choose(&mut rng).unwrap();
+        // Risk-gated pool (items 27/28): actions above the budget's
+        // allowance were excluded before the loop; the draw is uniform over
+        // what the driver may actually execute.
+        let admitted: Vec<ActionFactory> = ACTION_POOL
+            .iter()
+            .copied()
+            .filter(|f| {
+                crate::exploration::risk::classify_action(&(f.1)()) <= budget.allowed_risk
+            })
+            .collect();
+        let (name, mk) = admitted.choose(&mut rng).unwrap();
         // Go through the canonical executor so baseline-before-send and
         // anchored settle-wait ordering match MCP `tui_act` exactly
         // (re-review P0 "one canonical executor").
@@ -249,6 +284,38 @@ pub fn run(
         // — never a bare re-inference that discards what the app reported.
         let before_identity = fused_identity_of(session, tx.before());
         let after_identity = fused_identity_of(session, &after);
+
+        // Item 29: feed the novelty ledger with every dimension the step
+        // can evidence. Failure to read a dimension (no native coverage,
+        // no raw ring) shrinks the signal honestly rather than faking it.
+        {
+            let after_sem = session.fuse_screen(&after);
+            let control_ids: Vec<String> =
+                after_sem.controls.iter().map(|c| c.id.clone()).collect();
+            let focus_edges: Vec<(String, String, String)> = [(
+                tx.focus_before.as_ref().and_then(|f| f.0.clone()),
+                tx.focus_after.as_ref().and_then(|f| f.0.clone()),
+                Some(action.signature()),
+            )]
+            .into_iter()
+            .filter_map(|(f, t, via)| match (f, t) {
+                (Some(f), Some(t)) => Some((f, t, via.unwrap_or_default())),
+                _ => None,
+            })
+            .collect();
+            let coverage_targets: Vec<String> = session
+                .native_coverage_targets()
+                .into_iter()
+                .collect();
+            let mode_states = current_mode_states_pub(session);
+            novelty_ledger.note(
+                Some(&after_identity),
+                &focus_edges,
+                &control_ids,
+                &coverage_targets,
+                &mode_states,
+            );
+        }
 
         let novel_state = !identities.contains(&after_identity);
         if novel_state {
@@ -338,6 +405,7 @@ pub fn run(
         relaunches,
         exits,
         novel_transitions: novel,
+        novelty: novelty_ledger.summary(),
         terminated_early,
         elapsed_ms: started.elapsed().as_millis() as u64,
         recording_path: final_path,
@@ -355,6 +423,23 @@ fn fused_identity_of(
 ) -> crate::exploration::state_graph::StateIdentity {
     let sem = session.fuse_screen(screen);
     crate::exploration::state_graph::StateIdentity::with_semantic(screen, &sem)
+}
+
+/// Item 29: the current tri-state terminal-mode map, folded from the raw
+/// protocol timeline. Empty when the engine retains no raw bytes (the
+/// novelty ledger loses the mode dimension honestly).
+pub fn current_mode_states_pub(
+    session: &mut Session,
+) -> Vec<(String, crate::protocol::KnownModeState)> {
+    let (bytes, cap, dropped) = session.raw_output_window();
+    if cap == 0 {
+        return Vec::new();
+    }
+    let trace = crate::protocol::ProtocolTrace::decode(&bytes);
+    crate::protocol::fold_mode_states(&trace.modes, dropped == 0)
+        .into_iter()
+        .map(|(m, s)| (m.to_string(), s))
+        .collect()
 }
 
 /// Feed executed steps into the run's state graph — from the ordered record

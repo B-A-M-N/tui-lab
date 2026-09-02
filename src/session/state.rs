@@ -949,6 +949,18 @@ impl Session {
         &self.native
     }
 
+    /// Item 29: native coverage targets the app has reported so far this
+    /// session (the `coverage` event stream). Empty for non-cooperative
+    /// apps — the caller's novelty ledger just loses that dimension.
+    pub fn native_coverage_targets(&self) -> Vec<String> {
+        self.native
+            .events
+            .iter()
+            .filter(|e| e.event == "coverage")
+            .map(|e| e.target.clone())
+            .collect()
+    }
+
     /// Drain the native channel NOW (bounded read; partial lines stay
     /// pending) and fold fresh events into the queue. Necessary before any
     /// fused read that must not be stale: `native.poll()` otherwise runs
@@ -997,6 +1009,17 @@ impl Session {
         match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
             Some(port) => port.probe_query_response(query),
             None => (None, Vec::new()),
+        }
+    }
+
+    /// Item 26: `(screen_seq, unix_ms)` for every screen change at/after
+    /// `after_seq`, oldest first — the measured evidence for an action's
+    /// first-frame latency. Empty when no change was observed.
+    pub fn screen_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        let any = self.backend.as_any_mut();
+        match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
+            Some(port) => port.screen_changes_since(after_seq),
+            None => Vec::new(),
         }
     }
 

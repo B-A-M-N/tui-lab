@@ -520,6 +520,18 @@ pub struct RenderTransaction {
     /// Input→first-response-byte latency in milliseconds (the app's own
     /// reaction time, not the settle time).
     pub first_byte_ms: Option<u64>,
+    /// Item 26: input→first-screen-frame latency (the first ScreenChanged
+    /// event after the action). `None` when the action never changed the
+    /// parsed screen.
+    pub first_frame_ms: Option<u64>,
+    /// Item 26: input→first-semantic-change latency (the first
+    /// SemanticChanged-class transition — screen diff that alters the
+    /// controls/regions/focus reading). `None` when semantics never moved.
+    pub first_semantic_ms: Option<u64>,
+    /// Item 26: how many of the response's protocol ops were full-screen
+    /// erase-class ops (`CSI ...J` / `CSI ...H` with wide coverage) vs the
+    /// total op count — the repaint-style ratio. 0.0 when nothing rendered.
+    pub full_repaint_ratio: f64,
     /// Total response bytes.
     pub bytes: u64,
 }
@@ -540,13 +552,18 @@ const RENDER_OP_SAMPLE_CAP: usize = 256;
 /// Build the render transaction for a completed act by decoding the raw
 /// bytes between the bracketing stream offsets. `bytes_total_after` is the
 /// absolute stream end at settle time; `captured_at` is the monotonic
-/// instant the action was sent (for first-byte latency).
+/// instant the action was sent (for first-byte latency). The latency trio
+/// is computed by the caller (the executor owns the event window and the
+/// backend's screen-change log; this builder only packages evidence).
+#[allow(clippy::too_many_arguments)]
 fn build_render_transaction(
     session: &mut Session,
     action_sig: &str,
     offset_before: u64,
     offset_after: u64,
     first_byte_ms: Option<u64>,
+    first_frame_ms: Option<u64>,
+    first_semantic_ms: Option<u64>,
     before_state: &crate::screen::ScreenState,
     after_state: &crate::screen::ScreenState,
 ) -> Option<RenderTransaction> {
@@ -568,23 +585,39 @@ fn build_render_transaction(
     let lo = offset_before.max(window_start) as usize;
     let hi = offset_after.min(window_end) as usize;
     let complete = window_start <= offset_before && offset_after <= window_end;
-    let (op_count, ops) = if complete && lo < hi && hi <= bytes.len() + window_start as usize {
-        let slice = &bytes[lo - window_start as usize..hi - window_start as usize];
-        let trace = crate::protocol::ProtocolTrace::decode(slice);
-        let op_count = trace.ops.len();
-        let ops: Vec<RenderOp> = trace
-            .ops
-            .iter()
-            .take(RENDER_OP_SAMPLE_CAP)
-            .map(|e| RenderOp {
-                at: e.at as u64,
-                describe: e.op.describe(),
-            })
-            .collect();
-        (op_count, ops)
-    } else {
-        (0, Vec::new())
-    };
+    // Item 26: the repaint census — how many of the response's ops are
+    // full-screen erase-class (CSI ... J) vs everything else. A ratio near
+    // 1.0 with a large op_count says "repaints everything on every action"
+    // (flicker-prone); near 0.0 says targeted diffs.
+    let (op_count, ops, full_repaint_ratio) =
+        if complete && lo < hi && hi <= bytes.len() + window_start as usize {
+            let slice = &bytes[lo - window_start as usize..hi - window_start as usize];
+            let trace = crate::protocol::ProtocolTrace::decode(slice);
+            let op_count = trace.ops.len();
+            let erases = trace
+                .ops
+                .iter()
+                .filter(|e| matches!(&e.op,
+                    crate::protocol::TerminalOp::Csi { final_byte: 'J', .. }))
+                .count();
+            let ratio = if op_count > 0 {
+                erases as f64 / op_count as f64
+            } else {
+                0.0
+            };
+            let ops: Vec<RenderOp> = trace
+                .ops
+                .iter()
+                .take(RENDER_OP_SAMPLE_CAP)
+                .map(|e| RenderOp {
+                    at: e.at as u64,
+                    describe: e.op.describe(),
+                })
+                .collect();
+            (op_count, ops, ratio)
+        } else {
+            (0, Vec::new(), 0.0)
+        };
     Some(RenderTransaction {
         action: action_sig.to_string(),
         range_start: offset_before,
@@ -606,6 +639,9 @@ fn build_render_transaction(
                 * after_state.cols as usize,
         dirty_rows,
         first_byte_ms,
+        first_frame_ms,
+        first_semantic_ms,
+        full_repaint_ratio,
         bytes: offset_after.saturating_sub(offset_before),
     })
 }
@@ -1018,6 +1054,39 @@ fn execute_act_inner(
     };
     let protocol_offset_after = window.sess().raw_window_range().1;
 
+    // Item 26: first-frame and first-semantic latencies. The frame figure
+    // comes from the backend's measured screen-change log (the settle path
+    // never routes through Session::observe, so no ScreenChanged event
+    // lands in the queue — the log is where the pump stamps the change).
+    // The semantic figure stays event-driven: an explicit SemanticChanged /
+    // FocusChanged event inside the settle window.
+    let phase_latencies = {
+        let sess = window.sess();
+        sess.absorb_ingest_now();
+        let pre_screen_seq = baseline.screen_seq;
+        let frame = sess
+            .screen_changes_since(pre_screen_seq)
+            .first()
+            .map(|(_, at_ms)| at_ms.saturating_sub(sent_at_unix_ms));
+        let batch = sess.events_since(pre_event_seq);
+        // Semantic change: an explicit SemanticChanged event, or a screen
+        // change whose transition actually altered semantics (dirty rows
+        // overlap a focus/structure delta is implicit; keep it honest: an
+        // explicit event only).
+        let semantic = batch
+            .events
+            .iter()
+            .find(|ev| {
+                matches!(
+                    ev.kind,
+                    crate::events::TerminalEventKind::SemanticChanged
+                        | crate::events::TerminalEventKind::FocusChanged { .. }
+                )
+            })
+            .map(|ev| ev.at.saturating_sub(sent_at_unix_ms));
+        (frame, semantic)
+    };
+
     let transition = crate::screen::diff(&before_frame.state, &after_state);
     let render = build_render_transaction(
         window.sess(),
@@ -1025,6 +1094,8 @@ fn execute_act_inner(
         protocol_offset_before,
         protocol_offset_after,
         first_byte_ms,
+        phase_latencies.0,
+        phase_latencies.1,
         &before_frame.state,
         &after_state,
     );

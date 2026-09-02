@@ -1197,6 +1197,9 @@ impl TuiLabServer {
                     "op_count": r.op_count,
                     "ops": r.ops.iter().map(|o| json!({ "at": o.at, "op": o.describe })).collect::<Vec<_>>(),
                     "first_byte_ms": r.first_byte_ms,
+                    "first_frame_ms": r.first_frame_ms,
+                    "first_semantic_ms": r.first_semantic_ms,
+                    "full_repaint_ratio": r.full_repaint_ratio,
                     "dirty_cells": r.dirty_cells,
                     "dirty_rows": r.dirty_rows,
                     "note": if r.complete { "" } else {
@@ -2488,10 +2491,18 @@ impl TuiLabServer {
                     // The budget is the authority (re-review item 13): limits come
                     // from the run's ExplorationBudget, with an optional action
                     // override; the report names the real completion reason.
+                    // Items 27/28: the risk allowance gates the pool — the
+                    // default (mutating) keeps Escape (unknown) out.
                     let budget = {
                         let run = run.lock().unwrap();
+                        let allowed_risk = p
+                            .max_risk
+                            .as_deref()
+                            .and_then(crate::intent::ActionRisk::parse)
+                            .unwrap_or(crate::intent::ActionRisk::Mutating);
                         crate::exploration::random::Budget {
                             max_actions: p.actions.unwrap_or(run.state_graph.budget().max_actions),
+                            allowed_risk,
                             ..crate::exploration::random::Budget::from_graph_budget(
                                 run.state_graph.budget(),
                             )

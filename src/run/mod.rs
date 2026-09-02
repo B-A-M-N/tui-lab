@@ -141,6 +141,13 @@ pub struct RenderSummary {
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_byte_ms: Option<u64>,
+    /// Item 26: input→first-screen-frame and input→first-semantic-change
+    /// latencies, and the full-erase share of the response's ops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_frame_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_semantic_ms: Option<u64>,
+    pub full_repaint_ratio: f64,
     pub dirty_cells: usize,
 }
 
@@ -186,6 +193,9 @@ impl TransactionRecord {
                 op_count: r.op_count,
                 bytes: r.bytes,
                 first_byte_ms: r.first_byte_ms,
+                first_frame_ms: r.first_frame_ms,
+                first_semantic_ms: r.first_semantic_ms,
+                full_repaint_ratio: r.full_repaint_ratio,
                 dirty_cells: r.dirty_cells,
             }),
         }

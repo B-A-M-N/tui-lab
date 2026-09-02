@@ -871,13 +871,14 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         .fused_frame()
         .map(|(s, _, _)| s)
         .unwrap_or_else(|| semantic::analyze(&screen));
-    // Risk filter (Wave D risk classes): only click SAFE-looking targets —
-    // buttons and links whose click might mutate or destroy state are
-    // listed, not clicked, unless the screen marks them unambiguous. Here
-    // we click only controls whose label does not match destructive verbs.
-    let destructive = [
-        "delete", "remove", "quit", "kill", "reset", "format", "erase",
-    ];
+    // Risk filter (re-review item 27): classify every clickable control
+    // through the SHARED interaction-risk module. Controls whose label
+    // carries commit-fence evidence (Save/Submit/Apply/Deploy/Connect/
+    // Send/Authorize), destructive evidence, or external evidence are
+    // reported as fenced — never auto-clicked. Only controls whose class
+    // stays within Mutating (a click's own base class) without label
+    // escalation are probe targets.
+    let mut fenced: Vec<(String, &'static str)> = Vec::new();
     let clickable: Vec<&semantic::Control> = sem
         .controls
         .iter()
@@ -893,11 +894,49 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             ) || c.focusable
         })
         .filter(|c| {
-            let label = c.label.to_lowercase();
-            !destructive.iter().any(|d| label.contains(d))
+            use crate::exploration::risk::{classify_with_label, is_non_safe_label};
+            if !is_non_safe_label(&c.label) {
+                return true;
+            }
+            let class = classify_with_label(
+                crate::exploration::risk::classify_action(&CanonicalAction::MouseClick {
+                    button: MouseButton::Left,
+                    x: 0,
+                    y: 0,
+                }),
+                &c.label,
+            );
+            fenced.push((c.label.clone(), class.name()));
+            false
         })
         .take(max_clicks as usize)
         .collect();
+
+    if !fenced.is_empty() {
+        findings.push(Finding {
+            id: "MOUSE-COMMIT-FENCED".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "mouse".into(),
+            summary: format!(
+                "{} clickable control(s) were fenced, not clicked: their labels carry commit/destructive/external evidence (item 27). Pass explicit tui_act clicks to exercise them.",
+                fenced.len()
+            ),
+            evidence: fenced
+                .iter()
+                .map(|(label, class)| {
+                    ev_other(
+                        "commit_fenced_control",
+                        "label evidence fences this control from auto-click",
+                        json!({ "label": label, "risk_class": class }),
+                    )
+                })
+                .collect(),
+            confidence: 0.95,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
 
     if clickable.is_empty() {
         findings.push(Finding {
@@ -905,13 +944,13 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             rule_id: None,
             severity: "info".into(),
             category: "mouse".into(),
-            summary: "No safe clickable controls detected; nothing clicked (destructive-looking labels are never clicked by the audit).".into(),
+            summary: "No auto-clickable controls detected; nothing clicked (commit/destructive/external labels are fenced by the item-27 risk classes).".into(),
             evidence: vec![ev_other(
                 "no_click_targets",
                 "no enabled button/link controls passed the risk filter",
                 json!({
                     "controls_seen": sem.controls.len(),
-                    "risk_filter": "non-destructive, enabled, non-empty bounds",
+                    "risk_filter": "fenced labels excluded (commit/destructive/external), enabled, non-empty bounds",
                 }),
             )],
             confidence: 0.9,
@@ -3228,6 +3267,347 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
         reproduction: None,
         source_refs: Vec::new(),
     });
+
+    findings
+}
+
+/// Item 25 — resize SHRINK→GROW reflow invariants. The matrix audit checks
+/// each size independently; what it cannot see is the ROUND TRIP: content
+/// visible at the original size that vanishes on shrink and never comes
+/// back on grow (lost rows), focus that the app fails to restore, and
+/// ghost cells left behind in the grown-back area. Sequence:
+///
+///   baseline @ WxH  →  shrink to W/2xH/2  →  grow back to WxH
+///
+/// and each invariant is reported against measured before/after frames.
+pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
+    use std::time::Duration;
+
+    let mut findings = Vec::new();
+    let (w, h) = (session.cols(), session.rows());
+    // Skip degenerate originals: halving 40x12 would give 20x6 — legal, but
+    // below ~10 columns semantic analysis is noise. Report honestly.
+    if w < 20 || h < 8 {
+        findings.push(Finding {
+            id: "RFLW-TOO-SMALL".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "resize".into(),
+            summary: format!(
+                "session is {w}x{h}; the shrink→grow probe needs ≥20x8 to halve meaningfully — skipped."
+            ),
+            evidence: vec![ev_other(
+                "reflow_skipped",
+                "original size too small to halve",
+                json!({ "cols": w, "rows": h }),
+            )],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        return findings;
+    }
+
+    let settle = |s: &mut Session, quiet: u64| {
+        let _ = s.wait(
+            WaitCond::ScreenStable {
+                quiet_for: Duration::from_millis(quiet),
+                after_screen_seq: None,
+            },
+            2000,
+        );
+    };
+
+    let base = match session.observe_fused(120) {
+        Ok((s, sem, _, _)) => (s, sem),
+        Err(e) => {
+            findings.push(Finding {
+                id: "RFLW-ERR".into(),
+                rule_id: None,
+                severity: "error".into(),
+                category: "resize".into(),
+                summary: format!("baseline observe failed: {e}"),
+                evidence: vec![ev_other_empty("reflow_baseline_failed", "observe failed")],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            return findings;
+        }
+    };
+    let base_focus = base.1.focus.control_id.clone();
+    let base_nonblank_rows: Vec<usize> = base
+        .0
+        .viewport_text
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.trim().len() >= 4)
+        .map(|(i, _)| i)
+        .collect();
+
+    // ── Shrink ────────────────────────────────────────────────────────────
+    let (sw, sh) = (w / 2, h / 2);
+    if let Err(e) = session.resize(sw, sh) {
+        findings.push(Finding {
+            id: "RFLW-ERR".into(),
+            rule_id: None,
+            severity: "error".into(),
+            category: "resize".into(),
+            summary: format!("shrink to {sw}x{sh} failed: {e}"),
+            evidence: vec![ev_other_empty("reflow_shrink_failed", "resize returned Err")],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+        let _ = session.resize(w, h);
+        return findings;
+    }
+    settle(session, 150);
+    let shrunken = session.observe_fused(120).ok();
+    let shrink_focus = shrunken.as_ref().and_then(|t| t.1.focus.control_id.clone());
+    let (_shru_screen, shru_sem) = match shrunken {
+        Some(t) => (t.0, t.1),
+        None => {
+            findings.push(Finding {
+                id: "RFLW-ERR".into(),
+                rule_id: None,
+                severity: "error".into(),
+                category: "resize".into(),
+                summary: "observe after shrink failed".into(),
+                evidence: vec![ev_other_empty("reflow_shrink_observe_failed", "observe failed")],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            let _ = session.resize(w, h);
+            return findings;
+        }
+    };
+    let clipped_at_shrink: Vec<String> = shru_sem
+        .regions
+        .iter()
+        .filter(|rg| !matches!(rg.clipping_state, crate::semantic::ClippingState::None))
+        .map(|rg| rg.id.clone())
+        .collect();
+    if !clipped_at_shrink.is_empty() {
+        findings.push(Finding {
+            id: "RFLW-SHRINK-CLIP".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "resize".into(),
+            summary: format!(
+                "at {sw}x{sh} (half the original {w}x{h}), {} region(s) clip: {} — a small-window user loses content.",
+                clipped_at_shrink.len(),
+                clipped_at_shrink.join(", ")
+            ),
+            evidence: vec![ev_other(
+                "reflow_shrink_clipping",
+                "clipped regions at the halved size",
+                json!({ "cols": sw, "rows": sh, "clipped": clipped_at_shrink }),
+            )],
+            confidence: 0.9,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // ── Grow back ─────────────────────────────────────────────────────────
+    let _ = session.resize(w, h);
+    settle(session, 150);
+    let grown = session.observe_fused(120);
+    let (grw_screen, grw_sem) = match grown {
+        Ok(t) => (t.0, t.1),
+        Err(e) => {
+            findings.push(Finding {
+                id: "RFLW-ERR".into(),
+                rule_id: None,
+                severity: "error".into(),
+                category: "resize".into(),
+                summary: format!("observe after grow-back failed: {e}"),
+                evidence: vec![ev_other_empty("reflow_grow_observe_failed", "observe failed")],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            return findings;
+        }
+    };
+
+    // Invariant 1: content survives the round trip. Every baseline row
+    // with ≥4 non-blank chars must have its text present somewhere in the
+    // grown-back screen (app may rewrap, so compare text membership per
+    // trimmed row, not row index).
+    let grw_joined: String = grw_screen
+        .viewport_text
+        .iter()
+        .map(|r: &String| r.trim().to_string())
+        .filter(|r: &String| !r.is_empty())
+        .collect::<Vec<String>>()
+        .join("\n");
+    let mut lost_rows: Vec<String> = Vec::new();
+    for i in &base_nonblank_rows {
+        let text = base.0.viewport_text[*i].trim().to_string();
+        if text.is_empty() || !grw_joined.contains(&text) {
+            lost_rows.push(format!("row {i}: {text:?}"));
+        }
+    }
+    if !lost_rows.is_empty() {
+        findings.push(Finding {
+            id: "RFLW-CONTENT-LOST".into(),
+            rule_id: None,
+            severity: "error".into(),
+            category: "resize".into(),
+            summary: format!(
+                "{} baseline row(s) never reappeared after shrink→grow ({}x{} → {}x{} → {}x{}): {} — the app's reflow loses content permanently.",
+                lost_rows.len(), w, h, sw, sh, w, h,
+                lost_rows.join("; ")
+            ),
+            evidence: vec![ev_other(
+                "reflow_content_lost",
+                "baseline rows absent from the grown-back frame",
+                json!({
+                    "original": { "cols": w, "rows": h },
+                    "shrunken": { "cols": sw, "rows": sh },
+                    "lost_rows": lost_rows,
+                }),
+            )],
+            confidence: 0.85,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    } else {
+        findings.push(Finding {
+            id: "RFLW-CONTENT-OK".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "resize".into(),
+            summary: format!(
+                "content survives the round trip: all {} content row(s) present after {w}x{h} → {sw}x{sh} → {w}x{h}.",
+                base_nonblank_rows.len()
+            ),
+            evidence: vec![ev_other(
+                "reflow_content_ok",
+                "every content row reappears after grow-back",
+                json!({ "rows_checked": base_nonblank_rows.len() }),
+            )],
+            confidence: 0.85,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Invariant 2: focus survives (or is honestly re-homed). Compare IDs
+    // when both sides name one; a missing focus at the end is a defect
+    // only if the baseline HAD one.
+    if let (Some(before), Some(after)) = (&base_focus, &grw_sem.focus.control_id) {
+        if before != after {
+            findings.push(Finding {
+                id: "RFLW-FOCUS-MOVED".into(),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "resize".into(),
+                summary: format!(
+                    "focus changed across the round trip: {before:?} → {after:?} (the app did not restore the focused control)."
+                ),
+                evidence: vec![ev_other(
+                    "reflow_focus_moved",
+                    "focus id at baseline vs after grow-back (stable IDs)",
+                    json!({ "before": before, "after": after, "at_shrink": shrink_focus }),
+                )],
+                confidence: 0.8,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+    } else if base_focus.is_some() && grw_sem.focus.control_id.is_none() {
+        findings.push(Finding {
+            id: "RFLW-FOCUS-LOST".into(),
+            rule_id: None,
+            severity: "warn".into(),
+            category: "resize".into(),
+            summary: "the app had a focused control at baseline and none after shrink→grow — keyboard users start from nothing.".into(),
+            evidence: vec![ev_other(
+                "reflow_focus_lost",
+                "focus present before, absent after",
+                json!({ "before": base_focus, "at_shrink": shrink_focus }),
+            )],
+            confidence: 0.8,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    } else {
+        findings.push(Finding {
+            id: "RFLW-FOCUS-OK".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "resize".into(),
+            summary: "focus state survives the round trip (both ends agree, or neither had a focus).".into(),
+            evidence: vec![ev_other(
+                "reflow_focus_ok",
+                "focus before/at-shrink/after",
+                json!({ "before": base_focus, "at_shrink": shrink_focus, "after": grw_sem.focus.control_id }),
+            )],
+            confidence: 0.8,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
+
+    // Invariant 3: no ghost cells — after grow-back, rows the app owns
+    // (content rows at baseline) must not carry trailing garbage beyond
+    // what the baseline had. Compare the max non-space column per content
+    // region: a grown-back row substantially wider than its baseline
+    // counterpart means leftover pixels from the shrunken layout.
+    let ghost_rows: Vec<usize> = grw_screen
+        .viewport_text
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            let t = r.trim_end();
+            // "Ghost" heuristic: trailing fragments after wide blank runs
+            // mid-row (content — 8+ spaces — non-space — end).
+            if let Some(pos) = t.rfind("        ") {
+                let tail = &t[pos + 8..];
+                !tail.trim().is_empty() && tail.trim().chars().all(|c| c.is_ascii_graphic())
+            } else {
+                false
+            }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let base_ghostish = base
+        .0
+        .viewport_text
+        .iter()
+        .filter(|r| {
+            let t = r.trim_end();
+            matches!(t.rfind("        "), Some(pos) if !t[pos + 8..].trim().is_empty())
+        })
+        .count();
+    if ghost_rows.len() > base_ghostish {
+        findings.push(Finding {
+            id: "RFLW-GHOST-CELLS".into(),
+            rule_id: None,
+            severity: "info".into(),
+            category: "resize".into(),
+            summary: format!(
+                "{} row(s) show fragmented remnants after grow-back (baseline had {base_ghostish}) — possible ghost cells from an incomplete repaint.",
+                ghost_rows.len()
+            ),
+            evidence: vec![ev_other(
+                "reflow_ghost_candidates",
+                "rows with wide-gap + trailing fragment shape after grow-back",
+                json!({
+                    "rows": ghost_rows,
+                    "baseline_fragment_rows": base_ghostish,
+                    "note": "heuristic — verify visually before treating as a defect",
+                }),
+            )],
+            confidence: 0.5,
+            reproduction: None,
+            source_refs: Vec::new(),
+        });
+    }
 
     findings
 }

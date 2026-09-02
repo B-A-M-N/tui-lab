@@ -328,6 +328,11 @@ pub struct PortablePtyBackend {
     last_query_answered_seq: u64,
     last_output_at_ms: u64,
     last_screen_change_at_ms: u64,
+    /// Item 26: bounded log of `(screen_seq, unix_ms)` at each screen
+    /// change, so an action's FIRST frame instant is measurable even when
+    /// several changes followed it (the scalar `last_screen_change_at_ms`
+    /// only remembers the last). Capped; on overflow the head is dropped.
+    screen_change_log: Vec<(u64, u64)>,
     // Monotonic Instants for fine-grained wait timing (monotonic clock,
     // unlike SystemTime which can jump). These are updated in `pump()`
     // whenever the corresponding event occurs.
@@ -384,6 +389,7 @@ impl PortablePtyBackend {
             last_query_answered_seq: 0,
             last_output_at_ms: 0,
             last_screen_change_at_ms: 0,
+            screen_change_log: Vec::new(),
             child_pid: None,
             last_output_instant: now,
             last_screen_change_instant: now,
@@ -463,6 +469,12 @@ impl PortablePtyBackend {
             self.screen_seq += 1;
             self.last_screen_change_at_ms = now_ms();
             self.last_screen_change_instant = Instant::now();
+            // Item 26: record the change for per-action first-frame latency.
+            const SCREEN_CHANGE_LOG_CAP: usize = 256;
+            if self.screen_change_log.len() == SCREEN_CHANGE_LOG_CAP {
+                self.screen_change_log.remove(0);
+            }
+            self.screen_change_log.push((self.screen_seq, self.last_screen_change_at_ms));
         }
         // Wave F item 53: materialize the parser's scrollback rows so
         // search/observe read plain strings without touching the parser's
@@ -602,6 +614,19 @@ impl PortablePtyBackend {
     pub fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
         let _ = self.pump();
         (self.last_query_class, self.last_query_answered_seq)
+    }
+
+    /// Item 26: `(screen_seq, unix_ms)` for every screen change at/after
+    /// `after_seq`, oldest first — the evidence an action's FIRST frame
+    /// latency is derived from. Empty when the engine saw no change since
+    /// `after_seq`.
+    pub fn screen_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        let _ = self.pump();
+        self.screen_change_log
+            .iter()
+            .filter(|(seq, _)| *seq > after_seq)
+            .copied()
+            .collect()
     }
 
     /// Item 22: measured conformance probe. Feed `query` through the SAME
@@ -851,6 +876,7 @@ impl TerminalBackend for PortablePtyBackend {
         self.last_query_answered_seq = 0;
         self.last_output_at_ms = 0;
         self.last_screen_change_at_ms = 0;
+        self.screen_change_log.clear();
         self.scrollback_cache.clear();
         self.scrollback_seen = false;
         self.parser.callbacks_mut().query_responses.clear();
