@@ -155,14 +155,72 @@ class NSPMixin:
         # define their own on_mount should call super().on_mount()).
 "##;
 
-/// The reference Python snippet (for raw-ANSI / curses apps): points at the
-/// shipped `nsproto.py` module.
+/// The reference Python snippet (for raw-ANSI / curses apps): a self-contained,
+/// paste-ready version of the app-side client. The full test implementation
+/// lives in `fixtures/nsproto.py`; this kept copy is what
+/// `tui_framework action=adapter_snippet source=python` returns, so
+/// `adapter_snippet` always yields real source the user can adopt — never a
+/// comment pointer to a fixture the harness may or may not have.
 pub const PYTHON_REFERENCE: &str = r##"#!/usr/bin/env python3
-# NativeSemanticProtocol reference adapter (see fixtures/nsproto.py).
-# import nsproto
-# ns = nsproto.Client("my-tui", framework="curses")
-# ns.snapshot(nsproto.node("#root", "screen", children=[ ... ]))
-# ns.event("focus", "#save")
+# NativeSemanticProtocol reference adapter (raw-ANSI / curses / any Python TUI).
+# Call snapshot() after every render with your REAL node tree; tui-lab merges
+# it over inference. If TUI_LAB_SEMANTIC is unset, everything is a no-op, so
+# this is safe to leave in an app that also runs standalone.
+
+import json
+import os
+
+ENV_VAR = "TUI_LAB_SEMANTIC"
+
+
+def node(id, role, label=None, bounds=None, actions=None,
+         focusable=None, focused=None, enabled=None, children=None):
+    """Build one native node dict."""
+    out = {"id": id, "role": role}
+    for key, val in (("label", label), ("bounds", bounds), ("actions", actions),
+                     ("focusable", focusable), ("focused", focused),
+                     ("enabled", enabled), ("children", children)):
+        if val is not None:
+            out[key] = val
+    return out
+
+
+class Client:
+    """Append-only writer for the TUI_LAB_SEMANTIC channel."""
+
+    def __init__(self, app, framework=None):
+        self.path = os.environ.get(ENV_VAR)
+        self.enabled = self.path is not None
+        self.app = app
+        self.framework = framework
+
+    def _write(self, frame):
+        if not self.enabled:
+            return
+        frame = {"v": 1, **frame}
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(frame, separators=(",", ":")) + "\n")
+        except OSError:
+            pass  # a broken side channel must never break the app
+
+    def snapshot(self, root):
+        self._write({"type": "snapshot", "app": self.app,
+                     **({"framework": self.framework} if self.framework else {}),
+                     "root": root})
+
+    def event(self, event, target):
+        self._write({"type": "event", "event": event, "target": target})
+
+
+# Example: declare a two-button footer after your draw.
+# ns = Client("my-tui", framework="curses")
+# ns.snapshot(node("#root", "screen", children=[
+#     node("#save", "button", label="Save", focusable=True,
+#          focused=focus == 0, actions=["activate"]),
+#     node("#cancel", "button", label="Cancel", focusable=True,
+#          focused=focus == 1, actions=["activate"]),
+# ]))
 "##;
 
 /// Return the adapter snippet for a framework slug.
@@ -196,6 +254,32 @@ mod tests {
                 s.contains("\"snapshot\"") || s.contains("'snapshot'"),
                 "{fw}: snapshot frame"
             );
+        }
+    }
+
+    /// Review P1 item 15 — adapter snippets must EMIT source, not point at
+    /// it: every advertised framework returns paste-ready code (real function
+    /// bodies and frame names), never a comment-only stub or a pointer to a
+    /// fixture the user may not have. A regression to "look at fixtures/x.py"
+    /// must fail here.
+    #[test]
+    fn every_advertised_snippet_emits_real_source() {
+        for fw in ["ratatui", "textual", "python", "raw", "curses", "reference"] {
+            let s = snippet_for(fw).expect(&format!("{fw}: snippet available"));
+            let body = s.trim();
+            assert!(!body.is_empty(), "{fw}: not blank");
+            // Source-bearing: a real body defines a callable or a frame
+            // (`def`/`fn`/`class`/struct) AND names the protocol frame. A
+            // comment-only pointer would satisfy neither.
+            let defines_callable = body.contains("fn ")
+                || body.contains("def ")
+                || body.contains("class ")
+                || body.contains("struct ");
+            assert!(defines_callable, "{fw}: snippet must define real source");
+            // Every family must produce the snapshot write, not just an env var.
+            let emits_snapshot = body.contains("snapshot")
+                && (body.contains("type") && body.contains("snapshot"));
+            assert!(emits_snapshot, "{fw}: must emit a snapshot frame");
         }
     }
 }

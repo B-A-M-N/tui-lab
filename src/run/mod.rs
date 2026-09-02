@@ -832,6 +832,24 @@ impl RunContext {
         l
     }
 
+    /// Fingerprints of findings in ANY stored baseline OTHER than
+    /// `compare_label` (review P1 item 12). A current finding absent from the
+    /// compare baseline but present here was seen in an earlier pass — so its
+    /// reappearance is a REGRESSION, not a first-seen NEW defect. This is how
+    /// REGRESSED becomes genuinely reachable in `compare_with_resolved`.
+    pub fn resolved_finding_fingerprints(&self, compare_label: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for (label, findings) in &self.finding_baselines {
+            if label == compare_label {
+                continue;
+            }
+            for f in findings {
+                out.insert(crate::audit::compare::fingerprint(f));
+            }
+        }
+        out
+    }
+
     pub fn record_contract_baseline(
         &mut self,
         label: &str,
@@ -1305,6 +1323,16 @@ impl RunContext {
         let mut out = Vec::new();
         let mut skipped = 0usize;
         for f in &self.findings {
+            // Late-join source loci (review P1 item 14): coverage events often
+            // arrive AFTER the audit pass that produced this finding, so a
+            // finding stored without loci gains them here if the coverage
+            // ledger can now attest them. The repair packet then points the
+            // agent at the exact source, not at nothing.
+            let joined = if f.source_refs.is_empty() {
+                self.join_source_refs_if_known(f)
+            } else {
+                f.clone()
+            };
             let repro_ids: Vec<String> = self
                 .saved_scenarios
                 .keys()
@@ -1317,16 +1345,17 @@ impl RunContext {
                 self.load_scenario(id).ok()
             };
             let packet = crate::audit::repair::RepairPacket::assemble(
-                f.clone(),
+                joined.clone(),
                 &self.id,
                 sessions.clone(),
                 loader,
             );
             match packet {
                 Some(mut p) => {
-                    // Carry the finding's loci onto the packet (the assemble
-                    // API leaves them for the caller to avoid duplication).
-                    p.source_refs = f.source_refs.clone();
+                    // Carry the (late-joined) finding's loci onto the packet
+                    // (the assemble API leaves them for the caller to avoid
+                    // duplication).
+                    p.source_refs = joined.source_refs;
                     out.push(p);
                 }
                 None => skipped += 1,

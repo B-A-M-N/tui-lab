@@ -2812,7 +2812,15 @@ impl TuiLabServer {
                 if let Some(cmp_label) = compare_to.as_deref() {
                     match run.finding_baseline(cmp_label) {
                         Some(baseline) => {
-                            let compared = crate::audit::compare::compare(baseline, &report.findings);
+                            // REGRESSED is reachable: a finding absent from
+                            // this baseline but seen in an EARLIER pass is a
+                            // regression, not a first-seen new defect (review
+                            // P1 item 12).
+                            let resolved = crate::audit::compare::Resolved(
+                                run.resolved_finding_fingerprints(cmp_label),
+                            );
+                            let compared =
+                                crate::audit::compare::compare_with_resolved(baseline, &report.findings, &resolved);
                             compare_block = json!({
                                 "baseline": cmp_label,
                                 "available": true,
@@ -3512,7 +3520,14 @@ impl TuiLabServer {
                         Vec::new(),
                     ),
                     Some(base) => {
-                        let compared = crate::audit::compare::compare(base, run.findings());
+                        // REGRESSED reachable (review P1 item 12): a finding
+                        // seen in an earlier pass but absent from this
+                        // baseline is a regression when it reappears.
+                        let resolved = crate::audit::compare::Resolved(
+                            run.resolved_finding_fingerprints(&compare_label),
+                        );
+                        let compared =
+                            crate::audit::compare::compare_with_resolved(base, run.findings(), &resolved);
                         let this = compared
                             .iter()
                             .find(|c| c.finding.id == finding_id)

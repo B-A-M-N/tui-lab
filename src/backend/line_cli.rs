@@ -755,6 +755,8 @@ impl TerminalBackend for PtyLineBackend {
             scrollback: true,
             bracketed_paste: false,
             signals: cfg!(unix),
+            // The CLI engine retains the raw output ring.
+            protocol_capture: true,
         }
     }
 

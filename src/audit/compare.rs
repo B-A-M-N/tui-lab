@@ -39,13 +39,42 @@ pub struct ComparedFinding {
     pub baseline: Option<Finding>,
 }
 
-/// Compare the current findings against a stored baseline.
+/// Fingerprints of findings a previous pass already had resolved (fixed, or
+/// knowingly absent after repair). When a current finding absent from the
+/// compare baseline IS in this set, it is a genuine REGRESSION (it came back)
+/// rather than a first-seen NEW defect.
+#[derive(Debug, Clone, Default)]
+pub struct Resolved(pub std::collections::HashSet<String>);
+
+/// Compare against a baseline, classifying regressions properly.
+pub fn compare_with_resolved(
+    baseline: &[Finding],
+    current: &[Finding],
+    resolved: &Resolved,
+) -> Vec<ComparedFinding> {
+    compare_impl(baseline, current, &resolved.0)
+}
+
+/// Compare the current findings against a stored baseline, classifying each
+/// fresh finding as `persisting`, `new`, or (when its fingerprint was
+/// previously resolved) `regressed`; baseline-only findings are `fixed`.
+/// REGRESSED is genuinely reachable here — the caller supplies the set of
+/// fingerprints a prior pass resolved, so a re-appearing defect is distinct
+/// from a first-seen one (review P1 item 12).
 ///
 /// - in baseline + absent now → FIXED
-/// - absent from baseline + present now → NEW
-/// - present in both → PERSISTING (carried so the caller sees the full set;
-///   severity changes are surfaced in the summary)
+/// - present in both → PERSISTING
+/// - absent from baseline, never resolved → NEW
+/// - absent from baseline, previously resolved → REGRESSED
 pub fn compare(baseline: &[Finding], current: &[Finding]) -> Vec<ComparedFinding> {
+    compare_impl(baseline, current, &std::collections::HashSet::new())
+}
+
+fn compare_impl(
+    baseline: &[Finding],
+    current: &[Finding],
+    resolved_keys: &std::collections::HashSet<String>,
+) -> Vec<ComparedFinding> {
     let base_keys: std::collections::HashSet<String> = baseline.iter().map(fingerprint).collect();
     let cur_keys: std::collections::HashSet<String> = current.iter().map(fingerprint).collect();
 
@@ -54,6 +83,8 @@ pub fn compare(baseline: &[Finding], current: &[Finding]) -> Vec<ComparedFinding
         let fp = fingerprint(f);
         let verdict = if base_keys.contains(&fp) {
             "persisting"
+        } else if resolved_keys.contains(&fp) {
+            "regressed"
         } else {
             "new"
         };
@@ -87,11 +118,10 @@ pub fn summary(compared: &[ComparedFinding]) -> serde_json::Value {
         "regressed": count("regressed"),
         "new": count("new"),
         "persisting": count("persisting"),
-        // Regressions in the strict sense: a finding previously recorded as
-        // fixed (absent from baseline because it was never seen) is "new";
-        // REGRESSED is reserved for a baseline that had marked the problem
-        // resolved. The MCP layer derives regressed from labeled baselines
-        // where this distinction is knowable; here it is the raw counts.
+        // REGRESSED is a real verdict: a finding that came back after a pass
+        // had resolved it (compare_with_resolved). Without a resolved set it
+        // is correctly 0 — a raw snapshot baseline cannot distinguish a
+        // regression from a first-seen NEW defect.
     })
 }
 
@@ -172,5 +202,36 @@ mod tests {
         assert_eq!(s["fixed"], 1);
         assert_eq!(s["new"], 1);
         assert_eq!(s["persisting"], 0);
+    }
+
+    /// REGRESSED is genuinely reachable via the resolved set (review P1 item
+    /// 12): the same fingerprint absent from the baseline but present now is
+    /// `new` without a resolved marker and `regressed` with one.
+    #[test]
+    fn regressed_is_distinct_from_new_via_resolved_set() {
+        let baseline: Vec<Finding> = Vec::new(); // an empty baseline
+        let current = vec![finding("KB-TRAP", "keyboard", "tab_trap")];
+        let fp = fingerprint(&current[0]);
+
+        // No resolved marker → first-seen → NEW.
+        let plain = compare(&baseline, &current);
+        let v_plain = plain
+            .iter()
+            .find(|c| c.verdict == "new")
+            .expect("new present");
+        assert_eq!(v_plain.verdict, "new");
+
+        // With the fingerprint marked resolved → genuinely REGRESSED.
+        let mut resolved = Resolved::default();
+        resolved.0.insert(fp);
+        let with_resolved = compare_with_resolved(&baseline, &current, &resolved);
+        let v_regressed = with_resolved
+            .iter()
+            .find(|c| c.verdict == "regressed")
+            .expect("regressed present");
+        assert_eq!(v_regressed.verdict, "regressed");
+        let s = summary(&with_resolved);
+        assert_eq!(s["regressed"], 1, "summary reflects the real verdict");
+        assert_eq!(s["new"], 0);
     }
 }

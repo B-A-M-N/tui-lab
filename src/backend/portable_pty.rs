@@ -1308,6 +1308,9 @@ impl TerminalBackend for PortablePtyBackend {
         caps.bracketed_paste = self.parser.screen().bracketed_paste();
         // Wave F item 52: the app pushed kitty keyboard flags at some point.
         caps.kitty_keyboard = self.parser.callbacks().kitty_seen;
+        // This engine retains the raw PTY byte ring (`recent_raw_output`),
+        // so protocol capture is genuinely available.
+        caps.protocol_capture = true;
         caps
     }
 
