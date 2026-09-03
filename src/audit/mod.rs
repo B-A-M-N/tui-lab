@@ -151,8 +151,10 @@ pub struct Finding {
     /// Probable source loci for the problem (W2.10): empty for purely
     /// screen-derived findings; populated when evidence can name a file:line
     /// (native coverage events, framework adapters, stack-derived loci).
-    /// `SourceRef::is_actionable()` gates whether a repair pass should
-    /// trust the locus — a low-confidence guess is carried, not hidden.
+    /// `SourceRef::is_actionable()` gates whether an investigating agent
+    /// should treat the locus as the cause site — provenance (attested
+    /// vs correlated, review §4) gates first, confidence refines; a
+    /// below-fence guess is carried, not hidden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<crate::semantic::source_ref::SourceRef>,
 }
