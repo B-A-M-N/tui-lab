@@ -19,7 +19,7 @@ pub mod recognizers;
 pub mod regions;
 pub mod relationships;
 pub mod source_ref;
-pub use source_ref::{ComponentIdentity, SourceRef};
+pub use source_ref::{ComponentIdentity, Provenance, SourceRef};
 pub mod state_tree;
 pub mod tree_builder;
 pub mod widgets;

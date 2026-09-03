@@ -2380,6 +2380,7 @@ fn source_ref_from_target(t: &str) -> Option<crate::semantic::source_ref::Source
         framework_id: None,
         confidence: 0.7,
         source: "framework-adapter".to_string(),
+        provenance: crate::semantic::source_ref::Provenance::Correlated,
     })
 }
 
@@ -3361,7 +3362,17 @@ mod source_ref_tests {
         let sr = source_ref_from_target("src/ui/settings.rs:184").expect("parse");
         assert_eq!(sr.file, "src/ui/settings.rs");
         assert_eq!(sr.line, 184);
-        assert!(sr.is_actionable(), "0.7 confidence is at the fence");
+        // Review §4: this join is a run-level correlation, not a cause-site
+        // attestation — provenance `correlated` keeps it investigative even
+        // though the locus itself is well-mapped (confidence 0.7).
+        assert_eq!(
+            sr.provenance,
+            crate::semantic::source_ref::Provenance::Correlated
+        );
+        assert!(
+            !sr.is_actionable(),
+            "correlated loci stay below the actionable fence"
+        );
         let with_col = source_ref_from_target("src/a.rs:12:5").expect("parse");
         assert_eq!(with_col.column, Some(5));
         assert!(source_ref_from_target("not-a-ref").is_none());
@@ -3396,7 +3407,16 @@ mod source_ref_tests {
             !f.source_refs.is_empty(),
             "covered control gets its app-declared locus"
         );
-        assert!(f.source_refs[0].is_actionable());
+        // Review §4: a file-locus ledger key joined on control identity is
+        // a RUN-LEVEL CORRELATION, not a cause-site attestation — the app
+        // never said "this locus is where button/save lives"; it only
+        // declared the locus for some other coverage target in the same
+        // run. Correlated stays investigative, below the actionable fence.
+        assert_eq!(
+            f.source_refs[0].provenance,
+            crate::semantic::source_ref::Provenance::Correlated
+        );
+        assert!(!f.source_refs[0].is_actionable());
         // An uncovered control carries no locus — never guessed.
         let _ = run.extend_findings_with_source_refs(vec![finding_pointing_at("button/other/1,1")]);
         let f2 = run.findings().last().unwrap();

@@ -202,6 +202,7 @@ mod tests {
                 framework_id: None,
                 confidence: 0.7,
                 source: "framework-adapter".into(),
+                provenance: crate::semantic::source_ref::Provenance::Attested,
             },
             crate::semantic::source_ref::SourceRef {
                 file: "guess.rs".into(),
@@ -211,6 +212,7 @@ mod tests {
                 framework_id: None,
                 confidence: 0.2,
                 source: "manual".into(),
+                provenance: crate::semantic::source_ref::Provenance::Inferred,
             },
         ];
         let f = finding_with(Some("scen-42"), refs);
