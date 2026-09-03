@@ -567,6 +567,67 @@ async fn lease_blocks_driving_and_allows_observing() {
     );
     assert_eq!(static_audit["mode"], "static", "{static_audit}");
 
+    // Review §5: passive LIVE-SESSION audits observe the raw ring and fused
+    // frame but send nothing — they must stay available under a human lease
+    // (the old is_active() gate wrongly refused them). allow_mutation is
+    // passed to prove the lease refusal did not previously depend on it.
+    for passive in [
+        "color",
+        "terminal_modes",
+        "rendering",
+        "input_protocol",
+        "shell_cli",
+        "lifecycle",
+        "query_response",
+    ] {
+        let run = unwrap_ok(
+            &server
+                .tui_audit(params_typed(serde_json::json!({
+                    "profile": passive, "id": id, "allow_mutation": true,
+                })))
+                .await,
+            &format!("{passive} audit under lease"),
+        );
+        assert_eq!(
+            run["mode"], "active",
+            "{passive} is a live-session reader; it must run under a human lease: {run}"
+        );
+        // And it produced a finding_count (the audit actually ran).
+        assert!(run.get("finding_count").is_some(), "{passive}: {run}");
+    }
+
+    // Review §6: the process-consuming audit exists on the wire now, but
+    // neither allow_mutation nor anything else but allow_process_restart
+    // authorizes it — and it is refused BEFORE any lease consideration.
+    let exit_no_flag = unwrap_err(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "lifecycle_exit", "id": id, "allow_mutation": true,
+            })))
+            .await,
+        "lifecycle_exit without restart authorization",
+    );
+    assert_eq!(
+        exit_no_flag["category"], "invalid_request",
+        "{exit_no_flag}"
+    );
+    assert!(
+        exit_no_flag["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("allow_process_restart"),
+        "refusal must name the real authorization: {exit_no_flag}"
+    );
+    let exit_leased = unwrap_err(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "lifecycle_exit", "id": id, "allow_process_restart": true,
+            })))
+            .await,
+        "lifecycle_exit authorized but under lease",
+    );
+    assert_eq!(exit_leased["category"], "control_leased", "{exit_leased}");
+
     // One-shot capture observes the frame: allowed under lease.
     let cap = unwrap_ok(
         &server
