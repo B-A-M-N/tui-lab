@@ -428,6 +428,97 @@ pub fn resolve_intent(
     })
 }
 
+// ─── Multi-step intent plans (review §8) ──────────────────────────────────
+//
+// `plan_action` returns ONE `CanonicalAction`. For keypress verbs that is
+// "press Enter wherever the app currently thinks focus is" — the motivating
+// defect: resolve_intent could identify `button/save`, and the plan would
+// still be a bare Enter that activates whatever is focused NOW. An honest
+// activation plan must first SECURE focus on the resolved target and verify
+// it landed there before the key is sent.
+
+/// One step of an [`IntentPlan`]. `EnsureFocus`/`AssertFocus` bracket the
+/// payload so an executor cannot send the key without the guard in between.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlannedStep {
+    /// Move focus to `target_id` (mouse click at the control's center —
+    /// the only verified direct route; keyboard traversal is NOT guessed).
+    /// Skipped by the executor when the target is already focused.
+    EnsureFocus {
+        target_id: String,
+        click: CanonicalAction,
+    },
+    /// Stale-state guard: re-observe and refuse unless focus == target_id.
+    /// Runs BETWEEN the focus move and the key, so a race or a focus trap
+    /// stops the plan before it activates the wrong control.
+    AssertFocus { target_id: String },
+    /// The payload action (the Enter/Space/Type the verb asked for).
+    Act(CanonicalAction),
+}
+
+/// A multi-step intent: focus-secured, guarded, then executed. The
+/// executor runs steps in order and aborts on the first failure.
+#[derive(Debug, Clone)]
+pub struct IntentPlan {
+    /// The control the target resolved to (at plan time).
+    pub control: Control,
+    /// The verb that will be applied.
+    pub verb: ActionVerb,
+    /// Risk class (verb base risk, raised by target evidence).
+    pub risk: ActionRisk,
+    /// Steps in execution order.
+    pub steps: Vec<PlannedStep>,
+}
+
+/// Resolve + plan a focus-SECURED intent (review §8). Verbs whose payload
+/// lands on the focused control (Activate/Select/Open/Toggle — the Enter
+/// and Space keys) get `EnsureFocus → AssertFocus → Act`; direct verbs
+/// (Click, Focus, Type-into) plan as a single `Act` step because their
+/// action already names its own target.
+pub fn plan_intent(
+    sem: &SemanticScreen,
+    target: &ActionTarget,
+    verb: ActionVerb,
+) -> Result<IntentPlan, IntentError> {
+    let control = resolve_target(sem, target)?;
+    let risk = classify_risk(&verb, Some(&control));
+    let key_verbs = matches!(
+        verb,
+        ActionVerb::Activate | ActionVerb::Select | ActionVerb::Open | ActionVerb::Toggle
+    );
+    let steps = if key_verbs {
+        if !control.focusable {
+            return Err(IntentError::VerbMismatch {
+                target: control.id.clone(),
+                verb: verb.name().into(),
+            });
+        }
+        let click = CanonicalAction::MouseClick {
+            button: MouseButton::Left,
+            x: control.bounds.x.saturating_add(control.bounds.width / 2),
+            y: control.bounds.y,
+        };
+        vec![
+            PlannedStep::EnsureFocus {
+                target_id: control.id.clone(),
+                click,
+            },
+            PlannedStep::AssertFocus {
+                target_id: control.id.clone(),
+            },
+            PlannedStep::Act(plan_action(&verb, &control)?),
+        ]
+    } else {
+        vec![PlannedStep::Act(plan_action(&verb, &control)?)]
+    };
+    Ok(IntentPlan {
+        control,
+        verb,
+        risk,
+        steps,
+    })
+}
+
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 fn ambiguous(target: &ActionTarget, matches: &[&Control]) -> IntentError {
@@ -623,6 +714,101 @@ mod tests {
         assert_eq!(intent.control.id, "button/save");
         assert!(matches!(intent.action, CanonicalAction::Key { .. }));
         assert_eq!(intent.risk, ActionRisk::Mutating);
+    }
+
+    /// Review §8, the motivating defect: activation must activate the
+    /// RESOLVED target, not wherever focus currently is. The plan is
+    /// EnsureFocus (click on the target) → AssertFocus (guard) → Enter —
+    /// never a bare Enter over the current focus.
+    #[test]
+    fn activation_plan_secures_focus_before_the_key() {
+        let s = sem(
+            vec![
+                control("button/save", ControlKind::Button, "Save", 0, 5),
+                control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
+            ],
+            None, // NO current focus — the old test accepted a bare Enter here
+        );
+        let plan = plan_intent(
+            &s,
+            &ActionTarget::Id {
+                id: "button/save".into(),
+            },
+            ActionVerb::Activate,
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.steps.len(),
+            3,
+            "secure → guard → act: {:?}",
+            plan.steps
+        );
+        match &plan.steps[0] {
+            PlannedStep::EnsureFocus { target_id, click } => {
+                assert_eq!(target_id, "button/save");
+                assert!(
+                    matches!(click, CanonicalAction::MouseClick { .. }),
+                    "focus is secured by a click on the target: {click:?}"
+                );
+            }
+            other => panic!("step 0 must EnsureFocus, got {other:?}"),
+        }
+        assert_eq!(
+            plan.steps[1],
+            PlannedStep::AssertFocus {
+                target_id: "button/save".into()
+            }
+        );
+        assert!(
+            matches!(
+                &plan.steps[2],
+                PlannedStep::Act(CanonicalAction::Key { .. })
+            ),
+            "payload is the Enter: {:?}",
+            plan.steps[2]
+        );
+    }
+
+    /// Direct verbs (Click) need no focus securing: their action names the
+    /// target by coordinates already. One step.
+    #[test]
+    fn click_plans_as_a_single_direct_step() {
+        let s = sem(
+            vec![control("button/ok", ControlKind::Button, "OK", 0, 5)],
+            None,
+        );
+        let plan = plan_intent(
+            &s,
+            &ActionTarget::Id {
+                id: "button/ok".into(),
+            },
+            ActionVerb::Click,
+        )
+        .expect("plan");
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(
+            &plan.steps[0],
+            PlannedStep::Act(CanonicalAction::MouseClick { .. })
+        ));
+    }
+
+    /// Toggle on a non-focusable checkbox is refused at PLAN time — the
+    /// focus-secured route cannot reach it, and a bare Space would toggle
+    /// whatever IS focused.
+    #[test]
+    fn toggle_plan_refuses_unfocusable_target() {
+        let mut c = control("check/archive", ControlKind::Checkbox, "Archive", 0, 5);
+        c.focusable = false;
+        let s = sem(vec![c], None);
+        let err = plan_intent(
+            &s,
+            &ActionTarget::Id {
+                id: "check/archive".into(),
+            },
+            ActionVerb::Toggle,
+        )
+        .expect_err("unfocusable toggle must refuse");
+        assert!(matches!(err, IntentError::VerbMismatch { .. }), "{err:?}");
     }
 
     /// The motivating failure mode: two "Save" buttons must be an
