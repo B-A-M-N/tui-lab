@@ -4,15 +4,22 @@
 //! Before this module, the MCP layer decided static-vs-active with a string
 //! match that omitted `"full"` — so `tui_audit profile=full` ran *fewer*
 //! checks than `profile=keyboard`, which is backwards. The engine now owns
-//! the decision:
+//! the decision, and since the descriptor-table refactor it owns it in ONE
+//! place ([`PROFILES`]): parse, name, routing, lease gating, safe-only
+//! policy, `full` membership/sequence, and the accepted-selector error all
+//! derive from the same table.
 //!
 //! ```text
-//! full = static composite (focus + layout/clipping + discoverability +
-//!         keyboard-static) + keyboard + focus + resize + clipping active
+//! full = static composite + every included_in_full driver, in table order
+//! full NEVER includes lifecycle_exit (process-consuming; explicit opt-in
+//!        via allow_process_restart=true, never implied by allow_mutation)
 //! ```
 //!
 //! The MCP layer calls [`run_profile`] and reports the returned mode; it no
-//! longer interprets profile names.
+//! longer interprets profile names. For the human control lease the MCP
+//! layer asks `requires_exclusive_control()` (drives/resizes/consumes), NOT
+//! `is_active()` (needs a live session) — passive diagnostics stay available
+//! under a human lease.
 
 use crate::audit::{EvidenceKind, EvidenceRef, Finding};
 use crate::session::state::Session;
@@ -22,7 +29,10 @@ use serde_json::json;
 /// engine-level error, not an MCP-level guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditProfile {
-    /// Everything: static composite plus every active driver.
+    /// All standard audit families: static composite plus every
+    /// non-process-consuming driver, in descriptor-table order. Deliberately
+    /// EXCLUDES `lifecycle_exit` (it terminates the target) — full must
+    /// never consume the application under audit.
     Full,
     /// Traverse focus with Tab (active).
     Keyboard,
@@ -82,111 +92,38 @@ pub enum AuditProfile {
 
 impl AuditProfile {
     /// Parse a profile name. Unknown names are an error — the engine does
-    /// not silently degrade a typo into a weaker audit.
+    /// not silently degrade a typo into a weaker audit. The accepted set
+    /// and the error text come from the descriptor table, so a new profile
+    /// can never be parseable-but-undocumented or documented-but-unparseable
+    /// (the old hand-written error list had drifted behind 8 real profiles).
     pub fn parse(name: &str) -> Result<Self, String> {
-        match name {
-            "full" => Ok(AuditProfile::Full),
-            "keyboard" => Ok(AuditProfile::Keyboard),
-            "focus" => Ok(AuditProfile::Focus),
-            "resize" => Ok(AuditProfile::Resize),
-            "layout" => Ok(AuditProfile::Layout),
-            "clipping" => Ok(AuditProfile::Clipping),
-            "discoverability" => Ok(AuditProfile::Discoverability),
-            "navigation" => Ok(AuditProfile::Navigation),
-            "contract" => Ok(AuditProfile::Contract),
-            "color" => Ok(AuditProfile::Color),
-            "performance" => Ok(AuditProfile::Performance),
-            "mouse" => Ok(AuditProfile::Mouse),
-            "states" => Ok(AuditProfile::States),
-            "errors" => Ok(AuditProfile::Errors),
-            "unicode" => Ok(AuditProfile::Unicode),
-            "controls" => Ok(AuditProfile::Controls),
-            "terminal_modes" => Ok(AuditProfile::TerminalModes),
-            "rendering" => Ok(AuditProfile::Rendering),
-            "input_protocol" => Ok(AuditProfile::InputProtocol),
-            "shell_cli" => Ok(AuditProfile::ShellCli),
-            "lifecycle" => Ok(AuditProfile::Lifecycle),
-            "lifecycle_exit" => Ok(AuditProfile::LifecycleExit),
-            "query_response" => Ok(AuditProfile::QueryResponse),
-            other => Err(format!(
-                "unknown audit profile '{}'; expected one of full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls",
-                other
-            )),
-        }
+        PROFILES
+            .iter()
+            .find(|d| d.id == name)
+            .map(|d| d.profile.clone())
+            .ok_or_else(|| {
+                format!(
+                    "unknown audit profile '{}'; expected one of {}",
+                    name,
+                    PROFILES.iter().map(|d| d.id).collect::<Vec<_>>().join(", ")
+                )
+            })
     }
 
     /// The profile's canonical engine name (used in residue findings).
     pub fn name(&self) -> &'static str {
-        match self {
-            AuditProfile::Full => "full",
-            AuditProfile::Keyboard => "keyboard",
-            AuditProfile::Focus => "focus",
-            AuditProfile::Resize => "resize",
-            AuditProfile::Layout => "layout",
-            AuditProfile::Clipping => "clipping",
-            AuditProfile::Discoverability => "discoverability",
-            AuditProfile::Navigation => "navigation",
-            AuditProfile::Contract => "contract",
-            AuditProfile::Color => "color",
-            AuditProfile::Performance => "performance",
-            AuditProfile::Mouse => "mouse",
-            AuditProfile::States => "states",
-            AuditProfile::Errors => "errors",
-            AuditProfile::Unicode => "unicode",
-            AuditProfile::Controls => "controls",
-            AuditProfile::TerminalModes => "terminal_modes",
-            AuditProfile::Rendering => "rendering",
-            AuditProfile::InputProtocol => "input_protocol",
-            AuditProfile::ShellCli => "shell_cli",
-            AuditProfile::Lifecycle => "lifecycle",
-            AuditProfile::LifecycleExit => "lifecycle_exit",
-            AuditProfile::QueryResponse => "query_response",
-        }
+        descriptor(self).id
     }
 
-    /// Does this profile need to drive the live app (send input / resize)?
-    /// Wave G item 66: mouse/performance/states/errors are real drivers now
-    /// (they send input / sample latency); color stays frame-level, and
-    /// discoverability remains the one static pass.
-    /// Public so the MCP layer can apply the same driving/observing split
-    /// for the human control lease (item 76): active profiles refuse under
-    /// a live lease, static ones stay allowed.
+    /// Does this profile need a live `Session` (raw ring / fused frame /
+    /// process access) rather than one detached frame? This is the
+    /// orchestrator's static-vs-active ROUTING split only — it says
+    /// nothing about whether the profile drives the app. For the human
+    /// control lease, use [`Self::requires_exclusive_control`].
     pub fn is_active(&self) -> bool {
-        matches!(
+        !matches!(
             self,
-            AuditProfile::Full
-                | AuditProfile::Keyboard
-                | AuditProfile::Focus
-                | AuditProfile::Resize
-                | AuditProfile::Layout
-                | AuditProfile::Clipping
-                | AuditProfile::Navigation
-                | AuditProfile::Contract
-                | AuditProfile::Mouse
-                | AuditProfile::Performance
-                | AuditProfile::States
-                | AuditProfile::Errors
-                // Color is an active-side, non-driving read of the live
-                // session (raw ring + fused frame), same class as
-                // TerminalModes. Its omission here made profile=color
-                // unreachable: the orchestrator routed it to the static
-                // branch, which errors "no static checks" — the real
-                // driver existed but no caller could reach it.
-                | AuditProfile::Color
-                // Needs the session (raw ring + fused frame), not just one
-                // frame — same "active-side, non-driving" class as Color.
-                | AuditProfile::TerminalModes
-                | AuditProfile::Rendering
-                | AuditProfile::InputProtocol
-                | AuditProfile::ShellCli
-                | AuditProfile::Lifecycle
-                // Item 21: the exit test needs the live session (raw ring,
-                // restart); it is active-side even though it is a terminal
-                // lifecycle read in spirit.
-                | AuditProfile::LifecycleExit
-                // Sends one device query (CSI 6n) — still observational,
-                // but it writes to the child, so it stays in the active class.
-                | AuditProfile::QueryResponse
+            AuditProfile::Discoverability | AuditProfile::Unicode | AuditProfile::Controls
         )
     }
 
@@ -200,49 +137,354 @@ impl AuditProfile {
     /// (item 35) and the safe-only default (item 36); the MCP layer
     /// surfaces it so a caller sees WHY a profile was withheld.
     pub fn risk(&self) -> MutationRisk {
-        match self {
-            // Reads frames/rings only. Sends nothing.
-            AuditProfile::Discoverability
-            | AuditProfile::Color
-            | AuditProfile::Unicode
-            | AuditProfile::Controls
-            | AuditProfile::TerminalModes
-            | AuditProfile::Rendering
-            | AuditProfile::InputProtocol
-            | AuditProfile::ShellCli
-            | AuditProfile::Lifecycle => MutationRisk::Observational,
-            // Kills and relaunches the target — the strongest possible
-            // mutation. Never eligible for safe-only sessions.
-            AuditProfile::LifecycleExit => MutationRisk::RestartRequired,
-            // Writes one device query to the child's stdin; no UI
-            // semantics change. The reply is engine-generated.
-            AuditProfile::QueryResponse => MutationRisk::Observational,
-            // Contract conformance drives the app through its own checks;
-            // treat it as at-least-reversible.
-            AuditProfile::Contract => MutationRisk::Reversible,
-            // These drive the app but restore what they touch: Tab-walks
-            // end with Shift+Tab reversals, resize restores the original
-            // geometry, performance samples settle back, keyboard/focus/
-            // navigation leave the focus graph intact. Residue is detected
-            // by AuditTransaction, not assumed away.
-            AuditProfile::Keyboard
-            | AuditProfile::Focus
-            | AuditProfile::Resize
-            | AuditProfile::Layout
-            | AuditProfile::Clipping
-            | AuditProfile::Navigation
-            | AuditProfile::Performance => MutationRisk::Reversible,
-            // Clicks land on REAL controls (Save, Submit, Connect …) and
-            // key/error bursts type into the app: external state can
-            // change with no undo. These are the ones the safe-only
-            // default gates.
-            AuditProfile::Mouse | AuditProfile::States | AuditProfile::Errors => {
-                MutationRisk::PotentiallyMutating
-            }
-            // The composite inherits the strongest member risk.
-            AuditProfile::Full => MutationRisk::PotentiallyMutating,
-        }
+        descriptor(self).risk
     }
+
+    /// Does this profile send UI input, resize the terminal, or consume
+    /// the process? Those need exclusive control, so `tui_audit` refuses
+    /// them while a human lease is live. Observational profiles that
+    /// still need the live session (color, terminal_modes, rendering,
+    /// input_protocol, shell_cli, lifecycle, query_response) stay
+    /// available during a lease — observation is always allowed (review
+    /// §5: `is_active()` must not gate the lease; one boolean was making
+    /// passive diagnostics refuse under a human's control).
+    pub fn requires_exclusive_control(&self) -> bool {
+        descriptor(self).exclusive_control
+    }
+}
+
+/// One row of the single source of truth for audit profiles (review §7):
+/// the same table derives parsing, naming, routing, lease gating, the
+/// safe-only policy, `full`'s membership/sequence, and the
+/// accepted-selector error. A new profile is added HERE once and the
+/// parity test vs the MCP enum fails if the wire side forgets it.
+///
+/// Table order IS `full`'s driver execution order: static composite first
+/// (separate pass), then transaction-wrapped driver groups (reversible
+/// before potentially-mutating, with deep-isolation restart gaps before
+/// the mutating ones), then the observational readers. Order matters for
+/// evidence readability — do not reorder casually.
+pub struct AuditProfileDescriptor {
+    /// Canonical selector (also the residue-finding name).
+    pub id: &'static str,
+    pub profile: AuditProfile,
+    pub risk: MutationRisk,
+    /// Needs exclusive control: sends UI input, resizes, or consumes the
+    /// process. The lease gate keys on this (not on `is_active`).
+    pub exclusive_control: bool,
+    /// Member of `profile=full`. `full` is not a member of itself,
+    /// `layout` is the alias of `resize` (full already runs resize), the
+    /// static-composite profiles ride full's static pass instead of the
+    /// driver sequence, and `lifecycle_exit` is deliberately excluded:
+    /// full must never terminate the target — that requires explicit
+    /// opt-in (`allow_process_restart=true`).
+    pub included_in_full: bool,
+    /// Wrap this profile's run in an AuditTransaction (pre-state capture
+    /// with residue verification): true for drivers that send input or
+    /// resize; false for observational readers (nothing to restore)
+    /// and for `lifecycle_exit` (the app is deliberately consumed).
+    pub transaction: bool,
+    /// `full` transaction grouping: members sharing a group run inside
+    /// ONE AuditTransaction, contiguously, in table order. 0 = not part
+    /// of full's driver sequence.
+    pub full_group: u8,
+    /// The driver: (session, focus graph to merge traversal edges into).
+    /// Rows that never dispatch through the table (`full` itself, the
+    /// static-composite profiles, `contract`) carry an unreachable body —
+    /// the type needs the field; the dispatcher never calls it.
+    pub driver: DriverFn,
+}
+
+pub static PROFILES: &[AuditProfileDescriptor] = &[
+    // --- full (the composite selector; iterates members, never dispatched) ---
+    AuditProfileDescriptor {
+        id: "full",
+        profile: AuditProfile::Full,
+        risk: MutationRisk::PotentiallyMutating,
+        exclusive_control: true,
+        included_in_full: false,
+        transaction: true,
+        full_group: 0,
+        driver: |_, _| unreachable!("full iterates members; it is not dispatched"),
+    },
+    // --- full's driver sequence (transaction groups, in run order) ---
+    AuditProfileDescriptor {
+        id: "keyboard",
+        profile: AuditProfile::Keyboard,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 1,
+        driver: |s, graph| crate::audit::driver::keyboard_audit(s, 20, graph),
+    },
+    AuditProfileDescriptor {
+        id: "focus",
+        profile: AuditProfile::Focus,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 1,
+        driver: |s, _graph| crate::audit::driver::focus_audit(s),
+        // focus_audit takes no graph; the closure ignores it.
+    },
+    AuditProfileDescriptor {
+        id: "resize",
+        profile: AuditProfile::Resize,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 2,
+        driver: |s, _graph| {
+            let mut inner = crate::audit::driver::resize_audit(s);
+            inner.extend(crate::audit::driver::resize_reflow_audit(s));
+            inner
+        },
+    },
+    // Documented alias of `resize` (same driver, same risk); full already
+    // runs resize, so the alias is not a second full member.
+    AuditProfileDescriptor {
+        id: "layout",
+        profile: AuditProfile::Layout,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: false,
+        transaction: true,
+        full_group: 2,
+        driver: |s, _graph| {
+            let mut inner = crate::audit::driver::resize_audit(s);
+            inner.extend(crate::audit::driver::resize_reflow_audit(s));
+            inner
+        },
+    },
+    AuditProfileDescriptor {
+        id: "clipping",
+        profile: AuditProfile::Clipping,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 2,
+        driver: |s, _graph| crate::audit::driver::clipping_audit(s),
+    },
+    AuditProfileDescriptor {
+        id: "navigation",
+        profile: AuditProfile::Navigation,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 3,
+        driver: |s, graph| {
+            let mut inner = crate::audit::driver::navigation_audit(s, 20, graph);
+            inner.extend(crate::audit::driver::navigation_keys_audit(s, 6));
+            inner
+        },
+    },
+    AuditProfileDescriptor {
+        id: "mouse",
+        profile: AuditProfile::Mouse,
+        risk: MutationRisk::PotentiallyMutating,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 4,
+        // full's budget (8 clicks); a standalone mouse audit samples more.
+        driver: |s, _graph| crate::audit::driver::mouse_audit(s, 8),
+    },
+    AuditProfileDescriptor {
+        id: "states",
+        profile: AuditProfile::States,
+        risk: MutationRisk::PotentiallyMutating,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 5,
+        driver: |s, _graph| crate::audit::driver::states_audit(s, 6),
+    },
+    AuditProfileDescriptor {
+        id: "errors",
+        profile: AuditProfile::Errors,
+        risk: MutationRisk::PotentiallyMutating,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 6,
+        driver: |s, _graph| crate::audit::driver::errors_audit(s, 12),
+    },
+    AuditProfileDescriptor {
+        id: "performance",
+        profile: AuditProfile::Performance,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: true,
+        transaction: true,
+        full_group: 7,
+        driver: |s, _graph| crate::audit::driver::performance_audit(s, 5),
+    },
+    // --- observational, live-session readers (no transaction; lease-safe) ---
+    AuditProfileDescriptor {
+        id: "color",
+        profile: AuditProfile::Color,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::color_audit(s),
+    },
+    AuditProfileDescriptor {
+        id: "terminal_modes",
+        profile: AuditProfile::TerminalModes,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::terminal_modes_audit(s),
+    },
+    AuditProfileDescriptor {
+        id: "rendering",
+        profile: AuditProfile::Rendering,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::rendering_audit(s),
+    },
+    AuditProfileDescriptor {
+        id: "input_protocol",
+        profile: AuditProfile::InputProtocol,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::input_protocol_audit(s),
+    },
+    AuditProfileDescriptor {
+        id: "shell_cli",
+        profile: AuditProfile::ShellCli,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::shell_cli_audit(s),
+    },
+    AuditProfileDescriptor {
+        id: "lifecycle",
+        profile: AuditProfile::Lifecycle,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::lifecycle_audit(s),
+    },
+    // Writes one device query (CSI 6n) to the child's stdin; the reply is
+    // engine-generated and no UI semantics change, so it stays lease-safe.
+    AuditProfileDescriptor {
+        id: "query_response",
+        profile: AuditProfile::QueryResponse,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: true,
+        transaction: false,
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::query_response_audit(s),
+    },
+    // --- standalone budgets differ from full's for these drivers ---
+    // (resolved in run_profile_with_contract_impl: standalone mouse/states/
+    // errors/performance sample MORE than the full-composite budgets above;
+    // see SINGLE_PROFILE_OVERRIDES.)
+    // --- static single-frame profiles (full's static composite pass) ---
+    AuditProfileDescriptor {
+        id: "discoverability",
+        profile: AuditProfile::Discoverability,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: false,
+        transaction: false,
+        full_group: 0,
+        driver: |_, _| unreachable!("static profiles route through the frame-check registry"),
+    },
+    AuditProfileDescriptor {
+        id: "unicode",
+        profile: AuditProfile::Unicode,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: false,
+        transaction: false,
+        full_group: 0,
+        driver: |_, _| unreachable!("static profiles route through the frame-check registry"),
+    },
+    AuditProfileDescriptor {
+        id: "controls",
+        profile: AuditProfile::Controls,
+        risk: MutationRisk::Observational,
+        exclusive_control: false,
+        included_in_full: false,
+        transaction: false,
+        full_group: 0,
+        driver: |_, _| unreachable!("static profiles route through the frame-check registry"),
+    },
+    // Contract conformance drives the app through its own checks;
+    // at-least-reversible. Dispatched before this table (it needs the
+    // loaded contract), so its driver row is never called.
+    AuditProfileDescriptor {
+        id: "contract",
+        profile: AuditProfile::Contract,
+        risk: MutationRisk::Reversible,
+        exclusive_control: true,
+        included_in_full: false,
+        transaction: true,
+        full_group: 0,
+        driver: |_, _| unreachable!("contract dispatches through check_contract"),
+    },
+    // --- process-consuming (never in full; explicit opt-in only) ---
+    AuditProfileDescriptor {
+        id: "lifecycle_exit",
+        profile: AuditProfile::LifecycleExit,
+        risk: MutationRisk::RestartRequired,
+        exclusive_control: true,
+        included_in_full: false,
+        transaction: false, // the app is deliberately consumed, not restored
+        full_group: 0,
+        driver: |s, _graph| crate::audit::driver::lifecycle_exit_audit(s),
+    },
+];
+
+/// A driver body: takes the session and the traversal graph to merge
+/// focus edges into, returns findings.
+pub type DriverFn = fn(&mut Session, &mut crate::semantic::focus_graph::FocusGraph) -> Vec<Finding>;
+
+/// Standalone budgets that differ from full's composite budgets (full
+/// samples less per driver so the composite stays bounded). Keyed by
+/// profile; consulted only when the profile runs ALONE.
+static SINGLE_PROFILE_OVERRIDES: &[(AuditProfile, DriverFn)] = &[
+    (AuditProfile::Mouse, |s, _g| {
+        crate::audit::driver::mouse_audit(s, 12)
+    }),
+    (AuditProfile::States, |s, _g| {
+        crate::audit::driver::states_audit(s, 10)
+    }),
+    (AuditProfile::Errors, |s, _g| {
+        crate::audit::driver::errors_audit(s, 15)
+    }),
+    (AuditProfile::Performance, |s, _g| {
+        crate::audit::driver::performance_audit(s, 7)
+    }),
+];
+
+fn descriptor(p: &AuditProfile) -> &'static AuditProfileDescriptor {
+    PROFILES
+        .iter()
+        .find(|d| d.profile == *p)
+        .expect("descriptor table covers every AuditProfile variant")
 }
 
 /// Wave 4 item 34: audit mutation-risk classes. The taxonomy the
@@ -566,122 +808,76 @@ fn run_profile_with_contract_impl(
         }
     };
 
-    let active_findings = match profile {
-        AuditProfile::Full => {
-            let mut fs = tx(session, &mut |s| {
-                let mut inner = crate::audit::driver::keyboard_audit(s, 20, &mut graph);
-                inner.extend(crate::audit::driver::focus_audit(s));
-                inner
-            });
-            fs.extend(tx(session, &mut |s| {
-                let mut inner = crate::audit::driver::resize_audit(s);
-                inner.extend(crate::audit::driver::resize_reflow_audit(s));
-                inner.extend(crate::audit::driver::clipping_audit(s));
-                inner
-            }));
-            fs.extend(tx(session, &mut |s| {
-                let mut inner = crate::audit::driver::navigation_audit(s, 20, &mut graph);
-                inner.extend(crate::audit::driver::navigation_keys_audit(s, 6));
-                inner
-            }));
-            if restart_between {
-                if let Some(f) = do_restart(session, "navigation", "mouse") {
-                    restarts += 1;
-                    fs.push(f);
+    let mut fs: Vec<Finding> = Vec::new();
+    if profile == AuditProfile::Full {
+        // `full` = static composite + every `included_in_full` driver, in
+        // table order (P0 fix 2, now table-derived). Transaction groups run
+        // contiguously inside one AuditTransaction each; deep-isolation
+        // restart gaps are inserted before each group whose members can
+        // mutate (risk above Reversible) — previously hand-placed before
+        // mouse/states/errors, which is exactly the set this derives to.
+        let members: Vec<&AuditProfileDescriptor> = PROFILES
+            .iter()
+            .filter(|d| d.included_in_full && d.full_group > 0)
+            .collect();
+        let mut last_group = 0u8;
+        for d in members {
+            if restart_between && d.full_group != last_group && d.risk >= MutationRisk::Reversible {
+                // Reversible-or-worse group boundary: give the next group a
+                // fresh app. (Groups 1-3 restore what they touch; the gap
+                // still helps when an earlier group left residue.)
+                if d.risk > MutationRisk::Reversible || d.full_group >= 4 {
+                    if let Some(f) = do_restart(session, "previous group", d.id) {
+                        restarts += 1;
+                        fs.push(f);
+                    }
                 }
             }
-            fs.extend(tx(session, &mut |s| {
-                crate::audit::driver::mouse_audit(s, 8)
-            }));
-            if restart_between {
-                if let Some(f) = do_restart(session, "mouse", "states") {
-                    restarts += 1;
-                    fs.push(f);
-                }
+            last_group = d.full_group;
+            if d.transaction {
+                let f = d.driver;
+                fs.extend(tx(session, &mut |s| f(s, &mut graph)));
+            } else {
+                fs.extend((d.driver)(session, &mut graph));
             }
-            fs.extend(tx(session, &mut |s| {
-                crate::audit::driver::states_audit(s, 6)
-            }));
-            if restart_between {
-                if let Some(f) = do_restart(session, "states", "errors") {
-                    restarts += 1;
-                    fs.push(f);
-                }
-            }
-            fs.extend(tx(session, &mut |s| {
-                crate::audit::driver::errors_audit(s, 12)
-            }));
-            fs.extend(tx(session, &mut |s| {
-                crate::audit::driver::performance_audit(s, 5)
-            }));
-            // Observational-only drivers: read rings/frames, send nothing —
-            // no transaction needed (their non-restoration is not residue).
-            fs.extend(crate::audit::driver::color_audit(session));
-            fs.extend(crate::audit::driver::terminal_modes_audit(session));
-            fs.extend(crate::audit::driver::rendering_audit(session));
-            fs.extend(crate::audit::driver::input_protocol_audit(session));
-            fs.extend(crate::audit::driver::shell_cli_audit(session));
-            fs.extend(crate::audit::driver::lifecycle_audit(session));
-            fs.extend(crate::audit::driver::query_response_audit(session));
-            if restarts > 0 {
-                fs.push(Finding {
-                    id: "ORCH-DEEP-SUMMARY".into(),
-                    rule_id: None,
-                    severity: "info".into(),
-                    category: "orchestration".into(),
-                    summary: format!(
-                        "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
-                    ),
-                    evidence: vec![EvidenceRef::point(
-                        EvidenceKind::Other,
-                        "deep_isolation_summary",
-                        "restart count for this composite run",
-                    )
-                    .with_detail(json!({ "restarts": restarts }))],
-                    confidence: 1.0,
-                    reproduction: None,
-                    source_refs: Vec::new(),
-                });
-            }
-            fs
         }
-        AuditProfile::Keyboard => tx(session, &mut |s| {
-            crate::audit::driver::keyboard_audit(s, 20, &mut graph)
-        }),
-        AuditProfile::Focus => tx(session, &mut |s| crate::audit::driver::focus_audit(s)),
-        AuditProfile::Resize | AuditProfile::Layout => tx(session, &mut |s| {
-            let mut inner = crate::audit::driver::resize_audit(s);
-            inner.extend(crate::audit::driver::resize_reflow_audit(s));
-            inner
-        }),
-        AuditProfile::Clipping => tx(session, &mut |s| crate::audit::driver::clipping_audit(s)),
-        AuditProfile::Navigation => tx(session, &mut |s| {
-            let mut inner = crate::audit::driver::navigation_audit(s, 20, &mut graph);
-            inner.extend(crate::audit::driver::navigation_keys_audit(s, 6));
-            inner
-        }),
-        AuditProfile::Mouse => tx(session, &mut |s| crate::audit::driver::mouse_audit(s, 12)),
-        AuditProfile::Performance => tx(session, &mut |s| {
-            crate::audit::driver::performance_audit(s, 7)
-        }),
-        AuditProfile::States => tx(session, &mut |s| crate::audit::driver::states_audit(s, 10)),
-        AuditProfile::Errors => tx(session, &mut |s| crate::audit::driver::errors_audit(s, 15)),
-        AuditProfile::Color => crate::audit::driver::color_audit(session),
-        // Frame-level read of the raw ring: observes but sends nothing, so
-        // it does not need a transaction (Wave G split, item 66).
-        AuditProfile::TerminalModes => crate::audit::driver::terminal_modes_audit(session),
-        AuditProfile::Rendering => crate::audit::driver::rendering_audit(session),
-        AuditProfile::InputProtocol => crate::audit::driver::input_protocol_audit(session),
-        AuditProfile::ShellCli => crate::audit::driver::shell_cli_audit(session),
-        AuditProfile::Lifecycle => crate::audit::driver::lifecycle_audit(session),
-        // Item 21: consumes the app (clean exit + signal probes). No audit
-        // transaction — the app is deliberately terminated and relaunched.
-        AuditProfile::LifecycleExit => crate::audit::driver::lifecycle_exit_audit(session),
-        AuditProfile::QueryResponse => crate::audit::driver::query_response_audit(session),
-        _ => unreachable!("non-active profiles returned above"),
-    };
+        if restarts > 0 {
+            fs.push(Finding {
+                id: "ORCH-DEEP-SUMMARY".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "orchestration".into(),
+                summary: format!(
+                    "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
+                ),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "deep_isolation_summary",
+                    "restart count for this composite run",
+                )
+                .with_detail(json!({ "restarts": restarts }))],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+        }
+    } else {
+        // Single profile: dispatch through the table, with the standalone
+        // budgets where they differ from full's composite budgets.
+        let d = descriptor(&profile);
+        let body = SINGLE_PROFILE_OVERRIDES
+            .iter()
+            .find(|(p, _)| *p == profile)
+            .map(|(_, f)| *f)
+            .unwrap_or(d.driver);
+        if d.transaction {
+            fs.extend(tx(session, &mut |s| body(s, &mut graph)));
+        } else {
+            fs.extend(body(session, &mut graph));
+        }
+    }
     findings.extend(orchestration_notes);
-    findings.extend(active_findings);
+    findings.extend(fs);
 
     let mode = if profile.wants_static_composite() {
         "composite"
@@ -728,7 +924,7 @@ mod tests {
     fn full_is_active_and_parseable() {
         let p = AuditProfile::parse("full").expect("full parses");
         assert_eq!(p, AuditProfile::Full);
-        assert!(p.is_active(), "full must drive the live app");
+        assert!(p.is_active(), "full must read the live app");
         assert!(p.wants_static_composite(), "full includes static passes");
     }
 
@@ -736,34 +932,161 @@ mod tests {
     fn unknown_profiles_are_errors() {
         assert!(AuditProfile::parse("detailed").is_err());
         assert!(AuditProfile::parse("").is_err());
+        // The error names every table selector (the old hand-written list
+        // omitted 8 real profiles).
+        let msg = AuditProfile::parse("detailed").unwrap_err();
+        for d in PROFILES {
+            assert!(msg.contains(d.id), "error must name {}", d.id);
+        }
     }
 
+    /// Every table selector parses and round-trips through `name()`.
     #[test]
-    fn every_documented_profile_parses() {
-        for name in [
-            "full",
-            "keyboard",
-            "focus",
-            "resize",
-            "layout",
-            "clipping",
-            "discoverability",
-            "navigation",
+    fn every_table_selector_parses() {
+        for d in PROFILES {
+            let p =
+                AuditProfile::parse(d.id).unwrap_or_else(|e| panic!("{} must parse: {e}", d.id));
+            assert_eq!(p.name(), d.id);
+            assert_eq!(p, d.profile);
+        }
+    }
+
+    /// The parse error's accepted list IS the table (no second list).
+    #[test]
+    fn accepted_selectors_come_from_the_table() {
+        let msg = AuditProfile::parse("nope").unwrap_err();
+        let listed: Vec<&str> = msg
+            .rsplit("expected one of ")
+            .next()
+            .unwrap()
+            .split(", ")
+            .collect();
+        let table: Vec<&str> = PROFILES.iter().map(|d| d.id).collect();
+        assert_eq!(listed, table);
+    }
+
+    /// Descriptor invariants the orchestrator relies on (review §7: the
+    /// table is the authority, so its internal contract is tested here).
+    #[test]
+    fn descriptor_table_invariants() {
+        // Every variant has exactly one row.
+        let variants = [
+            AuditProfile::Full,
+            AuditProfile::Keyboard,
+            AuditProfile::Focus,
+            AuditProfile::Resize,
+            AuditProfile::Layout,
+            AuditProfile::Clipping,
+            AuditProfile::Discoverability,
+            AuditProfile::Navigation,
+            AuditProfile::Contract,
+            AuditProfile::Color,
+            AuditProfile::Performance,
+            AuditProfile::Mouse,
+            AuditProfile::States,
+            AuditProfile::Errors,
+            AuditProfile::Unicode,
+            AuditProfile::Controls,
+            AuditProfile::TerminalModes,
+            AuditProfile::Rendering,
+            AuditProfile::InputProtocol,
+            AuditProfile::ShellCli,
+            AuditProfile::Lifecycle,
+            AuditProfile::LifecycleExit,
+            AuditProfile::QueryResponse,
+        ];
+        for v in variants {
+            let n = PROFILES.iter().filter(|d| d.profile == v).count();
+            assert_eq!(n, 1, "{:?} must have exactly one descriptor row", v);
+        }
+        // full never includes itself or anything process-consuming.
+        for d in PROFILES.iter().filter(|d| d.included_in_full) {
+            assert_ne!(d.profile, AuditProfile::Full);
+            assert_ne!(
+                d.risk,
+                MutationRisk::RestartRequired,
+                "{} must never be a full member: full must not consume the target",
+                d.id
+            );
+        }
+        // Restart-required profiles demand exclusive control.
+        for d in PROFILES
+            .iter()
+            .filter(|d| d.risk == MutationRisk::RestartRequired)
+        {
+            assert!(
+                d.exclusive_control,
+                "{} consumes the process; it must demand exclusive control",
+                d.id
+            );
+        }
+        // Observational profiles never demand exclusive control (the lease
+        // must not block passive diagnostics — review §5).
+        for d in PROFILES
+            .iter()
+            .filter(|d| d.risk == MutationRisk::Observational)
+        {
+            assert!(
+                !d.exclusive_control,
+                "{} is observational; the human lease must not block it",
+                d.id
+            );
+        }
+        // full's driver sequence (full_group > 0) is contiguous 1..=N with
+        // no gaps, so group-boundary detection in the composite loop works.
+        let mut groups: Vec<u8> = PROFILES
+            .iter()
+            .filter(|d| d.included_in_full && d.full_group > 0)
+            .map(|d| d.full_group)
+            .collect();
+        groups.sort();
+        groups.dedup();
+        assert_eq!(groups, (1..=groups.len() as u8).collect::<Vec<u8>>());
+    }
+
+    /// Review §5: the lease split. Passive/observational profiles
+    /// (including live-session readers) must NOT demand exclusive
+    /// control; drivers and process-consumers must.
+    #[test]
+    fn lease_gate_split() {
+        for id in [
             "color",
-            "performance",
-            "mouse",
-            "states",
-            "errors",
-            "unicode",
-            "controls",
             "terminal_modes",
             "rendering",
             "input_protocol",
             "shell_cli",
             "lifecycle",
             "query_response",
+            "discoverability",
+            "unicode",
+            "controls",
         ] {
-            assert!(AuditProfile::parse(name).is_ok(), "{} must parse", name);
+            let p = AuditProfile::parse(id).unwrap();
+            assert!(
+                !p.requires_exclusive_control(),
+                "{id} must run under a human lease"
+            );
+        }
+        for id in [
+            "full",
+            "keyboard",
+            "focus",
+            "resize",
+            "layout",
+            "clipping",
+            "navigation",
+            "performance",
+            "mouse",
+            "states",
+            "errors",
+            "contract",
+            "lifecycle_exit",
+        ] {
+            let p = AuditProfile::parse(id).unwrap();
+            assert!(
+                p.requires_exclusive_control(),
+                "{id} must refuse under a human lease"
+            );
         }
     }
 
@@ -1008,6 +1331,17 @@ mod tests {
             )
             .await
             .expect("start");
+        // The child writes its DA1/6n queries at startup; give the PTY a
+        // moment to deliver them into the backend's retained ring before
+        // the audit reads it (a plain observe settles the stream — the
+        // audit itself is a ring read and deliberately does not wait).
+        {
+            let _ = pool
+                .with_session(Some(&id), |s| {
+                    let _ = s.observe(300);
+                })
+                .await;
+        }
         let report = pool
             .with_session(Some(&id), |s| run_profile(s, "query_response"))
             .await
