@@ -1,0 +1,246 @@
+//! Frame evidence: frame records, commits, held events, focus history.
+//!
+//! Impl-family extraction (Phase 1): the `RunContext` struct and its
+//! fields stay in `super`; this child module only hosts the method
+//! bodies for this subsystem. Signatures, visibility, and callers are
+//! unchanged.
+
+use super::*;
+
+impl RunContext {
+    /// Record one focus transition observed during any session's traffic
+    /// (the run's focus graph, one entry per semantic focus change).
+    pub fn record_focus_transition(
+        &mut self,
+        session_id: &str,
+        from: Option<String>,
+        to: Option<String>,
+    ) {
+        if from == to {
+            return;
+        }
+        self.focus_transitions
+            .push((now_ms(), session_id.to_string(), from, to));
+    }
+
+    /// The focus-transition ledger.
+    pub fn focus_transitions(&self) -> &[(u64, String, Option<String>, Option<String>)] {
+        &self.focus_transitions
+    }
+
+    /// Record one focus transition into BOTH focus ledgers (Wave D item
+    /// 36): the legacy label list for display continuity, and the
+    /// control-ID [`crate::semantic::focus_graph::FocusGraph`] for proof.
+    /// `via` names the input that produced the transition; the graph only
+    /// joins transitions whose ends carry stable control IDs — label-only
+    /// observations stay in the legacy ledger.
+    pub fn record_focus_observation(
+        &mut self,
+        session_id: &str,
+        from_label: Option<String>,
+        to_label: Option<String>,
+        from_id: Option<&str>,
+        to_id: Option<&str>,
+        via: &str,
+    ) {
+        // Legacy label ledger (unchanged shape, skips no-op transitions).
+        if from_label != to_label {
+            self.focus_transitions.push((
+                now_ms(),
+                session_id.to_string(),
+                from_label.clone(),
+                to_label.clone(),
+            ));
+        }
+        // ID-keyed graph.
+        if let (Some(f), Some(t)) = (from_id, to_id) {
+            self.focus_graph.transition(f, t, to_label.as_deref(), via);
+        }
+    }
+
+    /// Assign the next citable frame id (Wave B item 11) and stamp the
+    /// frame with run provenance. Returns the id (`frame:N`).
+    pub fn register_frame(&mut self, frame: &mut crate::backend::CanonicalFrame) -> u64 {
+        self.next_frame_id += 1;
+        let id = self.next_frame_id;
+        frame.assign_frame_id(id);
+        frame.run_id = Some(self.id.clone());
+        id
+    }
+
+    /// Recall one committed frame's HOT record by citable id (item 51).
+    /// `None` means not in the hot ring — either never committed to this
+    /// run, or evicted (check [`Self::frame_hot_evicted`]); the cold log
+    /// (`frames.jsonl`, persistent runs) still resolves it.
+    pub fn frame_record(&self, frame_id: u64) -> Option<&FrameRecord> {
+        self.frame_hot.iter().find(|r| r.frame_id == frame_id)
+    }
+
+    /// The hot frame ring, oldest first (item 51 storage split: hot ids +
+    /// hashes here, full grids only in the cold log).
+    pub fn frame_hot_records(&self) -> impl Iterator<Item = &FrameRecord> {
+        self.frame_hot.iter()
+    }
+
+    /// How many hot records have been evicted past the ring bound.
+    pub fn frame_hot_evicted(&self) -> u64 {
+        self.frame_hot_evicted
+    }
+
+    /// The frame commit pipeline (re-review item 40): the ONE path a
+    /// captured frame takes from raw capture to citable evidence.
+    ///
+    /// ```text
+    /// capture ──▶ assign frame_id ──▶ stamp run/session provenance
+    ///         ──▶ persist to frames.jsonl (persistent runs, O_APPEND)
+    /// ```
+    ///
+    /// Returns the citable id. Persistence is incremental (one append per
+    /// committed frame) so a crash keeps every frame committed before it;
+    /// a write failure marks the run `persistence_unhealthy` and the frame
+    /// still gets its id (the run ledger always holds it in memory).
+    pub fn commit_frame(
+        &mut self,
+        frame: &mut crate::backend::CanonicalFrame,
+        session: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        self.ensure_open()?;
+        let started = std::time::Instant::now();
+        let id = self.register_frame(frame);
+        if frame.session_id.is_none() {
+            frame.session_id = session.map(str::to_string);
+        }
+        // HOT half of the storage split (item 51): the projection facts
+        // land in the bounded ring even for ephemeral runs — a citable
+        // frame id that answers no questions would be a number, not
+        // evidence. The semantic identity is the ESTABLISHED fused truth when
+        // the capture stamped it (review P0.5) — evidence persistence
+        // serializes truth and never recomputes it — falling back to the bare
+        // grid identity only for frames captured before fused stamping.
+        let semantic_identity = frame
+            .semantic_identity
+            .clone()
+            .unwrap_or_else(|| crate::semantic::semantic_identity(&frame.state));
+        let record = FrameRecord {
+            frame_id: id,
+            session: frame.session_id.clone(),
+            generation: frame.generation,
+            screen_seq: frame.screen_seq,
+            output_seq: frame.output_seq,
+            structure_hash: frame.state.structure_hash.clone(),
+            visual_hash: frame.state.visual_hash.clone(),
+            semantic_identity,
+            committed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            commit_us: started.elapsed().as_micros() as u64,
+        };
+        self.frame_hot.push_back(record);
+        while self.frame_hot.len() > FRAME_HOT_RING {
+            self.frame_hot.pop_front();
+            self.frame_hot_evicted += 1;
+        }
+        if let Some(dir) = self.run_dir.as_ref() {
+            let line = serde_json::json!({
+                "frame_id": id,
+                "run_id": frame.run_id,
+                "session": frame.session_id,
+                "generation": frame.generation,
+                "screen_seq": frame.screen_seq,
+                "output_seq": frame.output_seq,
+                "structure_hash": frame.state.structure_hash,
+                "visual_hash": frame.state.visual_hash,
+                "semantic_identity": frame.semantic_identity.clone().unwrap_or_else(|| crate::semantic::semantic_identity(&frame.state)),
+            });
+            let path = dir.join("frames.jsonl");
+            let body = format!("{line}\n");
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+            {
+                Ok(()) => {}
+                Err(_) => self.persistence_unhealthy = true,
+            }
+        }
+        Ok(id)
+    }
+
+    /// Hold one session's drained terminal events for persistence (Wave B
+    /// item 14). Sessions own the live queue; the run keeps the export.
+    ///
+    /// Persistent runs (re-review item 38) append each batch to
+    /// `events/<session>.jsonl` *immediately* — one O_APPEND write per
+    /// batch — so a crash loses at most the batch in flight, never the
+    /// whole session history. `flush` then only handles the ephemeral-run
+    /// backlog (whole-file write at close, the old contract).
+    pub fn hold_events(
+        &mut self,
+        session: &str,
+        events: Vec<crate::events::TerminalEvent>,
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        if let Some(dir) = self.run_dir.as_ref() {
+            let ev_dir = dir.join("events");
+            if std::fs::create_dir_all(&ev_dir).is_err() {
+                self.persistence_unhealthy = true;
+                self.held_events.push((session.to_string(), events));
+                return Ok(());
+            }
+            let safe = sanitize(session);
+            let path = ev_dir.join(format!("{}.jsonl", safe));
+            let mut body = String::new();
+            for ev in &events {
+                if let Ok(line) = serde_json::to_string(ev) {
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+            }
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+            {
+                Ok(()) => {
+                    let written = self
+                        .event_flushed_counts
+                        .entry(session.to_string())
+                        .or_insert(0);
+                    *written += events.len() as u64;
+                    // Artifact registered once per session (the log is a
+                    // growing file, not a per-batch artifact).
+                    let artifact_path =
+                        std::path::PathBuf::from("events").join(format!("{}.jsonl", safe));
+                    if !self
+                        .artifacts
+                        .iter()
+                        .any(|a| a.path.as_ref() == Some(&artifact_path))
+                    {
+                        self.register_artifact(
+                            crate::run::ArtifactKind::EventLog,
+                            Some(artifact_path),
+                            None,
+                            Some(session.to_string()),
+                            "terminal event log (incrementally persisted)",
+                        )
+                        .ok();
+                    }
+                    self.event_count += events.len() as u64;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.persistence_unhealthy = true;
+                    // Fall through to the in-memory hold so flush retries.
+                }
+            }
+        }
+        self.held_events.push((session.to_string(), events));
+        Ok(())
+    }
+}
