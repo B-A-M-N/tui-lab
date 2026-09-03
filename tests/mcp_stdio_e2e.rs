@@ -180,7 +180,7 @@ fn stdio_e2e_full_lifecycle() {
     );
     mcp.notify("notifications/initialized");
 
-    // --- tools/list: exactly the registry's 15-tool surface (item 69's
+    // --- tools/list: exactly the registry's 16-tool surface (item 69's
     // pin, held over the wire) ---
     let tools = mcp.request("tools/list", serde_json::json!({}));
     let mut names: Vec<String> = tools["result"]["tools"]
@@ -310,7 +310,7 @@ fn stdio_e2e_full_lifecycle() {
 
     // --- probe: the Wave-2 troubleshooting primitive over the wire ---
     // A drift probe (no stimulus) must return an envelope with the exact
-    // provenance string, an honest settle, and the anomaly/transition shape.
+    // provenance string, an honest settle, and the material-change/transition shape.
     let probe = mcp.tool(
         "tui_probe",
         serde_json::json!({
@@ -327,8 +327,8 @@ fn stdio_e2e_full_lifecycle() {
     );
     assert_eq!(probe["data"]["settle"], "Skipped", "drift settle: {probe}");
     assert!(
-        probe["data"]["anomalies"].is_array() && probe["data"]["transition"].is_object(),
-        "probe carries anomalies + transition: {probe}"
+        probe["data"]["material_changes"].is_array() && probe["data"]["transition"].is_object(),
+        "probe carries material_changes + transition: {probe}"
     );
 
     // A stimulated probe reports the exact canonical signature.

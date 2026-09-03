@@ -9,7 +9,7 @@
 //! It never requires classification first (Raw-mode friendly) and never
 //! mandates a stable screen (the strategy decides "done"). It reports what
 //! *changed* materially — screen cells, semantics (controls/regions/focus),
-//! process state — and flags anomalies, so an unknown TUI can be debugged by
+//! process state — and flags material changes, so an unknown TUI can be debugged by
 //! experiment rather than by forcing every attempt into an assertion.
 
 use std::time::Instant;
@@ -21,7 +21,7 @@ use crate::screen::diff::Transition;
 use crate::screen::ScreenState;
 use crate::session::state::Session;
 
-/// What aspects of a probe's transition to watch for anomalies.
+/// What aspects of a probe's transition to watch for material changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeWatch {
     Cursor,
@@ -52,8 +52,11 @@ pub struct ProbeResult {
     /// every semantic read sees (native self-reports participate).
     pub after_focus: Option<(Option<String>, Option<String>)>,
     pub timing_ms: u64,
-    /// Human-readable anomalies (watched aspects that changed materially).
-    pub anomalies: Vec<String>,
+    /// Human-readable material changes (watched aspects that changed).
+    /// A change is EVIDENCE of the stimulus's effect — it is an anomaly
+    /// only when it deviates from a stated expectation, which this engine
+    /// does not (yet) model (review §9).
+    pub material_changes: Vec<String>,
 }
 
 impl ProbeResult {
@@ -109,7 +112,7 @@ impl ProbeResult {
 /// - `stimulus`: the CANONICAL action to apply between before and after
 ///   (None = pure observation of drift).
 /// - `completion`: how "after" is decided (stable, first-change, text, …).
-/// - `watch`: aspects to surface as anomalies when they changed.
+/// - `watch`: aspects to surface as material changes when they changed.
 /// - `quiet_ms` / `budget_ms`: the settle policy and overall ceiling so a
 ///   never-settling TUI still returns.
 pub fn run_probe(
@@ -194,8 +197,8 @@ pub fn run_probe_with_guard(
     // 4) Diff.
     let transition = crate::screen::diff::diff(&before, &after);
 
-    // 6) Consistent anomalies from the watched aspects.
-    let mut anomalies = Vec::new();
+    // 6) Consistent material changes from the watched aspects.
+    let mut material_changes = Vec::new();
     for aspect in watch {
         match aspect {
             ProbeWatch::Cursor => {
@@ -203,7 +206,7 @@ pub fn run_probe_with_guard(
                     let before = &c.before;
                     let after = &c.after;
                     let moved = (before.x, before.y) != (after.x, after.y);
-                    anomalies.push(format!(
+                    material_changes.push(format!(
                         "cursor moved {:?} -> {:?} (moved={}, visible {}-{})",
                         (before.x, before.y),
                         (after.x, after.y),
@@ -216,7 +219,7 @@ pub fn run_probe_with_guard(
             ProbeWatch::Focus => {
                 let sd = &transition.semantic_diff;
                 if sd.focus_before.as_deref() != sd.focus_after.as_deref() {
-                    anomalies.push(format!(
+                    material_changes.push(format!(
                         "focus changed {:?} -> {:?}",
                         sd.focus_before, sd.focus_after
                     ));
@@ -225,21 +228,21 @@ pub fn run_probe_with_guard(
             ProbeWatch::Controls => {
                 let sd = &transition.semantic_diff;
                 if !sd.controls_added.is_empty() {
-                    anomalies.push(format!("controls added: {:?}", sd.controls_added));
+                    material_changes.push(format!("controls added: {:?}", sd.controls_added));
                 }
                 if !sd.controls_removed.is_empty() {
-                    anomalies.push(format!("controls removed: {:?}", sd.controls_removed));
+                    material_changes.push(format!("controls removed: {:?}", sd.controls_removed));
                 }
             }
             ProbeWatch::Regions => {
                 let sd = &transition.semantic_diff;
                 if !sd.regions_added.is_empty() {
-                    anomalies.push(format!("regions added: {:?}", sd.regions_added));
+                    material_changes.push(format!("regions added: {:?}", sd.regions_added));
                 }
             }
             ProbeWatch::Style => {
                 if transition.screen_diff.style_changes > 0 {
-                    anomalies.push(format!(
+                    material_changes.push(format!(
                         "style changes: {}",
                         transition.screen_diff.style_changes
                     ));
@@ -247,12 +250,12 @@ pub fn run_probe_with_guard(
             }
             ProbeWatch::Process => {
                 if let Some(p) = &transition.screen_diff.process {
-                    anomalies.push(format!(
+                    material_changes.push(format!(
                         "process: running {}/{}",
                         p.before.running, p.after.running
                     ));
                     if let Some(code) = p.after.exit_code {
-                        anomalies.push(format!("process exited with code {code}"));
+                        material_changes.push(format!("process exited with code {code}"));
                     }
                 }
             }
@@ -291,7 +294,7 @@ pub fn run_probe_with_guard(
         transition,
         after_focus,
         timing_ms: start.elapsed().as_millis() as u64,
-        anomalies,
+        material_changes,
     })
 }
 
@@ -510,9 +513,12 @@ mod tests {
         );
         assert!(
             result.transition.screen_diff.changed_cells > 0
-                || result.anomalies.iter().any(|a| a.contains("controls")),
+                || result
+                    .material_changes
+                    .iter()
+                    .any(|a| a.contains("controls")),
             "probe should surface the added menu: {:?}",
-            result.anomalies
+            result.material_changes
         );
         assert_eq!(result.action, "text", "exact canonical signature");
         assert_eq!(result.settle, SettleStatus::Met, "text appeared");
