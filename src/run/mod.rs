@@ -1185,12 +1185,14 @@ impl RunContext {
     }
 
     /// Ingest findings, attaching probable source loci (W2.10) where the
-    /// app's own coverage declarations can name them. A native coverage
-    /// event target of the form `widget:<id>` or a bare `#id`/id maps to
-    /// every `file:line` target the app also declared: the app itself told
-    /// us both facts, so joining them is app-attested evidence, not
-    /// inference. Findings whose evidence names no covered control keep
-    /// `source_refs` empty — a locus is carried, never guessed.
+    /// app's own coverage declarations can name them. Two joins, tiered by
+    /// provenance (review §4): a matched widget-target entry that itself
+    /// carries app-declared loci joins those as `attested` (native id →
+    /// coverage event → locus — the app drew every edge); otherwise the
+    /// run-level file-locus keys join as `correlated` (investigative,
+    /// below the actionable fence). Findings whose evidence names no
+    /// covered control keep `source_refs` empty — a locus is carried,
+    /// never guessed.
     pub fn extend_findings_with_source_refs(
         &mut self,
         findings: Vec<crate::audit::Finding>,
@@ -1202,10 +1204,6 @@ impl RunContext {
             .keys()
             .filter(|t| target_is_file_locus(t))
             .collect();
-        if file_targets.is_empty() {
-            self.findings.extend(findings);
-            return Ok(());
-        }
         // Widget-ish targets (widget:<id>, #id, bare id) → the app declared
         // coverage for that component in the same channel.
         let widget_targets: Vec<&String> = self
@@ -1213,6 +1211,10 @@ impl RunContext {
             .keys()
             .filter(|t| !target_is_file_locus(t))
             .collect();
+        if file_targets.is_empty() && widget_targets.is_empty() {
+            self.findings.extend(findings);
+            return Ok(());
+        }
         let mut enriched = findings;
         for f in &mut enriched {
             if !f.source_refs.is_empty() {
@@ -1221,20 +1223,32 @@ impl RunContext {
             let mut refs: Vec<crate::semantic::source_ref::SourceRef> = Vec::new();
             for ev in &f.evidence {
                 let target = ev.target.as_deref().unwrap_or("");
-                let matched = widget_targets
+                let Some(matched_widget) = widget_targets
                     .iter()
-                    .any(|w| coverage_target_matches_control(w, target));
-                if matched {
-                    // Attach every file locus the app declared — all of them
-                    // are candidate cause sites; per-locus confidence stays
-                    // modest because the app did not scope to this finding.
-                    for ft in &file_targets {
-                        if let Some(sr) = source_ref_from_target(ft) {
-                            refs.push(sr);
-                        }
-                    }
+                    .find(|w| coverage_target_matches_control(w, target))
+                else {
+                    continue;
+                };
+                // Attested first: the matched entry's own app-declared loci.
+                if let Some(entry) = self.coverage_ledger.get(*matched_widget) {
+                    refs.extend(entry.source_refs.iter().cloned().map(|mut sr| {
+                        sr.provenance = crate::semantic::source_ref::Provenance::Attested;
+                        sr
+                    }));
+                }
+                if !refs.is_empty() {
                     break;
                 }
+                // Correlated fallback: file loci declared elsewhere in the
+                // same run — all candidate cause sites, never attested for
+                // THIS finding; per-locus confidence stays modest because
+                // the app did not scope to this finding.
+                for ft in &file_targets {
+                    if let Some(sr) = source_ref_from_target(ft) {
+                        refs.push(sr);
+                    }
+                }
+                break;
             }
             if !refs.is_empty() {
                 // Deduplicate by location.
@@ -1287,19 +1301,30 @@ impl RunContext {
                 continue;
             };
             // Prefer the app-attested loci stored on the matched entry.
+            // This is the direct chain the provenance tier calls attested:
+            // the finding's control matched a coverage target the app
+            // declared a native id AND a source locus for (review §4).
             if let Some(entry) = self.coverage_ledger.get(*w) {
-                refs.extend(entry.source_refs.iter().cloned());
+                refs.extend(entry.source_refs.iter().cloned().map(|mut sr| {
+                    sr.provenance = crate::semantic::source_ref::Provenance::Attested;
+                    sr
+                }));
                 if !entry.source_refs.is_empty() {
                     continue;
                 }
             }
-            // Fall back to file-locus keys (confidence 0.7 join).
+            // Fall back to file-locus keys. This is a RUN-LEVEL correlation
+            // — the finding shares identity with coverage whose loci the
+            // app declared elsewhere — so it joins as `correlated`, never
+            // attested, and sits below the actionable fence (review §4: a
+            // 0.7 float must not turn correlation into a cause site).
             for ft in self
                 .coverage_ledger
                 .keys()
                 .filter(|t| target_is_file_locus(t))
             {
-                if let Some(sr) = source_ref_from_target(ft) {
+                if let Some(mut sr) = source_ref_from_target(ft) {
+                    sr.provenance = crate::semantic::source_ref::Provenance::Correlated;
                     refs.push(sr);
                 }
             }
@@ -1314,14 +1339,17 @@ impl RunContext {
         joined
     }
 
-    /// Assemble [`crate::audit::repair::RepairPacket`]s for every finding
-    /// (audit item: vket/RepairPacket). Each packet joins the finding with
-    /// its replayable reproduction, its source loci, and a verification
-    /// recipe — everything an agent needs to go from "bug detected" to
-    /// "specific source edit" without re-deriving the parts. Findings that
-    /// cannot form a packet (no evidence) are skipped and counted, never
-    /// silently dropped from the list.
-    pub fn repair_packets(&self) -> (Vec<crate::audit::repair::RepairPacket>, usize) {
+    /// Assemble [`crate::audit::repair::DiagnosticContext`]s for every
+    /// finding (review §2/§3, formerly `repair_packets`/`RepairPacket`).
+    /// Each context joins the finding with its replayable reproduction
+    /// (when one exists), its provenance-tiered source loci, a
+    /// verification plan (targeted checks + optional replay leg), and
+    /// observation-shaped next steps — everything an agent needs to
+    /// investigate the finding without re-deriving the parts. This
+    /// surface increases knowledge; it does not prescribe edits. Findings
+    /// that cannot form a context (no evidence) are skipped and counted,
+    /// never silently dropped from the list.
+    pub fn diagnostic_contexts(&self) -> (Vec<crate::audit::repair::DiagnosticContext>, usize) {
         let sessions: Vec<String> = self.session_specs.keys().cloned().collect();
         let mut out = Vec::new();
         let mut skipped = 0usize;
@@ -1347,7 +1375,7 @@ impl RunContext {
                 let _ = &repro_ids;
                 self.load_scenario(id).ok()
             };
-            let packet = crate::audit::repair::RepairPacket::assemble(
+            let packet = crate::audit::repair::DiagnosticContext::assemble(
                 joined.clone(),
                 &self.id,
                 sessions.clone(),
@@ -1441,18 +1469,22 @@ impl RunContext {
     /// component's app-attested source locus. The locus comes from the
     /// same NativeSemanticProtocol channel (the node's `source` field), so
     /// linking widget target → file:line is a join of two app-declared
-    /// facts, not an inference. Widget-shaped targets accumulate their
-    /// loci; file targets keep the locus they already are.
+    /// facts, not an inference — the provenance tier (review §4) stamps
+    /// such loci `attested`, the only tier that clears the actionable
+    /// fence. Widget-shaped targets accumulate their loci; file targets
+    /// keep the locus they already are.
     pub fn record_coverage_event_with_identity(
         &mut self,
         session: &str,
         target: &str,
-        source_ref: crate::semantic::source_ref::SourceRef,
+        mut source_ref: crate::semantic::source_ref::SourceRef,
     ) -> anyhow::Result<()> {
         self.record_coverage_event(session, target)?;
         let Some(entry) = self.coverage_ledger.get_mut(target) else {
             return Ok(());
         };
+        // Native id → coverage event → locus: the app drew every edge.
+        source_ref.provenance = crate::semantic::source_ref::Provenance::Attested;
         if !entry
             .source_refs
             .iter()
@@ -3421,6 +3453,44 @@ mod source_ref_tests {
         let _ = run.extend_findings_with_source_refs(vec![finding_pointing_at("button/other/1,1")]);
         let f2 = run.findings().last().unwrap();
         assert!(f2.source_refs.is_empty(), "no locus without coverage");
+    }
+
+    /// Review §4: the ATTESTED chain — the finding's control matches a
+    /// widget-target coverage entry that itself carries app-declared source
+    /// loci. That is the app drawing the line (native id → coverage event →
+    /// locus), and it is the only join that lands above the actionable
+    /// fence.
+    #[test]
+    fn attested_join_only_via_widget_entry_with_declared_loci() {
+        let mut run = RunContext::ephemeral();
+        // The attested chain is the identity fold: `widget:#save.activate`
+        // reported WITH the locus the app declared for #save. Via
+        // record_coverage_event (no locus), the same key would only
+        // correlate.
+        use crate::semantic::source_ref::{Provenance, SourceRef};
+        let _ = run.record_coverage_event_with_identity(
+            "s1",
+            "widget:#save.activate",
+            SourceRef {
+                file: "src/ui/settings.rs".into(),
+                line: 184,
+                column: None,
+                symbol: None,
+                framework_id: Some("#save".into()),
+                confidence: 1.0,
+                source: "framework-adapter".into(),
+                provenance: Provenance::Unknown,
+            },
+        );
+        let _ =
+            run.extend_findings_with_source_refs(vec![finding_pointing_at("button/save/40,12")]);
+        let f = run.findings().last().unwrap();
+        assert_eq!(f.source_refs.len(), 1);
+        assert_eq!(f.source_refs[0].provenance, Provenance::Attested);
+        assert!(
+            f.source_refs[0].is_actionable(),
+            "native id → coverage event → locus is the actionable chain"
+        );
     }
 
     /// P0.7: delta reads real accumulated evidence via a cursor — targets
