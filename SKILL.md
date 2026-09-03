@@ -11,7 +11,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how "done" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.
 - `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
   - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output, event
-- `tui_probe` — Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched anomalies. stimulus {kind:none} = drift probe.
+- `tui_probe` — Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched material changes. stimulus {kind:none} = drift probe.
   - completion: stable, first_change, any_change, text_appears, text_disappears, process_exit, semantic_change, may_be_silent
 - `tui_assert` — Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
   - assertion: text, text_absent, position, focus, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, focused_not, oracle
@@ -23,14 +23,14 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
   - format: start, stop, cast, svg, png
 - `tui_explore` — Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph. Driving: blocked while a human lease is live.
   - mode: random, guided_candidates, semantic, state_graph
-- `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Active profiles are blocked while a human lease is live.
-  - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes, rendering, input_protocol, shell_cli, lifecycle, query_response
+- `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.
+  - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes, rendering, input_protocol, shell_cli, lifecycle, lifecycle_exit, query_response
 - `tui_coverage` — Coverage: native NSP coverage-event ledger plus the optional tuicov executable (honest Unsupported when absent).
   - action: detect, summary, collect, delta, uncovered, ledger
 - `tui_framework` — Framework detection, capability probes, and NativeSemanticProtocol adapter snippets (Ratatui/Textual/Python).
   - action: detect, capabilities, adapter_snippet
-- `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, repair packets for every finding, repair bundle for ONE finding (reproduction + app-attested source loci + targeted verification recipe + regression check), and context (this registry as JSON).
-  - action: status, persist, close, context, list, resume, repair, new, bundle
+- `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, diagnose (or its alias repair): diagnostic evidence contexts per finding — provenance-tiered source loci, verification plan (targeted checks, replay only with a reproduction), observation-shaped next steps — never edit prescriptions, bundle for ONE finding (context + before/after regression diff), and context (this registry as JSON).
+  - action: status, persist, close, context, list, resume, diagnose, repair, new, bundle
 - `tui_contract` — Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (regions become components, named controls become oracle assertions; carries the scaffold.inferred marker; edit from observation toward intent).
   - action: load, validate, status, compare, scaffold, baseline
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
@@ -96,5 +96,5 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 - `tui://runs/{run_id}` — Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).
 - `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
 - `tui://sessions/{session_id}/screen` — Live screen text + geometry.
+- `tui://sessions/{session_id}/terminal-profile` — Evidence-backed terminal capability report (review §12): reads the live backend capabilities without forcing a screen settle — observationally pure, unlike the screen-backed views.
 - `tui://findings` — Findings accumulated this run (audits, contracts, exploration).
-

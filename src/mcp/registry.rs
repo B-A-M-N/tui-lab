@@ -48,7 +48,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_probe",
-        summary: "Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched anomalies. stimulus {kind:none} = drift probe.",
+        summary: "Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched material changes. stimulus {kind:none} = drift probe.",
         selector: Some(("completion", <crate::mcp::params::ProbeCompletion as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -78,7 +78,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_audit",
-        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Active profiles are blocked while a human lease is live.",
+        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.",
         selector: Some(("profile", <crate::mcp::params::AuditProfile as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -93,7 +93,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_run",
-        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, repair packets for every finding, repair bundle for ONE finding (reproduction + app-attested source loci + targeted verification recipe + regression check), and context (this registry as JSON).",
+        summary: "Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, diagnose (or its alias repair): diagnostic evidence contexts per finding — provenance-tiered source loci, verification plan (targeted checks, replay only with a reproduction), observation-shaped next steps — never edit prescriptions, bundle for ONE finding (context + before/after regression diff), and context (this registry as JSON).",
         selector: Some(("action", <crate::mcp::params::RunAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -133,6 +133,11 @@ pub const RESOURCES: &[ResourceCapability] = &[
     ResourceCapability {
         uri: "tui://sessions/{session_id}/screen",
         description: "Live screen text + geometry.",
+    },
+    ResourceCapability {
+        uri: "tui://sessions/{session_id}/terminal-profile",
+        description:
+            "Evidence-backed terminal capability report (review §12): reads the live backend capabilities without forcing a screen settle — observationally pure, unlike the screen-backed views.",
     },
     ResourceCapability {
         uri: "tui://findings",

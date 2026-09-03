@@ -216,7 +216,7 @@ sys.stdout.write('\\x1b[7mSTYLE-BASE\\x1b[0m'); sys.stdout.flush()",
         transition,
         after_focus: None,
         timing_ms: 0,
-        anomalies: vec![],
+        material_changes: vec![],
     };
     if result.transition.screen_diff.style_changes > 0
         && result.transition.screen_diff.changed_cells == 0
@@ -260,7 +260,7 @@ fn bell_only_change_counts_as_material() {
         transition,
         after_focus: None,
         timing_ms: 5,
-        anomalies: vec![],
+        material_changes: vec![],
     };
     assert!(
         result.has_changes(),
@@ -297,7 +297,7 @@ fn native_only_change_counts_as_material() {
         transition,
         after_focus: None,
         timing_ms: 5,
-        anomalies: vec![],
+        material_changes: vec![],
     };
     assert!(
         result.has_changes(),

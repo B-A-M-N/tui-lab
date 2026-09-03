@@ -161,7 +161,7 @@ fn build_gist(
             "probe '{}' found {} material change(s); timing {} ms; {},
              affecting '{}'",
             ascii_clean(p.action.as_str()),
-            p.anomalies.len(),
+            p.material_changes.len(),
             p.timing_ms,
             describe_transition(&p.transition),
             finding.category.clone(),
@@ -440,7 +440,7 @@ mod tests {
             transition,
             after_focus: None,
             timing_ms: 42,
-            anomalies: vec!["focus moved".into()],
+            material_changes: vec!["focus moved".into()],
         }
     }
 
