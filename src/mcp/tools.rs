@@ -3480,11 +3480,11 @@ impl TuiLabServer {
             }
             // ── repair: RepairPackets for every finding (audit item) ──
             RA::Repair => {
-                let (packets, skipped) = {
+                let (contexts, skipped) = {
                     let run = self.run.lock().unwrap();
-                    run.repair_packets()
+                    run.diagnostic_contexts()
                 };
-                if packets.is_empty() && skipped == 0 {
+                if contexts.is_empty() && skipped == 0 {
                     return ok(json!({
                         "packets": [],
                         "skipped": 0,
@@ -3492,10 +3492,10 @@ impl TuiLabServer {
                     }));
                 }
                 ok(json!({
-                    "packets": packets,
+                    "contexts": contexts,
                     "skipped": skipped,
                     "note": if skipped > 0 {
-                        Some(format!("{skipped} finding(s) could not form a packet (no evidence) and were skipped"))
+                        Some(format!("{skipped} finding(s) could not form a context (no evidence) and were skipped"))
                     } else {
                         None
                     },
@@ -3529,8 +3529,8 @@ impl TuiLabServer {
                 };
                 // The packet for THIS finding (pure join; packets read run
                 // state and never mutate it).
-                let (packets, _skipped) = run.repair_packets();
-                let packet = packets.into_iter().find(|p| p.finding.id == finding_id);
+                let (contexts, _skipped) = run.diagnostic_contexts();
+                let packet = contexts.into_iter().find(|c| c.finding.id == finding_id);
                 // The before/after verdicts from the labeled baseline.
                 let baseline = run.finding_baseline(&compare_label);
                 let (verdicts, before, regressions): (

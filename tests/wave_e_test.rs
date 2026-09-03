@@ -288,24 +288,30 @@ fn failing_oracle_fails_scenario_step() {
     );
 }
 
-// ── Wave 5: greenfield repair loop ──────────────────────────────────────
+// ── Wave 5: greenfield diagnosis loop (review §2/§3 recontracting) ──────
 
 #[test]
-fn repair_packet_keys_verification_on_rule_identity() {
+fn diagnostic_context_keys_verification_on_rule_identity() {
     // Item 42: two occurrences of the same rule get different instance
-    // ids but the SAME rule key — the verification recipe and packet
+    // ids but the SAME rule key — the verification plan and context
     // identity must carry the rule, not the instance, so a fresh audit
     // pass compares correctly across runs.
     let mk = |inst: &str| crate_shim_finding("CLIP-001", inst);
     let f1 = mk("CLIP-001");
     let f2 = mk("CLIP-002");
     for f in [f1, f2] {
-        let packet = tui_lab::audit::repair::RepairPacket::assemble(f, "run", vec![], |_| None)
-            .expect("packet");
-        assert_eq!(packet.rule_id, "CLIP-001", "rule identity, not instance");
+        let ctx = tui_lab::audit::repair::DiagnosticContext::assemble(f, "run", vec![], |_| None)
+            .expect("context");
+        assert_eq!(ctx.rule_id, "CLIP-001", "rule identity, not instance");
+        // Review §3: no scenario no longer means no verification — the
+        // plan carries targeted checks; only the replay leg is absent.
         assert!(
-            packet.verification.is_none(),
-            "no scenario → no invented recipe"
+            ctx.verification.replay.is_none(),
+            "no scenario → no invented replay leg"
+        );
+        assert!(
+            !ctx.verification.targeted_checks.is_empty(),
+            "targeted checks stand without a scenario"
         );
     }
 }
@@ -337,12 +343,13 @@ fn targeted_check_derived_from_evidence_target() {
     f.reproduction = Some("scen-x".into());
     let sc = tui_lab::scenario::model::Scenario::new("repro")
         .act(serde_json::json!({"action":"key","key":"tab"}));
-    let packet =
-        tui_lab::audit::repair::RepairPacket::assemble(f, "run", vec![], |_| Some(sc.clone()))
-            .expect("packet");
-    let recipe = packet.verification.expect("recipe exists with repro");
-    assert_eq!(recipe.finding_rule_id, "FOCUS-002");
-    let targeted = recipe.target.expect("targeted check derived");
+    let ctx =
+        tui_lab::audit::repair::DiagnosticContext::assemble(f, "run", vec![], |_| Some(sc.clone()))
+            .expect("context");
+    let plan = &ctx.verification;
+    let replay = plan.replay.as_ref().expect("replay leg exists with repro");
+    assert_eq!(replay.finding_rule_id, "FOCUS-002");
+    let targeted = &plan.targeted_checks[0];
     assert_eq!(targeted.target, "region/main");
     assert!(
         targeted.recheck_hint.contains("FOCUS-002"),
@@ -428,6 +435,9 @@ fn coverage_event_with_identity_attests_source_locus() {
             framework_id: None,
             confidence: 1.0,
             source: "native".into(),
+            // The identity fold stamps `attested` itself (review §4) —
+            // native id → coverage event → locus is the app's own line.
+            provenance: tui_lab::semantic::Provenance::Unknown,
         },
     );
     let _ = run.record_coverage_event("s1", "#save.activate"); // plain hits still fold
@@ -435,6 +445,11 @@ fn coverage_event_with_identity_attests_source_locus() {
     assert_eq!(entry.hits, 2);
     assert_eq!(entry.source_refs.len(), 1, "deduped by location");
     assert_eq!(entry.source_refs[0].file, "src/ui/save.rs");
+    assert_eq!(
+        entry.source_refs[0].provenance,
+        tui_lab::semantic::Provenance::Attested,
+        "the identity fold upgrades to attested"
+    );
 
     // And the enricher: a finding whose evidence names this control gains
     // the app-attested locus through the pure explain-time join.
