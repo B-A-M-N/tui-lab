@@ -537,7 +537,10 @@ fn pipe_child_sees_no_tty() {
          import time; time.sleep(1)",
     );
     let out = b
-        .wait(WaitCond::Text("IN-False OUT-False ERR-False".into()), Duration::from_secs(5))
+        .wait(
+            WaitCond::Text("IN-False OUT-False ERR-False".into()),
+            Duration::from_secs(5),
+        )
         .expect("wait");
     assert!(
         out.met,
@@ -567,7 +570,10 @@ fn pipe_committed_lines_stay_committed_across_chunks() {
     let _ = b.wait(WaitCond::Text("UAL".into()), Duration::from_secs(5));
     let out = b.stdout_lines();
     assert!(out.contains(&"A".to_string()), "first line intact: {out:?}");
-    assert!(out.contains(&"B".to_string()), "second line NOT fused to A: {out:?}");
+    assert!(
+        out.contains(&"B".to_string()),
+        "second line NOT fused to A: {out:?}"
+    );
     assert!(
         out.contains(&"PARTUAL".to_string()),
         "genuinely unterminated line continues across chunks: {out:?}"
@@ -597,11 +603,26 @@ fn pipe_separates_stdout_from_stderr() {
     let _ = b.wait(WaitCond::Text("OUT-CHERRY".into()), Duration::from_secs(5));
     let out = b.stdout_lines();
     let err = b.stderr_lines();
-    assert!(out.iter().any(|l| l.contains("OUT-APPLE")), "stdout: {out:?}");
-    assert!(out.iter().any(|l| l.contains("OUT-CHERRY")), "stdout: {out:?}");
-    assert!(!out.iter().any(|l| l.contains("BANANA")), "stdout polluted: {out:?}");
-    assert!(err.iter().any(|l| l.contains("ERR-BANANA")), "stderr: {err:?}");
-    assert!(!err.iter().any(|l| l.contains("APPLE")), "stderr polluted: {err:?}");
+    assert!(
+        out.iter().any(|l| l.contains("OUT-APPLE")),
+        "stdout: {out:?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("OUT-CHERRY")),
+        "stdout: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("BANANA")),
+        "stdout polluted: {out:?}"
+    );
+    assert!(
+        err.iter().any(|l| l.contains("ERR-BANANA")),
+        "stderr: {err:?}"
+    );
+    assert!(
+        !err.iter().any(|l| l.contains("APPLE")),
+        "stderr polluted: {err:?}"
+    );
     b.stop().ok();
 }
 
@@ -630,7 +651,10 @@ fn pipe_screen_has_viewport_scrollback_and_search() {
     );
     // Search covers history (the evicted-from-viewport early pl-* rows).
     let hits = b.search("pl-0").expect("search");
-    assert!(hits.iter().any(|h: &SearchHit| h.region == "scrollback"), "{hits:?}");
+    assert!(
+        hits.iter().any(|h: &SearchHit| h.region == "scrollback"),
+        "{hits:?}"
+    );
     // Honest capability: real history, no terminal grid features.
     let caps: Capabilities = b.capabilities();
     assert!(caps.scrollback);
@@ -648,7 +672,11 @@ fn pipe_reports_exit_status() {
     assert!(out.met, "short script exits");
     let st = b.process();
     assert!(!st.running, "finished");
-    assert_eq!(st.exit_code, Some(7), "exit code surfaced from the pipe child");
+    assert_eq!(
+        st.exit_code,
+        Some(7),
+        "exit code surfaced from the pipe child"
+    );
     b.stop().ok();
 }
 
@@ -770,7 +798,10 @@ fn fused_semantic_truth_across_all_shapes() {
     // overlay still applies — the fused path is idempotent and never freezes
     // the native facts.
     let (sem2, tree2, report2) = sess.fused_frame().expect("second fused frame");
-    assert_eq!(sem2.focus.control, sem.focus.control, "stable focus across reads");
+    assert_eq!(
+        sem2.focus.control, sem.focus.control,
+        "stable focus across reads"
+    );
     assert_eq!(report2.focus_applied, report.focus_applied);
     let focused2: Vec<String> = {
         fn walk2(n: &tui_lab::semantic::node::SemanticNode, out: &mut Vec<String>) {
@@ -834,10 +865,7 @@ fn audit_transaction_reports_timing_metrics() {
     assert_eq!(findings.len(), 1);
     let m = findings[0].evidence[0].detail["audit_metrics"].clone();
     assert_eq!(m["profile"], "probe");
-    assert!(
-        m["total_ms"].is_u64(),
-        "timing present on the finding: {m}"
-    );
+    assert!(m["total_ms"].is_u64(), "timing present on the finding: {m}");
     assert!(
         m["total_ms"].as_u64().unwrap() >= m["driver_ms"].as_u64().unwrap_or(0),
         "total covers the driver phase: {m}"
@@ -861,19 +889,13 @@ fn audit_transaction_reports_timing_metrics() {
 #[test]
 fn frame_records_are_hot_queryable_and_bounded() {
     let mut run = tui_lab::run::RunContext::ephemeral();
-    let mut f1 = tui_lab::backend::CanonicalFrame::new(
-        tui_lab::screen::ScreenState::new(80, 24),
-        1,
-        10,
-    );
+    let mut f1 =
+        tui_lab::backend::CanonicalFrame::new(tui_lab::screen::ScreenState::new(80, 24), 1, 10);
     f1.state.structure_hash = "w6-a".into();
     f1.state.visual_hash = "v-w6-a".into();
     let id1 = run.commit_frame(&mut f1, Some("w6-sess")).expect("commit");
-    let mut f2 = tui_lab::backend::CanonicalFrame::new(
-        tui_lab::screen::ScreenState::new(80, 24),
-        2,
-        11,
-    );
+    let mut f2 =
+        tui_lab::backend::CanonicalFrame::new(tui_lab::screen::ScreenState::new(80, 24), 2, 11);
     f2.state.structure_hash = "w6-b".into();
     let id2 = run.commit_frame(&mut f2, Some("w6-sess")).expect("commit");
 
@@ -882,7 +904,10 @@ fn frame_records_are_hot_queryable_and_bounded() {
     assert_eq!(r1.structure_hash, "w6-a");
     assert_eq!(r1.visual_hash, "v-w6-a");
     assert_eq!(r1.screen_seq, 1);
-    assert!(!r1.semantic_identity.is_empty(), "semantic identity stamped");
+    assert!(
+        !r1.semantic_identity.is_empty(),
+        "semantic identity stamped"
+    );
     assert!(r1.commit_us <= 1_000_000, "commit timing plausible");
     assert_eq!(run.frame_record(id2).expect("frame 2").screen_seq, 2);
     assert_eq!(run.frame_hot_records().count(), 2, "both resident");
@@ -907,10 +932,12 @@ fn frame_records_are_hot_queryable_and_bounded() {
         "oldest record left the hot ring"
     );
     let status = run.status(Vec::new());
-    assert_eq!(status["frames"]["hot_evicted"], serde_json::json!(run.frame_hot_evicted()));
+    assert_eq!(
+        status["frames"]["hot_evicted"],
+        serde_json::json!(run.frame_hot_evicted())
+    );
     assert!(
-        status["frames"]["hot_resident"].as_u64().unwrap()
-            <= tui_lab::run::FRAME_HOT_RING as u64
+        status["frames"]["hot_resident"].as_u64().unwrap() <= tui_lab::run::FRAME_HOT_RING as u64
     );
 }
 
@@ -954,7 +981,10 @@ fn fused_commit_is_reactive_and_correctly_invalidated() {
     sess.invalidate_fused();
     let hits_mid = sess.fused_memo_hits();
     let (sem3, _t3, r3) = sess.fused_frame().expect("fused 3");
-    assert_eq!(sem3.focus.control, sem1.focus.control, "same truth after recompute");
+    assert_eq!(
+        sem3.focus.control, sem1.focus.control,
+        "same truth after recompute"
+    );
     assert_eq!(r3.native_ids, report1.native_ids);
     assert_eq!(
         sess.fused_memo_hits(),
@@ -964,9 +994,9 @@ fn fused_commit_is_reactive_and_correctly_invalidated() {
 
     // A new frame (focus move changes the app's declared tree) invalidates
     // through the key: the memo must not serve stale facts.
-    sess.send(tui_lab::backend::Input::Key(tui_lab::backend::KeyEvent::new(
-        tui_lab::backend::KeyCode::Right,
-    )))
+    sess.send(tui_lab::backend::Input::Key(
+        tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Right),
+    ))
     .expect("focus move");
     sess.observe(150).expect("observe after move");
     let (sem4, _t4, _r4) = sess.fused_frame().expect("fused 4");

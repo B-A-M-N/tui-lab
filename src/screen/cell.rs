@@ -325,7 +325,10 @@ mod match_text_at_tests {
         assert!(s.match_text_at(0, 1, "hello"));
         assert!(s.match_text_at(6, 1, "world"));
         assert!(!s.match_text_at(1, 1, "hello"), "offset by one misses");
-        assert!(!s.match_text_at(0, 1, "hello world!"), "longer than row content");
+        assert!(
+            !s.match_text_at(0, 1, "hello world!"),
+            "longer than row content"
+        );
     }
 
     #[test]
@@ -371,7 +374,15 @@ mod match_text_at_tests {
         let zwj = "\u{200D}";
         let s2 = screen_with_row(
             14,
-            &["👨\u{200D}", "👩\u{200D}", "👧\u{200D}", "👦", "e", "n", "d"],
+            &[
+                "👨\u{200D}",
+                "👩\u{200D}",
+                "👧\u{200D}",
+                "👦",
+                "e",
+                "n",
+                "d",
+            ],
         );
         assert!(
             s2.match_text_at(0, 1, &format!("👨{zwj}👩{zwj}👧{zwj}👦")),
@@ -379,8 +390,14 @@ mod match_text_at_tests {
         );
         assert!(s2.match_text_at(6, 1, "👦"), "last group at column 6");
         assert!(s2.match_text_at(8, 1, "end"), "text after the sequence");
-        assert!(!s2.match_text_at(0, 1, "👨"), "group 1 alone is not the whole");
-        assert!(!s2.match_text_at(2, 1, "end"), "sequence occupies columns 0-7");
+        assert!(
+            !s2.match_text_at(0, 1, "👨"),
+            "group 1 alone is not the whole"
+        );
+        assert!(
+            !s2.match_text_at(2, 1, "end"),
+            "sequence occupies columns 0-7"
+        );
     }
 
     #[test]
@@ -433,7 +450,14 @@ mod match_text_at_tests {
         // Sanity: the fixture builder produces the documented shape.
         let s = screen_with_row(6, &["x"]);
         assert_eq!(s.cols, 6);
-        assert_eq!(s.cursor, CursorState { x: 0, y: 0, visible: true });
+        assert_eq!(
+            s.cursor,
+            CursorState {
+                x: 0,
+                y: 0,
+                visible: true
+            }
+        );
         assert!(!s.process.running);
         assert_eq!(s.process.exit_code, None);
         assert_eq!(s.process.exit_signal, None);

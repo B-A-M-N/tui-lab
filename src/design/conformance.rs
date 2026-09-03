@@ -269,8 +269,8 @@ pub fn check_contract_with_mode(
     // Item 30: the SAME pre-state shape the audit transaction commits to
     // restoring — captured through the fused authority so residue is
     // judged on stable control ids, not renamable labels.
-    let pre = crate::audit::transaction::PreState::capture(session)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let pre =
+        crate::audit::transaction::PreState::capture(session).map_err(|e| anyhow::anyhow!(e))?;
 
     // 2. Components (static, current frame).
     results.extend(check_components(session, contract));
@@ -290,7 +290,10 @@ pub fn check_contract_with_mode(
     // not a side effect — same anchor/ledger/settle semantics as MCP acts.
     let _ = execute_act(
         session,
-        &CanonicalAction::Resize { cols: orig_cols, rows: orig_rows },
+        &CanonicalAction::Resize {
+            cols: orig_cols,
+            rows: orig_rows,
+        },
         120,
         1500,
         false,
@@ -299,14 +302,16 @@ pub fn check_contract_with_mode(
     // Item 30: residue verification — the check's honesty ledger. The same
     // verify the audit transaction runs: focused-control ID (fused), size,
     // structure (context only).
-    let residue = crate::audit::transaction::verify(session, &pre)
-        .unwrap_or_default();
+    let residue = crate::audit::transaction::verify(session, &pre).unwrap_or_default();
     let mut residue_detail = Vec::new();
     if let Some((from, to)) = &residue.focus_moved {
         residue_detail.push(format!("focus moved: {from:?} → {to:?}"));
     }
     if let Some((w, h)) = &residue.size_changed {
-        residue_detail.push(format!("size changed: {w}x{h} → {}x{}", orig_cols, orig_rows));
+        residue_detail.push(format!(
+            "size changed: {w}x{h} → {}x{}",
+            orig_cols, orig_rows
+        ));
     }
     let session_mutated = residue.has_residue();
 
@@ -518,8 +523,8 @@ fn check_one_component(
             ),
             None => format!("component role '{}' not found on screen", comp.role),
         };
-        let result = CheckResult::fail("component", comp.name.clone(), detail)
-            .required(comp.required);
+        let result =
+            CheckResult::fail("component", comp.name.clone(), detail).required(comp.required);
         return if comp.required {
             result
         } else {
@@ -577,19 +582,15 @@ fn role_matches(want: &str, node: &semantic::SemanticNode) -> bool {
 /// The nearest role match below the confidence gate, for honest failure
 /// detail (item 36): "not found" with a named near-miss is actionable;
 /// bare "not found" invites contract thrash.
-fn best_role_guess(
-    want: &str,
-    node: &semantic::SemanticNode,
-) -> Option<(String, f32)> {
+fn best_role_guess(want: &str, node: &semantic::SemanticNode) -> Option<(String, f32)> {
     let mut best: Option<(String, f32)> = None;
-    fn walk(
-        want: &str,
-        node: &semantic::SemanticNode,
-        best: &mut Option<(String, f32)>,
-    ) {
+    fn walk(want: &str, node: &semantic::SemanticNode, best: &mut Option<(String, f32)>) {
         if node.role.slug() == want
             && node.confidence.score < 0.6
-            && best.as_ref().map(|(_, c)| node.confidence.score > *c).unwrap_or(true)
+            && best
+                .as_ref()
+                .map(|(_, c)| node.confidence.score > *c)
+                .unwrap_or(true)
         {
             *best = Some((node.id.clone(), node.confidence.score));
         }
@@ -785,7 +786,10 @@ fn check_layout(session: &mut Session, contract: &ProjectContract) -> Vec<CheckR
     // not a side effect — same anchor/ledger/settle semantics as MCP acts.
     let _ = execute_act(
         session,
-        &CanonicalAction::Resize { cols: orig_cols, rows: orig_rows },
+        &CanonicalAction::Resize {
+            cols: orig_cols,
+            rows: orig_rows,
+        },
         120,
         1500,
         false,
@@ -807,11 +811,7 @@ fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> 
     ) {
         Ok(t) => t,
         Err(_) => {
-            return CheckResult::fail(
-                "layout",
-                name,
-                format!("resize to {cols}x{rows} failed"),
-            )
+            return CheckResult::fail("layout", name, format!("resize to {cols}x{rows} failed"))
         }
     };
     let screen = tx.after().clone();
@@ -849,7 +849,11 @@ fn check_clipping_on_screen(
         .map(|rg| rg.id.clone())
         .collect();
     if clipped.is_empty() {
-        CheckResult::pass("layout", name, "no region extends beyond the viewport".to_string())
+        CheckResult::pass(
+            "layout",
+            name,
+            "no region extends beyond the viewport".to_string(),
+        )
     } else {
         CheckResult::fail(
             "layout",
@@ -927,7 +931,10 @@ fn check_behavior(
     // ── escape_closes_modal ──
     if contract.escape_closes_modal {
         let pre = session.observe(50).ok();
-        let modal_before = pre.as_ref().map(|_| modal_present(session)).unwrap_or(false);
+        let modal_before = pre
+            .as_ref()
+            .map(|_| modal_present(session))
+            .unwrap_or(false);
         if !modal_before {
             // Establish the precondition from the contract itself: an
             // interaction whose expect declares `modal_open()` IS the
@@ -951,7 +958,11 @@ fn check_behavior(
                         }
                     }
                 }
-                opened = opened && session.observe(60).map(|_| modal_present(session)).unwrap_or(false);
+                opened = opened
+                    && session
+                        .observe(60)
+                        .map(|_| modal_present(session))
+                        .unwrap_or(false);
             }
             if !opened {
                 // Item 32: no modal and no declared opener — the check
@@ -1008,7 +1019,10 @@ fn check_behavior(
                 if execute_act(session, &action, 80, 900, false).is_ok() {
                     *driven += 1;
                     let after = session.observe(60).ok();
-                    let modal_after = after.as_ref().map(|_| modal_present(session)).unwrap_or(true);
+                    let modal_after = after
+                        .as_ref()
+                        .map(|_| modal_present(session))
+                        .unwrap_or(true);
                     let changed = after
                         .as_ref()
                         .map(|s| s.structure_hash != before_hash)
@@ -1251,8 +1265,14 @@ mod wave5_verdict_tests {
         // Item 32: the vocabulary is ordered; a Fail dominates everything.
         assert_eq!(Verdict::Pass.merge(Verdict::Warn), Verdict::Warn);
         assert_eq!(Verdict::Warn.merge(Verdict::Unverified), Verdict::Warn);
-        assert_eq!(Verdict::Unverified.merge(Verdict::Pass), Verdict::Unverified);
-        assert_eq!(Verdict::Unsupported.merge(Verdict::Unverified), Verdict::Unverified);
+        assert_eq!(
+            Verdict::Unverified.merge(Verdict::Pass),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            Verdict::Unsupported.merge(Verdict::Unverified),
+            Verdict::Unverified
+        );
         assert_eq!(Verdict::Unsupported.merge(Verdict::Fail), Verdict::Fail);
         assert_eq!(Verdict::Fail.merge(Verdict::Pass), Verdict::Fail);
         // Symmetry of the rank fold.

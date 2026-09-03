@@ -126,11 +126,13 @@ fn project_context_resolves_member_and_workspace() {
     let ctx = tui_lab::framework::context::ProjectContext::resolve(&member.to_string_lossy());
     let v = serde_json::to_value(&ctx).unwrap();
     assert_eq!(
-        v["package_root"], serde_json::json!(member.to_str().unwrap()),
+        v["package_root"],
+        serde_json::json!(member.to_str().unwrap()),
         "package root is the member crate"
     );
     assert_eq!(
-        v["workspace_root"], serde_json::json!(dir.path().to_str().unwrap()),
+        v["workspace_root"],
+        serde_json::json!(dir.path().to_str().unwrap()),
         "workspace root is the lockfile ancestor"
     );
     assert_eq!(v["workspace_anchor"], serde_json::json!("Cargo.lock"));

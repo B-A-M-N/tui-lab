@@ -150,8 +150,14 @@ fn is_sensitive_sanitize(key: &str) -> bool {
 /// Overwrite or insert the scratch HOME/TMPDIR into `out`.
 fn set_scratch(out: &mut Vec<(String, String)>, scratch: &ScratchDir) {
     out.retain(|(k, _)| k != "HOME" && k != "TMPDIR");
-    out.push(("HOME".to_string(), scratch.home().to_string_lossy().to_string()));
-    out.push(("TMPDIR".to_string(), scratch.tmp().to_string_lossy().to_string()));
+    out.push((
+        "HOME".to_string(),
+        scratch.home().to_string_lossy().to_string(),
+    ));
+    out.push((
+        "TMPDIR".to_string(),
+        scratch.tmp().to_string_lossy().to_string(),
+    ));
 }
 
 /// A minimal-but-correct PATH: drop the personal/user-bin entries the server
@@ -161,10 +167,7 @@ fn set_scratch(out: &mut Vec<(String, String)>, scratch: &ScratchDir) {
 /// hardcoded list would have missed. Never fabricated; derives from the real
 /// PATH.
 fn derive_minimal_path(path: &str) -> String {
-    let keep: Vec<&str> = path
-        .split(':')
-        .filter(|d| !is_user_dir(d))
-        .collect();
+    let keep: Vec<&str> = path.split(':').filter(|d| !is_user_dir(d)).collect();
     if keep.is_empty() {
         "/usr/local/bin:/usr/bin:/bin".to_string()
     } else {
@@ -264,9 +267,18 @@ mod tests {
 
     #[test]
     fn parse_is_exact() {
-        assert_eq!(EnvironmentPolicy::parse("inherit"), Ok(EnvironmentPolicy::Inherit));
-        assert_eq!(EnvironmentPolicy::parse("sanitized"), Ok(EnvironmentPolicy::Sanitized));
-        assert_eq!(EnvironmentPolicy::parse("hermetic"), Ok(EnvironmentPolicy::Hermetic));
+        assert_eq!(
+            EnvironmentPolicy::parse("inherit"),
+            Ok(EnvironmentPolicy::Inherit)
+        );
+        assert_eq!(
+            EnvironmentPolicy::parse("sanitized"),
+            Ok(EnvironmentPolicy::Sanitized)
+        );
+        assert_eq!(
+            EnvironmentPolicy::parse("hermetic"),
+            Ok(EnvironmentPolicy::Hermetic)
+        );
         assert!(EnvironmentPolicy::parse("docker").is_err());
     }
 
@@ -286,27 +298,45 @@ mod tests {
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
             ("NORMAL".to_string(), "keep".to_string()),
         ];
-        let s1 = EnvironmentPolicy::Sanitized.effective_env(&inh, &ScratchDir::resolve("s1", 1, "sp"));
-        let s2 = EnvironmentPolicy::Sanitized.effective_env(&inh, &ScratchDir::resolve("s2", 1, "sp"));
+        let s1 =
+            EnvironmentPolicy::Sanitized.effective_env(&inh, &ScratchDir::resolve("s1", 1, "sp"));
+        let s2 =
+            EnvironmentPolicy::Sanitized.effective_env(&inh, &ScratchDir::resolve("s2", 1, "sp"));
         assert!(!s1.iter().any(|(k, _)| k == "AWS_SECRET_ACCESS_KEY"));
         assert!(!s1.iter().any(|(k, _)| k == "SECRET_TOKEN"));
-        assert!(s1.iter().any(|(k, _)| k == "NORMAL"), "sanitized keeps the rest");
+        assert!(
+            s1.iter().any(|(k, _)| k == "NORMAL"),
+            "sanitized keeps the rest"
+        );
         let home1 = s1.iter().find(|(k, _)| k == "HOME").unwrap().1.clone();
         let home2 = s2.iter().find(|(k, _)| k == "HOME").unwrap().1.clone();
-        assert_ne!(home1, home2, "different sessions get different scratch HOME");
-        assert!(home1.contains("s1") && home2.contains("s2"), "session ids appear in scratch");
+        assert_ne!(
+            home1, home2,
+            "different sessions get different scratch HOME"
+        );
+        assert!(
+            home1.contains("s1") && home2.contains("s2"),
+            "session ids appear in scratch"
+        );
     }
 
     #[test]
     fn hermetic_derives_path_not_hardcoded() {
         let inh = vec![
-            ("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin:/sbin:/opt/tool/bin".to_string()),
+            (
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin:/sbin:/opt/tool/bin".to_string(),
+            ),
             ("TERM".to_string(), "xterm".to_string()),
         ];
-        let eff = EnvironmentPolicy::Hermetic.effective_env(&inh, &ScratchDir::resolve("s", 1, "hp"));
+        let eff =
+            EnvironmentPolicy::Hermetic.effective_env(&inh, &ScratchDir::resolve("s", 1, "hp"));
         let path = eff.iter().find(|(k, _)| k == "PATH").unwrap().1.clone();
         assert!(path.contains("/usr/bin"), "system bin kept");
-        assert!(path.contains("/sbin"), "distro sbin kept — not dropped by a hardcoded list");
+        assert!(
+            path.contains("/sbin"),
+            "distro sbin kept — not dropped by a hardcoded list"
+        );
         assert!(path.contains("/opt/tool/bin"), "opt tool bin kept");
         assert!(eff.iter().any(|(k, _)| k == "TERM"), "TERM kept");
         assert!(eff.iter().any(|(k, v)| k == "TERM" && v == "xterm"));

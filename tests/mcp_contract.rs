@@ -974,8 +974,10 @@ fn tui_act_completion_field_resolves_to_policy() {
 
     // A named-text completion carries its text INSIDE the completion
     // (re-review P0.1): the lossless spec form.
-    let appears = r#"{"action":"type","text":"ok","completion":{"type":"text_appears","text":"Saved"}}"#;
-    let p3: TuiActRequest = serde_json::from_str(appears).expect("deserialize text-appears request");
+    let appears =
+        r#"{"action":"type","text":"ok","completion":{"type":"text_appears","text":"Saved"}}"#;
+    let p3: TuiActRequest =
+        serde_json::from_str(appears).expect("deserialize text-appears request");
     assert!(
         matches!(
             p3.completion(),

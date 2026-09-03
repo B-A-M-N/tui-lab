@@ -25,3 +25,47 @@ pub use locator::ProjectLocator;
 pub use manager::SessionManager;
 pub use scratch::{EnvironmentPolicy, ScratchDir};
 pub use state::{FrameAnalysis, LaunchSpec, Session};
+
+#[cfg(test)]
+mod retirement_gate_tests {
+    /// Review P2 (SessionManager retirement assessment): production must
+    /// never construct or hold a `SessionManager` again — the actor-backed
+    /// [`super::SessionPool`] is the live surface, and the legacy manager is
+    /// test-only. This gate scans every production module for the type name
+    /// so a future import (in an `impl`, a struct field, a constructor call)
+    /// fails the build instead of silently reintroducing global-Mutex
+    /// serialization. Allowed references: the module's own definition, the
+    /// re-export, and doc comments.
+    #[test]
+    fn production_never_uses_session_manager() {
+        let mut violations: Vec<String> = Vec::new();
+        let prod_roots = ["src/mcp", "src/run", "src/audit", "src/execution"];
+        for root in prod_roots {
+            let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            dir.push(root);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (ln, line) in src.lines().enumerate() {
+                    if line.contains("SessionManager") && !line.trim_start().starts_with("//") {
+                        violations.push(format!("{}:{}", path.display(), ln + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "production modules must not reference SessionManager (legacy, \
+             test-only):\n{}",
+            violations.join("\n")
+        );
+    }
+}

@@ -171,7 +171,6 @@ impl FrameAnalysis {
     }
 }
 
-
 /// Rows whose cell text differs between two frames (Wave B item 12:
 /// `ScreenChanged.dirty_rows` derived at the only place with both frames).
 /// Compares viewport text per row — cheap, and matches what an incremental
@@ -367,7 +366,6 @@ impl Session {
         s.attach_session_hook();
         s
     }
-
 
     /// Attach the session's permanent reader-thread hook: byte/resize facts
     /// flow into the event queue for the whole session lifetime (re-review
@@ -676,10 +674,7 @@ impl Session {
         let caps = self.capabilities();
         // The backend enumerates observation from the live backend, so no
         // foreign evidence map is needed here.
-        crate::terminal::TerminalProfile::build(
-            caps,
-            &std::collections::HashMap::new(),
-        )
+        crate::terminal::TerminalProfile::build(caps, &std::collections::HashMap::new())
     }
 
     /// Item 48: apply a project contract's normalization policy to this
@@ -762,10 +757,8 @@ impl Session {
         let effective_env = isolation.effective_env(&self.id, self.generation, &spec.env);
         let (command, args, wrapper_available, network_isolated) =
             isolation.apply_to_command(&spec.command, &spec.args);
-        let requested_network_ns = matches!(
-            isolation,
-            crate::session::isolation::Isolation::Strict
-        );
+        let requested_network_ns =
+            matches!(isolation, crate::session::isolation::Isolation::Strict);
         self.backend.set_clear_env(!matches!(
             isolation,
             crate::session::isolation::Isolation::Local

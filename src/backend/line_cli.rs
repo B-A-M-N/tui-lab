@@ -310,7 +310,11 @@ impl PtyLineBackend {
                 format!(
                     "{}{}",
                     truncated,
-                    if y + 1 < viewport_lines.len() { "\r\n" } else { "" }
+                    if y + 1 < viewport_lines.len() {
+                        "\r\n"
+                    } else {
+                        ""
+                    }
                 )
                 .as_bytes(),
             );
@@ -639,13 +643,12 @@ impl TerminalBackend for PtyLineBackend {
                 } if self.screen_seq > *anchor => Some(*anchor + 1),
                 _ => None,
             };
-            let anchored_snap = anchored_edge
-                .and_then(|want| {
-                    self.edge_snaps
-                        .iter()
-                        .find(|(seq, _)| *seq == want)
-                        .map(|(seq, s)| (*seq, s.clone()))
-                });
+            let anchored_snap = anchored_edge.and_then(|want| {
+                self.edge_snaps
+                    .iter()
+                    .find(|(seq, _)| *seq == want)
+                    .map(|(seq, s)| (*seq, s.clone()))
+            });
             let (screen, screen_seq_of_state) = match anchored_snap {
                 Some((seq, s)) => (s, seq),
                 None => {

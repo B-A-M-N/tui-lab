@@ -1339,7 +1339,7 @@ mod tests {
                     .split('(')
                     .nth(1)
                     .unwrap_or("")
-                    .split(|c| c == ',' || c == ')')
+                    .split([',', ')'])
                     .next()
                     .unwrap_or("")
                     .trim();

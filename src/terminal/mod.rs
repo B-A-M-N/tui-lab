@@ -107,7 +107,10 @@ impl TerminalProfile {
     /// record (e.g. a profile read back from a stored run) that overrides a
     /// `false` flag to `Supported`, or attaches a richer proof string to one
     /// that's already supported.
-    pub fn build(caps: Capabilities, evidence: &std::collections::HashMap<&'static str, String>) -> Self {
+    pub fn build(
+        caps: Capabilities,
+        evidence: &std::collections::HashMap<&'static str, String>,
+    ) -> Self {
         // Per-capability: (id, name, flag, is_baseline, implications).
         let rows: [(&'static str, &'static str, bool, bool, &'static str); 9] = [
             (
@@ -179,9 +182,7 @@ impl TerminalProfile {
             .iter()
             .map(|(id, name, flag, is_baseline, implications)| {
                 let self_provided = evidence.get(id);
-                let observed_flag = self_provided
-                    .map(|s| proof_is_observed(s))
-                    .unwrap_or(*flag);
+                let observed_flag = self_provided.map(|s| proof_is_observed(s)).unwrap_or(*flag);
                 let state = if observed_flag {
                     CapabilityState::Supported
                 } else if *is_baseline {
@@ -230,10 +231,7 @@ impl TerminalProfile {
 
 impl Default for TerminalProfile {
     fn default() -> Self {
-        TerminalProfile::build(
-            Capabilities::default(),
-            &std::collections::HashMap::new(),
-        )
+        TerminalProfile::build(Capabilities::default(), &std::collections::HashMap::new())
     }
 }
 
@@ -289,7 +287,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn feat<'a>(p: &'a TerminalProfile, id: &str) -> &'a ProfileFeature {
-        p.features.iter().find(|f| f.id == id).expect("feature present")
+        p.features
+            .iter()
+            .find(|f| f.id == id)
+            .expect("feature present")
     }
 
     #[test]
@@ -299,11 +300,20 @@ mod tests {
         assert_eq!(feat(&p, "mouse").state, CapabilityState::Unverified);
         assert_eq!(feat(&p, "title").state, CapabilityState::Unverified);
         assert_eq!(feat(&p, "scrollback").state, CapabilityState::Unverified);
-        assert_eq!(feat(&p, "bracketed_paste").state, CapabilityState::Unverified);
-        assert_eq!(feat(&p, "kitty_keyboard").state, CapabilityState::Unverified);
+        assert_eq!(
+            feat(&p, "bracketed_paste").state,
+            CapabilityState::Unverified
+        );
+        assert_eq!(
+            feat(&p, "kitty_keyboard").state,
+            CapabilityState::Unverified
+        );
         // Baseline and platform truths stay truthful.
         assert_eq!(feat(&p, "colors").state, CapabilityState::Supported);
-        assert_eq!(feat(&p, "cell_attributes").state, CapabilityState::Supported);
+        assert_eq!(
+            feat(&p, "cell_attributes").state,
+            CapabilityState::Supported
+        );
         #[cfg(unix)]
         assert_eq!(feat(&p, "signals").state, CapabilityState::Supported);
         // The verdict surfaces the unverified count.
@@ -324,7 +334,9 @@ mod tests {
         assert_eq!(feat(&p, "mouse").state, CapabilityState::Supported);
         assert_eq!(feat(&p, "title").state, CapabilityState::Supported);
         assert!(
-            feat(&p, "mouse").evidence.contains("mouse protocol mode observed"),
+            feat(&p, "mouse")
+                .evidence
+                .contains("mouse protocol mode observed"),
             "a supported capability must cite the observation that proved it: {}",
             feat(&p, "mouse").evidence
         );

@@ -222,10 +222,7 @@ impl JournalHandle {
     }
 
     /// Spawn a writer with an explicit capacity.
-    pub fn spawn_with_capacity(
-        path: std::path::PathBuf,
-        capacity: usize,
-    ) -> std::io::Result<Self> {
+    pub fn spawn_with_capacity(path: std::path::PathBuf, capacity: usize) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -251,10 +248,7 @@ impl JournalHandle {
                         w_mark.store(mark, Ordering::Release);
                         w_health.lock().unwrap().on_line_handled();
                     } else {
-                        let err = format!(
-                            "write error at seq {}: I/O operation failed",
-                            item.seq
-                        );
+                        let err = format!("write error at seq {}: I/O operation failed", item.seq);
                         w_flag.store(true, Ordering::Release);
                         w_health.lock().unwrap().on_write_error(err);
                         // A failed append is terminal; drain remaining so
@@ -477,8 +471,7 @@ mod tests {
                 let per_thread = PUSH_COUNT / 8;
                 std::thread::spawn(move || {
                     for i in 0..per_thread {
-                        let seq: u64 =
-                            (thread_id * per_thread + i) as u64;
+                        let seq: u64 = (thread_id * per_thread + i) as u64;
                         th.submit(
                             seq,
                             format!(
@@ -521,8 +514,7 @@ mod tests {
         assert_eq!(
             total_accounted, PUSH_COUNT as u64,
             "written + dropped should equal attempted: written={} dropped={}",
-            snapshot["lines_written"],
-            snapshot["lines_dropped"]
+            snapshot["lines_written"], snapshot["lines_dropped"]
         );
 
         // At the end, after draining: Healthy.

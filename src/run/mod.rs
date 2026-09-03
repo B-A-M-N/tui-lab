@@ -837,7 +837,10 @@ impl RunContext {
     /// compare baseline but present here was seen in an earlier pass — so its
     /// reappearance is a REGRESSION, not a first-seen NEW defect. This is how
     /// REGRESSED becomes genuinely reachable in `compare_with_resolved`.
-    pub fn resolved_finding_fingerprints(&self, compare_label: &str) -> std::collections::HashSet<String> {
+    pub fn resolved_finding_fingerprints(
+        &self,
+        compare_label: &str,
+    ) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         for (label, findings) in &self.finding_baselines {
             if label == compare_label {
@@ -1659,12 +1662,8 @@ impl RunContext {
                 tx.focus_after.as_ref().and_then(|f| f.1.clone()),
             );
             if b_label != a_label {
-                self.focus_transitions.push((
-                    now_ms(),
-                    session.to_string(),
-                    b_label,
-                    a_label,
-                ));
+                self.focus_transitions
+                    .push((now_ms(), session.to_string(), b_label, a_label));
             }
         }
         Ok(())
@@ -2039,7 +2038,6 @@ impl RunContext {
         Ok(root)
     }
 
-
     /// Wait for the background journal writer to drain (bounded). Returns
     /// the watermark reached. A no-op for ephemeral runs.
     pub fn wait_for_journal(&self, deadline: std::time::Duration) -> u64 {
@@ -2052,8 +2050,7 @@ impl RunContext {
     /// Whether ledger persistence has failed and the run is degrading to
     /// memory-only (writer spawn error or terminal write error).
     pub fn persistence_unhealthy(&self) -> bool {
-        self.persistence_unhealthy
-            || self.journal.as_ref().is_some_and(|j| j.is_unhealthy())
+        self.persistence_unhealthy || self.journal.as_ref().is_some_and(|j| j.is_unhealthy())
     }
 
     /// Assign the next citable frame id (Wave B item 11) and stamp the
@@ -2206,13 +2203,20 @@ impl RunContext {
                 .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
             {
                 Ok(()) => {
-                    let written = self.event_flushed_counts.entry(session.to_string()).or_insert(0);
+                    let written = self
+                        .event_flushed_counts
+                        .entry(session.to_string())
+                        .or_insert(0);
                     *written += events.len() as u64;
                     // Artifact registered once per session (the log is a
                     // growing file, not a per-batch artifact).
                     let artifact_path =
                         std::path::PathBuf::from("events").join(format!("{}.jsonl", safe));
-                    if !self.artifacts.iter().any(|a| a.path.as_ref() == Some(&artifact_path)) {
+                    if !self
+                        .artifacts
+                        .iter()
+                        .any(|a| a.path.as_ref() == Some(&artifact_path))
+                    {
                         self.register_artifact(
                             crate::run::ArtifactKind::EventLog,
                             Some(artifact_path),
@@ -2320,8 +2324,7 @@ fn now_ms() -> u64 {
 fn target_is_file_locus(t: &str) -> bool {
     let has_sep = t.contains('/') || t.contains('\\');
     let has_ext = t.rsplit(['/', '\\']).next().is_some_and(|last| {
-        last.contains('.')
-            && !last.starts_with('.') // dotfile names like `.gitignore` edge — treat as no-ext
+        last.contains('.') && !last.starts_with('.') // dotfile names like `.gitignore` edge — treat as no-ext
     });
     has_sep && has_ext
 }
@@ -2716,7 +2719,10 @@ mod tests {
         let mut s = crate::session::state::Session::new("sweep-ev".into(), "python3".into());
         s.start_with_spec(crate::session::state::LaunchSpec {
             command: "python3".into(),
-            args: vec!["-c".into(), "print('SWEEP-EV'); import time; time.sleep(2)".into()],
+            args: vec![
+                "-c".into(),
+                "print('SWEEP-EV'); import time; time.sleep(2)".into(),
+            ],
             cwd: None,
             env: Vec::new(),
             cols: 80,
@@ -2743,7 +2749,11 @@ mod tests {
         sweep(&mut s, &mut run);
 
         // The on-disk log is already current — before any close/drain.
-        let path = run.run_dir().expect("dir").join("events").join("sweep-ev.jsonl");
+        let path = run
+            .run_dir()
+            .expect("dir")
+            .join("events")
+            .join("sweep-ev.jsonl");
         let log = std::fs::read_to_string(&path).expect("incremental event log");
         assert!(
             !log.is_empty(),
@@ -2767,11 +2777,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut run = RunContext::persistent(tmp.path()).expect("run");
 
-        let mut f = crate::backend::CanonicalFrame::new(
-            crate::screen::ScreenState::new(80, 24),
-            3,
-            9,
-        );
+        let mut f =
+            crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 3, 9);
         let id = run.commit_frame(&mut f, Some("cf-sess")).expect("commit");
         assert_eq!(id, 1, "first committed frame gets id 1");
         assert_eq!(f.frame_id, Some(1));
@@ -3280,20 +3287,16 @@ mod tests {
         assert!(run
             .record_scenario_act("s", 0, serde_json::json!({}))
             .is_err());
-        assert!(run.record_scenario_wait("s", 0, serde_json::json!({})).is_err());
+        assert!(run
+            .record_scenario_wait("s", 0, serde_json::json!({}))
+            .is_err());
         assert!(run
             .record_scenario_assert("s", 0, serde_json::json!({}))
             .is_err());
         assert!(run.record_coverage_event("s", "#save").is_err());
         assert!(run.hold_events("s", Vec::new()).is_err());
         assert!(run
-            .register_artifact(
-                ArtifactKind::Capture,
-                None,
-                None,
-                None,
-                "post-close"
-            )
+            .register_artifact(ArtifactKind::Capture, None, None, None, "post-close")
             .is_err());
         assert!(run.extend_findings(Vec::new()).is_err());
         assert!(run.extend_findings_with_source_refs(Vec::new()).is_err());
@@ -3370,7 +3373,10 @@ mod source_ref_tests {
             "widget:#save.activate",
             "button/save/40,12"
         ));
-        assert!(coverage_target_matches_control("#cancel", "button/cancel/52,12"));
+        assert!(coverage_target_matches_control(
+            "#cancel",
+            "button/cancel/52,12"
+        ));
         assert!(!coverage_target_matches_control(
             "widget:#quit.activate",
             "button/save/40,12"
@@ -3383,7 +3389,8 @@ mod source_ref_tests {
         let mut run = RunContext::ephemeral();
         let _ = run.record_coverage_event("s1", "src/ui/settings.rs:184");
         let _ = run.record_coverage_event("s1", "widget:#save.activate");
-        let _ = run.extend_findings_with_source_refs(vec![finding_pointing_at("button/save/40,12")]);
+        let _ =
+            run.extend_findings_with_source_refs(vec![finding_pointing_at("button/save/40,12")]);
         let f = run.findings().last().unwrap();
         assert!(
             !f.source_refs.is_empty(),
@@ -3429,7 +3436,11 @@ mod source_ref_tests {
             .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor)
             .map(|(t, _)| t.clone())
             .collect();
-        assert_eq!(new2.len(), 0, "re-hitting a known target is not 'new coverage'");
+        assert_eq!(
+            new2.len(),
+            0,
+            "re-hitting a known target is not 'new coverage'"
+        );
 
         // A genuinely new target after the cursor IS new.
         let _ = run.record_coverage_event("s1", "src/c.rs");

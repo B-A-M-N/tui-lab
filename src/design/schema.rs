@@ -93,7 +93,9 @@ pub struct ContractSchema {
 }
 
 /// How strictly a contract's checks bind (re-review item 33).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContractMode {
     /// Checks report; only `required` failures make the overall verdict
@@ -277,10 +279,7 @@ impl ProjectContract {
         let mut contract = Self::default();
 
         // Identity + provenance marker.
-        contract.schema.name = format!(
-            "scaffold-{}x{}",
-            screen.cols, screen.rows
-        );
+        contract.schema.name = format!("scaffold-{}x{}", screen.cols, screen.rows);
         contract.schema.extensions.insert(
             "scaffold.inferred".to_string(),
             serde_json::json!({
@@ -326,7 +325,10 @@ impl ProjectContract {
         // Controls → oracle assertions, one per named control (bounded so
         // a busy screen scaffolds something readable, not a dump).
         for c in sem.controls.iter().take(24) {
-            if matches!(c.kind, crate::semantic::ControlKind::Unknown | crate::semantic::ControlKind::Label) {
+            if matches!(
+                c.kind,
+                crate::semantic::ControlKind::Unknown | crate::semantic::ControlKind::Label
+            ) {
                 continue;
             }
             if c.label.trim().is_empty() {

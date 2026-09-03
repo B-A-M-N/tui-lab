@@ -20,7 +20,9 @@
 //! hasn't demonstrated (the same honesty rule as `Capabilities`).
 
 /// The knowledge mode of a semantic tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum KnowledgeMode {
     Raw,
     Inferred,
@@ -74,17 +76,32 @@ mod tests {
     #[test]
     fn raw_needs_no_evidence() {
         // The review's headline: Raw must never require contract/source/native.
-        assert_eq!(KnowledgeMode::from_evidence(false, false, false), KnowledgeMode::Raw);
+        assert_eq!(
+            KnowledgeMode::from_evidence(false, false, false),
+            KnowledgeMode::Raw
+        );
     }
 
     #[test]
     fn evidence_promotes_cumulatively() {
-        assert_eq!(KnowledgeMode::from_evidence(true, false, false), KnowledgeMode::Inferred);
-        assert_eq!(KnowledgeMode::from_evidence(false, true, false), KnowledgeMode::NativeEnriched);
-        assert_eq!(KnowledgeMode::from_evidence(false, false, true), KnowledgeMode::Contracted);
+        assert_eq!(
+            KnowledgeMode::from_evidence(true, false, false),
+            KnowledgeMode::Inferred
+        );
+        assert_eq!(
+            KnowledgeMode::from_evidence(false, true, false),
+            KnowledgeMode::NativeEnriched
+        );
+        assert_eq!(
+            KnowledgeMode::from_evidence(false, false, true),
+            KnowledgeMode::Contracted
+        );
         // Contract implies native + inferred, but the evidence inputs are the
         // authority — declaring only native must not claim a contract.
-        assert_eq!(KnowledgeMode::from_evidence(true, true, false), KnowledgeMode::NativeEnriched);
+        assert_eq!(
+            KnowledgeMode::from_evidence(true, true, false),
+            KnowledgeMode::NativeEnriched
+        );
     }
 
     #[test]

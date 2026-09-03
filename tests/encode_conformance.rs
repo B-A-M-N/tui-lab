@@ -714,7 +714,10 @@ fn raw_ring_captures_protocol_traffic_for_decoder() {
         trace.modes
     );
     assert!(
-        trace.modes.iter().any(|m| m.mode == "cursor_visible" && !m.set),
+        trace
+            .modes
+            .iter()
+            .any(|m| m.mode == "cursor_visible" && !m.set),
         "decoder reads ?25l as cursor hidden: {:?}",
         trace.modes
     );

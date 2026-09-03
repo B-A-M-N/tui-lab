@@ -135,7 +135,16 @@ pub fn semantic_identity(screen: &ScreenState) -> String {
         part(&mut h, &c.bounds.y.to_le_bytes());
         part(&mut h, &c.bounds.width.to_le_bytes());
         part(&mut h, &c.bounds.height.to_le_bytes());
-        part(&mut h, &[c.focusable as u8, c.focused as u8, c.enabled as u8, c.selected as u8, c.checked as u8]);
+        part(
+            &mut h,
+            &[
+                c.focusable as u8,
+                c.focused as u8,
+                c.enabled as u8,
+                c.selected as u8,
+                c.checked as u8,
+            ],
+        );
     }
     for r in &sem.regions {
         part(&mut h, r.id.as_bytes());
@@ -285,7 +294,12 @@ pub fn detect_frame(screen: &ScreenState) -> (SemanticScreen, crate::semantic::n
     let sem = analyze(screen);
     let widgets = widgets::detect_widgets(screen, &sem.regions);
     let tree = tree_builder::build_tree_from_parts(
-        screen, &sem.regions, &sem.controls, &sem.focus, &sem.affordances, &widgets,
+        screen,
+        &sem.regions,
+        &sem.controls,
+        &sem.focus,
+        &sem.affordances,
+        &widgets,
     );
     (sem, tree)
 }
@@ -301,7 +315,11 @@ pub fn fuse(
     screen: &ScreenState,
     cache: &mut SemanticCache,
     native: &crate::semantic::native::NativeChannel,
-) -> (SemanticScreen, crate::semantic::node::SemanticTree, crate::semantic::native::NativeOverlayReport) {
+) -> (
+    SemanticScreen,
+    crate::semantic::node::SemanticTree,
+    crate::semantic::native::NativeOverlayReport,
+) {
     // Cache safety (re-review P0: stale focus on a structure-hash hit).
     // The structural pair is keyed on `structure_hash` (text/layout), but
     // interaction state — focus from reverse-video, enabled from dim,
@@ -560,7 +578,10 @@ mod interaction_cache_tests {
         assert!(
             sem.controls.iter().all(|c| c.enabled),
             "non-dim controls are enabled: {:?}",
-            sem.controls.iter().map(|c| (c.label.clone(), c.enabled)).collect::<Vec<_>>()
+            sem.controls
+                .iter()
+                .map(|c| (c.label.clone(), c.enabled))
+                .collect::<Vec<_>>()
         );
 
         // Dim the Save span entirely (text unchanged — interaction-state
@@ -587,7 +608,10 @@ mod interaction_cache_tests {
         assert!(cancel.enabled, "non-dim control stays enabled");
         // Tree shape agrees (infer_enabled polarity).
         let save_node = find_label(&tree2.root, "Save").expect("Save node");
-        assert!(!save_node.state.enabled.value, "tree agrees: dim is disabled");
+        assert!(
+            !save_node.state.enabled.value,
+            "tree agrees: dim is disabled"
+        );
     }
 }
 
@@ -691,8 +715,8 @@ mod authority_gate_tests {
                 // Blank the opener, then continue blanking lines until the
                 // module's brace balance returns to zero (the module `}`).
                 out[j] = String::new();
-                let mut depth: i64 = (lines[j].matches('{').count() - lines[j].matches('}').count())
-                    as i64;
+                let mut depth: i64 =
+                    (lines[j].matches('{').count() - lines[j].matches('}').count()) as i64;
                 let mut k = j + 1;
                 while k < lines.len() {
                     let lk = lines[k];
@@ -724,7 +748,7 @@ mod authority_gate_tests {
         // black-box fallback construction."
         let known_bare_helpers = [
             "fused_for",             // assertion fallback for session-less callers
-            "control_label_exists", // pure screen helper
+            "control_label_exists",  // pure screen helper
             "diff",                  // frame-only transition util
             "compute_semantic_diff", // frame-only semantic diff
         ];

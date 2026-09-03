@@ -81,7 +81,11 @@ impl ScenarioRecorder {
         byte_len: usize,
     ) {
         use serde_json::Value;
-        let param_name = format!("{}_{}", payload_field.to_uppercase(), self.scenario.steps.len() + 1);
+        let param_name = format!(
+            "{}_{}",
+            payload_field.to_uppercase(),
+            self.scenario.steps.len() + 1
+        );
         // Sanity: the payload field must be a string for reference
         // substitution to work (type/paste payloads are strings).
         if let Some(payload) = action_params.get(payload_field) {

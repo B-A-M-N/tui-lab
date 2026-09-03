@@ -71,7 +71,8 @@ fn bare_tree_context_reports_none_roots() {
     // exactly what was (not) resolved — provenance of the non-answer.
     let v = serde_json::to_value(&ctx).unwrap();
     assert_eq!(
-        v["requested_dir"], serde_json::json!(sub.to_string_lossy().to_string()),
+        v["requested_dir"],
+        serde_json::json!(sub.to_string_lossy().to_string()),
         "{v}"
     );
 }
@@ -98,16 +99,7 @@ fn arbitrary_path_app_launches_and_audits_honestly() {
     let (dir, app) = bare_fixture_dir();
     let mut mgr = SessionManager::new();
     let sid = mgr
-        .start(
-            "python3",
-            &[app],
-            None,
-            &[],
-            80,
-            24,
-            "auto",
-            "local",
-        )
+        .start("python3", &[app], None, &[], 80, 24, "auto", "local")
         .expect("launch from an arbitrary path must work");
     {
         let sess = mgr.resolve_mut(Some(&sid)).unwrap();

@@ -183,7 +183,10 @@ mod tests {
             &[],
             &["button:save".to_string()],
             &[],
-            &[("mouse_sgr_encoding".to_string(), crate::protocol::KnownModeState::Enabled)],
+            &[(
+                "mouse_sgr_encoding".to_string(),
+                crate::protocol::KnownModeState::Enabled,
+            )],
         );
         assert!(n1.any_novel);
         assert_eq!(n1.signals.len(), 3);
@@ -194,9 +197,15 @@ mod tests {
             &[("a".into(), "b".into(), "tab".into())],
             &["button:save".to_string()],
             &[],
-            &[("mouse_sgr_encoding".to_string(), crate::protocol::KnownModeState::Enabled)],
+            &[(
+                "mouse_sgr_encoding".to_string(),
+                crate::protocol::KnownModeState::Enabled,
+            )],
         );
-        assert!(n2.any_novel, "a new focus edge is novelty even in a seen state");
+        assert!(
+            n2.any_novel,
+            "a new focus edge is novelty even in a seen state"
+        );
         let state_signal = n2
             .signals
             .iter()
@@ -204,7 +213,10 @@ mod tests {
             .unwrap();
         assert!(!state_signal.novel);
         assert_eq!(
-            n2.signals.iter().filter(|s| s.dimension == "focus_edge").count(),
+            n2.signals
+                .iter()
+                .filter(|s| s.dimension == "focus_edge")
+                .count(),
             1
         );
 
@@ -214,7 +226,10 @@ mod tests {
             &[("a".into(), "b".into(), "tab".into())],
             &["button:save".to_string()],
             &[],
-            &[("mouse_sgr_encoding".to_string(), crate::protocol::KnownModeState::Enabled)],
+            &[(
+                "mouse_sgr_encoding".to_string(),
+                crate::protocol::KnownModeState::Enabled,
+            )],
         );
         assert!(!n3.any_novel);
     }
@@ -229,7 +244,10 @@ mod tests {
             &[],
             &[],
             &[],
-            &[("alt_screen".to_string(), crate::protocol::KnownModeState::Unknown)],
+            &[(
+                "alt_screen".to_string(),
+                crate::protocol::KnownModeState::Unknown,
+            )],
         );
         assert!(n1.any_novel);
         let n2 = ledger.note(
@@ -237,10 +255,15 @@ mod tests {
             &[],
             &[],
             &[],
-            &[("alt_screen".to_string(), crate::protocol::KnownModeState::Disabled)],
+            &[(
+                "alt_screen".to_string(),
+                crate::protocol::KnownModeState::Disabled,
+            )],
         );
         assert!(
-            n2.signals.iter().any(|s| s.dimension == "mode_state" && s.novel),
+            n2.signals
+                .iter()
+                .any(|s| s.dimension == "mode_state" && s.novel),
             "Unknown→Disabled is a learned fact"
         );
     }

@@ -5,11 +5,12 @@
 //! observation ran against a mutated session while the audit report claimed
 //! to describe the screen the user would see.
 //!
-//! Shape: capture a pre-state snapshot (focus, dimensions, structure hash),
-//! run the driver body, then compare. Restoration is best-effort in the
-//! drivers themselves (bounded Shift+Tab hops, resize back); this type
-//! *verifies* and, when residue remains, emits an honest finding naming
-//! what moved — never silently rewrites the record.
+//! Shape: capture a pre-state snapshot (focus, dimensions, structure hash,
+//! cursor visibility, terminal title), run the driver body, then compare.
+//! Restoration is best-effort in the drivers themselves (bounded Shift+Tab
+//! hops, resize back); this type *verifies* and, when residue remains,
+//! emits an honest finding naming what moved — never silently rewrites the
+//! record.
 
 use serde_json::json;
 

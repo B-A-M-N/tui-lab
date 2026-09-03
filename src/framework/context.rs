@@ -42,8 +42,13 @@ pub struct ProjectContext {
 }
 
 /// Manifests that directly declare dependencies (a package root).
-const PACKAGE_MANIFESTS: &[&str] =
-    &["Cargo.toml", "package.json", "go.mod", "pyproject.toml", "requirements.txt"];
+const PACKAGE_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "go.mod",
+    "pyproject.toml",
+    "requirements.txt",
+];
 
 /// Files that indicate a workspace/monorepo boundary.
 const WORKSPACE_ANCHORS: &[&str] = &[
@@ -181,10 +186,7 @@ mod tests {
         )
         .unwrap();
         let ctx = ProjectContext::resolve(&member.to_string_lossy());
-        assert_eq!(
-            ctx.package_root.as_deref(),
-            Some(member.to_str().unwrap())
-        );
+        assert_eq!(ctx.package_root.as_deref(), Some(member.to_str().unwrap()));
         assert_eq!(
             ctx.workspace_root.as_deref(),
             Some(dir.path().to_str().unwrap()),

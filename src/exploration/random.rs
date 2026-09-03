@@ -244,9 +244,7 @@ pub fn run(
         let admitted: Vec<ActionFactory> = ACTION_POOL
             .iter()
             .copied()
-            .filter(|f| {
-                crate::exploration::risk::classify_action(&(f.1)()) <= budget.allowed_risk
-            })
+            .filter(|f| crate::exploration::risk::classify_action(&(f.1)()) <= budget.allowed_risk)
             .collect();
         let (name, mk) = admitted.choose(&mut rng).unwrap();
         // Go through the canonical executor so baseline-before-send and
@@ -303,10 +301,8 @@ pub fn run(
                 _ => None,
             })
             .collect();
-            let coverage_targets: Vec<String> = session
-                .native_coverage_targets()
-                .into_iter()
-                .collect();
+            let coverage_targets: Vec<String> =
+                session.native_coverage_targets().into_iter().collect();
             let mode_states = current_mode_states_pub(session);
             novelty_ledger.note(
                 Some(&after_identity),

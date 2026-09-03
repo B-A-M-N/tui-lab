@@ -178,15 +178,15 @@ pub fn run_with_contract(
         {
             let control_ids: Vec<String> =
                 after_sem.controls.iter().map(|c| c.id.clone()).collect();
-            let focus_edge_list: Vec<(String, String, String)> =
-                match (sem.focus.control_id.as_ref(), after_sem.focus.control_id.as_ref()) {
-                    (Some(f), Some(t)) => vec![(
-                        f.clone(),
-                        t.clone(),
-                        candidate_name(&action).to_string(),
-                    )],
-                    _ => Vec::new(),
-                };
+            let focus_edge_list: Vec<(String, String, String)> = match (
+                sem.focus.control_id.as_ref(),
+                after_sem.focus.control_id.as_ref(),
+            ) {
+                (Some(f), Some(t)) => {
+                    vec![(f.clone(), t.clone(), candidate_name(&action).to_string())]
+                }
+                _ => Vec::new(),
+            };
             let coverage_targets = session.native_coverage_targets();
             let mode_states = super::random::current_mode_states_pub(session);
             novelty_ledger.note(

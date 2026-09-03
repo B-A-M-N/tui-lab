@@ -15,7 +15,9 @@ use serde_json::json;
 /// The caller's belief about the current session state, verified inside the
 /// executor immediately before the input lands. Every field is optional;
 /// an empty guard is a no-op (the historical behavior).
-#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 pub struct MutationGuard {
     /// Session generation the observation came from. A restart between
     /// observe and act fails the guard even if the screen looks identical.
@@ -41,7 +43,9 @@ impl MutationGuard {
         let screen_fused = session.analyze_last();
         MutationGuard {
             generation: Some(session.generation),
-            structure_hash: screen_fused.as_ref().map(|a| a.frame.structure_hash.clone()),
+            structure_hash: screen_fused
+                .as_ref()
+                .map(|a| a.frame.structure_hash.clone()),
             focus_control_id: screen_fused
                 .as_ref()
                 .and_then(|a| a.semantic.focus.control_id.clone()),
@@ -51,7 +55,10 @@ impl MutationGuard {
     /// Validate against live state. `Ok(())` means every declared
     /// expectation holds; `Err(payload)` is the structured `stale_state`
     /// JSON naming the first violated expectation, expected vs actual.
-    pub fn validate(&self, session: &crate::session::state::Session) -> Result<(), serde_json::Value> {
+    pub fn validate(
+        &self,
+        session: &crate::session::state::Session,
+    ) -> Result<(), serde_json::Value> {
         // Generation first: a restart invalidates everything else.
         if let Some(want_gen) = self.generation {
             if session.generation != want_gen {

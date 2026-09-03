@@ -154,13 +154,23 @@ impl Isolation {
         let mut wrapped = vec!["--net".to_string(), "--".to_string()];
         wrapped.push(command.to_string());
         wrapped.extend(args.iter().cloned());
-        ("unshare".to_string(), wrapped, true, VerifiedState::Verified)
+        (
+            "unshare".to_string(),
+            wrapped,
+            true,
+            VerifiedState::Verified,
+        )
     }
 }
 
 /// Evidence block describing what a launch actually got (status/launch).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VerifiedState { Verified, NotApplied, Unverified, Failed }
+pub enum VerifiedState {
+    Verified,
+    NotApplied,
+    Unverified,
+    Failed,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationEvidence {
@@ -284,8 +294,7 @@ mod tests {
 
     #[test]
     fn local_never_wraps() {
-        let (cmd, args, wrapper_available, state) =
-            Isolation::Local.apply_to_command("sh", &[]);
+        let (cmd, args, wrapper_available, state) = Isolation::Local.apply_to_command("sh", &[]);
         assert_eq!(cmd, "sh");
         assert!(args.is_empty());
         assert!(!wrapper_available);

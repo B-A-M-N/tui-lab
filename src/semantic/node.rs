@@ -575,9 +575,26 @@ mod tests {
     fn native_slug_paths_never_drift() {
         use crate::semantic::native::{native_kind_for_test, native_role_for_test};
         for slug in [
-            "button", "field", "textbox", "input", "checkbox", "radio", "tab", "list",
-            "listitem", "menu", "menuitem", "table", "tree", "dialog", "panel",
-            "progressbar", "spinner", "label", "hyperlink", "screen",
+            "button",
+            "field",
+            "textbox",
+            "input",
+            "checkbox",
+            "radio",
+            "tab",
+            "list",
+            "listitem",
+            "menu",
+            "menuitem",
+            "table",
+            "tree",
+            "dialog",
+            "panel",
+            "progressbar",
+            "spinner",
+            "label",
+            "hyperlink",
+            "screen",
         ] {
             let role: Option<Role> = native_role_for_test(slug);
             let kind = native_kind_for_test(slug);

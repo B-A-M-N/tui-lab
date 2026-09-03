@@ -62,7 +62,10 @@ mod tests {
         };
         // Invalid-only traffic is NOT cooperation: nothing usable arrived.
         assert!(!st.native_channel_active);
-        assert!(!st.healthy, "invalid-only traffic is a broken emitter, not health");
+        assert!(
+            !st.healthy,
+            "invalid-only traffic is a broken emitter, not health"
+        );
     }
 
     #[test]
