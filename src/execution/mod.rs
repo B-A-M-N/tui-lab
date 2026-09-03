@@ -218,11 +218,9 @@ impl CanonicalAction {
         }
         match self {
             CanonicalAction::Key { key } => key_name(key),
-            CanonicalAction::Keys { keys } => keys
-                .iter()
-                .map(key_name)
-                .collect::<Vec<_>>()
-                .join("+"),
+            CanonicalAction::Keys { keys } => {
+                keys.iter().map(key_name).collect::<Vec<_>>().join("+")
+            }
             CanonicalAction::Type { .. } => "text".into(),
             CanonicalAction::Paste { .. } => "paste".into(),
             CanonicalAction::Raw { .. } => "raw".into(),
@@ -571,8 +569,14 @@ fn build_render_transaction(
     // pair — same derivation as the event queue's dirty_rows).
     let dirty_rows: Vec<u16> = (0..after_state.rows)
         .filter(|&y| {
-            let b = before_state.viewport_text.get(y as usize).map(String::as_str);
-            let a = after_state.viewport_text.get(y as usize).map(String::as_str);
+            let b = before_state
+                .viewport_text
+                .get(y as usize)
+                .map(String::as_str);
+            let a = after_state
+                .viewport_text
+                .get(y as usize)
+                .map(String::as_str);
             b != a
         })
         .collect();
@@ -597,8 +601,15 @@ fn build_render_transaction(
             let erases = trace
                 .ops
                 .iter()
-                .filter(|e| matches!(&e.op,
-                    crate::protocol::TerminalOp::Csi { final_byte: 'J', .. }))
+                .filter(|e| {
+                    matches!(
+                        &e.op,
+                        crate::protocol::TerminalOp::Csi {
+                            final_byte: 'J',
+                            ..
+                        }
+                    )
+                })
                 .count();
             let ratio = if op_count > 0 {
                 erases as f64 / op_count as f64
@@ -747,14 +758,14 @@ struct ActTransactionGuard<'a> {
 }
 
 impl<'a> ActTransactionGuard<'a> {
-    fn begin(
-        session: &'a mut Session,
-        suppress: bool,
-    ) -> ActTransactionGuard<'a> {
+    fn begin(session: &'a mut Session, suppress: bool) -> ActTransactionGuard<'a> {
         if suppress {
             session.suppress_recording();
         }
-        ActTransactionGuard { session, suppressed: suppress }
+        ActTransactionGuard {
+            session,
+            suppressed: suppress,
+        }
     }
 
     /// Reborrow the session for the transaction body. The reborrow lives only
@@ -943,15 +954,19 @@ fn execute_act_inner(
             } else {
                 Some((sem.focus.control_id.clone(), sem.focus.control.clone()))
             };
-            (
-                crate::semantic::semantic_identity_fused(&sem, &tree),
-                focus,
-            )
+            (crate::semantic::semantic_identity_fused(&sem, &tree), focus)
         })
         .unwrap_or((Default::default(), None));
     // The ONE compiler runs on the pre-action frame before it moves into
     // the transaction evidence (re-review P0).
-    let plan = crate::capture::compile_completion(&completion, &baseline, &before, pre_event_seq, quiet_ms, Some(before_fused_identity.clone()));
+    let plan = crate::capture::compile_completion(
+        &completion,
+        &baseline,
+        &before,
+        pre_event_seq,
+        quiet_ms,
+        Some(before_fused_identity.clone()),
+    );
     let mut before_frame = CanonicalFrame::new(before, 0, baseline.output_seq);
     before_frame.session_id = Some(session.id.clone());
     before_frame.generation = Some(session.generation);
@@ -1051,12 +1066,7 @@ fn execute_act_inner(
         sess.events_since(pre_event_seq)
             .events
             .iter()
-            .find(|ev| {
-                matches!(
-                    ev.kind,
-                    crate::events::TerminalEventKind::Output { .. }
-                )
-            })
+            .find(|ev| matches!(ev.kind, crate::events::TerminalEventKind::Output { .. }))
             .map(|ev| ev.at.saturating_sub(sent_at_unix_ms))
     };
     let protocol_offset_after = window.sess().raw_window_range().1;
@@ -1201,11 +1211,9 @@ fn run_completion_plan(
     let budget = std::time::Duration::from_millis(budget_ms);
     match plan {
         // Backend-proven conditions: one `wait_after` call each.
-        Plan::BackendWait(cond) => {
-            Ok(CaptureOutcome::from_wait(
-                session.wait_after(*anchor, cond, budget_ms)?,
-            ))
-        }
+        Plan::BackendWait(cond) => Ok(CaptureOutcome::from_wait(
+            session.wait_after(*anchor, cond, budget_ms)?,
+        )),
         Plan::Bell(after_bell_seq) => Ok(CaptureOutcome::from_wait(session.wait_after(
             *anchor,
             WaitCond::Bell {
@@ -1215,9 +1223,11 @@ fn run_completion_plan(
             },
             budget_ms,
         )?)),
-        Plan::ProcessExit => Ok(CaptureOutcome::from_wait(
-            session.wait_after(*anchor, WaitCond::ProcessExit, budget_ms)?,
-        )),
+        Plan::ProcessExit => Ok(CaptureOutcome::from_wait(session.wait_after(
+            *anchor,
+            WaitCond::ProcessExit,
+            budget_ms,
+        )?)),
         Plan::CommandDone => Ok(CaptureOutcome::from_wait(session.wait_after(
             *anchor,
             WaitCond::CommandDone {
@@ -1268,7 +1278,9 @@ fn run_completion_plan(
                 // previous one), so a wait that never observes never sees
                 // new events — poll WITH a bounded idle window, not against
                 // a static queue.
-                let batch = session.observe(quiet_ms.min(30)).map(|_| session.events_since(pre_event_seq))?;
+                let batch = session
+                    .observe(quiet_ms.min(30))
+                    .map(|_| session.events_since(pre_event_seq))?;
                 for ev in &batch.events {
                     if matcher.matches(&ev.kind) {
                         let frame = session.observe(quiet_ms)?;
@@ -1454,7 +1466,10 @@ pub fn execute_wait_event(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
     loop {
         session.poll_native();
-        let matched = session.all_events().into_iter().find(|ev| predicate.matches(ev));
+        let matched = session
+            .all_events()
+            .into_iter()
+            .find(|ev| predicate.matches(ev));
         if let Some(ev) = matched {
             return Ok(WaitEventOutcome {
                 met: true,

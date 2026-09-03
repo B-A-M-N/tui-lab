@@ -114,10 +114,7 @@ impl RepairPacket {
             .rule_id
             .clone()
             .unwrap_or_else(|| finding.id.clone());
-        let target = finding
-            .evidence
-            .first()
-            .and_then(|e| e.target.clone());
+        let target = finding.evidence.first().and_then(|e| e.target.clone());
         let targeted = target.as_ref().map(|t| TargetedCheck {
             target: t.clone(),
             recheck_hint: format!(
@@ -173,14 +170,21 @@ mod tests {
     use super::*;
     use crate::audit::{EvidenceKind, EvidenceRef};
 
-    fn finding_with(repro: Option<&str>, refs: Vec<crate::semantic::source_ref::SourceRef>) -> crate::audit::Finding {
+    fn finding_with(
+        repro: Option<&str>,
+        refs: Vec<crate::semantic::source_ref::SourceRef>,
+    ) -> crate::audit::Finding {
         crate::audit::Finding {
             id: "CLIP-001".into(),
             rule_id: None,
             severity: "error".into(),
             category: "layout".into(),
             summary: "Save button clipped at right edge".into(),
-            evidence: vec![EvidenceRef::point(EvidenceKind::Control, "button/save", "clipped")],
+            evidence: vec![EvidenceRef::point(
+                EvidenceKind::Control,
+                "button/save",
+                "clipped",
+            )],
             confidence: 0.9,
             reproduction: repro.map(String::from),
             source_refs: refs,
@@ -220,15 +224,18 @@ mod tests {
         assert_eq!(packet.reproduction.as_ref().unwrap().scenario_id, "scen-42");
         assert_eq!(packet.reproduction.as_ref().unwrap().steps, 1);
         assert!(packet.verification.is_some(), "repro → recipe");
-        assert_eq!(packet.actionable_refs.len(), 1, "low-confidence guess filtered");
+        assert_eq!(
+            packet.actionable_refs.len(),
+            1,
+            "low-confidence guess filtered"
+        );
         assert!(packet.source_refs.is_empty(), "caller fills from finding");
     }
 
     #[test]
     fn static_finding_declares_no_repro_honestly() {
         let f = finding_with(None, vec![]);
-        let packet =
-            RepairPacket::assemble(f, "run-1", vec![], |_| None).expect("packet");
+        let packet = RepairPacket::assemble(f, "run-1", vec![], |_| None).expect("packet");
         assert!(packet.reproduction.is_none());
         assert!(packet.verification.is_none(), "no invented recipe");
         assert!(packet.actionable_refs.is_empty());

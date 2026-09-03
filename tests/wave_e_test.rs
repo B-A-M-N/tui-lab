@@ -337,10 +337,9 @@ fn targeted_check_derived_from_evidence_target() {
     f.reproduction = Some("scen-x".into());
     let sc = tui_lab::scenario::model::Scenario::new("repro")
         .act(serde_json::json!({"action":"key","key":"tab"}));
-    let packet = tui_lab::audit::repair::RepairPacket::assemble(f, "run", vec![], |_| {
-        Some(sc.clone())
-    })
-    .expect("packet");
+    let packet =
+        tui_lab::audit::repair::RepairPacket::assemble(f, "run", vec![], |_| Some(sc.clone()))
+            .expect("packet");
     let recipe = packet.verification.expect("recipe exists with repro");
     assert_eq!(recipe.finding_rule_id, "FOCUS-002");
     let targeted = recipe.target.expect("targeted check derived");
@@ -373,12 +372,14 @@ fn contract_scaffold_declares_what_was_seen() {
         reverse: false,
         strike: false,
     };
-    screen.cells = (0..(80 * 24)).map(|i| {
-        let mut c = blank();
-        c.x = (i % 80) as u16;
-        c.y = (i / 80) as u16;
-        c
-    }).collect();
+    screen.cells = (0..(80 * 24))
+        .map(|i| {
+            let mut c = blank();
+            c.x = (i % 80) as u16;
+            c.y = (i / 80) as u16;
+            c
+        })
+        .collect();
     screen.cells[12 * 80 + 30].reverse = true;
     screen.viewport_text = vec![
         "┌─ Main ─────────────┐".to_string(),
@@ -386,8 +387,7 @@ fn contract_scaffold_declares_what_was_seen() {
         "└────────────────────┘".to_string(),
     ];
     let sem = tui_lab::semantic::analyze(&screen);
-    let contract =
-        tui_lab::design::ProjectContract::scaffold_from(&screen, &sem);
+    let contract = tui_lab::design::ProjectContract::scaffold_from(&screen, &sem);
     let marker = contract
         .schema
         .extensions
@@ -408,8 +408,7 @@ fn contract_scaffold_declares_what_was_seen() {
     // The contract must survive a round-trip through its own serde (and
     // the document validator must find no structural complaints).
     let doc = serde_yaml::to_string(&contract).expect("yaml");
-    let back: tui_lab::design::ProjectContract =
-        serde_yaml::from_str(&doc).expect("round-trip");
+    let back: tui_lab::design::ProjectContract = serde_yaml::from_str(&doc).expect("round-trip");
     let _ = back.validate();
 }
 

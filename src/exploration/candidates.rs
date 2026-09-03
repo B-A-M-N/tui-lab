@@ -144,9 +144,10 @@ pub fn suggest(
             let declared = ctx
                 .contract
                 .map(|c| {
-                    c.keybindings.iter().any(|kb| kb.keys.iter().any(|k| k == name))
-                        || c
-                            .interactions
+                    c.keybindings
+                        .iter()
+                        .any(|kb| kb.keys.iter().any(|k| k == name))
+                        || c.interactions
                             .iter()
                             .any(|i| i.keys.iter().any(|k| k == name))
                 })

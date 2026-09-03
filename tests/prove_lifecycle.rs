@@ -32,11 +32,14 @@ fn exit_mode_fixture(dir: &Path, mode: &str) -> String {
         "nonzero" => "print('BYE-DIRTY')\nsys.stdout.flush()\ntime.sleep(2)\nsys.exit(7)",
         // SIGTERM self-kill: the standard death. Because the exit happened
         // via signal, the harness must report the SIGNAL, not code 1.
-        "sigterm" => "print('BYE-TERM')\nsys.stdout.flush()\ntime.sleep(2)\nos.kill(os.getpid(), 15)",
+        "sigterm" => {
+            "print('BYE-TERM')\nsys.stdout.flush()\ntime.sleep(2)\nos.kill(os.getpid(), 15)"
+        }
         // Descendant mode: print, spawn a sleeper that outlives us, exit 0.
         // The sleeper writes its pid where the test can find it and ignores
         // SIGHUP so a mere group-HUP cannot fake a reap.
-        "descendant" => "\
+        "descendant" => {
+            "\
 print('PARENT-SPOWNED')
 sys.stdout.flush()
 time.sleep(2)
@@ -48,7 +51,8 @@ if child == 0:
     os._exit(0)
 with open(os.environ['DESC_PID_FILE'], 'w') as f:
     f.write(str(child))
-sys.exit(0)",
+sys.exit(0)"
+        }
         other => panic!("unknown mode {other}"),
     };
     fs::write(
@@ -88,8 +92,17 @@ time.sleep(30)
 }
 
 fn start(mgr: &mut SessionManager, app: &str, backend: &str) -> String {
-    mgr.start("python3", &[app.to_string()], None, &[], 80, 24, backend, "local")
-        .expect("launch")
+    mgr.start(
+        "python3",
+        &[app.to_string()],
+        None,
+        &[],
+        80,
+        24,
+        backend,
+        "local",
+    )
+    .expect("launch")
 }
 
 /// Drive a session to its first frame (ProcessStarted is derived on first
@@ -105,7 +118,10 @@ fn to_first_frame(mgr: &mut SessionManager, sid: &str) -> u64 {
 /// ProcessExited event is emitted into the session's event queue (the
 /// event is a diff of the last two observed frames — a wait alone does
 /// not emit it), and return the WaitOutcome.
-fn wait_exit(sess: &mut tui_lab::session::Session, budget_ms: u64) -> tui_lab::backend::WaitOutcome {
+fn wait_exit(
+    sess: &mut tui_lab::session::Session,
+    budget_ms: u64,
+) -> tui_lab::backend::WaitOutcome {
     let out = sess
         .wait(WaitCond::ProcessExit, budget_ms)
         .expect("ProcessExit wait");
@@ -117,9 +133,10 @@ fn event_kinds(sess: &tui_lab::session::Session) -> Vec<(String, Option<i32>, Op
     sess.all_events()
         .into_iter()
         .map(|e| match &e.kind {
-            tui_lab::events::TerminalEventKind::ProcessExited { exit_code, exit_signal } => {
-                ("process_exited".into(), *exit_code, exit_signal.clone())
-            }
+            tui_lab::events::TerminalEventKind::ProcessExited {
+                exit_code,
+                exit_signal,
+            } => ("process_exited".into(), *exit_code, exit_signal.clone()),
             other => (other.name().to_string(), None, None),
         })
         .collect()
@@ -184,7 +201,10 @@ fn nonzero_exit_preserves_the_code() {
         sess.process()
     };
     assert_eq!(proc.exit_code, Some(7), "the real code survives: {proc:?}");
-    assert!(proc.exit_signal.is_none(), "an exit(7) is not a signal death");
+    assert!(
+        proc.exit_signal.is_none(),
+        "an exit(7) is not a signal death"
+    );
     assert!(!proc.running);
     let exited = {
         let sess = mgr.resolve(Some(&sid)).unwrap();
@@ -224,10 +244,7 @@ fn signal_death_reports_the_signal_not_a_code() {
             .filter(|(k, _, _)| k == "process_exited")
             .collect::<Vec<_>>()
     };
-    let (_, code, sig) = exited
-        .first()
-        .expect("exactly one exited event")
-        .clone();
+    let (_, code, sig) = exited.first().expect("exactly one exited event").clone();
     assert_eq!(
         sig.as_deref(),
         Some("Terminated"),
@@ -315,7 +332,10 @@ fn stop_reaps_outliving_descendants_via_the_process_group() {
     assert!(desc_pid > 0, "the fixture wrote its descendant pid");
 
     let alive = |pid: u32| Path::new(&format!("/proc/{pid}")).exists();
-    assert!(alive(desc_pid), "the descendant outlives its parent (pid {desc_pid})");
+    assert!(
+        alive(desc_pid),
+        "the descendant outlives its parent (pid {desc_pid})"
+    );
 
     // stop() — the harness's only teardown — must reap the group.
     mgr.stop(&sid).expect("stop");
@@ -383,10 +403,7 @@ fn restart_is_same_session_new_generation_new_pid() {
     let old_pid = old_pid.expect("pid");
     let (_id, gen2) = mgr.restart(&sid).expect("restart");
     assert_eq!(gen2, gen1 + 1, "generation increments in place");
-    assert!(
-        mgr.list().contains(&sid),
-        "restart keeps the session id"
-    );
+    assert!(mgr.list().contains(&sid), "restart keeps the session id");
     // The new process runs the fixture again: ALIVE-1 must reappear.
     let out = {
         let sess = mgr.resolve_mut(Some(&sid)).unwrap();
@@ -417,12 +434,17 @@ fn restart_is_same_session_new_generation_new_pid() {
         let all = sess.all_events();
         let exited: Vec<_> = all
             .iter()
-            .filter(|e| matches!(e.kind, tui_lab::events::TerminalEventKind::ProcessExited { .. }))
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    tui_lab::events::TerminalEventKind::ProcessExited { .. }
+                )
+            })
             .cloned()
             .collect();
-        let started_gen2 = all
-            .iter()
-            .any(|e| e.generation == gen2 && e.kind == tui_lab::events::TerminalEventKind::ProcessStarted);
+        let started_gen2 = all.iter().any(|e| {
+            e.generation == gen2 && e.kind == tui_lab::events::TerminalEventKind::ProcessStarted
+        });
         (exited, started_gen2)
     };
     assert!(
@@ -451,7 +473,7 @@ fn stop_is_terminal_and_idempotent_at_the_manager() {
     assert!(!mgr.list().contains(&sid), "session removed");
     assert!(mgr.active_id().is_none(), "active pointer cleared");
     mgr.stop(&sid).ok(); // idempotent second stop — no error
-    // And the process is really gone.
+                         // And the process is really gone.
     let mut gone = false;
     for _ in 0..50 {
         if !Path::new(&format!("/proc/{pid}")).exists() {
@@ -468,10 +490,7 @@ fn stop_is_terminal_and_idempotent_at_the_manager() {
 /// path), so lifecycle truth is not a portable-pty-only property.
 #[test]
 fn exit_matrix_holds_on_the_pipe_engine() {
-    for (mode, expect_code, expect_sig) in [
-        ("clean", Some(0), None),
-        ("nonzero", Some(7), None),
-    ] {
+    for (mode, expect_code, expect_sig) in [("clean", Some(0), None), ("nonzero", Some(7), None)] {
         let dir = TempDir::new().unwrap();
         let app = exit_mode_fixture(dir.path(), mode);
         let mut mgr = SessionManager::new();

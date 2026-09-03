@@ -268,10 +268,7 @@ pub const SILENT_GRACE_MS: u64 = 100;
 
 /// Whether a screen's viewport or scrollback contains `text`.
 pub fn screen_contains(screen: &ScreenState, text: &str) -> bool {
-    screen
-        .viewport_text
-        .iter()
-        .any(|r| r.contains(text))
+    screen.viewport_text.iter().any(|r| r.contains(text))
         || screen.scrollback.iter().any(|r| r.contains(text))
 }
 
@@ -294,11 +291,23 @@ pub fn capture_by_strategy(
             let quiet = quiet_ms
                 .map(Duration::from_millis)
                 .unwrap_or_else(|| Duration::from_millis(120));
-            wait_capture(backend, WaitCond::ScreenStable { quiet_for: quiet, after_screen_seq: Some(anchor_screen_seq) }, budget)
+            wait_capture(
+                backend,
+                WaitCond::ScreenStable {
+                    quiet_for: quiet,
+                    after_screen_seq: Some(anchor_screen_seq),
+                },
+                budget,
+            )
         }
-        CaptureStrategy::FirstChange => {
-            wait_capture(backend, WaitCond::ScreenStable { quiet_for: Duration::from_millis(0), after_screen_seq: Some(anchor_screen_seq) }, budget)
-        }
+        CaptureStrategy::FirstChange => wait_capture(
+            backend,
+            WaitCond::ScreenStable {
+                quiet_for: Duration::from_millis(0),
+                after_screen_seq: Some(anchor_screen_seq),
+            },
+            budget,
+        ),
         CaptureStrategy::AfterDuration { ms } => {
             let dur = Duration::from_millis(*ms);
             if dur == Duration::ZERO {
@@ -340,7 +349,9 @@ pub fn capture_by_strategy(
                     CaptureSequenceReason::ProcessExited => {
                         crate::backend::CaptureReason::ProcessExit
                     }
-                    CaptureSequenceReason::OutputClosed => crate::backend::CaptureReason::OutputClosed,
+                    CaptureSequenceReason::OutputClosed => {
+                        crate::backend::CaptureReason::OutputClosed
+                    }
                     _ => crate::backend::CaptureReason::Deadline,
                 },
                 met: seq.completed,
@@ -353,16 +364,10 @@ pub fn capture_by_strategy(
                 frames: Some(seq.frames),
             })
         }
-        CaptureStrategy::UntilText(t) => wait_capture(
-            backend,
-            WaitCond::Text(t.clone()),
-            budget,
-        ),
-        CaptureStrategy::UntilTextAbsent(t) => wait_capture(
-            backend,
-            WaitCond::TextAbsent(t.clone()),
-            budget,
-        ),
+        CaptureStrategy::UntilText(t) => wait_capture(backend, WaitCond::Text(t.clone()), budget),
+        CaptureStrategy::UntilTextAbsent(t) => {
+            wait_capture(backend, WaitCond::TextAbsent(t.clone()), budget)
+        }
         CaptureStrategy::UntilExit => wait_capture(backend, WaitCond::ProcessExit, budget),
         CaptureStrategy::UntilEvent(_matcher) => {
             // Re-review P0 (arbitrary Event): the backend cannot match kinds,
@@ -612,12 +617,17 @@ mod tests {
             Duration::from_secs(8),
         )
         .expect("capture");
-        assert!(out.met, "three sequential screen changes must be observable");
+        assert!(
+            out.met,
+            "three sequential screen changes must be observable"
+        );
         // Re-review P0: the full sequence must survive the call.
         let frames = out.frames.as_ref().expect("frames sequence returned");
         assert_eq!(frames.len(), 3, "requested == captured");
         assert!(
-            frames.windows(2).any(|p| p[0].structure_hash != p[1].structure_hash),
+            frames
+                .windows(2)
+                .any(|p| p[0].structure_hash != p[1].structure_hash),
             "collected frames should be distinct screens"
         );
         b.stop().ok();

@@ -341,7 +341,9 @@ mod tests {
             .await
             .expect("start");
         let pipeline = pool
-            .with_session(Some(&id), |s| minimize_crash(s, &[], FailureKind::Crash, "t"))
+            .with_session(Some(&id), |s| {
+                minimize_crash(s, &[], FailureKind::Crash, "t")
+            })
             .await
             .expect("actor run");
         assert!(!pipeline.reproduced);

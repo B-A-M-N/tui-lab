@@ -120,7 +120,9 @@ pub fn run_probe(
     quiet_ms: u64,
     budget_ms: u64,
 ) -> anyhow::Result<ProbeResult> {
-    run_probe_with_guard(session, stimulus, completion, watch, quiet_ms, budget_ms, None)
+    run_probe_with_guard(
+        session, stimulus, completion, watch, quiet_ms, budget_ms, None,
+    )
 }
 
 /// [`run_probe`] with an expected-state guard (re-review P0.9): the guard
@@ -265,7 +267,10 @@ pub fn run_probe_with_guard(
         .and_then(|c| c.frames.clone())
         .unwrap_or_else(|| vec![after.clone()]);
 
-    let settle = tx.as_ref().map(|tx| tx.settle).unwrap_or(SettleStatus::Skipped);
+    let settle = tx
+        .as_ref()
+        .map(|tx| tx.settle)
+        .unwrap_or(SettleStatus::Skipped);
     // Fused after-focus: for a stimulated probe the transaction already
     // computed it; a drift probe fuses its fresh frame here.
     let after_focus = tx
@@ -399,13 +404,22 @@ pub fn native_cooperation_probe() -> NativeCooperationReport {
                 "channel silent — the app never wrote a frame".to_string()
             };
         } else if status.frames_invalid > 0 {
-            report.detail = format!("{} invalid frame(s) among {}", status.frames_invalid, status.frames_received);
+            report.detail = format!(
+                "{} invalid frame(s) among {}",
+                status.frames_invalid, status.frames_received
+            );
         } else if !report.native_control_resolved {
-            report.detail = "frames landed but the declared control did not resolve in fused semantics".to_string();
+            report.detail =
+                "frames landed but the declared control did not resolve in fused semantics"
+                    .to_string();
         } else if !report.native_focus_applied {
-            report.detail = "frames landed but the native focus declaration did not apply".to_string();
+            report.detail =
+                "frames landed but the native focus declaration did not apply".to_string();
         } else {
-            report.detail = format!("fixture declared its tree ({} frames); fused semantics carry native truth", status.frames_received);
+            report.detail = format!(
+                "fixture declared its tree ({} frames); fused semantics carry native truth",
+                status.frames_received
+            );
         }
         Ok(report)
     });
@@ -481,7 +495,9 @@ mod tests {
 
         let result = run_probe(
             &mut sess,
-            Some(CanonicalAction::Type { text: "GO\n".into() }),
+            Some(CanonicalAction::Type {
+                text: "GO\n".into(),
+            }),
             CompletionPolicy::TextAppears("[B]".into()),
             &default_watch(),
             120,
@@ -571,7 +587,9 @@ mod tests {
 
         let result = run_probe(
             &mut sess,
-            Some(CanonicalAction::Type { text: "go\n".into() }),
+            Some(CanonicalAction::Type {
+                text: "go\n".into(),
+            }),
             CompletionPolicy::TextAppears("EV-NEXT".into()),
             &default_watch(),
             120,
@@ -591,10 +609,7 @@ mod tests {
         }
         // The named consumer still reads everything (no stolen events).
         let post = sess.events_for_consumer("watcher");
-        assert!(
-            post.cursor >= pre_cursor,
-            "consumer cursor never rewinds"
-        );
+        assert!(post.cursor >= pre_cursor, "consumer cursor never rewinds");
         assert!(
             !result.terminal_events.is_empty() || post.cursor >= pre_cursor,
             "probe window produced events or queue intact"

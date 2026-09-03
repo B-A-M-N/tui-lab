@@ -448,15 +448,16 @@ fn doctor() {
     // probe. With python3 present, a silent or broken channel is a FAIL:
     // cooperation is a core, advertised capability.
     let native_probe = if python3 {
-        std::panic::catch_unwind(tui_lab::diagnostic::native_cooperation_probe)
-            .unwrap_or_else(|_| tui_lab::diagnostic::NativeCooperationReport {
+        std::panic::catch_unwind(tui_lab::diagnostic::native_cooperation_probe).unwrap_or_else(
+            |_| tui_lab::diagnostic::NativeCooperationReport {
                 ran: false,
                 frames_received: 0,
                 frames_invalid: 0,
                 native_control_resolved: false,
                 native_focus_applied: false,
                 detail: "probe panicked".to_string(),
-            })
+            },
+        )
     } else {
         tui_lab::diagnostic::NativeCooperationReport {
             // Skipped, not failed: degradation is honest (warn tier).
@@ -485,13 +486,7 @@ fn doctor() {
     );
 
     let _ = writeln!(out);
-    let core = pty
-        && semantic
-        && recording
-        && checkpoints
-        && scenarios
-        && exploration
-        && native_ok;
+    let core = pty && semantic && recording && checkpoints && scenarios && exploration && native_ok;
     if core {
         let _ = writeln!(out, "Core subsystems operational.");
     } else {

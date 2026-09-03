@@ -276,10 +276,7 @@ impl TmuxBackend {
             "-S",
             "-",
         ]) {
-            let lines: Vec<String> = hist
-                .lines()
-                .map(strip_escapes)
-                .collect::<Vec<_>>();
+            let lines: Vec<String> = hist.lines().map(strip_escapes).collect::<Vec<_>>();
             let viewport = self.rows as usize;
             let start = lines.len().saturating_sub(viewport);
             state.scrollback = lines[..start].to_vec();
@@ -704,10 +701,7 @@ fn tmux_key(kev: &crate::backend::KeyEvent) -> BackendResult<K> {
             let ctrl = mods.contains(KeyModifiers::CTRL);
             let alt = mods.contains(KeyModifiers::ALT);
             if ctrl {
-                named(&format!(
-                    "{}C-{c}",
-                    if alt { "M-" } else { "" }
-                ))
+                named(&format!("{}C-{c}", if alt { "M-" } else { "" }))
             } else if alt {
                 named(&format!("M-{c}"))
             } else {
@@ -764,15 +758,29 @@ mod tests {
     fn key_names_cover_the_canonical_vocabulary() {
         use crate::backend::{KeyCode, KeyModifiers};
         let k = |code, mods| {
-            tmux_key(&crate::backend::KeyEvent::with_modifiers(code, mods))
-            .expect("key")
+            tmux_key(&crate::backend::KeyEvent::with_modifiers(code, mods)).expect("key")
         };
         // Named keys are presses; plain chars are literal text.
-        assert_eq!(k(KeyCode::Enter, KeyModifiers::NONE), K::Named("Enter".into()));
-        assert_eq!(k(KeyCode::Tab, KeyModifiers::SHIFT), K::Named("BTab".into()));
-        assert_eq!(k(KeyCode::Char('c'), KeyModifiers::CTRL), K::Named("C-c".into()));
-        assert_eq!(k(KeyCode::Char('q'), KeyModifiers::NONE), K::Lit("q".into()));
-        assert_eq!(k(KeyCode::Function(5), KeyModifiers::NONE), K::Named("F5".into()));
+        assert_eq!(
+            k(KeyCode::Enter, KeyModifiers::NONE),
+            K::Named("Enter".into())
+        );
+        assert_eq!(
+            k(KeyCode::Tab, KeyModifiers::SHIFT),
+            K::Named("BTab".into())
+        );
+        assert_eq!(
+            k(KeyCode::Char('c'), KeyModifiers::CTRL),
+            K::Named("C-c".into())
+        );
+        assert_eq!(
+            k(KeyCode::Char('q'), KeyModifiers::NONE),
+            K::Lit("q".into())
+        );
+        assert_eq!(
+            k(KeyCode::Function(5), KeyModifiers::NONE),
+            K::Named("F5".into())
+        );
         assert_eq!(k(KeyCode::Up, KeyModifiers::NONE), K::Named("Up".into()));
     }
 
@@ -796,7 +804,13 @@ mod tests {
         // These are the boundaries the module header promises. If a future
         // change claims tmux can capture raw bytes or signal the child, that
         // is a capability it does not actually have — fail.
-        assert!(!caps.protocol_capture, "tmux cannot hand back raw protocol bytes");
-        assert!(!caps.signals, "the attached process is not our child; no signals");
+        assert!(
+            !caps.protocol_capture,
+            "tmux cannot hand back raw protocol bytes"
+        );
+        assert!(
+            !caps.signals,
+            "the attached process is not our child; no signals"
+        );
     }
 }

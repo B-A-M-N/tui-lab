@@ -59,10 +59,7 @@ impl FrameworkDetection {
     /// Overall confidence: the primary candidate's, or 0.0 when nothing
     /// matched (the historical field, kept for wire stability).
     pub fn confidence(&self) -> f32 {
-        self.primary
-            .as_ref()
-            .map(|c| c.confidence)
-            .unwrap_or(0.0)
+        self.primary.as_ref().map(|c| c.confidence).unwrap_or(0.0)
     }
 }
 
@@ -84,7 +81,14 @@ const CLASS_STYLING: &str = "styling";
 
 const FRAMEWORKS: &[FrameworkSpec] = &[
     ("ratatui", CLASS_FRAMEWORK, &["ratatui"], &[], &[], &[]),
-    ("textual", CLASS_FRAMEWORK, &[], &["textual"], &[], &["textual"]),
+    (
+        "textual",
+        CLASS_FRAMEWORK,
+        &[],
+        &["textual"],
+        &[],
+        &["textual"],
+    ),
     (
         "opentui",
         CLASS_FRAMEWORK,
@@ -106,7 +110,14 @@ const FRAMEWORKS: &[FrameworkSpec] = &[
     // styling. Both still DETECT (their presence is evidence about the
     // tree) but they classify separately so "framework: crossterm" — a
     // category error the old shape committed — cannot recur.
-    ("crossterm", CLASS_TERMINAL_IO, &["crossterm"], &[], &[], &[]),
+    (
+        "crossterm",
+        CLASS_TERMINAL_IO,
+        &["crossterm"],
+        &[],
+        &[],
+        &[],
+    ),
     (
         "lipgloss",
         CLASS_STYLING,
@@ -197,8 +208,7 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         }
         // Workspace manifests declare deps in [workspace.dependencies]; a
         // workspace root is a perfectly good detection locus (item 46).
-        if !candidates.iter().any(|c| c.class == CLASS_FRAMEWORK)
-            && file_set.contains("Cargo.lock")
+        if !candidates.iter().any(|c| c.class == CLASS_FRAMEWORK) && file_set.contains("Cargo.lock")
         {
             if let Ok(lock) = read_file(cwd, "Cargo.lock").parse::<toml::Value>() {
                 if let Some(pkgs) = lock.get("package").and_then(|p| p.as_array()) {
@@ -267,7 +277,9 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
                     if let Some(name) = d.as_str() {
                         let name: String = name
                             .chars()
-                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+                            .take_while(|c| {
+                                c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'
+                            })
                             .collect();
                         if !name.is_empty() {
                             py_deps.push(name.to_lowercase());

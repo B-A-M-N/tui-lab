@@ -298,11 +298,7 @@ impl EventBus {
 /// history view and the terminal event ring can never be two divergent
 /// authorities.
 impl BusEvent {
-    pub fn from_terminal(
-        ev: &crate::events::TerminalEvent,
-        source_seq: u64,
-        seq: u64,
-    ) -> Self {
+    pub fn from_terminal(ev: &crate::events::TerminalEvent, source_seq: u64, seq: u64) -> Self {
         BusEvent {
             seq,
             source: match ev.kind {
@@ -367,8 +363,7 @@ pub fn project_history(
                 break;
             }
         }
-        if !query.event_types.is_empty() && !query.event_types.iter().any(|t| t == ev.kind.name())
-        {
+        if !query.event_types.is_empty() && !query.event_types.iter().any(|t| t == ev.kind.name()) {
             continue;
         }
         if out.len() >= limit {
@@ -405,7 +400,11 @@ mod tests {
     #[test]
     fn sources_converge_onto_one_total_order() {
         let mut bus = EventBus::new();
-        bus.publish("s", BusSource::Terminal, BusEventKind::Terminal(TerminalEventKind::Bell));
+        bus.publish(
+            "s",
+            BusSource::Terminal,
+            BusEventKind::Terminal(TerminalEventKind::Bell),
+        );
         bus.publish_native("s", "focus:list");
         bus.publish_coverage("s", "src/main.rs:42");
         assert_eq!(bus.total(), 3, "all sources share one timeline");
@@ -442,7 +441,11 @@ mod tests {
         assert_eq!(first.events.len(), 1);
         bus.publish_native("s", "menu:select");
         let again = bus.since(c0);
-        assert_eq!(again.events.len(), 2, "re-read from original cursor sees both");
+        assert_eq!(
+            again.events.len(),
+            2,
+            "re-read from original cursor sees both"
+        );
         let incremental = bus.since(first.cursor);
         assert_eq!(incremental.events.len(), 1);
     }

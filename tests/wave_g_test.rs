@@ -150,7 +150,9 @@ fn errors_audit_catches_on_screen_error_text() {
         "marker named in summary: {:?}",
         f.summary
     );
-    let weak = f.evidence[0].detail["weak_markers"].as_array().expect("weak");
+    let weak = f.evidence[0].detail["weak_markers"]
+        .as_array()
+        .expect("weak");
     assert!(
         weak.iter().any(|m| m.as_str() == Some("error:")),
         "error: listed among weak markers: {weak:?}"
@@ -189,9 +191,7 @@ fn errors_audit_strong_markers_stay_errors() {
         .as_array()
         .expect("strong");
     assert!(
-        strong
-            .iter()
-            .any(|m| m.as_str() == Some("panicked at")),
+        strong.iter().any(|m| m.as_str() == Some("panicked at")),
         "panic marker recorded: {strong:?}"
     );
     mgr.stop(&id).ok();
@@ -895,7 +895,9 @@ async fn run_provenance_binding_and_resume_guard() {
     // Baseline drive succeeds.
     unwrap_ok(
         &server
-            .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "enter", "id": sid }),
+            ))
             .await,
         "act under A",
     );
@@ -904,7 +906,9 @@ async fn run_provenance_binding_and_resume_guard() {
     // stopping S. There is no explicit new-run op: resume fills that role,
     // so the provenance guard is the resume path keeping S out of B.
     unwrap_ok(
-        &server.tui_run(params_typed(serde_json::json!({ "action": "persist" }))).await,
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "persist" })))
+            .await,
         "persist A",
     );
 
@@ -922,14 +926,18 @@ async fn run_provenance_binding_and_resume_guard() {
 
     // Driving S under B is refused (provenance), not silently re-targeted.
     let drive = &server
-        .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+        .tui_act(params_typed(
+            serde_json::json!({ "action": "key", "key": "enter", "id": sid }),
+        ))
         .await;
     let dv = drive
         .structured_content
         .clone()
         .or_else(|| {
             drive.content.first().map(|c| {
-                let rmcp::model::ContentBlock::Text(t) = c else { unreachable!() };
+                let rmcp::model::ContentBlock::Text(t) = c else {
+                    unreachable!()
+                };
                 serde_json::from_str(&t.text).unwrap()
             })
         })
@@ -955,7 +963,9 @@ async fn run_provenance_binding_and_resume_guard() {
     );
     unwrap_ok(
         &server
-            .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "enter", "id": sid }),
+            ))
             .await,
         "S driveable again under its owner A",
     );
@@ -963,7 +973,9 @@ async fn run_provenance_binding_and_resume_guard() {
     // Positive cleanup: stopping S drops the owner entry.
     unwrap_ok(
         &server
-            .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": sid })))
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "stop", "id": sid }),
+            ))
             .await,
         "stop S",
     );
@@ -971,7 +983,9 @@ async fn run_provenance_binding_and_resume_guard() {
     // before (no panic on the ownership lookup).
     assert!(
         server
-            .tui_act(params_typed(serde_json::json!({ "action": "key", "key": "enter", "id": sid })))
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "enter", "id": sid })
+            ))
             .await
             .is_error
             .unwrap_or(false),

@@ -67,7 +67,10 @@ pub struct CacheResult {
 #[derive(Debug, Default)]
 pub struct SemanticCache {
     /// structure_hash → (flat analysis, tree).
-    pub(crate) entries: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))>,
+    pub(crate) entries: Vec<(
+        String,
+        (SemanticScreen, crate::semantic::node::SemanticTree),
+    )>,
     hits: u64,
     misses: u64,
     /// Item 37: the interaction half's ledger — recomputations and how
@@ -107,7 +110,11 @@ impl SemanticCache {
             // Hit: return the stored analysis; no detector runs.
             let sem = self.entries[idx].1 .0.clone();
             self.hits += 1;
-            return CacheResult { sem, hit: true, key };
+            return CacheResult {
+                sem,
+                hit: true,
+                key,
+            };
         }
         self.misses += 1;
         let pair = crate::semantic::detect_frame(screen);
@@ -119,7 +126,11 @@ impl SemanticCache {
         }
         self.entries.push((key.clone(), (sem.clone(), pair.1)));
         self.enforce_retention();
-        CacheResult { sem, hit: false, key }
+        CacheResult {
+            sem,
+            hit: false,
+            key,
+        }
     }
 
     /// Insert a precomputed (flat, tree) pair for `key`. The fused path
@@ -147,8 +158,10 @@ impl SemanticCache {
         if self.entries.len() <= MAX_ENTRIES {
             return;
         }
-        let mut kept: Vec<(String, (SemanticScreen, crate::semantic::node::SemanticTree))> =
-            Vec::with_capacity(2);
+        let mut kept: Vec<(
+            String,
+            (SemanticScreen, crate::semantic::node::SemanticTree),
+        )> = Vec::with_capacity(2);
         for (k, s) in self.entries.iter().rev() {
             if kept.is_empty() || kept[0].0 != *k {
                 if kept.len() == 2 {
@@ -235,7 +248,10 @@ mod tests {
         let r1 = cache.analyze(&a);
         assert!(!r1.hit, "first observation must run the pipeline");
         let r2 = cache.analyze(&a);
-        assert!(r2.hit, "second observation of the same structure must be cached");
+        assert!(
+            r2.hit,
+            "second observation of the same structure must be cached"
+        );
         assert_eq!(r1.sem.cols, r2.sem.cols);
         assert!(cache.hits() >= 1, "hit counted");
     }

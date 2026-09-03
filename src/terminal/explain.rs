@@ -168,11 +168,7 @@ fn build_gist(
         ),
         None => {
             // Static finding: describe from its evidence refs alone.
-            let kinds: Vec<&str> = finding
-                .evidence
-                .iter()
-                .map(|e| e.kind_name())
-                .collect();
+            let kinds: Vec<&str> = finding.evidence.iter().map(|e| e.kind_name()).collect();
             format!(
                 "static rule '{}' cited {} evidence source(s): {}",
                 finding.category.clone(),
@@ -190,20 +186,15 @@ fn feature_for_category<'a>(
 ) -> Option<&'a ProfileFeature> {
     match category {
         // Discoverability findings lean on visible style (a capability).
-        c if c.contains("discoverability") => profile
-            .features
-            .iter()
-            .find(|f| f.id == "colors"),
+        c if c.contains("discoverability") => profile.features.iter().find(|f| f.id == "colors"),
         // Navigation findings rely on scrollback when exploring.
-        c if c.contains("navigation") || c.contains("scroll") => profile
-            .features
-            .iter()
-            .find(|f| f.id == "scrollback"),
+        c if c.contains("navigation") || c.contains("scroll") => {
+            profile.features.iter().find(|f| f.id == "scrollback")
+        }
         // Clipping/layout findings need accurate attributes.
-        c if c.contains("clip") || c.contains("layout") => profile
-            .features
-            .iter()
-            .find(|f| f.id == "cell_attributes"),
+        c if c.contains("clip") || c.contains("layout") => {
+            profile.features.iter().find(|f| f.id == "cell_attributes")
+        }
         _ => None,
     }
 }
@@ -212,13 +203,22 @@ fn describe_transition(t: &Transition) -> String {
     let mut parts = Vec::new();
     parts.push(format!("{} cells changed", t.screen_diff.changed_cells));
     if !t.semantic_diff.controls_added.is_empty() {
-        parts.push(format!("{} control(s) added", t.semantic_diff.controls_added.len()));
+        parts.push(format!(
+            "{} control(s) added",
+            t.semantic_diff.controls_added.len()
+        ));
     }
     if !t.semantic_diff.controls_removed.is_empty() {
-        parts.push(format!("{} control(s) removed", t.semantic_diff.controls_removed.len()));
+        parts.push(format!(
+            "{} control(s) removed",
+            t.semantic_diff.controls_removed.len()
+        ));
     }
     if !t.semantic_diff.regions_added.is_empty() {
-        parts.push(format!("{} region(s) added", t.semantic_diff.regions_added.len()));
+        parts.push(format!(
+            "{} region(s) added",
+            t.semantic_diff.regions_added.len()
+        ));
     }
     if t.screen_diff.cursor.is_some() {
         parts.push("cursor moved".into());
@@ -231,31 +231,32 @@ fn describe_transition(t: &Transition) -> String {
 
 /// Trace one evidence ref to its source, resolving against the probe when the
 /// kind maps to probe/transition data.
-fn explain_evidence(ev: &EvidenceRef, probe: Option<&crate::diagnostic::ProbeResult>) -> ExplainStep {
+fn explain_evidence(
+    ev: &EvidenceRef,
+    probe: Option<&crate::diagnostic::ProbeResult>,
+) -> ExplainStep {
     let target = ev.target.clone();
     let kind = ev.kind.clone();
 
     match (&ev.kind, probe, &ev.target) {
         // Screen snapshot → the after-frame structure hash, if the probe's
         // after matches (or we can at least cite the supplied transition).
-        (EvidenceKind::ScreenSnapshot, Some(p), Some(hash)) => {
-            ExplainStep {
-                kind: kind.clone(),
-                target: target.clone(),
-                finding_summary: ev.summary.clone(),
-                narrative: format!(
-                    "frame hash '{}' {} the probe's after-frame ({} cells changed)",
-                    hash,
-                    if p.after.structure_hash == *hash {
-                        "equals"
-                    } else {
-                        "is cited for but differs from"
-                    },
-                    p.transition.screen_diff.changed_cells,
-                ),
-                resolution: ExplainResolution::Resolved,
-            }
-        }
+        (EvidenceKind::ScreenSnapshot, Some(p), Some(hash)) => ExplainStep {
+            kind: kind.clone(),
+            target: target.clone(),
+            finding_summary: ev.summary.clone(),
+            narrative: format!(
+                "frame hash '{}' {} the probe's after-frame ({} cells changed)",
+                hash,
+                if p.after.structure_hash == *hash {
+                    "equals"
+                } else {
+                    "is cited for but differs from"
+                },
+                p.transition.screen_diff.changed_cells,
+            ),
+            resolution: ExplainResolution::Resolved,
+        },
         // Control / Region → cite the semantic diff deltas from the probe.
         (EvidenceKind::Control, Some(p), _) => {
             let n = p.transition.semantic_diff.controls_added.len();
@@ -471,7 +472,9 @@ mod tests {
         let exp = explain_finding(&f, None, None);
         assert!(exp.gist.contains("static rule"), "{}", exp.gist);
         assert!(
-            exp.steps.iter().all(|s| !s.narrative.contains("cells changed")),
+            exp.steps
+                .iter()
+                .all(|s| !s.narrative.contains("cells changed")),
             "a static finding must not invent a transition"
         );
     }

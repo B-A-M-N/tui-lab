@@ -106,12 +106,14 @@ fn probe_stimulus_accepts_canonical_actions() {
         (r#"{"action":"paste","paste":"hello"}"#, "paste"),
         (r#"{"action":"raw","raw":[27,91,65]}"#, "raw"),
         (r#"{"action":"resize","cols":60,"rows":20}"#, "resize"),
-        (r#"{"action":"mouse_scroll","x":5,"y":5,"direction":"up"}"#, "mouse_scroll"),
+        (
+            r#"{"action":"mouse_scroll","x":5,"y":5,"direction":"up"}"#,
+            "mouse_scroll",
+        ),
         (r#"{"action":"signal","signal":15}"#, "signal"),
         (r#"{"action":"keys","keys":["tab","down"]}"#, "keys"),
     ] {
-        let s: ProbeStimulus = serde_json::from_str(json)
-            .unwrap_or_else(|e| panic!("{json}: {e}"));
+        let s: ProbeStimulus = serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
         let action = s.to_action().unwrap_or_else(|| panic!("{json}: no action"));
         assert_eq!(action.name(), expected_name, "{json}");
     }
@@ -175,8 +177,11 @@ for i in range(200):
         outcome.reason.name()
     );
     // Frames are genuinely distinct.
-    let hashes: std::collections::HashSet<&str> =
-        outcome.frames.iter().map(|f| f.visual_hash.as_str()).collect();
+    let hashes: std::collections::HashSet<&str> = outcome
+        .frames
+        .iter()
+        .map(|f| f.visual_hash.as_str())
+        .collect();
     assert!(hashes.len() > 1, "captured frames must differ visually");
 }
 

@@ -211,7 +211,11 @@ fn stale_guard_blocks_input_on_drift() {
     };
 
     let report = ScenarioRunner::run(&scenario, sess);
-    assert_eq!(report.steps_failed, 1, "guard must fail: {:?}", report.step_results);
+    assert_eq!(
+        report.steps_failed, 1,
+        "guard must fail: {:?}",
+        report.step_results
+    );
     assert!(
         report.step_results[0].detail.contains("stale_state"),
         "verdict names the drift: {}",
@@ -228,7 +232,10 @@ fn stale_guard_blocks_input_on_drift() {
     sess.observe(300).expect("post check");
     let frame = sess.last().expect("frame");
     assert!(
-        !frame.viewport_text.iter().any(|r| r.contains("GUARD-GOT-INPUT")),
+        !frame
+            .viewport_text
+            .iter()
+            .any(|r| r.contains("GUARD-GOT-INPUT")),
         "guarded input must NOT reach the app: {:?}",
         frame.viewport_text
     );
@@ -267,7 +274,11 @@ fn satisfied_guard_lets_step_run() {
     };
 
     let report = ScenarioRunner::run(&scenario, sess);
-    assert_eq!(report.steps_passed, 1, "satisfied guard passes: {:?}", report.step_results);
+    assert_eq!(
+        report.steps_passed, 1,
+        "satisfied guard passes: {:?}",
+        report.step_results
+    );
     // The input really landed this time.
     let out = sess
         .wait(

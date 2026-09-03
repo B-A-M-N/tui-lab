@@ -200,8 +200,7 @@ mod tests {
         // snapshot() must fail if a previous parallel test raced us; run it
         // and check both the argv and the reply.
         let result = snapshot();
-        let argv = std::fs::read_to_string(bindir.join("argv.log"))
-            .unwrap_or_else(|_| "".into());
+        let argv = std::fs::read_to_string(bindir.join("argv.log")).unwrap_or_else(|_| "".into());
         let argv: Vec<&str> = argv.trim().lines().collect();
         assert_eq!(
             argv,

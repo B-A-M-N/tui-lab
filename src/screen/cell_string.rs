@@ -96,8 +96,7 @@ impl CellString {
             }
             // A new base char flushes the previous group.
             if !group.is_empty() {
-                let continuation =
-                    (group.width() as u16).saturating_sub(1);
+                let continuation = (group.width() as u16).saturating_sub(1);
                 slots.push(CellSlot {
                     col: group_col,
                     text: std::mem::take(&mut group),

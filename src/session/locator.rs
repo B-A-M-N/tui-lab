@@ -202,7 +202,10 @@ mod tests {
     fn explicit_root_short_circuits_the_walk() {
         let dir = tmp_project_with("Cargo.toml");
         let loc = ProjectLocator::locate(Some(dir.path().to_str().unwrap()), "/tmp/unrelated");
-        assert_eq!(loc.explicit_root.as_deref(), Some(dir.path().to_str().unwrap()));
+        assert_eq!(
+            loc.explicit_root.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
         assert_eq!(loc.manifest_roots, vec![dir.path().display().to_string()]);
     }
 
@@ -212,15 +215,22 @@ mod tests {
         let bare = tempfile::tempdir().expect("tempdir");
         let loc = ProjectLocator::locate(None, bare.path().to_str().unwrap());
         assert!(loc.manifest_roots.is_empty(), "{:?}", loc.manifest_roots);
-        assert_eq!(loc.root(), loc.launch_cwd, "falls back to cwd, never panics");
+        assert_eq!(
+            loc.root(),
+            loc.launch_cwd,
+            "falls back to cwd, never panics"
+        );
     }
 
     #[test]
     fn detects_git_boundary_beside_manifest() {
         let dir = tmp_project_with("Cargo.toml");
         std::fs::create_dir(dir.path().join(".git")).expect("git marker");
-        std::fs::write(dir.path().join(".git").join("HEAD"), "ref: refs/heads/main\n")
-            .expect("HEAD");
+        std::fs::write(
+            dir.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("HEAD");
         let loc = ProjectLocator::locate(None, dir.path().to_str().unwrap());
         assert_eq!(loc.vcs.as_deref(), Some("git"));
     }

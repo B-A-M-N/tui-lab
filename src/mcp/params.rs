@@ -217,7 +217,10 @@ impl EventPredicate {
             return false;
         }
         if let Some(needle) = &self.contains {
-            if !event_text(ev).map(|t| t.contains(needle.as_str())).unwrap_or(false) {
+            if !event_text(ev)
+                .map(|t| t.contains(needle.as_str()))
+                .unwrap_or(false)
+            {
                 return false;
             }
         }
@@ -243,8 +246,12 @@ fn event_text(ev: &crate::events::TerminalEvent) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
         K::QueryAnswered { class } => class.clone(),
-        K::Bell | K::VisualChanged | K::FocusChanged { .. } | K::ProcessStarted
-        | K::ProcessExited { .. } | K::SemanticChanged => return None,
+        K::Bell
+        | K::VisualChanged
+        | K::FocusChanged { .. }
+        | K::ProcessStarted
+        | K::ProcessExited { .. }
+        | K::SemanticChanged => return None,
     })
 }
 
@@ -463,7 +470,9 @@ impl BackendParam {
             BackendParam::Auto | BackendParam::PortableVt100 => {
                 crate::session::state::BackendKind::PortableVt
             }
-            BackendParam::Cli | BackendParam::LineCli => crate::session::state::BackendKind::PtyLine,
+            BackendParam::Cli | BackendParam::LineCli => {
+                crate::session::state::BackendKind::PtyLine
+            }
             BackendParam::Pipe => crate::session::state::BackendKind::Pipe,
             BackendParam::Tmux => crate::session::state::BackendKind::TmuxAttach,
         }
@@ -1326,7 +1335,9 @@ impl TuiActRequest {
             | TuiActRequest::MouseDrag { completion, .. }
             | TuiActRequest::MouseScroll { completion, .. }
             | TuiActRequest::Resize { completion, .. }
-            | TuiActRequest::Signal { completion, .. } => completion.as_ref().and_then(|c| c.quiet_ms()),
+            | TuiActRequest::Signal { completion, .. } => {
+                completion.as_ref().and_then(|c| c.quiet_ms())
+            }
         }
     }
 
@@ -1423,7 +1434,9 @@ impl ProbeStimulus {
     /// names a real action).
     pub fn to_action(&self) -> Option<crate::execution::CanonicalAction> {
         match self {
-            ProbeStimulus::Canonical(req) => crate::execution::CanonicalAction::from_request(req).ok(),
+            ProbeStimulus::Canonical(req) => {
+                crate::execution::CanonicalAction::from_request(req).ok()
+            }
             ProbeStimulus::Legacy(l) => l.to_action(),
         }
     }
@@ -1456,7 +1469,11 @@ pub enum LegacyStimulus {
     /// Type literal text.
     Type { text: String },
     /// Mouse click at cell coordinates.
-    Click { button: MouseButtonParam, x: u16, y: u16 },
+    Click {
+        button: MouseButtonParam,
+        x: u16,
+        y: u16,
+    },
     /// No stimulus — observe drift between two settled frames.
     None,
 }
@@ -1468,13 +1485,29 @@ impl LegacyStimulus {
         use crate::execution::CanonicalAction as CA;
         match self {
             LegacyStimulus::None => None,
-            LegacyStimulus::Key { key, ctrl, alt, shift } => {
+            LegacyStimulus::Key {
+                key,
+                ctrl,
+                alt,
+                shift,
+            } => {
                 let mut mods = KeyModifiers::empty();
-                if *ctrl { mods |= KeyModifiers::CTRL; }
-                if *alt { mods |= KeyModifiers::ALT; }
-                if *shift { mods |= KeyModifiers::SHIFT; }
+                if *ctrl {
+                    mods |= KeyModifiers::CTRL;
+                }
+                if *alt {
+                    mods |= KeyModifiers::ALT;
+                }
+                if *shift {
+                    mods |= KeyModifiers::SHIFT;
+                }
                 let code = parse_key_name(key)?;
-                Some(CA::Key { key: crate::backend::KeyEvent { code, modifiers: mods } })
+                Some(CA::Key {
+                    key: crate::backend::KeyEvent {
+                        code,
+                        modifiers: mods,
+                    },
+                })
             }
             LegacyStimulus::Type { text } => Some(CA::Type { text: text.clone() }),
             LegacyStimulus::Click { button, x, y } => Some(CA::MouseClick {

@@ -27,19 +27,26 @@ use crate::intent::ActionRisk;
 /// A click on any of these can change persistent or external state with no
 /// undo; autonomous drivers must not select them as probe targets.
 pub const COMMIT_LABELS: &[&str] = &[
-    "save", "submit", "apply", "deploy", "connect", "send", "authorize",
+    "save",
+    "submit",
+    "apply",
+    "deploy",
+    "connect",
+    "send",
+    "authorize",
 ];
 
 /// Labels that destroy in-process state (carried over from the mouse
 /// audit's original filter, now shared).
 pub const DESTRUCTIVE_LABELS: &[&str] = &[
-    "delete", "remove", "quit", "exit", "kill", "reset", "format", "erase",
-    "destroy", "wipe", "purge", "shutdown",
+    "delete", "remove", "quit", "exit", "kill", "reset", "format", "erase", "destroy", "wipe",
+    "purge", "shutdown",
 ];
 
 /// Labels that reach outside the process (network, clipboard, publishing).
-pub const EXTERNAL_LABELS: &[&str] =
-    &["upload", "publish", "export", "share", "download", "fetch", "sync"];
+pub const EXTERNAL_LABELS: &[&str] = &[
+    "upload", "publish", "export", "share", "download", "fetch", "sync",
+];
 
 /// True when `label` (case-insensitive) contains a commit-fence word.
 pub fn is_commit_label(label: &str) -> bool {
@@ -199,7 +206,15 @@ mod tests {
     /// click targets regardless of control kind.
     #[test]
     fn commit_labels_are_fenced() {
-        for w in ["Save", "Submit", "Apply", "Deploy", "Connect", "Send", "Authorize"] {
+        for w in [
+            "Save",
+            "Submit",
+            "Apply",
+            "Deploy",
+            "Connect",
+            "Send",
+            "Authorize",
+        ] {
             assert!(is_commit_label(w), "{w} must be fenced");
             assert_eq!(
                 classify_with_label(ActionRisk::Safe, &format!(" {} ", w)),
@@ -225,7 +240,10 @@ mod tests {
     #[test]
     fn escape_is_not_safe_by_default() {
         assert_eq!(classify_action(&k(KeyCode::Escape)), ActionRisk::Unknown);
-        assert!(ActionRisk::Unknown > ActionRisk::Mutating, "Unknown must not pass a mutating gate");
+        assert!(
+            ActionRisk::Unknown > ActionRisk::Mutating,
+            "Unknown must not pass a mutating gate"
+        );
         assert_eq!(
             classify_key_with(&KeyCode::Escape, true),
             ActionRisk::Mutating,
@@ -243,8 +261,14 @@ mod tests {
             assert_eq!(classify_action(&k(c)), ActionRisk::Safe, "{c:?}");
         }
         assert_eq!(classify_action(&k(KeyCode::Enter)), ActionRisk::Mutating);
-        assert_eq!(classify_action(&k(KeyCode::Function(5))), ActionRisk::Mutating);
-        assert_eq!(classify_action(&k(KeyCode::Char('x'))), ActionRisk::Mutating);
+        assert_eq!(
+            classify_action(&k(KeyCode::Function(5))),
+            ActionRisk::Mutating
+        );
+        assert_eq!(
+            classify_action(&k(KeyCode::Char('x'))),
+            ActionRisk::Mutating
+        );
     }
 
     #[test]

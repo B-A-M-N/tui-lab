@@ -247,7 +247,8 @@ oracles:
             ("validation", crate::design::ContractMode::Validation),
             ("strict", crate::design::ContractMode::Strict),
         ] {
-            let yaml = GOOD_YAML.replace("version: \"2\"", &format!("version: \"2\"\n  mode: {text}"));
+            let yaml =
+                GOOD_YAML.replace("version: \"2\"", &format!("version: \"2\"\n  mode: {text}"));
             let c = parse_yaml(&yaml).unwrap();
             assert_eq!(c.schema.mode, want, "mode={text}");
         }

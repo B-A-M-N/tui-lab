@@ -282,7 +282,11 @@ impl PipeBackend {
                 format!(
                     "{}{}",
                     truncated,
-                    if y + 1 < viewport_lines.len() { "\r\n" } else { "" }
+                    if y + 1 < viewport_lines.len() {
+                        "\r\n"
+                    } else {
+                        ""
+                    }
                 )
                 .as_bytes(),
             );
@@ -377,7 +381,9 @@ impl TerminalBackend for PipeBackend {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| BackendError::Spawn(e.to_string()))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| BackendError::Spawn(e.to_string()))?;
         let stdin = child.stdin.take().ok_or_else(|| {
             BackendError::Spawn("pipe backend could not take stdin handle".into())
         })?;
@@ -507,18 +513,18 @@ impl TerminalBackend for PipeBackend {
                     )));
                 }
                 match kev.code {
-                crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
-                crate::backend::KeyCode::Char(c) => {
-                    let mut s = String::new();
-                    s.push(c);
-                    self.write_input(s.as_bytes())?;
-                }
-                _ => {
-                    return Err(BackendError::Unsupported(
-                        "pipe backend supports Char/Enter keys only; no terminal grid exists"
-                            .into(),
-                    ))
-                }
+                    crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
+                    crate::backend::KeyCode::Char(c) => {
+                        let mut s = String::new();
+                        s.push(c);
+                        self.write_input(s.as_bytes())?;
+                    }
+                    _ => {
+                        return Err(BackendError::Unsupported(
+                            "pipe backend supports Char/Enter keys only; no terminal grid exists"
+                                .into(),
+                        ))
+                    }
                 }
             }
             Input::Keys(keys) => {

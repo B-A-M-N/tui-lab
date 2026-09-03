@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn every_advertised_snippet_emits_real_source() {
         for fw in ["ratatui", "textual", "python", "raw", "curses", "reference"] {
-            let s = snippet_for(fw).expect(&format!("{fw}: snippet available"));
+            let s = snippet_for(fw).unwrap_or_else(|| panic!("{fw}: snippet available"));
             let body = s.trim();
             assert!(!body.is_empty(), "{fw}: not blank");
             // Source-bearing: a real body defines a callable or a frame
@@ -277,8 +277,8 @@ mod tests {
                 || body.contains("struct ");
             assert!(defines_callable, "{fw}: snippet must define real source");
             // Every family must produce the snapshot write, not just an env var.
-            let emits_snapshot = body.contains("snapshot")
-                && (body.contains("type") && body.contains("snapshot"));
+            let emits_snapshot =
+                body.contains("snapshot") && (body.contains("type") && body.contains("snapshot"));
             assert!(emits_snapshot, "{fw}: must emit a snapshot frame");
         }
     }

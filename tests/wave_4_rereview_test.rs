@@ -28,10 +28,13 @@ fn history_projection_windows_filters_and_counts() {
         mk(1, TerminalEventKind::Bell),
         mk(2, TerminalEventKind::Output { byte_len: 10 }),
         mk(3, TerminalEventKind::Bell),
-        mk(4, TerminalEventKind::NativeEvent {
-            event: "focus:list".into(),
-            target: "n1".into(),
-        }),
+        mk(
+            4,
+            TerminalEventKind::NativeEvent {
+                event: "focus:list".into(),
+                target: "n1".into(),
+            },
+        ),
         mk(5, TerminalEventKind::Output { byte_len: 20 }),
     ];
 
@@ -39,10 +42,7 @@ fn history_projection_windows_filters_and_counts() {
     let all = project_history(&events, &HistoryQuery::default(), 0);
     assert_eq!(all.events.len(), 5);
     assert_eq!(
-        all.events
-            .iter()
-            .find(|e| e.seq == 4)
-            .map(|e| e.source),
+        all.events.iter().find(|e| e.seq == 4).map(|e| e.source),
         Some(BusSource::Native),
         "NativeEvent projects to the native source"
     );
@@ -53,13 +53,25 @@ fn history_projection_windows_filters_and_counts() {
         .events
         .iter()
         .filter(|e| e.source == BusSource::Terminal)
-        .filter(|e| matches!(e.kind, tui_lab::events::BusEventKind::Terminal(TerminalEventKind::Output { .. })))
+        .filter(|e| {
+            matches!(
+                e.kind,
+                tui_lab::events::BusEventKind::Terminal(TerminalEventKind::Output { .. })
+            )
+        })
         .map(|e| e.source_seq)
         .collect();
     assert_eq!(out_seqs, vec![2, 4], "per-source counters are stable");
 
     // Windowing: seq > 2.
-    let since = project_history(&events, &HistoryQuery { since_seq: 2, ..Default::default() }, 0);
+    let since = project_history(
+        &events,
+        &HistoryQuery {
+            since_seq: 2,
+            ..Default::default()
+        },
+        0,
+    );
     assert_eq!(
         since.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
         vec![3, 4, 5]
@@ -75,13 +87,20 @@ fn history_projection_windows_filters_and_counts() {
         0,
     );
     assert_eq!(bells.events.len(), 2);
-    assert!(bells
-        .events
-        .iter()
-        .all(|e| matches!(e.kind, tui_lab::events::BusEventKind::Terminal(TerminalEventKind::Bell))));
+    assert!(bells.events.iter().all(|e| matches!(
+        e.kind,
+        tui_lab::events::BusEventKind::Terminal(TerminalEventKind::Bell)
+    )));
 
     // Limit truncation: cursor = last SERVED seq so paging never skips.
-    let page1 = project_history(&events, &HistoryQuery { limit: Some(2), ..Default::default() }, 0);
+    let page1 = project_history(
+        &events,
+        &HistoryQuery {
+            limit: Some(2),
+            ..Default::default()
+        },
+        0,
+    );
     assert_eq!(page1.events.len(), 2);
     assert_eq!(page1.cursor, 2);
     let page2 = project_history(
@@ -100,9 +119,23 @@ fn history_projection_windows_filters_and_counts() {
     );
 
     // Declared gap: reaching behind the eviction watermark.
-    let gapped = project_history(&events, &HistoryQuery { since_seq: 0, ..Default::default() }, 2);
+    let gapped = project_history(
+        &events,
+        &HistoryQuery {
+            since_seq: 0,
+            ..Default::default()
+        },
+        2,
+    );
     assert!(gapped.gap, "queries behind eviction must declare the gap");
-    let fresh = project_history(&events, &HistoryQuery { since_seq: 2, ..Default::default() }, 2);
+    let fresh = project_history(
+        &events,
+        &HistoryQuery {
+            since_seq: 2,
+            ..Default::default()
+        },
+        2,
+    );
     assert!(!fresh.gap, "a query entirely inside the window is complete");
 }
 
@@ -134,18 +167,25 @@ fn session_history_serves_real_action_events() {
         "a launched child that printed must produce output events"
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.kind, tui_lab::events::TerminalEventKind::ScreenChanged { .. })),
+        events.iter().any(|e| matches!(
+            e.kind,
+            tui_lab::events::TerminalEventKind::ScreenChanged { .. }
+        )),
         "the hello→world transition must be a screen_changed event"
     );
     // Serve through the projection with a cursor and confirm it advances.
     let batch = project_history(&events, &HistoryQuery::default(), sess.events_evicted());
     assert!(!batch.gap);
-    assert_eq!(batch.cursor, batch.events.last().map(|e| e.seq).unwrap_or(0));
+    assert_eq!(
+        batch.cursor,
+        batch.events.last().map(|e| e.seq).unwrap_or(0)
+    );
     let after = project_history(
         &sess.all_events(),
-        &HistoryQuery { since_seq: batch.cursor, ..Default::default() },
+        &HistoryQuery {
+            since_seq: batch.cursor,
+            ..Default::default()
+        },
         0,
     );
     assert!(
@@ -161,8 +201,8 @@ fn session_history_serves_real_action_events() {
 /// poll it in.
 #[test]
 fn history_wire_kinds_and_native_source() {
-    use tui_lab::events::TerminalEventKind;
     use std::io::Write;
+    use tui_lab::events::TerminalEventKind;
     let mut mgr = SessionManager::new();
     let sid = python_session(&mut mgr, "print('x'); import time; time.sleep(30)");
     {
@@ -173,7 +213,10 @@ fn history_wire_kinds_and_native_source() {
             .native_channel()
             .env_pair()
             .expect("session has a semantic channel");
-        let mut f = std::fs::OpenOptions::new().append(true).open(path).expect("open channel");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open channel");
         writeln!(
             f,
             r#"{{"v":1,"type":"event","event":"focus","target":"menu.file"}}"#
@@ -196,12 +239,14 @@ fn history_wire_kinds_and_native_source() {
     );
     // The converged vocabulary projects it under the native source.
     let batch = project_history(&sess.all_events(), &HistoryQuery::default(), 0);
-    assert!(batch
-        .events
-        .iter()
-        .any(|e| e.source == BusSource::Native
-            && matches!(e.kind, tui_lab::events::BusEventKind::Terminal(TerminalEventKind::NativeEvent { .. }))),
-        "native events must carry the native source on the converged timeline");
+    assert!(
+        batch.events.iter().any(|e| e.source == BusSource::Native
+            && matches!(
+                e.kind,
+                tui_lab::events::BusEventKind::Terminal(TerminalEventKind::NativeEvent { .. })
+            )),
+        "native events must carry the native source on the converged timeline"
+    );
     // And the kind filter names it exactly as an agent would ask.
     let only_native = project_history(
         &sess.all_events(),
@@ -231,13 +276,19 @@ fn event_predicate_matches_conjunctively() {
         kind,
     };
     let bell = mk(1, TerminalEventKind::Bell);
-    let title = mk(2, TerminalEventKind::TitleChanged {
-        title: "Editor — file.rs".into(),
-    });
-    let native = mk(3, TerminalEventKind::NativeEvent {
-        event: "focus".into(),
-        target: "menu.file".into(),
-    });
+    let title = mk(
+        2,
+        TerminalEventKind::TitleChanged {
+            title: "Editor — file.rs".into(),
+        },
+    );
+    let native = mk(
+        3,
+        TerminalEventKind::NativeEvent {
+            event: "focus".into(),
+            target: "menu.file".into(),
+        },
+    );
 
     let kinds = |kinds: &[&str]| EventPredicate {
         kinds: kinds.iter().map(|s| s.to_string()).collect(),
@@ -295,10 +346,12 @@ fn wait_event_fires_on_new_output_and_respects_since_seq() {
             contains: None,
             since_seq: Some(sess.event_queue_last_seq()),
         };
-        let out =
-            tui_lab::execution::execute_wait_event(mgr.get_mut(&sid).unwrap(), &pred, 5000)
-                .expect("wait");
-        assert!(out.met, "the delayed second print must produce a screen_changed event");
+        let out = tui_lab::execution::execute_wait_event(mgr.get_mut(&sid).unwrap(), &pred, 5000)
+            .expect("wait");
+        assert!(
+            out.met,
+            "the delayed second print must produce a screen_changed event"
+        );
         assert!(out.matched_seq > 0);
 
         // Re-waiting from the matched cursor finds nothing new and times out.
@@ -307,9 +360,8 @@ fn wait_event_fires_on_new_output_and_respects_since_seq() {
             contains: None,
             since_seq: Some(out.matched_seq),
         };
-        let out2 =
-            tui_lab::execution::execute_wait_event(mgr.get_mut(&sid).unwrap(), &stale, 400)
-                .expect("wait");
+        let out2 = tui_lab::execution::execute_wait_event(mgr.get_mut(&sid).unwrap(), &stale, 400)
+            .expect("wait");
         assert!(!out2.met, "no further screen change is pending");
     }
     mgr.stop(&sid).ok();
@@ -410,9 +462,7 @@ while True:
     );
     // Detach (stop): the pane must SURVIVE — the TUI predates us.
     rt.block_on(async {
-        pool.with_session(Some(
-            pool.active_id().as_deref().unwrap_or(""),
-        ), |s| {
+        pool.with_session(Some(pool.active_id().as_deref().unwrap_or("")), |s| {
             s.stop().expect("stop");
         })
         .await

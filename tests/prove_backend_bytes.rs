@@ -37,7 +37,10 @@ fn hex_echo(n: usize) -> String {
 /// Wait for the HEX readback with a bounded, descriptive budget.
 fn wait_hex<T: TerminalBackend>(b: &mut T, want: &str) {
     let out = b
-        .wait(WaitCond::Text(format!("HEX:{want}")), Duration::from_secs(10))
+        .wait(
+            WaitCond::Text(format!("HEX:{want}")),
+            Duration::from_secs(10),
+        )
         .expect("wait for hex readback");
     assert!(
         out.met,

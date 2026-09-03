@@ -58,12 +58,11 @@ fn scenario_replay_preserves_process_exit_completion() {
     // The recorded action: type "q\n" with completion=process_exit (the
     // child reads a line, echoes it, exits). Replay must wait for the child
     // to EXIT, not for a screen settle that never comes.
-    let scenario = Scenario::new("exit-replay")
-        .act(serde_json::json!({
-            "action": "type",
-            "text": "q\n",
-            "completion": "process_exit"
-        }));
+    let scenario = Scenario::new("exit-replay").act(serde_json::json!({
+        "action": "type",
+        "text": "q\n",
+        "completion": "process_exit"
+    }));
 
     let mut mgr = SessionManager::new();
     let id = python_session(
@@ -92,12 +91,11 @@ fn scenario_replay_preserves_process_exit_completion() {
 fn scenario_replay_preserves_recorded_quiet_window() {
     // A recorded wait_ms travels with the step; replay uses the recorded
     // value, not the old hardcoded 150/1150.
-    let scenario = Scenario::new("quiet-replay")
-        .act(serde_json::json!({
-            "action": "key",
-            "key": "x",
-            "wait_ms": 400
-        }));
+    let scenario = Scenario::new("quiet-replay").act(serde_json::json!({
+        "action": "key",
+        "key": "x",
+        "wait_ms": 400
+    }));
 
     let mut mgr = SessionManager::new();
     let id = python_session(&mut mgr, "import time; time.sleep(10)");
@@ -119,8 +117,8 @@ fn scenario_replay_preserves_recorded_quiet_window() {
 
 #[test]
 fn sensitive_recording_declares_parameter_not_payload() {
-    use tui_lab::scenario::recorder::ScenarioRecorder;
     use tui_lab::scenario::model::SensitiveKind;
+    use tui_lab::scenario::recorder::ScenarioRecorder;
 
     let mut rec = ScenarioRecorder::new("login");
     rec.record_act_sensitive(
@@ -133,12 +131,18 @@ fn sensitive_recording_declares_parameter_not_payload() {
 
     // The value is gone from every serialized step.
     let json = serde_json::to_string(&scenario).unwrap();
-    assert!(!json.contains("hunter2"), "the secret must never land in the scenario file");
+    assert!(
+        !json.contains("hunter2"),
+        "the secret must never land in the scenario file"
+    );
 
     // The parameter is declared, and the step references it.
     assert_eq!(scenario.parameter_names(), vec!["TEXT_1"]);
     let step_text = serde_json::to_string(&scenario.steps[0].params).unwrap();
-    assert!(step_text.contains("${TEXT_1}"), "step references the parameter: {step_text}");
+    assert!(
+        step_text.contains("${TEXT_1}"),
+        "step references the parameter: {step_text}"
+    );
 
     // Roundtrip through JSON preserves the declaration.
     let back: Scenario = serde_json::from_str(&json).unwrap();
@@ -151,14 +155,19 @@ fn unresolved_parameter_fails_structured_not_parse_error() {
         .act(serde_json::json!({"action": "type", "text": "${PASSWORD}", "sensitive": true}));
     // Declare the parameter the way the recorder would.
     let mut scenario = scenario;
-    scenario.parameters.push(tui_lab::scenario::model::SensitiveParameter {
-        name: "PASSWORD".into(),
-        kind: tui_lab::scenario::model::SensitiveKind::Password,
-        description: None,
-    });
+    scenario
+        .parameters
+        .push(tui_lab::scenario::model::SensitiveParameter {
+            name: "PASSWORD".into(),
+            kind: tui_lab::scenario::model::SensitiveKind::Password,
+            description: None,
+        });
 
     let mut mgr = SessionManager::new();
-    let id = python_session(&mut mgr, "import sys; import time; sys.stdin.read(1); time.sleep(5)");
+    let id = python_session(
+        &mut mgr,
+        "import sys; import time; sys.stdin.read(1); time.sleep(5)",
+    );
     let sess = mgr.resolve_mut(Some(&id)).unwrap();
     sess.observe(200).expect("baseline");
 
@@ -167,7 +176,9 @@ fn unresolved_parameter_fails_structured_not_parse_error() {
     let report = ScenarioRunner::run(&scenario, sess);
     assert_eq!(report.steps_failed, 1);
     assert!(
-        report.step_results[0].detail.contains("unresolved_parameter"),
+        report.step_results[0]
+            .detail
+            .contains("unresolved_parameter"),
         "structured failure naming the missing parameter: {}",
         report.step_results[0].detail
     );
@@ -189,11 +200,13 @@ fn supplied_parameter_resolves_and_executes() {
         .act(serde_json::json!({"action": "type", "text": "${PASSWORD}\n"}))
         .assert(serde_json::json!({"assertion": "text", "text": "GOT"}));
     let mut scenario = scenario;
-    scenario.parameters.push(tui_lab::scenario::model::SensitiveParameter {
-        name: "PASSWORD".into(),
-        kind: tui_lab::scenario::model::SensitiveKind::Password,
-        description: None,
-    });
+    scenario
+        .parameters
+        .push(tui_lab::scenario::model::SensitiveParameter {
+            name: "PASSWORD".into(),
+            kind: tui_lab::scenario::model::SensitiveKind::Password,
+            description: None,
+        });
 
     let mut mgr = SessionManager::new();
     let id = python_session(
@@ -228,11 +241,11 @@ fn supplied_parameter_resolves_and_executes() {
 
 #[test]
 fn unknown_native_role_does_not_become_button() {
+    use tui_lab::screen::ScreenState;
     use tui_lab::semantic::cache::SemanticCache;
     use tui_lab::semantic::controls::ControlKind;
-    use tui_lab::semantic::native::{NativeChannel, NativeNode};
     use tui_lab::semantic::fuse;
-    use tui_lab::screen::ScreenState;
+    use tui_lab::semantic::native::{NativeChannel, NativeNode};
 
     // A native-only node with a role outside the vocabulary, plus bounds —
     // the exact case that used to be invented into a clickable Button.

@@ -322,11 +322,14 @@ pub fn fold_mode_states(
     }
     for ev in events {
         // Only insert modes the vocabulary names (mode_name already filters).
-        out.insert(ev.mode, if ev.set {
-            KnownModeState::Enabled
-        } else {
-            KnownModeState::Disabled
-        });
+        out.insert(
+            ev.mode,
+            if ev.set {
+                KnownModeState::Enabled
+            } else {
+                KnownModeState::Disabled
+            },
+        );
     }
     out
 }
@@ -407,7 +410,10 @@ impl ProtocolDecoder {
     /// A trailing partial sequence is *not* emitted — it stays pending until
     /// the next `feed` (or [`Self::finish`]).
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalOp> {
-        self.feed_stamped(bytes).into_iter().map(|(_, op)| op).collect()
+        self.feed_stamped(bytes)
+            .into_iter()
+            .map(|(_, op)| op)
+            .collect()
     }
 
     /// Feed a byte slice; returns each op with the EXACT byte offset where
@@ -448,7 +454,10 @@ impl ProtocolDecoder {
     /// Flush pending text and materialize a trailing unfinished sequence so a
     /// trace never silently drops bytes that ended mid-stream.
     pub fn finish(&mut self) -> Vec<TerminalOp> {
-        self.finish_stamped().into_iter().map(|(_, op)| op).collect()
+        self.finish_stamped()
+            .into_iter()
+            .map(|(_, op)| op)
+            .collect()
     }
 
     /// Core finish: push the tail ops (stamped) into `out`.
@@ -460,39 +469,56 @@ impl ProtocolDecoder {
             DecodeState::Escape => {}
             DecodeState::EscapePrefix(b) => {
                 let at = self.pos.saturating_sub(1);
-                self.emitted.push((at, TerminalOp::Escape {
-                    byte: b,
-                    consumed: None,
-                }));
+                self.emitted.push((
+                    at,
+                    TerminalOp::Escape {
+                        byte: b,
+                        consumed: None,
+                    },
+                ));
             }
             // A CSI with no final byte is genuinely incomplete (malformed
             // stream tail). Surface it as its escaped bytes rather than invent
             // a final byte; an agent seeing it knows the stream was cut.
-            DecodeState::Csi { private, params, start } => {
+            DecodeState::Csi {
+                private,
+                params,
+                start,
+            } => {
                 if let Some(fb) = raw_final_byte(&params) {
                     let numbers = split_params(&params[..params.len() - 1], private);
-                    self.emitted.push((start, TerminalOp::Csi {
-                        final_byte: fb,
-                        private,
-                        params: numbers.unwrap_or_default(),
-                    }));
+                    self.emitted.push((
+                        start,
+                        TerminalOp::Csi {
+                            final_byte: fb,
+                            private,
+                            params: numbers.unwrap_or_default(),
+                        },
+                    ));
                 }
             }
-            DecodeState::Osc(number, payload, start) | DecodeState::OscSt(number, payload, start) => {
+            DecodeState::Osc(number, payload, start)
+            | DecodeState::OscSt(number, payload, start) => {
                 let op = self.finalize_osc(number, payload);
                 self.emitted.push((start, op));
             }
             DecodeState::StringSeq(kind, payload, start) => {
-                self.emitted.push((start, TerminalOp::OpaqueSequence {
-                    kind,
-                    summary: opaque_summary(&payload),
-                }));
+                self.emitted.push((
+                    start,
+                    TerminalOp::OpaqueSequence {
+                        kind,
+                        summary: opaque_summary(&payload),
+                    },
+                ));
             }
             DecodeState::StringSeqSt(kind, payload, start) => {
-                self.emitted.push((start, TerminalOp::OpaqueSequence {
-                    kind,
-                    summary: opaque_summary(&payload),
-                }));
+                self.emitted.push((
+                    start,
+                    TerminalOp::OpaqueSequence {
+                        kind,
+                        summary: opaque_summary(&payload),
+                    },
+                ));
             }
         }
     }
@@ -536,7 +562,10 @@ impl ProtocolDecoder {
         }
         let bytes = std::mem::take(&mut self.text);
         let start = self.text_start;
-        self.emitted.push((start, TerminalOp::Text(String::from_utf8_lossy(&bytes).into_owned())));
+        self.emitted.push((
+            start,
+            TerminalOp::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        ));
     }
 
     /// Ground-state text byte: fold into the UTF-8 run, decoding complete
@@ -588,10 +617,13 @@ impl ProtocolDecoder {
             DecodeState::EscapePrefix(prefix) => {
                 self.flush_text();
                 let at = self.pos.saturating_sub(1);
-                self.emitted.push((at, TerminalOp::Escape {
-                    byte: prefix,
-                    consumed: Some(b),
-                }));
+                self.emitted.push((
+                    at,
+                    TerminalOp::Escape {
+                        byte: prefix,
+                        consumed: Some(b),
+                    },
+                ));
                 self.state = DecodeState::Ground;
             }
             DecodeState::Csi {
@@ -663,10 +695,13 @@ impl ProtocolDecoder {
                     }
                     0x07 if bel_ok => {
                         self.flush_text();
-                        self.emitted.push((start, TerminalOp::OpaqueSequence {
-                            kind,
-                            summary: opaque_summary(&payload),
-                        }));
+                        self.emitted.push((
+                            start,
+                            TerminalOp::OpaqueSequence {
+                                kind,
+                                summary: opaque_summary(&payload),
+                            },
+                        ));
                         self.state = DecodeState::Ground;
                     }
                     _ if b >= 0x08 => {
@@ -681,10 +716,13 @@ impl ProtocolDecoder {
             DecodeState::StringSeqSt(kind, payload, start) => {
                 if b == b'\\' {
                     self.flush_text();
-                    self.emitted.push((start, TerminalOp::OpaqueSequence {
-                        kind,
-                        summary: opaque_summary(&payload),
-                    }));
+                    self.emitted.push((
+                        start,
+                        TerminalOp::OpaqueSequence {
+                            kind,
+                            summary: opaque_summary(&payload),
+                        },
+                    ));
                     self.state = DecodeState::Ground;
                 } else {
                     self.state = DecodeState::Escape;
@@ -759,10 +797,13 @@ impl ProtocolDecoder {
             _ if (0x20..=0x7f).contains(&b) && b != 0x7f => {
                 self.flush_text();
                 let at = self.pos.saturating_sub(1);
-                self.emitted.push((at, TerminalOp::Escape {
-                    byte: b,
-                    consumed: None,
-                }));
+                self.emitted.push((
+                    at,
+                    TerminalOp::Escape {
+                        byte: b,
+                        consumed: None,
+                    },
+                ));
                 self.state = DecodeState::Ground;
             }
             _ => {
@@ -995,7 +1036,10 @@ mod tests {
         assert_eq!(d.ops[0].op, TerminalOp::Text("hello".into()));
         assert_eq!(d.ops[1].op, TerminalOp::Control(ControlCode::LineFeed));
         assert_eq!(d.ops[2].op, TerminalOp::Text("world".into()));
-        assert_eq!(d.ops[3].op, TerminalOp::Control(ControlCode::CarriageReturn));
+        assert_eq!(
+            d.ops[3].op,
+            TerminalOp::Control(ControlCode::CarriageReturn)
+        );
         assert!(d.has_text());
     }
 
@@ -1041,7 +1085,10 @@ mod tests {
 
         // Bare ESC [ J  -> elided params = empty.
         let d2 = ProtocolTrace::decode(b"\x1b[J");
-        if let TerminalOp::Csi { params, final_byte, .. } = &d2.ops[0].op {
+        if let TerminalOp::Csi {
+            params, final_byte, ..
+        } = &d2.ops[0].op
+        {
             assert_eq!(final_byte, &'J');
             assert!(params.is_empty(), "elided CSI has no params");
         } else {
@@ -1062,7 +1109,11 @@ mod tests {
 
         // OSC8 hyperlink terminated by ST (ESC \) instead of BEL.
         let d2 = ProtocolTrace::decode(b"\x1b]8;https://example.com\x1b\\link\x1b]8;;\x1b\\");
-        let oscs: Vec<_> = d2.ops.iter().filter(|e| e.op.kind() == OpKind::Osc).collect();
+        let oscs: Vec<_> = d2
+            .ops
+            .iter()
+            .filter(|e| e.op.kind() == OpKind::Osc)
+            .collect();
         assert_eq!(oscs.len(), 2);
         assert!(oscs[0].op.describe().contains("https://example.com"));
         assert!(d2.has_text(), "the 'link' text must be decoded");
@@ -1172,7 +1223,11 @@ mod tests {
         stream.extend("設".as_bytes());
 
         let d = ProtocolTrace::decode(&stream);
-        let bel = d.ops.iter().find(|e| e.op.kind() == OpKind::Control).unwrap();
+        let bel = d
+            .ops
+            .iter()
+            .find(|e| e.op.kind() == OpKind::Control)
+            .unwrap();
         assert_eq!(bel.at, 2, "BEL at byte 2");
         let osc0 = &d.ops[2];
         assert!(
@@ -1182,7 +1237,16 @@ mod tests {
         );
         assert_eq!(osc0.at, 3, "OSC-0 began at 3 (right after BEL)");
         let osc8 = &d.ops[3];
-        assert!(matches!(&osc8.op, TerminalOp::Osc { number: Some(8), .. }), "osc8");
+        assert!(
+            matches!(
+                &osc8.op,
+                TerminalOp::Osc {
+                    number: Some(8),
+                    ..
+                }
+            ),
+            "osc8"
+        );
         assert_eq!(osc8.at, osc_st_at, "ST-terminated OSC offset must be exact");
         let csi = &d.ops[4];
         assert!(
@@ -1205,7 +1269,11 @@ mod tests {
         // "rest" must flush on the break with its real stream offset (13).
         stamped.extend(dec.feed_stamped(&stream[5..]));
         let text = stamped.iter().find(|(_, op)| op.kind() == OpKind::Text);
-        assert_eq!(text.map(|(at, _)| *at), Some(10), "text run began at 10 (after the 10-byte OSC)");
+        assert_eq!(
+            text.map(|(at, _)| *at),
+            Some(10),
+            "text run began at 10 (after the 10-byte OSC)"
+        );
         let osc = stamped.iter().find(|(_, op)| op.kind() == OpKind::Osc);
         assert_eq!(osc.map(|(at, _)| *at), Some(0), "OSC began at 0");
     }
@@ -1217,8 +1285,15 @@ mod tests {
         // base64 of "secret" is c2VjcmV0.
         let stream = b"\x1b]52;c;c2VjcmV0\x07";
         let d = ProtocolTrace::decode(stream);
-        if let TerminalOp::Osc { number: Some(52), payload } = &d.ops[0].op {
-            assert!(payload.contains("redacted=true"), "redaction note: {payload}");
+        if let TerminalOp::Osc {
+            number: Some(52),
+            payload,
+        } = &d.ops[0].op
+        {
+            assert!(
+                payload.contains("redacted=true"),
+                "redaction note: {payload}"
+            );
             assert!(!payload.contains("c2VjcmV0"), "payload must not leak");
         } else {
             panic!("not osc52: {:?}", d.ops[0].op);
@@ -1226,7 +1301,11 @@ mod tests {
         // Opt-in preserves it (payload includes the `c;` clipboard selector
         // — finalize splits only the leading OSC number off).
         let d2 = ProtocolTrace::decode_with_sensitive(stream);
-        if let TerminalOp::Osc { number: Some(52), payload } = &d2.ops[0].op {
+        if let TerminalOp::Osc {
+            number: Some(52),
+            payload,
+        } = &d2.ops[0].op
+        {
             assert_eq!(payload, "c;c2VjcmV0");
         } else {
             panic!("not osc52 with sensitive");
@@ -1243,15 +1322,33 @@ mod tests {
         stream.extend(b"\x1b^privacy\x1b\\"); // PM
         stream.extend(b"\x1bXsos\x1b\\"); // SOS
         let d = ProtocolTrace::decode(&stream);
-        let opaque: Vec<&TraceEntry> = d.ops.iter().filter(|e| e.op.kind() == OpKind::Opaque).collect();
+        let opaque: Vec<&TraceEntry> = d
+            .ops
+            .iter()
+            .filter(|e| e.op.kind() == OpKind::Opaque)
+            .collect();
         assert_eq!(opaque.len(), 4, "all four string kinds, got {:?}", d.ops);
         assert!(
             matches!(&opaque[0].op, TerminalOp::OpaqueSequence { kind: StringKind::Dcs, summary } if summary.contains("0;1|9;2|")),
             "dcs payload kept"
         );
-        assert!(matches!(&opaque[1].op, TerminalOp::OpaqueSequence { kind: StringKind::Apc, summary } if summary == "kitty-query"));
-        assert!(matches!(&opaque[2].op, TerminalOp::OpaqueSequence { kind: StringKind::Pm, .. }));
-        assert!(matches!(&opaque[3].op, TerminalOp::OpaqueSequence { kind: StringKind::Sos, .. }));
+        assert!(
+            matches!(&opaque[1].op, TerminalOp::OpaqueSequence { kind: StringKind::Apc, summary } if summary == "kitty-query")
+        );
+        assert!(matches!(
+            &opaque[2].op,
+            TerminalOp::OpaqueSequence {
+                kind: StringKind::Pm,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &opaque[3].op,
+            TerminalOp::OpaqueSequence {
+                kind: StringKind::Sos,
+                ..
+            }
+        ));
         // Offsets: DCS at 0, APC at 11, PM at 26, SOS at 37.
         assert_eq!(opaque[0].at, 0);
         assert_eq!(opaque[1].at, 11);
@@ -1269,7 +1366,9 @@ mod tests {
         assert_eq!(second.len(), 2, "DCS op + trailing text run");
         let (at, op) = &second[0];
         assert_eq!(*at, 0);
-        assert!(matches!(op, TerminalOp::OpaqueSequence { kind: StringKind::Dcs, summary } if summary == "data"));
+        assert!(
+            matches!(op, TerminalOp::OpaqueSequence { kind: StringKind::Dcs, summary } if summary == "data")
+        );
         assert_eq!(second[1], (8, TerminalOp::Text("tail".into())));
     }
 
@@ -1293,8 +1392,17 @@ mod tests {
             ]
         );
         // The multi-param CSI produced two events at the SAME offset.
-        let mouse_at: Vec<usize> = d.modes.iter().filter(|m| m.mode.starts_with("mouse")).map(|m| m.at).collect();
-        assert_eq!(mouse_at, vec![mouse_at[0]; 2], "combined CSI shares its start offset");
+        let mouse_at: Vec<usize> = d
+            .modes
+            .iter()
+            .filter(|m| m.mode.starts_with("mouse"))
+            .map(|m| m.at)
+            .collect();
+        assert_eq!(
+            mouse_at,
+            vec![mouse_at[0]; 2],
+            "combined CSI shares its start offset"
+        );
         // The raw CSI ops are still in the op trace.
         assert_eq!(d.of_kind(OpKind::Csi).len(), 5);
     }

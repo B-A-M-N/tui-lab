@@ -87,7 +87,13 @@ fn screen_generation(screen: &tui_lab::screen::ScreenState) -> Option<u64> {
         .max()
 }
 
-fn start_at(mgr: &mut SessionManager, app: &str, cols: u16, rows: u16, env: &[(String, String)]) -> String {
+fn start_at(
+    mgr: &mut SessionManager,
+    app: &str,
+    cols: u16,
+    rows: u16,
+    env: &[(String, String)],
+) -> String {
     mgr.start(
         "python3",
         &[app.to_string()],
@@ -191,7 +197,11 @@ fn env_matrix_term_variants_and_scrubbed_env() {
     let mut mgr = SessionManager::new();
     type EnvCase = (String, &'static str, Vec<(String, String)>);
     let envs: Vec<EnvCase> = vec![
-        ("dumb".into(), "TERM=dumb", vec![("TERM".into(), "dumb".into())]),
+        (
+            "dumb".into(),
+            "TERM=dumb",
+            vec![("TERM".into(), "dumb".into())],
+        ),
         (
             "xterm-256color".into(),
             "TERM=xterm-256color",
@@ -234,16 +244,7 @@ fn env_matrix_term_variants_and_scrubbed_env() {
         "python3 must resolve to an absolute path for clean isolation: {python3:?}"
     );
     let sid = mgr
-        .start(
-            &python3,
-            &[app],
-            None,
-            &[],
-            80,
-            24,
-            "auto",
-            "clean",
-        )
+        .start(&python3, &[app], None, &[], 80, 24, "auto", "clean")
         .expect("clean-isolated launch");
     assert_profile_holds(&mut mgr, &sid, 80, 24, 1, "clean isolation");
     mgr.stop(&sid).ok();
@@ -255,13 +256,7 @@ fn env_matrix_term_variants_and_scrubbed_env() {
 fn floor_size_under_dumb_term_holds() {
     let (_dir, app) = fixture_dir();
     let mut mgr = SessionManager::new();
-    let sid = start_at(
-        &mut mgr,
-        &app,
-        20,
-        8,
-        &[("TERM".into(), "dumb".into())],
-    );
+    let sid = start_at(&mut mgr, &app, 20, 8, &[("TERM".into(), "dumb".into())]);
     assert_profile_holds(&mut mgr, &sid, 20, 8, 1, "20x8 + TERM=dumb");
     mgr.stop(&sid).ok();
 }

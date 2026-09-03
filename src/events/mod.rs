@@ -28,7 +28,9 @@ pub const EVENT_RING_CAPACITY: usize = 4096;
 
 pub mod bus;
 
-pub use bus::{project_history, BusBatch, BusEvent, BusEventKind, BusSource, EventBus, HistoryQuery};
+pub use bus::{
+    project_history, BusBatch, BusEvent, BusEventKind, BusSource, EventBus, HistoryQuery,
+};
 
 /// One thing that happened on a terminal, in order.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

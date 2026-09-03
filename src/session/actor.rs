@@ -143,7 +143,8 @@ impl SessionActor {
     /// ack, then drop our own sender so the actor's `blocking_recv` can
     /// return `None` and the thread join is attainable.
     async fn shutdown_ack(&self) -> Result<(), ActorError> {
-        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
         // Backpressured send: if the mailbox is full this awaits the actor
         // draining a slot, so the Shutdown mail always gets in (review P0.3
@@ -210,9 +211,9 @@ impl SessionActor {
         });
         match self.tx.try_send(Mail::Job(job)) {
             Ok(()) => Ok(rrx),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(ActorError::ActorBusy(
-                self.id.clone(),
-            )),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(ActorError::ActorBusy(self.id.clone()))
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 Err(ActorError::ActorGone(self.id.clone()))
             }
@@ -229,7 +230,8 @@ impl SessionActor {
     /// async path) uses `shutdown_ack` instead; this stays as a bounded
     /// fire-and-join option for non-async contexts.
     pub fn shutdown(&self) {
-        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
         // Retry `try_send` until it lands or the mailbox proves closed. A full
         // mailbox means the actor is draining; it will free a slot, so we
@@ -261,8 +263,7 @@ impl SessionActor {
             // hang this thread forever. `closing=true` means the actor will
             // break on Shutdown regardless of remaining queued jobs.
             use tokio::sync::oneshot::error::TryRecvError;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 match ack_rx.try_recv() {
                     Ok(()) | Err(TryRecvError::Closed) => break,
@@ -328,11 +329,11 @@ impl SessionPool {
     }
 
     /// Create + start a session; the actor owns it from birth (review item 10).
-/// `Session::new` is cheap (pure struct construction) and runs on the async
-/// caller, but the actual launch — `start_with_spec`, which spawns the PTY
-/// and does the initial settle — executes as a job ON the actor thread. The
-/// async caller awaits that job's oneshot, so launch errors surface verbatim
-/// but the blocking process-start no longer holds up a runtime worker.
+    /// `Session::new` is cheap (pure struct construction) and runs on the async
+    /// caller, but the actual launch — `start_with_spec`, which spawns the PTY
+    /// and does the initial settle — executes as a job ON the actor thread. The
+    /// async caller awaits that job's oneshot, so launch errors surface verbatim
+    /// but the blocking process-start no longer holds up a runtime worker.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
@@ -432,7 +433,9 @@ impl SessionPool {
                 env: vec![],
                 cols,
                 rows,
-                backend: crate::session::state::BackendKind::TmuxAttach.display().to_string(),
+                backend: crate::session::state::BackendKind::TmuxAttach
+                    .display()
+                    .to_string(),
                 isolation: "local".to_string(),
             },
         );
@@ -440,7 +443,8 @@ impl SessionPool {
         actor
             .send(move |s: &mut Session| -> anyhow::Result<()> {
                 // "Start" for an attach = verify the pane is still live.
-                s.backend_mut().start(&owned_target, &[], None, &[], cols, rows)?;
+                s.backend_mut()
+                    .start(&owned_target, &[], None, &[], cols, rows)?;
                 Ok(())
             })
             .await
@@ -728,9 +732,13 @@ mod tests {
                 tokio::spawn(async move {
                     let mut sent = 0;
                     for _ in 0..200 {
-                        if actor.send(|_s: &mut Session| {
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                        }).await.is_err() {
+                        if actor
+                            .send(|_s: &mut Session| {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            })
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         sent += 1;
@@ -773,14 +781,18 @@ mod tests {
             .await
             .expect("start");
         let actor = pool.resolve(Some(&id)).expect("actor present");
-        actor.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        actor
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let err = actor
             .send(|_s: &mut Session| 1)
             .await
             .expect_err("post-closing send must fail");
         assert!(matches!(err, ActorError::ActorGone(_)));
         // Restore so the pool can clean up normally.
-        actor.closing.store(false, std::sync::atomic::Ordering::SeqCst);
+        actor
+            .closing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         pool.stop(&id).await.ok();
     }
 }

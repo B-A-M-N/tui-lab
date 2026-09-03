@@ -1020,8 +1020,10 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         // structure), moves only native focus, or produces observable
         // activity (settle Met) has RESPONDED — the old focus-or-structure
         // test labeled such legitimate responses "unresponsive".
-        let focus_moved = tx.focus_before.and_then(|f| f.0.clone()) != tx.focus_after.and_then(|f| f.0.clone());
-        let structure_changed = tx.transition.before_structure_hash != tx.transition.after_structure_hash;
+        let focus_moved =
+            tx.focus_before.and_then(|f| f.0.clone()) != tx.focus_after.and_then(|f| f.0.clone());
+        let structure_changed =
+            tx.transition.before_structure_hash != tx.transition.after_structure_hash;
         let visual_changed = tx.transition.before_visual_hash != tx.transition.after_visual_hash;
         let observable_activity = tx.settle == crate::execution::SettleStatus::Met;
         if focus_moved || structure_changed || visual_changed || observable_activity {
@@ -1507,8 +1509,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 .iter()
                 .filter(|l| {
                     let ll = l.to_lowercase();
-                    strong.iter().any(|m| ll.contains(m))
-                        || weak.iter().any(|m| ll.contains(m))
+                    strong.iter().any(|m| ll.contains(m)) || weak.iter().any(|m| ll.contains(m))
                 })
                 .take(5)
                 .cloned()
@@ -1909,7 +1910,9 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
                     partial_erasers += 1;
                 }
             }
-            TerminalOp::Csi { final_byte: 'H', .. } => cursor_moves += 1,
+            TerminalOp::Csi {
+                final_byte: 'H', ..
+            } => cursor_moves += 1,
             TerminalOp::Csi {
                 final_byte: 'A' | 'B' | 'C' | 'D',
                 ..
@@ -1921,7 +1924,13 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
                 ..
             } => {
                 let mode = params.first().copied().unwrap_or(0);
-                let set = matches!(e.op, TerminalOp::Csi { final_byte: 'h', .. });
+                let set = matches!(
+                    e.op,
+                    TerminalOp::Csi {
+                        final_byte: 'h',
+                        ..
+                    }
+                );
                 match (mode, set) {
                     (2026, true) => sync_on += 1,
                     (2026, false) => sync_off += 1,
@@ -1930,7 +1939,9 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
                     _ => {}
                 }
             }
-            TerminalOp::Csi { final_byte: 'm', .. } => sgr_ops += 1,
+            TerminalOp::Csi {
+                final_byte: 'm', ..
+            } => sgr_ops += 1,
             TerminalOp::Text(_) => text_ops += 1,
             _ => {}
         }
@@ -2540,7 +2551,12 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     let mut osc_color_query = 0usize; // OSC 10/11 ; ? BEL
     for e in &trace.ops {
         match &e.op {
-            TerminalOp::Csi { final_byte: 'c', params, private, .. } => {
+            TerminalOp::Csi {
+                final_byte: 'c',
+                params,
+                private,
+                ..
+            } => {
                 let p0 = params.first().copied().unwrap_or(0);
                 if *private {
                     // `CSI ? ... c` is not a DA request shape we track.
@@ -2549,15 +2565,26 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
                 }
                 let _ = p0;
             }
-            TerminalOp::Csi { final_byte: 'n', params, .. } => {
-                match params.first().copied() {
-                    Some(6) => dsr6 += 1,
-                    Some(5) => dsr5 += 1,
-                    _ => {}
-                }
-            }
-            TerminalOp::Csi { final_byte: 'p', private: true, .. } => decrqm += 1,
-            TerminalOp::Csi { final_byte: 'u', private: true, params, .. } => {
+            TerminalOp::Csi {
+                final_byte: 'n',
+                params,
+                ..
+            } => match params.first().copied() {
+                Some(6) => dsr6 += 1,
+                Some(5) => dsr5 += 1,
+                _ => {}
+            },
+            TerminalOp::Csi {
+                final_byte: 'p',
+                private: true,
+                ..
+            } => decrqm += 1,
+            TerminalOp::Csi {
+                final_byte: 'u',
+                private: true,
+                params,
+                ..
+            } => {
                 if params.is_empty() {
                     kitty_query += 1;
                 }
@@ -2642,7 +2669,10 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     // Cross-check: the answered cursor must equal the live cursor at probe
     // time (1-based). Decode `ESC [ row ; col R` out of the answer bytes.
     let answered_cursor = decode_cpr(&answer);
-    let live = session.observe(0).ok().map(|s| (s.cursor.y as u32 + 1, s.cursor.x as u32 + 1));
+    let live = session
+        .observe(0)
+        .ok()
+        .map(|s| (s.cursor.y as u32 + 1, s.cursor.x as u32 + 1));
     let cursor_matches = match (answered_cursor, live) {
         (Some((r, c)), Some((lr, lc))) => r == lr && c == lc,
         _ => false,
@@ -2653,8 +2683,10 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     let child_asked_events: Vec<u64> = session
         .all_events()
         .into_iter()
-        .filter(|e| matches!(&e.kind,
-            crate::events::TerminalEventKind::QueryAnswered { class } if class == "dsr_cpr"))
+        .filter(|e| {
+            matches!(&e.kind,
+            crate::events::TerminalEventKind::QueryAnswered { class } if class == "dsr_cpr")
+        })
         .map(|e| e.seq)
         .collect();
 
@@ -2702,7 +2734,11 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
         category: "query_response".into(),
         summary,
         evidence: vec![ev_other(
-            if answered { "cpr_probe_measured" } else { "cpr_probe_missing" },
+            if answered {
+                "cpr_probe_measured"
+            } else {
+                "cpr_probe_missing"
+            },
             "measured device-query round trip",
             detail,
         )],
@@ -3365,7 +3401,10 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             severity: "error".into(),
             category: "resize".into(),
             summary: format!("shrink to {sw}x{sh} failed: {e}"),
-            evidence: vec![ev_other_empty("reflow_shrink_failed", "resize returned Err")],
+            evidence: vec![ev_other_empty(
+                "reflow_shrink_failed",
+                "resize returned Err",
+            )],
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
@@ -3385,7 +3424,10 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
                 severity: "error".into(),
                 category: "resize".into(),
                 summary: "observe after shrink failed".into(),
-                evidence: vec![ev_other_empty("reflow_shrink_observe_failed", "observe failed")],
+                evidence: vec![ev_other_empty(
+                    "reflow_shrink_observe_failed",
+                    "observe failed",
+                )],
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
@@ -3435,7 +3477,10 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
                 severity: "error".into(),
                 category: "resize".into(),
                 summary: format!("observe after grow-back failed: {e}"),
-                evidence: vec![ev_other_empty("reflow_grow_observe_failed", "observe failed")],
+                evidence: vec![ev_other_empty(
+                    "reflow_grow_observe_failed",
+                    "observe failed",
+                )],
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),

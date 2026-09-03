@@ -99,64 +99,65 @@ impl ScenarioRunner {
                     continue;
                 }
             }
-            let (step_passed, detail) = match step.kind {
-                StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
-                    Ok(req) => {
-                        // Typed action (Wave-2 item 10): the scenario step's
-                        // JSON is the same shape the live MCP call carried,
-                        // so replay executes exactly what was recorded.
-                        //
-                        // Re-review P0.2: replay honors the RECORDED
-                        // completion and quiet window. The old path forced
-                        // StableScreen/150/1150, so a recorded
-                        // `key q + completion=process_exit` replayed as a
-                        // 150ms screen settle — different semantics, false
-                        // failures on silent/exit actions, and a scenario
-                        // that was never an exact recording of live
-                        // behavior.
-                        let vis = if req.sensitive() {
-                            crate::execution::InputVisibility::Sensitive
-                        } else {
-                            crate::execution::InputVisibility::Normal
-                        };
-                        let quiet = req
-                            .wait_ms()
-                            .or_else(|| req.completion_quiet_ms())
-                            .unwrap_or(150);
-                        let completion =
-                            req.completion()
-                                .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
-                        let (step_passed, detail) =
-                            match crate::execution::CanonicalAction::from_request(&req) {
-                                Ok(action) => {
-                                    match crate::execution::execute_act_with_completion(
-                                        session,
-                                        &action,
-                                        quiet,
-                                        quiet.saturating_add(1000),
-                                        req.no_wait(),
-                                        vis,
-                                        completion,
-                                    ) {
-                                        Ok(tx) => (
-                                            tx.settled(),
-                                            format!(
-                                                "act executed, settled={:?} ({})",
-                                                tx.settle,
-                                                tx.settle_reason()
-                                            ),
-                                        ),
-                                        Err(e) => (false, format!("act failed: {e}")),
-                                    }
-                                }
-                                Err(msg) => (false, format!("invalid act params: {msg}")),
+            let (step_passed, detail) =
+                match step.kind {
+                    StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
+                        Ok(req) => {
+                            // Typed action (Wave-2 item 10): the scenario step's
+                            // JSON is the same shape the live MCP call carried,
+                            // so replay executes exactly what was recorded.
+                            //
+                            // Re-review P0.2: replay honors the RECORDED
+                            // completion and quiet window. The old path forced
+                            // StableScreen/150/1150, so a recorded
+                            // `key q + completion=process_exit` replayed as a
+                            // 150ms screen settle — different semantics, false
+                            // failures on silent/exit actions, and a scenario
+                            // that was never an exact recording of live
+                            // behavior.
+                            let vis = if req.sensitive() {
+                                crate::execution::InputVisibility::Sensitive
+                            } else {
+                                crate::execution::InputVisibility::Normal
                             };
-                        (step_passed, detail)
-                    }
-                    Err(e) => (false, format!("unparseable act step: {e}")),
-                },
-                StepKind::Wait => {
-                    match serde_json::from_value::<TuiWaitParams>(params.clone()) {
+                            let quiet = req
+                                .wait_ms()
+                                .or_else(|| req.completion_quiet_ms())
+                                .unwrap_or(150);
+                            let completion = req
+                                .completion()
+                                .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
+                            let (step_passed, detail) =
+                                match crate::execution::CanonicalAction::from_request(&req) {
+                                    Ok(action) => {
+                                        match crate::execution::execute_act_with_completion(
+                                            session,
+                                            &action,
+                                            quiet,
+                                            quiet.saturating_add(1000),
+                                            req.no_wait(),
+                                            vis,
+                                            completion,
+                                        ) {
+                                            Ok(tx) => (
+                                                tx.settled(),
+                                                format!(
+                                                    "act executed, settled={:?} ({})",
+                                                    tx.settle,
+                                                    tx.settle_reason()
+                                                ),
+                                            ),
+                                            Err(e) => (false, format!("act failed: {e}")),
+                                        }
+                                    }
+                                    Err(msg) => (false, format!("invalid act params: {msg}")),
+                                };
+                            (step_passed, detail)
+                        }
+                        Err(e) => (false, format!("unparseable act step: {e}")),
+                    },
+                    StepKind::Wait => {
+                        match serde_json::from_value::<TuiWaitParams>(params.clone()) {
                         Ok(wp) => match crate::mcp::helpers::build_wait(&wp) {
                             Some(cond) => {
                                 match crate::execution::execute_wait(
@@ -185,75 +186,83 @@ impl ScenarioRunner {
                         },
                         Err(e) => (false, format!("unparseable wait step: {e}")),
                     }
-                }
-                StepKind::Assert => {
-                    match session.observe(50) {
-                        Ok(screen) => {
-                            // Wave E: an oracle assert step carries a
-                            // declarative oracle expression ({"assertion":
-                            // "oracle", "text": "modal_open()"}), evaluated
-                            // through the same language contracts and audits
-                            // use.
-                            let is_oracle = params.get("assertion").and_then(|a| a.as_str())
-                                == Some("oracle");
-                            if is_oracle {
-                                let expr =
-                                    params.get("text").and_then(|t| t.as_str()).or_else(
-                                        || params.get("reference").and_then(|t| t.as_str()),
-                                    );
-                                match expr {
-                                    Some(expr) => {
-                                        // Re-review P0.5: oracle evaluation reads
-                                        // the FUSED semantic truth (native
-                                        // channel participates), the same
-                                        // analysis `tui_observe semantic` shows —
-                                        // never a bare re-inference that can
-                                        // disagree with the observation the
-                                        // caller just made.
-                                        session.poll_native();
-                                        let sem = session.fuse_screen(&screen);
-                                        let outcome =
-                                            crate::design::eval_static(expr, &screen, &sem);
-                                        if outcome.parse_error.is_some() {
-                                            (false, format!("invalid oracle: {}", outcome.detail))
-                                        } else if outcome.passed {
-                                            (true, format!("oracle '{expr}': {}", outcome.detail))
-                                        } else {
-                                            (
-                                                false,
-                                                format!(
-                                                    "oracle '{expr}' failed: {}",
-                                                    outcome.detail
-                                                ),
-                                            )
+                    }
+                    StepKind::Assert => {
+                        match session.observe(50) {
+                            Ok(screen) => {
+                                // Wave E: an oracle assert step carries a
+                                // declarative oracle expression ({"assertion":
+                                // "oracle", "text": "modal_open()"}), evaluated
+                                // through the same language contracts and audits
+                                // use.
+                                let is_oracle = params.get("assertion").and_then(|a| a.as_str())
+                                    == Some("oracle");
+                                if is_oracle {
+                                    let expr =
+                                        params.get("text").and_then(|t| t.as_str()).or_else(|| {
+                                            params.get("reference").and_then(|t| t.as_str())
+                                        });
+                                    match expr {
+                                        Some(expr) => {
+                                            // Re-review P0.5: oracle evaluation reads
+                                            // the FUSED semantic truth (native
+                                            // channel participates), the same
+                                            // analysis `tui_observe semantic` shows —
+                                            // never a bare re-inference that can
+                                            // disagree with the observation the
+                                            // caller just made.
+                                            session.poll_native();
+                                            let sem = session.fuse_screen(&screen);
+                                            let outcome =
+                                                crate::design::eval_static(expr, &screen, &sem);
+                                            if outcome.parse_error.is_some() {
+                                                (
+                                                    false,
+                                                    format!("invalid oracle: {}", outcome.detail),
+                                                )
+                                            } else if outcome.passed {
+                                                (
+                                                    true,
+                                                    format!("oracle '{expr}': {}", outcome.detail),
+                                                )
+                                            } else {
+                                                (
+                                                    false,
+                                                    format!(
+                                                        "oracle '{expr}' failed: {}",
+                                                        outcome.detail
+                                                    ),
+                                                )
+                                            }
                                         }
+                                        None => (
+                                            false,
+                                            "oracle step missing expression (expected 'text')"
+                                                .into(),
+                                        ),
                                     }
-                                    None => (
-                                        false,
-                                        "oracle step missing expression (expected 'text')".into(),
-                                    ),
-                                }
-                            } else {
-                                match serde_json::from_value::<TuiAssertParams>(params.clone()) {
-                                    Ok(ap) => {
-                                        let (p, d, invalid) =
-                                            crate::execution::execute_assert(&ap, &screen);
-                                        if invalid.is_some() {
-                                            (false, format!("invalid assertion: {d}"))
-                                        } else {
-                                            (p, d)
+                                } else {
+                                    match serde_json::from_value::<TuiAssertParams>(params.clone())
+                                    {
+                                        Ok(ap) => {
+                                            let (p, d, invalid) =
+                                                crate::execution::execute_assert(&ap, &screen);
+                                            if invalid.is_some() {
+                                                (false, format!("invalid assertion: {d}"))
+                                            } else {
+                                                (p, d)
+                                            }
                                         }
+                                        Err(e) => (false, format!("unparseable assert step: {e}")),
                                     }
-                                    Err(e) => (false, format!("unparseable assert step: {e}")),
                                 }
                             }
+                            // A failed observation is an execution error, never a
+                            // fabricated blank screen (re-review item 4).
+                            Err(e) => (false, format!("observe failed during assert: {e}")),
                         }
-                        // A failed observation is an execution error, never a
-                        // fabricated blank screen (re-review item 4).
-                        Err(e) => (false, format!("observe failed during assert: {e}")),
                     }
-                }
-            };
+                };
 
             if step_passed {
                 passed += 1;
@@ -334,10 +343,7 @@ fn check_expect(
 /// step's params (re-review P0.3), or `None` when the step is fully
 /// resolved. Only DECLARED parameters count: an undeclared `${...}` in a
 /// payload is the caller's literal text, not our business.
-fn unresolved_reference(
-    params: &serde_json::Value,
-    scenario: &Scenario,
-) -> Option<String> {
+fn unresolved_reference(params: &serde_json::Value, scenario: &Scenario) -> Option<String> {
     for p in &scenario.parameters {
         let needle = p.reference();
         let mut found = false;

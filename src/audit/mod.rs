@@ -8,9 +8,9 @@ use serde_json::json;
 use std::path::PathBuf;
 
 pub mod compare;
-pub mod repair;
 pub mod driver;
 pub mod orchestrator;
+pub mod repair;
 pub mod transaction;
 pub use driver::*;
 
@@ -236,10 +236,7 @@ impl Finding {
     }
 
     /// Attach probable source loci, returning the finding (chainable).
-    pub fn with_source_refs(
-        mut self,
-        refs: Vec<crate::semantic::source_ref::SourceRef>,
-    ) -> Self {
+    pub fn with_source_refs(mut self, refs: Vec<crate::semantic::source_ref::SourceRef>) -> Self {
         self.source_refs = refs;
         self
     }
@@ -295,8 +292,14 @@ pub fn run(
 pub fn static_profile_available(profile: &str) -> bool {
     matches!(
         profile,
-        "full" | "focus" | "layout" | "clipping" | "discoverability" | "keyboard"
-            | "unicode" | "controls"
+        "full"
+            | "focus"
+            | "layout"
+            | "clipping"
+            | "discoverability"
+            | "keyboard"
+            | "unicode"
+            | "controls"
     )
 }
 
@@ -590,10 +593,7 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
     let _ = screen;
     let mut out = Vec::new();
 
-    fn region_contains(
-        r: &crate::semantic::regions::Region,
-        c: &Control,
-    ) -> bool {
+    fn region_contains(r: &crate::semantic::regions::Region, c: &Control) -> bool {
         let b = &r.bounds;
         // A control is claimed by a region when its label start sits inside
         // the region's bounds (the same join the focus/relationship engines
@@ -939,7 +939,12 @@ mod tests {
             kind: ControlKind::Button,
             label: "Save".into(),
             value: None,
-            bounds: ControlBounds { x: 1, y: 0, width: 4, height: 1 },
+            bounds: ControlBounds {
+                x: 1,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
             region_id: None,
             focusable: true,
             focused: false,
@@ -955,7 +960,12 @@ mod tests {
             id: id.into(),
             kind: crate::semantic::regions::RegionKind::Panel,
             title: None,
-            bounds: crate::semantic::regions::Bounds { x, y: 0, width: w, height: 1 },
+            bounds: crate::semantic::regions::Bounds {
+                x,
+                y: 0,
+                width: w,
+                height: 1,
+            },
             confidence: crate::semantic::Confidence::inferred(0.9, &["test"]),
             parent_id: None,
             child_ids: vec![],

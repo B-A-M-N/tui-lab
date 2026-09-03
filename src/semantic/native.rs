@@ -50,7 +50,12 @@ pub struct EventTuple {
 
 impl EventTuple {
     pub fn new(ts: u64, event: String, target: String, seq: u64) -> Self {
-        Self { ts, event, target, seq }
+        Self {
+            ts,
+            event,
+            target,
+            seq,
+        }
     }
 }
 
@@ -355,8 +360,7 @@ impl NativeChannel {
             // Capture the join facts before the mutable move below — the
             // tree node's id is the key back into `sem.controls`.
             let resolved_id: Option<String> = resolved.as_ref().map(|n| n.id.clone());
-            let resolved_label: Option<String> =
-                resolved.as_ref().and_then(|n| n.label.clone());
+            let resolved_label: Option<String> = resolved.as_ref().and_then(|n| n.label.clone());
             if node.focused == Some(true) {
                 if let Some(n) = resolved.as_deref_mut() {
                     n.state.focused = true;
@@ -444,7 +448,11 @@ impl NativeChannel {
     /// has wrapped around (when `Vec`-based `remove(0)` cap would leave the
     /// cursor past `len`).
     pub fn events_since(&self, seq: u64) -> Vec<EventTuple> {
-        self.events.iter().filter(|e| e.seq > seq).cloned().collect()
+        self.events
+            .iter()
+            .filter(|e| e.seq > seq)
+            .cloned()
+            .collect()
     }
 
     /// The highest sequence number seen so far (0 when no events have been
@@ -541,16 +549,14 @@ fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &Native
     // can point at the app's code. Later frames refresh `source_refs` in
     // place — adapters can sharpen a locus over time.
     if n.identity.is_none() {
-        n.identity = Some(crate::semantic::source_ref::ComponentIdentity::semantic(n.id.clone()));
+        n.identity = Some(crate::semantic::source_ref::ComponentIdentity::semantic(
+            n.id.clone(),
+        ));
     }
     if let Some(identity) = &mut n.identity {
         identity.native_id = Some(node.id.clone());
         if let Some(src) = &node.source {
-            if !identity
-                .source_refs
-                .iter()
-                .any(|r| r == src)
-            {
+            if !identity.source_refs.iter().any(|r| r == src) {
                 identity.source_refs.push(src.clone());
             }
         }
@@ -613,10 +619,7 @@ pub fn native_kind_for_test(slug: &str) -> Option<crate::semantic::controls::Con
 /// Re-review P0 (native-only insertion): place an unmatched native node into
 /// the inferred tree. Attach under the smallest containing node (root when
 /// nothing contains it); returns `false` when the node has no usable bounds.
-fn insert_native_only(
-    root: &mut crate::semantic::node::SemanticNode,
-    native: &NativeNode,
-) -> bool {
+fn insert_native_only(root: &mut crate::semantic::node::SemanticNode, native: &NativeNode) -> bool {
     let [x, y, w, h] = match native.bounds {
         Some(b) if b[2] > 0 && b[3] > 0 => b,
         _ => return false,
@@ -653,10 +656,14 @@ fn native_to_semantic_node(
 ) -> crate::semantic::node::SemanticNode {
     crate::semantic::node::SemanticNode {
         id: native.id.clone(),
-        role: role_from_slug(&native.role)
-            .unwrap_or(crate::semantic::node::Role::Unknown),
+        role: role_from_slug(&native.role).unwrap_or(crate::semantic::node::Role::Unknown),
         parent: None,
-        bounds: crate::semantic::regions::Bounds { x, y, width: w, height: h },
+        bounds: crate::semantic::regions::Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
         label: native.label.clone(),
         value: native.value.clone(),
         state: crate::semantic::node::NodeState {
@@ -857,9 +864,7 @@ pub(crate) mod tests_support {
         if node.label.as_deref() == Some(label) {
             return Some(node);
         }
-        node.children
-            .iter()
-            .find_map(|c| find_label(c, label))
+        node.children.iter().find_map(|c| find_label(c, label))
     }
 
     /// Count leaf nodes with interactive roles (the tree-side counterpart of
@@ -1108,7 +1113,10 @@ mod tests {
         assert!(report.active(), "overlay engaged");
         // Focus: same verdict in both shapes, and in the flat focus info.
         assert_eq!(report.focus_applied.as_deref(), Some("#cancel"));
-        assert!(report.matched.iter().any(|id| id == "#save"), "save matched");
+        assert!(
+            report.matched.iter().any(|id| id == "#save"),
+            "save matched"
+        );
         // Tree side: focused node flagged.
         let cancel_node = crate::semantic::native::tests_support::find_label(&tree.root, "Cancel");
         let save_node = crate::semantic::native::tests_support::find_label(&tree.root, "Save");

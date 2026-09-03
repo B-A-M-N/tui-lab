@@ -1069,8 +1069,8 @@ fn stdio_e2e_closed_run_refuses_driving() {
         serde_json::json!({ "action": "key", "key": "enter", "id": session }),
     );
     assert_eq!(act0["category"], "success", "act while open: {act0}");
-    let tx_before = mcp.tool("tui_run", serde_json::json!({ "action": "status" }))["data"]["counts"]
-        ["transactions"]
+    let tx_before = mcp.tool("tui_run", serde_json::json!({ "action": "status" }))["data"]
+        ["counts"]["transactions"]
         .as_u64()
         .expect("tx count");
 
@@ -1089,10 +1089,22 @@ fn stdio_e2e_closed_run_refuses_driving() {
 
     // Every driving tool now refuses with run_closed.
     for (name, args) in [
-        ("tui_act", serde_json::json!({ "action": "key", "key": "enter", "id": session })),
-        ("tui_wait", serde_json::json!({ "condition": "screen_stable", "budget_ms": 100, "id": session })),
-        ("tui_assert", serde_json::json!({ "assertion": "text", "text": "x", "id": session })),
-        ("tui_probe", serde_json::json!({ "stimulus": { "kind": "none" }, "completion": "stable", "budget_ms": 100, "id": session })),
+        (
+            "tui_act",
+            serde_json::json!({ "action": "key", "key": "enter", "id": session }),
+        ),
+        (
+            "tui_wait",
+            serde_json::json!({ "condition": "screen_stable", "budget_ms": 100, "id": session }),
+        ),
+        (
+            "tui_assert",
+            serde_json::json!({ "assertion": "text", "text": "x", "id": session }),
+        ),
+        (
+            "tui_probe",
+            serde_json::json!({ "stimulus": { "kind": "none" }, "completion": "stable", "budget_ms": 100, "id": session }),
+        ),
     ] {
         let mut a = args;
         a["id"] = serde_json::json!(session);
@@ -1457,7 +1469,10 @@ fn stdio_e2e_native_cooperation_over_the_wire() {
             "cols": 80, "rows": 24,
         }),
     );
-    assert_eq!(start["category"], "success", "fixture start failed: {start}");
+    assert_eq!(
+        start["category"], "success",
+        "fixture start failed: {start}"
+    );
     let session = start["data"]["session"]
         .as_str()
         .expect("session id")
@@ -1485,11 +1500,13 @@ fn stdio_e2e_native_cooperation_over_the_wire() {
     );
     let st = &native["adapter_status"];
     assert_eq!(
-        st["adapter_available"], serde_json::json!(true),
+        st["adapter_available"],
+        serde_json::json!(true),
         "harness injected TUI_LAB_SEMANTIC: {st}"
     );
     assert_eq!(
-        st["native_channel_active"], serde_json::json!(true),
+        st["native_channel_active"],
+        serde_json::json!(true),
         "frames landed: {st}"
     );
     assert_eq!(st["healthy"], serde_json::json!(true), "{st}");
@@ -1499,11 +1516,13 @@ fn stdio_e2e_native_cooperation_over_the_wire() {
     );
     assert_eq!(st["frames_invalid"], serde_json::json!(0), "{st}");
     assert_eq!(
-        native["framework"], serde_json::json!("raw-ansi"),
+        native["framework"],
+        serde_json::json!("raw-ansi"),
         "the app's declared framework must ride the response: {native}"
     );
     assert_eq!(
-        native["app"], serde_json::json!("nsp-demo"),
+        native["app"],
+        serde_json::json!("nsp-demo"),
         "the app's declared name must ride the response: {native}"
     );
     let matched = native["matched"]
@@ -1525,7 +1544,8 @@ fn stdio_e2e_native_cooperation_over_the_wire() {
     assert_eq!(sem["category"], "success", "semantic observe failed: {sem}");
     let focus = &sem["data"]["semantic"]["focus"];
     assert_eq!(
-        focus["confidence"], serde_json::json!(1.0),
+        focus["confidence"],
+        serde_json::json!(1.0),
         "native focus carries confidence 1.0: {focus}"
     );
     let evidence = focus["evidence"]

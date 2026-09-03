@@ -27,7 +27,10 @@ fn detect_ratatui_from_cargo_toml() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.primary.as_ref().map(|c| c.name.as_str()), Some("ratatui"));
+    assert_eq!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("ratatui")
+    );
     assert_eq!(det.primary.as_ref().map(|c| c.class), Some("framework"));
     assert!(det.primary.as_ref().unwrap().confidence >= 0.9);
     assert!(det.evidence.iter().any(|e| e.contains("ratatui")));
@@ -47,13 +50,13 @@ fn detect_crossterm_is_terminal_library_not_framework() {
     // The DETECTION is real (0.9 confidence) — what changed is the class:
     // the primary candidate is terminal_io, not a framework claim.
     assert_eq!(det.confidence(), 0.9);
-    assert_eq!(
-        det.primary.as_ref().map(|c| c.class),
-        Some("terminal_io")
-    );
+    assert_eq!(det.primary.as_ref().map(|c| c.class), Some("terminal_io"));
     // But it IS detected and classified.
     assert_eq!(det.terminal_io.as_deref(), Some("crossterm"));
-    assert!(det.candidates.iter().any(|c| c.name == "crossterm" && c.class == "terminal_io"));
+    assert!(det
+        .candidates
+        .iter()
+        .any(|c| c.name == "crossterm" && c.class == "terminal_io"));
     assert!(det.evidence.iter().any(|e| e.contains("crossterm")));
 }
 
@@ -76,7 +79,10 @@ fn detect_textual_from_package_json() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.primary.as_ref().map(|c| c.name.as_str()), Some("textual"));
+    assert_eq!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("textual")
+    );
     assert!(det.confidence() >= 0.9);
 }
 
@@ -96,8 +102,14 @@ fn detect_opentui_not_textual() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.primary.as_ref().map(|c| c.name.as_str()), Some("opentui"));
-    assert_ne!(det.primary.as_ref().map(|c| c.name.as_str()), Some("textual"));
+    assert_eq!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("opentui")
+    );
+    assert_ne!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("textual")
+    );
 }
 
 #[test]
@@ -128,7 +140,10 @@ fn detect_bubbletea_from_go_mod() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.primary.as_ref().map(|c| c.name.as_str()), Some("bubbletea"));
+    assert_eq!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("bubbletea")
+    );
 }
 
 #[test]
@@ -139,7 +154,10 @@ fn detect_textual_from_python_requirements() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.primary.as_ref().map(|c| c.name.as_str()), Some("textual"));
+    assert_eq!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("textual")
+    );
 }
 
 #[test]
@@ -182,7 +200,10 @@ fn detect_native_adapter_false_when_not_implemented() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.primary.as_ref().map(|c| c.name.as_str()), Some("ratatui"));
+    assert_eq!(
+        det.primary.as_ref().map(|c| c.name.as_str()),
+        Some("ratatui")
+    );
     // Wave F items 58–63: ratatui HAS a native adapter now (see
     // `framework::adapters::snippet_for`). The false-case is covered by
     // frameworks without one — e.g. the ink detection below — so here we
@@ -235,15 +256,25 @@ fn ratatui_plus_crossterm_ranks_framework_over_terminal_io() {
     write_project(&dir, &files);
 
     let det = detect(dir.path().to_str().unwrap());
-    assert_eq!(det.framework(), Some("ratatui"), "framework claim wins primary");
+    assert_eq!(
+        det.framework(),
+        Some("ratatui"),
+        "framework claim wins primary"
+    );
     assert_eq!(
         det.primary.as_ref().map(|c| c.name.as_str()),
         Some("ratatui")
     );
     assert_eq!(det.terminal_io.as_deref(), Some("crossterm"));
     // Both candidates present with their classes.
-    assert!(det.candidates.iter().any(|c| c.name == "ratatui" && c.class == "framework"));
-    assert!(det.candidates.iter().any(|c| c.name == "crossterm" && c.class == "terminal_io"));
+    assert!(det
+        .candidates
+        .iter()
+        .any(|c| c.name == "ratatui" && c.class == "framework"));
+    assert!(det
+        .candidates
+        .iter()
+        .any(|c| c.name == "crossterm" && c.class == "terminal_io"));
     // Candidates are confidence-ordered.
     let confs: Vec<f32> = det.candidates.iter().map(|c| c.confidence).collect();
     let mut sorted = confs.clone();
@@ -266,7 +297,10 @@ fn styling_lib_is_reported_separately_from_framework() {
     let det = detect(dir.path().to_str().unwrap());
     assert_eq!(det.framework(), Some("bubbletea"));
     assert_eq!(det.styling.as_deref(), Some("lipgloss"));
-    assert!(det.candidates.iter().any(|c| c.name == "lipgloss" && c.class == "styling"));
+    assert!(det
+        .candidates
+        .iter()
+        .any(|c| c.name == "lipgloss" && c.class == "styling"));
 }
 
 /// Independent loci agreeing reinforce: textual via pyproject AND

@@ -39,9 +39,7 @@ fn target_resolves(
             .unwrap_or(false),
         // Transaction refs cite the ledger; the id must be a non-empty
         // citable token (the run's transaction records own the mapping).
-        EvidenceKind::Transaction => {
-            target.as_deref().map(|t| !t.is_empty()).unwrap_or(false)
-        }
+        EvidenceKind::Transaction => target.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
         // Frame refs cite `frame:<id>` or the seq-pair form.
         EvidenceKind::Frame => target
             .as_deref()
@@ -55,22 +53,16 @@ fn target_resolves(
         EvidenceKind::Artifact => true, // checked separately via `artifact`
         // Terminal events cite the event stream (bell/title/exit…); the
         // target names the event class — non-empty and specific.
-        EvidenceKind::TerminalEvent => {
-            target.as_deref().map(|t| !t.is_empty()).unwrap_or(false)
-        }
+        EvidenceKind::TerminalEvent => target.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
         // Assertion refs cite a recorded assertion run (pass or fail).
-        EvidenceKind::Assertion => {
-            target.as_deref().map(|t| !t.is_empty()).unwrap_or(false)
-        }
+        EvidenceKind::Assertion => target.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
         // `Other` is the escape hatch the drivers use for measured
         // diagnostics (keyboard_buttons, wide_glyph_overlap, …). It must
         // still NAME what it points at — never an anonymous blob.
         EvidenceKind::Other => target
             .as_deref()
             .map(|t| !t.is_empty())
-            .unwrap_or_else(|| {
-                panic!("{ctx}: Other-kind evidence must carry a named target")
-            }),
+            .unwrap_or_else(|| panic!("{ctx}: Other-kind evidence must carry a named target")),
     }
 }
 
@@ -330,7 +322,8 @@ impl MergedTargets<'_> {
                 a.structure_hashes.contains(t) || b.structure_hashes.contains(t)
             }
             EvidenceKind::Control => {
-                a.control_ids.contains(t) || b.control_ids.contains(t)
+                a.control_ids.contains(t)
+                    || b.control_ids.contains(t)
                     || a.control_labels.contains(t)
                     || b.control_labels.contains(t)
             }

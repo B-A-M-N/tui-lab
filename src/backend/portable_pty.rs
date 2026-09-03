@@ -474,7 +474,8 @@ impl PortablePtyBackend {
             if self.screen_change_log.len() == SCREEN_CHANGE_LOG_CAP {
                 self.screen_change_log.remove(0);
             }
-            self.screen_change_log.push((self.screen_seq, self.last_screen_change_at_ms));
+            self.screen_change_log
+                .push((self.screen_seq, self.last_screen_change_at_ms));
         }
         // Wave F item 53: materialize the parser's scrollback rows so
         // search/observe read plain strings without touching the parser's
@@ -1120,7 +1121,9 @@ impl TerminalBackend for PortablePtyBackend {
             WaitCond::Bell {
                 after_bell_seq: Some(seq),
             } => seq.saturating_sub(1),
-            WaitCond::Bell { after_bell_seq: None } => self.bell_seq,
+            WaitCond::Bell {
+                after_bell_seq: None,
+            } => self.bell_seq,
             _ => self.bell_seq,
         };
         let baseline_interaction_seq = self.interaction_seq();

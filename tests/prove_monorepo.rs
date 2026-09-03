@@ -158,10 +158,7 @@ fn npm_member_resolves_roots_and_detects_from_member() {
     let ws = npm_workspaces();
     let member = ws.path().join("packages").join("tui");
     let ctx = tui_lab::framework::context::ProjectContext::resolve(member.to_str().unwrap());
-    assert_eq!(
-        ctx.package_root.as_deref(),
-        Some(member.to_str().unwrap())
-    );
+    assert_eq!(ctx.package_root.as_deref(), Some(member.to_str().unwrap()));
     assert_eq!(
         ctx.workspace_root.as_deref(),
         Some(ws.path().to_str().unwrap()),
@@ -230,8 +227,7 @@ fn mcp_detect_from_member_reports_member_context() {
         if v["id"] == 2 {
             let data = &v["result"]["structuredContent"]["data"];
             assert_eq!(
-                v["result"]["structuredContent"]["category"],
-                "success",
+                v["result"]["structuredContent"]["category"], "success",
                 "detect over the wire: {v}"
             );
             assert_eq!(
@@ -295,19 +291,17 @@ fn session_from_member_dir_keeps_launch_cwd_provenance() {
         );
         // The member app actually runs.
         let out = sess
-            .wait(
-                tui_lab::backend::WaitCond::Text("MEMBER-APP".into()),
-                5_000,
-            )
+            .wait(tui_lab::backend::WaitCond::Text("MEMBER-APP".into()), 5_000)
             .expect("wait");
-        assert!(out.met, "member app must run: {:?}", out.state.viewport_text);
+        assert!(
+            out.met,
+            "member app must run: {:?}",
+            out.state.viewport_text
+        );
         // Restart reproduces the member-relative launch.
         sess.restart().expect("restart");
         let out2 = sess
-            .wait(
-                tui_lab::backend::WaitCond::Text("MEMBER-APP".into()),
-                5_000,
-            )
+            .wait(tui_lab::backend::WaitCond::Text("MEMBER-APP".into()), 5_000)
             .expect("wait after restart");
         assert!(out2.met, "restarted member app must run again");
     }

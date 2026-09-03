@@ -38,7 +38,10 @@ impl InvokeAffordance {
         if on_target.iter().any(|a| a.action == self.affordance_id) {
             return AffordanceResolution::Available;
         }
-        if screen_affordances.iter().any(|a| a.action == self.affordance_id) {
+        if screen_affordances
+            .iter()
+            .any(|a| a.action == self.affordance_id)
+        {
             return AffordanceResolution::NotOnTarget;
         }
         AffordanceResolution::Missing

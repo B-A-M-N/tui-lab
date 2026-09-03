@@ -51,11 +51,19 @@ fn act_records_causal_render_transaction() {
         "the action must bracket a non-empty byte range"
     );
     assert!(render.complete, "the response must be retained for decode");
-    assert_eq!(render.action, "text", "action.signature() names typed text `text`");
+    assert_eq!(
+        render.action, "text",
+        "action.signature() names typed text `text`"
+    );
     assert!(render.bytes > 0);
 
     // The decoded ops contain the app's literal response text.
-    let joined: String = render.ops.iter().map(|o| o.describe.as_str()).collect::<Vec<_>>().join(" ");
+    let joined: String = render
+        .ops
+        .iter()
+        .map(|o| o.describe.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         joined.contains("GOT:") || render.op_count > 0,
         "decoded ops must reflect the app's response; got: {joined:?}"
@@ -181,7 +189,10 @@ fn mode_states_serialize_unverified_flag() {
     let v = serde_json::to_value(st).unwrap();
     assert_eq!(v, serde_json::json!("unknown"));
     let st = tui_lab::protocol::KnownModeState::Enabled;
-    assert_eq!(serde_json::to_value(st).unwrap(), serde_json::json!("enabled"));
+    assert_eq!(
+        serde_json::to_value(st).unwrap(),
+        serde_json::json!("enabled")
+    );
 }
 
 /// Rendering imbalance under an incomplete window is `unverified` info, not
@@ -260,7 +271,12 @@ fn lifecycle_exit_audit_verifies_clean_exit_teardown() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    for mode in ["alt_screen", "cursor_visible", "mouse_press_release", "bracketed_paste"] {
+    for mode in [
+        "alt_screen",
+        "cursor_visible",
+        "mouse_press_release",
+        "bracketed_paste",
+    ] {
         assert!(
             engaged.contains(&mode),
             "fixture engaged {mode}; baseline saw {engaged:?}"
@@ -273,8 +289,16 @@ fn lifecycle_exit_audit_verifies_clean_exit_teardown() {
         .iter()
         .filter(|f| f.id == "LCX-SIGNAL-EXIT")
         .count();
-    assert_eq!(sig_exits, 2, "SIGINT + SIGTERM both terminate the fixture; findings: {:?}",
-        report.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>());
+    assert_eq!(
+        sig_exits,
+        2,
+        "SIGINT + SIGTERM both terminate the fixture; findings: {:?}",
+        report
+            .findings
+            .iter()
+            .map(|f| f.id.clone())
+            .collect::<Vec<_>>()
+    );
     // The session must be left in a sane state (app relaunched then stopped
     // or restarted) — a follow-up observe must not error.
     let sess = mgr.resolve_mut(Some(&sid)).unwrap();
@@ -396,12 +420,18 @@ fn query_response_audit_measures_real_round_trip() {
         "answer must be a CSI ... R reply, got {ans:?}"
     );
     // Conformance: the answered cursor matches the live cursor at probe time.
-    assert_eq!(detail["cursor_matches_live"], true, "CPR must report the live cursor: {ev}");
+    assert_eq!(
+        detail["cursor_matches_live"], true,
+        "CPR must report the live cursor: {ev}"
+    );
     // The probe is bounded and did not write to the child: no bytes were
     // injected into the app's input (the child is blocked on input(); if
     // the probe had written, it would have read them and exited).
     let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-    assert!(sess.process().running, "the probe must not disturb the child");
+    assert!(
+        sess.process().running,
+        "the probe must not disturb the child"
+    );
 }
 
 /// The event path: when the CHILD itself asks (prints `CSI 6n` on its
@@ -491,7 +521,11 @@ fn navigation_keys_audit_proves_arrow_reversibility() {
     assert!(
         unused.is_none(),
         "arrow-moving fixture must produce right-edge transitions; findings: {:?}",
-        report.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+        report
+            .findings
+            .iter()
+            .map(|f| f.id.clone())
+            .collect::<Vec<_>>()
     );
     // Reverse consistency is reported for the class (either OK or a gap —
     // the proof requirement is that the class got the edge-for-edge check).
@@ -499,7 +533,10 @@ fn navigation_keys_audit_proves_arrow_reversibility() {
         .findings
         .iter()
         .any(|f| f.id.contains("LEFT-RIGHT-REVERSE"));
-    assert!(has_reverse, "left/right class must get its reverse-consistency verdict");
+    assert!(
+        has_reverse,
+        "left/right class must get its reverse-consistency verdict"
+    );
     // The summary names the recorded edge classes.
     let summary = report
         .findings
@@ -593,13 +630,18 @@ fn render_transaction_reports_full_latency_surface() {
         false,
     )
     .expect("act");
-    let r = tx.render.as_ref().expect("portable engine retains raw bytes");
+    let r = tx
+        .render
+        .as_ref()
+        .expect("portable engine retains raw bytes");
     // First byte measured — the app wrote output.
     assert!(r.first_byte_ms.is_some(), "first-byte must be measured");
     assert!(r.first_byte_ms.unwrap() <= tx.elapsed_ms + 100);
     // First frame measured — the app's text changed the parsed screen.
-    assert!(r.first_frame_ms.is_some(),
-        "a text-emitting action must produce a screen frame: render={r:?}");
+    assert!(
+        r.first_frame_ms.is_some(),
+        "a text-emitting action must produce a screen frame: render={r:?}"
+    );
     assert!(r.first_frame_ms.unwrap() <= tx.elapsed_ms + 100);
     // Repaint ratio is a valid share even when no erases occurred.
     assert!(
@@ -613,7 +655,11 @@ fn render_transaction_reports_full_latency_surface() {
         ops_text.contains("GOT:") && ops_text.contains("INV"),
         "decoded ops must carry the app's response text: {ops_text:?}"
     );
-    assert!(r.bytes > 2, "more than the echoed key byte: bytes={}", r.bytes);
+    assert!(
+        r.bytes > 2,
+        "more than the echoed key byte: bytes={}",
+        r.bytes
+    );
 }
 
 // ── Items 27/28: interaction risk classes drive autonomous drivers ───────
@@ -631,14 +677,25 @@ fn risk_classes_fence_commit_labels_for_auto_click() {
         x: 0,
         y: 0,
     };
-    for label in ["Save", "Submit", "Apply", "Deploy", "Connect", "Send", "Authorize"] {
+    for label in [
+        "Save",
+        "Submit",
+        "Apply",
+        "Deploy",
+        "Connect",
+        "Send",
+        "Authorize",
+    ] {
         let base = risk::classify_action(&click);
         let with_label = risk::classify_with_label(base, label);
         assert!(
             with_label >= ActionRisk::Mutating,
             "click on '{label}' must classify at least mutating, got {with_label:?}"
         );
-        assert!(risk::is_commit_label(&format!("  {label} now")), "case/space tolerant");
+        assert!(
+            risk::is_commit_label(&format!("  {label} now")),
+            "case/space tolerant"
+        );
     }
     // A neutral label raises nothing: the raw click class stands.
     assert_eq!(
@@ -658,11 +715,7 @@ fn escape_excluded_from_exploration_pool_by_default() {
     use tui_lab::intent::ActionRisk;
 
     let budget = Budget::from_graph_budget(&Default::default());
-    let admitted: Vec<&str> = budget
-        .admitted_pool()
-        .iter()
-        .map(|(f, _)| f.0)
-        .collect();
+    let admitted: Vec<&str> = budget.admitted_pool().iter().map(|(f, _)| f.0).collect();
     assert!(
         !admitted.contains(&"escape"),
         "Escape (unknown) must be excluded under a mutating allowance: {admitted:?}"
@@ -677,23 +730,18 @@ fn escape_excluded_from_exploration_pool_by_default() {
         allowed_risk: ActionRisk::Unknown,
         ..Budget::from_graph_budget(&Default::default())
     };
-    let admitted: Vec<&str> = budget
-        .admitted_pool()
-        .iter()
-        .map(|(f, _)| f.0)
-        .collect();
-    assert!(admitted.contains(&"escape"), "unknown allowance admits escape");
+    let admitted: Vec<&str> = budget.admitted_pool().iter().map(|(f, _)| f.0).collect();
+    assert!(
+        admitted.contains(&"escape"),
+        "unknown allowance admits escape"
+    );
 
     // Lower to safe: activation keys drop out too.
     let budget = Budget {
         allowed_risk: ActionRisk::Safe,
         ..Budget::from_graph_budget(&Default::default())
     };
-    let admitted: Vec<&str> = budget
-        .admitted_pool()
-        .iter()
-        .map(|(f, _)| f.0)
-        .collect();
+    let admitted: Vec<&str> = budget.admitted_pool().iter().map(|(f, _)| f.0).collect();
     assert!(
         !admitted.contains(&"enter") && !admitted.contains(&"space"),
         "safe allowance excludes activation keys: {admitted:?}"
@@ -706,16 +754,15 @@ fn escape_excluded_from_exploration_pool_by_default() {
 /// not-assumed-safe); with a declared binding it is Mutating.
 #[test]
 fn escape_candidate_risk_follows_declared_evidence() {
-    use tui_lab::exploration::candidates::{CandidateContext, suggest};
+    use tui_lab::exploration::candidates::{suggest, CandidateContext};
     use tui_lab::exploration::state_graph::{ExplorationBudget, StateGraph};
     use tui_lab::intent::ActionRisk;
 
     let screen = screen_fixture();
     let sem = tui_lab::semantic::analyze(&screen);
     let graph = StateGraph::new(ExplorationBudget::default());
-    let current = tui_lab::exploration::state_graph::StateId::from_structure_hash(
-        &screen.structure_hash,
-    );
+    let current =
+        tui_lab::exploration::state_graph::StateId::from_structure_hash(&screen.structure_hash);
     let ctx = CandidateContext {
         state_graph: &graph,
         current,
@@ -739,7 +786,11 @@ fn screen_fixture() -> tui_lab::screen::ScreenState {
     tui_lab::screen::ScreenState {
         cols: 40,
         rows: 2,
-        cursor: tui_lab::screen::CursorState { x: 0, y: 0, visible: true },
+        cursor: tui_lab::screen::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+        },
         title: None,
         cells: Vec::new(),
         viewport_text: vec!["[ OK ]".into(), "".into()],
@@ -772,27 +823,34 @@ fn random_exploration_reports_novelty_scoreboard() {
 
     // Step 1: lands in state A, focuses control c1 → 2 signals.
     let id_a = StateIdentity::from_parts("state-a");
-    let n1 = ledger.note(
-        Some(&id_a),
-        &[],
-        &["button:ok".to_string()],
-        &[],
-        &[],
-    );
+    let n1 = ledger.note(Some(&id_a), &[], &["button:ok".to_string()], &[], &[]);
     assert!(n1.any_novel);
 
     // Step 2: same state, but tab moved focus ok→cancel → focus_edge novel.
     let n2 = ledger.note(
         Some(&id_a),
-        &[("button:ok".to_string(), "button:cancel".to_string(), "tab".to_string())],
+        &[(
+            "button:ok".to_string(),
+            "button:cancel".to_string(),
+            "tab".to_string(),
+        )],
         &["button:ok".to_string(), "button:cancel".to_string()],
         &[],
         &[],
     );
     assert!(n2.any_novel, "new focus edge in a seen state is novelty");
-    assert!(n2.signals.iter().any(|s| s.dimension == "semantic_state" && !s.novel));
-    assert!(n2.signals.iter().any(|s| s.dimension == "focus_edge" && s.novel));
-    assert!(n2.signals.iter().any(|s| s.dimension == "control" && s.novel));
+    assert!(n2
+        .signals
+        .iter()
+        .any(|s| s.dimension == "semantic_state" && !s.novel));
+    assert!(n2
+        .signals
+        .iter()
+        .any(|s| s.dimension == "focus_edge" && s.novel));
+    assert!(n2
+        .signals
+        .iter()
+        .any(|s| s.dimension == "control" && s.novel));
 
     let summary = ledger.summary();
     assert_eq!(summary.semantic_states, 1);
