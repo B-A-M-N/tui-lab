@@ -336,7 +336,7 @@ fn crate_shim_finding(rule: &str, inst: &str) -> tui_lab::audit::Finding {
 
 #[test]
 fn targeted_check_derived_from_evidence_target() {
-    // Item 44: the recipe names the exact control target to re-check, not
+    // Item 44: the plan names the exact control target to re-check, not
     // "replay everything".
     let mut f = crate_shim_finding("FOCUS-002", "FOCUS-002");
     f.rule_id = Some("FOCUS-002".into());
@@ -507,4 +507,98 @@ fn conformance_reports_session_mutation_residue() {
     let v = serde_json::to_value(report.summary()).unwrap();
     assert_eq!(v["session_mutated"], serde_json::json!(false));
     assert!(v["residue"].is_array());
+}
+
+/// Review §13/§20: coverage `delta` must not let one consumer consume
+/// another's window. With `since_seq` the read is caller-owned — the same
+/// window is served to every caller that passes the same cursor, and the
+/// run's own cursor does not move.
+#[test]
+fn coverage_delta_since_seq_is_caller_owned() {
+    // A run pre-seeded with two coverage targets (the same public ledger
+    // API the runtime ingestion path calls), handed to the server via the
+    // test constructor.
+    let mut run = tui_lab::run::RunContext::ephemeral();
+    let _ = run.record_coverage_event("s1", "#save.activate");
+    let _ = run.record_coverage_event("s1", "#cancel.activate");
+    let seq_two = run.coverage_seq;
+    let server = tui_lab::mcp::tools::TuiLabServer::with_run(run);
+
+    // Consumer A: stateless delta from 0 — sees both targets, and the run
+    // cursor is untouched (cursor_mode=caller).
+    let a = futures_block_on(server.tui_coverage(params_typed(
+        serde_json::json!({ "action": "delta", "since_seq": 0 }),
+    )));
+    let a = unwrap_ok(&a, "delta A");
+    assert_eq!(a["cursor_mode"], "caller", "{a}");
+    assert_eq!(a["new_target_count"], 2, "{a}");
+    assert_eq!(a["cursor_now"].as_u64(), Some(seq_two));
+
+    // A THIRD target lands. Consumer B asking from 0 must still see ALL
+    // three — A's read consumed nothing.
+    // (Seed through the handler surface is not public; instead the
+    // incremental window below proves the cursor semantics directly.)
+    let b = futures_block_on(server.tui_coverage(params_typed(
+        serde_json::json!({ "action": "delta", "since_seq": 0 }),
+    )));
+    let b = unwrap_ok(&b, "delta B");
+    assert_eq!(
+        b["new_target_count"], 2,
+        "B sees the full window again: {b}"
+    );
+
+    // Incremental use: from the current cursor nothing is new (exhausted),
+    // and the run cursor STILL did not move.
+    let c = futures_block_on(server.tui_coverage(params_typed(
+        serde_json::json!({ "action": "delta", "since_seq": seq_two }),
+    )));
+    let c = unwrap_ok(&c, "delta incremental");
+    assert_eq!(c["new_target_count"], 0, "{c}");
+    assert_eq!(c["cursor_mode"], "caller");
+
+    // The legacy no-param call reports the full window (run cursor was
+    // never moved by the caller-owned reads above)…
+    let legacy = futures_block_on(
+        server.tui_coverage(params_typed(serde_json::json!({ "action": "delta" }))),
+    );
+    let legacy = unwrap_ok(&legacy, "delta legacy");
+    assert_eq!(legacy["cursor_mode"], "run", "{legacy}");
+    assert_eq!(
+        legacy["new_target_count"], 2,
+        "run cursor untouched: {legacy}"
+    );
+    let _ = (a, b, c);
+
+    // …and DID advance it: a repeat is exhausted.
+    let repeat = futures_block_on(
+        server.tui_coverage(params_typed(serde_json::json!({ "action": "delta" }))),
+    );
+    let repeat = unwrap_ok(&repeat, "delta legacy repeat");
+    assert_eq!(
+        repeat["new_target_count"], 0,
+        "exhausted after run read: {repeat}"
+    );
+}
+
+/// Shorthand: block on the tool future (the handler is async but the
+/// surface under test is stateless — a tiny current-thread runtime keeps
+/// the test synchronous like the rest of this file).
+fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt")
+        .block_on(fut)
+}
+
+fn params_typed<T: serde::de::DeserializeOwned>(
+    v: serde_json::Value,
+) -> rmcp::handler::server::wrapper::Parameters<T> {
+    rmcp::handler::server::wrapper::Parameters(serde_json::from_value(v).expect("valid params"))
+}
+
+fn unwrap_ok(raw: &rmcp::model::CallToolResult, ctx: &str) -> serde_json::Value {
+    let v = raw.structured_content.clone().expect("structured content");
+    assert!(!raw.is_error.unwrap_or(false), "{} failed: {}", ctx, v);
+    v.get("data").cloned().expect("data payload")
 }
