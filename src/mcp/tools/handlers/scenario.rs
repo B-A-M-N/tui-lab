@@ -472,13 +472,39 @@ pub(crate) async fn tui_scenario(
             };
             let selector = p.id.clone();
             let run = s.run.clone();
+            // Audit P0-18: caller-supplied sensitive-parameter values, in
+            // memory only — they ride into the runner and are never
+            // recorded in the ledger or any artifact (the runner resolves
+            // ${NAME} references before execution; only resolved steps
+            // execute, and the ledger stores actions, not the replay's
+            // input values).
+            let parameter_values: Vec<crate::scenario::model::ParameterValue> = p
+                .parameters
+                .as_ref()
+                .map(|m| {
+                    m.iter()
+                        .map(|(name, value)| crate::scenario::model::ParameterValue {
+                            name: name.clone(),
+                            value: value.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             s.with_sess(selector.as_deref(), move |sess| {
                 // Wave G item 76: replay drives the app; a live human
                 // lease refuses the whole run before step one.
                 if let Some(refused) = lease_refused(sess) {
                     return refused;
                 }
-                let report = crate::scenario::runner::ScenarioRunner::run(&scenario, sess);
+                // Audit P0-21: the replay runs inside the run context, so
+                // every executed act step lands in the transaction ledger
+                // and frame evidence through the shared driving pipeline.
+                let report = crate::scenario::runner::ScenarioRunner::run_in_run(
+                    &scenario,
+                    sess,
+                    &parameter_values,
+                    Some(&run),
+                );
                 let (sid, gen) = (sess.id.clone(), sess.generation);
                 let _ = run
                     .lock()

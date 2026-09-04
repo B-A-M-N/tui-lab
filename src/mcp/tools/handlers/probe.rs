@@ -64,7 +64,15 @@ pub(crate) async fn tui_probe(
     // the act tool can (paste, raw bytes, mouse families, resize,
     // signal), not just the old key/type/click trio. Drift probes: no
     // stimulus, or the legacy {"kind":"none"}.
+    // Audit P0-2/P0-3: the stimulus keeps its own guard AND its own
+    // sensitivity policy — a probed `sensitive: true` payload must be
+    // redacted exactly where `tui_act` would redact it.
     let probe_guard = p.stimulus.as_ref().and_then(|s| s.guard());
+    let visibility = p
+        .stimulus
+        .as_ref()
+        .map(|s| s.visibility())
+        .unwrap_or(crate::execution::InputVisibility::Normal);
     let stimulus = match &p.stimulus {
             None => None,
             // A canonical request ALWAYS names a real action; the legacy
@@ -84,6 +92,10 @@ pub(crate) async fn tui_probe(
                 }
             },
         };
+    // The moved-into-the-probe action's shape, captured up front: the
+    // sensitive-capture decision below needs the payload field (Type/Paste)
+    // and length after `stimulus` itself has been consumed.
+    let stim_shape = stimulus.as_ref().map(|a| (a.name(), a.payload_len()));
     // Re-review item 13: the structured capture spec — "the first N
     // frames of the transition" and "sample after a fixed delay" are
     // capture questions the completion names cannot ask. Handled as a
@@ -98,6 +110,17 @@ pub(crate) async fn tui_probe(
     let selector = p.id.clone();
     let run = s.run.clone();
     s.with_sess(selector.as_deref(), move |sess| {
+            // Audit P0-2: a stimulus that sends input IS machine driving.
+            // The human control lease refuses it exactly like tui_act —
+            // leasing the terminal means no key reaches it from any tool.
+            // Drift probes (stimulus none / {kind:none}) stay observational
+            // and remain allowed under a lease.
+            let drives = stimulus.is_some();
+            if drives {
+                if let Some(refused) = crate::mcp::helpers::lease_refused(sess) {
+                    return refused;
+                }
+            }
             // Item 13: the duration-sample capture needs its delay AFTER the
             // settle; fold it into the effective budget so the wait inside
             // the probe accounts for it.
@@ -105,6 +128,8 @@ pub(crate) async fn tui_probe(
                 Some((_, extra_ms)) if extra_ms > 0 => budget_ms.saturating_add(extra_ms),
                 _ => budget_ms,
             };
+            // Audit P0-16: the capture spec rides INTO the probe — the
+            // transition collector arms at the stimulus, not after settle.
             match crate::diagnostic::run_probe_with_guard(
                 sess,
                 stimulus,
@@ -113,17 +138,85 @@ pub(crate) async fn tui_probe(
                 quiet_ms,
                 effective_budget,
                 probe_guard.as_ref(),
+                visibility,
+                frame_capture,
             ) {
                 Ok(result) => {
                     {
                         let (sid, gen) = (sess.id.clone(), sess.generation);
                         let mut run = run.lock().unwrap();
                         let _ = run.record_event(&sid, "probe");
-                        let _ = run.record_scenario_wait(
-                            &sid,
-                            gen,
-                            serde_json::to_value(&p).unwrap_or_default(),
-                        );
+                        // Audit P0-17: a probe is not a `wait` step. The old
+                        // recording stuffed the whole TuiProbeParams into a
+                        // wait step — a grammar the replay runner parses as
+                        // an empty screen_stable wait, silently dropping the
+                        // stimulus. Truthful evidence instead: the run event
+                        // above carries the probe; scenario recordings get
+                        // the DECOMPOSITION — the stimulus as an act step
+                        // (replayable via the normal act path) when one was
+                        // sent. The settle/observe half is the probe's own
+                        // semantics and is not a replayable wait.
+                        if drives {
+                            if let Some(stim) = p.stimulus.as_ref() {
+                                let mut params = match stim {
+                                    crate::mcp::params::ProbeStimulus::Canonical(req) => {
+                                        serde_json::to_value(req).unwrap_or_default()
+                                    }
+                                    crate::mcp::params::ProbeStimulus::Legacy(legacy) => {
+                                        match legacy.to_action() {
+                                            Some(a) => super::drive::act_request_json(&a),
+                                            None => serde_json::json!({}),
+                                        }
+                                    }
+                                };
+                                if let serde_json::Value::Object(ref mut m) = params {
+                                    m.insert("from_probe".into(), serde_json::Value::Bool(true));
+                                }
+                                // Audit P0-3 (E2E-verified): a sensitive
+                                // stimulus records like a sensitive act —
+                                // the payload field becomes a ${PARAM}
+                                // reference and the secret never reaches the
+                                // scenario file. The old path serialized the
+                                // whole request verbatim, leaking the value.
+                                let sensitive = stim.visibility()
+                                    == crate::execution::InputVisibility::Sensitive;
+                                let payload_field = if sensitive {
+                                    match stim_shape.map(|(n, _)| n) {
+                                        Some("type") => Some("text"),
+                                        Some("paste") => Some("paste"),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                match payload_field {
+                                    Some(field) => {
+                                        let byte_len =
+                                            stim_shape.map(|(_, l)| l).unwrap_or_default();
+                                        let _ = run.record_scenario_act_sensitive(
+                                            &sid,
+                                            gen,
+                                            params,
+                                            field,
+                                            crate::scenario::model::SensitiveKind::Secret,
+                                            byte_len,
+                                        );
+                                    }
+                                    None if sensitive => {
+                                        if let serde_json::Value::Object(ref mut m) = params {
+                                            m.insert(
+                                                "redacted".into(),
+                                                serde_json::Value::Bool(true),
+                                            );
+                                        }
+                                        let _ = run.record_scenario_act(&sid, gen, params);
+                                    }
+                                    None => {
+                                        let _ = run.record_scenario_act(&sid, gen, params);
+                                    }
+                                }
+                            }
+                        }
                     }
                     let events = result
                         .terminal_events
@@ -173,51 +266,13 @@ pub(crate) async fn tui_probe(
                         },
                         "frames_captured": result.frames.len(),
                     });
-                    // Item 13: a frames:N capture — the first N distinct
-                    // frames AFTER the settled state (the microscope view
-                    // of a redraw, animation, or spin loop). Reported
-                    // separately from the probe's own settle frames so the
-                    // completion evidence stays clean; an AfterDuration
-                    // capture samples one frame after a fixed delay.
-                    if let Some(spec) = frame_capture {
-                        let capture_json = match spec {
-                            (count, _) if count > 0 => {
-                                let anchor = sess.event_state().screen_seq;
-                                let outcome = crate::capture::capture_frame_sequence(
-                                    sess.backend_mut(),
-                                    count,
-                                    anchor,
-                                    std::time::Duration::from_millis(budget_ms),
-                                );
-                                json!({
-                                    "requested": outcome.requested,
-                                    "captured": outcome.captured,
-                                    "completed": outcome.completed,
-                                    "reason": outcome.reason.name(),
-                                    "elapsed_ms": outcome.elapsed_ms,
-                                    "frames": outcome.frames.iter().map(|f| json!({
-                                        "structure_hash": f.structure_hash,
-                                        "visual_hash": f.visual_hash,
-                                        "viewport_text": f.viewport_text,
-                                    })).collect::<Vec<_>>(),
-                                })
-                            }
-                            (_, delay_ms) => {
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(5000)));
-                                match sess.observe(30) {
-                                    Ok(f) => json!({
-                                        "sampled_after_ms": delay_ms,
-                                        "frame": {
-                                            "structure_hash": f.structure_hash,
-                                            "visual_hash": f.visual_hash,
-                                            "viewport_text": f.viewport_text,
-                                        },
-                                    }),
-                                    Err(e) => json!({ "error": format!("delayed sample failed: {e}") }),
-                                }
-                            }
-                        };
-                        result_json["capture"] = capture_json;
+                    // Item 13 + audit P0-16: the transition capture rode INTO
+                    // the probe — the collector armed at the stimulus, so
+                    // these are the redraw/flicker frames of the transition
+                    // itself, not the post-settle plateau the old code
+                    // photographed.
+                    if let Some(cap) = &result.transition_capture {
+                        result_json["capture"] = serde_json::to_value(cap).unwrap_or_default();
                     }
                     ok(result_json)
                 }

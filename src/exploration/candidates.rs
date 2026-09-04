@@ -268,7 +268,13 @@ pub fn suggest(
                     ),
                     json!({ "control_id": c.id, "label": c.label, "kind": c.kind }),
                 )],
-                risk: ActionRisk::Safe,
+                // Audit P0-4: the executor realizes this candidate as a
+                // MOUSE CLICK, and a click can activate the control. It
+                // was labeled Safe, so a `max_risk=safe` explorer could
+                // mutate the app while its own risk model claimed it
+                // never would. Mutating is the honest class until a
+                // non-activating focus primitive exists.
+                risk: ActionRisk::Mutating,
                 control_id: Some(c.id.clone()),
             });
         }

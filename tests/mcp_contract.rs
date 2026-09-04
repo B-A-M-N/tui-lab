@@ -3,7 +3,7 @@
 //! The `#[tool]`-generated methods are private and the `ToolRouter::call`
 //! path needs an `rmcp` transport context, so we test the contract at the unit
 //! level: every MCP tool is a thin envelope over these `pub` functions
-//! (`run_assertion`, `build_input`, `build_wait`), the `SessionManager`
+//! (`run_assertion`, `build_input`, `build_wait`), the `SessionPool`
 //! (`start`/`restart`), and the checkpoint/store globals. The tool wrappers
 //! only serialize the results these produce, so exercising them here is the
 //! real contract. (A full stdio-transport dispatch test is a separate,
@@ -13,6 +13,8 @@
 //! `start`, rejection of unsupported backend/isolation, `exit_code` comparing an
 //! expected code, unknown assertions as `invalid_request`, real checkpoint
 //! delete, and non-cast recording as `unsupported`.
+//!
+//! Migrated off the legacy `SessionManager` (audit P1-54).
 
 use tui_lab::backend::{Input, KeyCode, KeyModifiers};
 use tui_lab::error::{Envelope, ErrorCategory};
@@ -20,72 +22,55 @@ use tui_lab::execution::CanonicalAction;
 use tui_lab::mcp::helpers::{build_wait, control_label_exists, err, ok, run_assertion};
 use tui_lab::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 use tui_lab::screen::{ProcessState, ScreenState};
-use tui_lab::session::manager::SessionManager;
+use tui_lab::session::SessionPool;
 
-fn start_child(mgr: &mut SessionManager, command: &str, args: &[&str]) -> String {
-    mgr.start(
-        command,
-        &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        None,
-        &[],
-        80,
-        24,
-        "auto",
-        "local",
-    )
-    .expect("start")
+async fn start_child(pool: &SessionPool, command: &str, args: &[&str]) -> String {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    pool.start(command, &args, None, &[], 80, 24, "auto", "local")
+        .await
+        .expect("start")
 }
 
-#[test]
-fn contract_run_assertion_exit_code_compares_expected_code() {
+#[tokio::test]
+async fn contract_run_assertion_exit_code_compares_expected_code() {
     // Build a screen whose process has exited with code 7.
-    let mut mgr = SessionManager::new();
-    let id = start_child(&mut mgr, "python3", &["-c", "import sys; sys.exit(7)"]);
+    let pool = SessionPool::new();
+    let id = start_child(&pool, "python3", &["-c", "import sys; sys.exit(7)"]).await;
     // Wait for it to exit, then observe.
-    let _ = mgr
-        .resolve_mut(Some(&id))
-        .unwrap()
-        .wait(tui_lab::backend::WaitCond::ProcessExit, 5000);
-    let screen = mgr.resolve_mut(Some(&id)).unwrap().observe(40).unwrap();
-
-    // expected_code == 7 -> passes
-    let p = TuiAssertParams {
-        assertion: "exit_code".into(),
-        text: None,
-        subject: None,
-        reference: None,
-        x: None,
-        y: None,
-        cols: None,
-        rows: None,
-        expected_code: Some(7),
-        id: Some(id.clone()),
-    };
-    let (passed, _, invalid) = run_assertion(&p, &screen);
-    assert!(passed);
-    assert!(invalid.is_none());
+    let (_passed_7, passed_0, detail_0, _invalid_0) = pool
+        .with_session(Some(&id), {
+            let id = id.clone();
+            move |sess| {
+                let _ = &id;
+                let _ = sess.wait(tui_lab::backend::WaitCond::ProcessExit, 5000);
+                let screen = sess.observe(40).expect("observe");
+                let mk = |expected: Option<i32>| TuiAssertParams {
+                    assertion: "exit_code".into(),
+                    text: None,
+                    subject: None,
+                    reference: None,
+                    x: None,
+                    y: None,
+                    cols: None,
+                    rows: None,
+                    expected_code: expected,
+                    id: None,
+                };
+                let (passed, _, invalid) = run_assertion(&mk(Some(7)), &screen);
+                assert!(passed);
+                assert!(invalid.is_none());
+                let (passed0, detail, invalid0) = run_assertion(&mk(Some(0)), &screen);
+                (passed, passed0, detail, invalid0)
+            }
+        })
+        .await
+        .expect("job");
 
     // expected_code == 0 -> fails (real comparison, not just "not running")
-    let p = TuiAssertParams {
-        assertion: "exit_code".into(),
-        text: None,
-        subject: None,
-        reference: None,
-        x: None,
-        y: None,
-        cols: None,
-        rows: None,
-        expected_code: Some(0),
-        id: Some(id),
-    };
-    let (passed, detail, invalid) = run_assertion(&p, &screen);
-    assert!(!passed);
-    assert!(invalid.is_none());
-    assert!(
-        detail.contains("expected exit code 0"),
-        "detail: {}",
-        detail
-    );
+    assert!(_passed_7, "expected_code == 7 passes");
+    assert!(!passed_0);
+    assert!(_invalid_0.is_none());
+    assert!(detail_0.contains("expected exit code 0"), "detail: {detail_0}");
 }
 
 #[test]
@@ -245,21 +230,29 @@ fn contract_checkpoint_store_save_compare_delete() {
     assert!(!store.delete("sess", &name), "second delete is false");
 }
 
-#[test]
-fn contract_restart_preserves_id_and_bumps_generation() {
-    let mut mgr = SessionManager::new();
-    let id = start_child(&mut mgr, "python3", &["-c", "import time; time.sleep(5)"]);
-    let before = mgr.get(&id).unwrap().generation;
-    let (new_id, gen) = mgr.restart(&id).expect("restart");
+#[tokio::test]
+async fn contract_restart_preserves_id_and_bumps_generation() {
+    let pool = SessionPool::new();
+    let id = start_child(&pool, "python3", &["-c", "import time; time.sleep(5)"]).await;
+    let before = pool
+        .with_session(Some(&id), |sess| sess.generation)
+        .await
+        .expect("job");
+    let (new_id, gen) = pool.restart(&id).await.expect("restart");
     assert_eq!(new_id, id, "restart must preserve the session id");
     assert_eq!(gen, before + 1, "generation must increment");
-    assert_eq!(mgr.get(&id).unwrap().generation, before + 1);
+    let after = pool
+        .with_session(Some(&id), |sess| sess.generation)
+        .await
+        .expect("job");
+    assert_eq!(after, before + 1);
+    pool.stop(&id).await.expect("stop");
 }
 
-#[test]
-fn contract_launch_spec_preserved_across_restart() {
-    let mut mgr = SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn contract_launch_spec_preserved_across_restart() {
+    let pool = SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &["-c".to_string(), "print('hi')".to_string()],
@@ -270,28 +263,28 @@ fn contract_launch_spec_preserved_across_restart() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let spec = mgr
-        .get(&id)
-        .unwrap()
-        .launch()
-        .cloned()
+    let spec = pool
+        .with_session(Some(&id), |sess| sess.launch().cloned())
+        .await
+        .expect("job")
         .expect("launch spec");
     assert_eq!(spec.cols, 100);
     assert_eq!(spec.rows, 30);
     assert_eq!(spec.cwd.as_deref(), Some("/tmp"));
     assert_eq!(spec.env, vec![("FOO".to_string(), "bar".to_string())]);
     // Restart reuses the same spec.
-    mgr.restart(&id).unwrap();
-    let spec2 = mgr
-        .get(&id)
-        .unwrap()
-        .launch()
-        .cloned()
+    pool.restart(&id).await.unwrap();
+    let spec2 = pool
+        .with_session(Some(&id), |sess| sess.launch().cloned())
+        .await
+        .expect("job")
         .expect("launch spec");
     assert_eq!(spec2.cols, 100);
     assert_eq!(spec2.cwd.as_deref(), Some("/tmp"));
     assert_eq!(spec2.env, vec![("FOO".to_string(), "bar".to_string())]);
+    pool.stop(&id).await.expect("stop");
 }
 
 #[test]

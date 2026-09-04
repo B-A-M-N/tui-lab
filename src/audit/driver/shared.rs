@@ -45,10 +45,19 @@ pub(super) fn has_incomplete_border(row: &str) -> bool {
     first_is_border != last_is_border
 }
 
-/// Decode the session's retained raw output, or return None with an
-/// honest MODE-NOSRC-style finding when the backend retains nothing.
+/// Decode the session's retained raw output, or return None when the
+/// backend retains nothing (cap 0) or the read FAILED — audit P1-44: the
+/// failure is logged to stderr so a driver that "found no protocol
+/// traffic" because its ring read errored is diagnosable rather than
+/// silently conflated with "no traffic".
 pub(super) fn decode_raw(session: &mut Session) -> Option<(ProtocolTrace, usize, u64)> {
-    let (bytes, cap, dropped) = session.raw_output_window();
+    let (bytes, cap, dropped) = match session.raw_output_window() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[audit] raw output window read failed (reported as no-source): {e}");
+            return None;
+        }
+    };
     if cap == 0 {
         return None;
     }

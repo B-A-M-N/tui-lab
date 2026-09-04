@@ -54,6 +54,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// status) so a promoted run never pretends to be replay-complete
 /// (re-review P0 fix 5).
 const MAX_TRANSACTION_RECORDS: usize = 512;
+/// Audit P1-48: the ledger's memory window is a high-water/low-water pair —
+/// trim fires past HIGH and drains back to LOW, so the resident bound is
+/// exactly HIGH (never HIGH + LOW as the old `MAX + 512` trigger allowed).
+const TRANSACTION_RING_HIGH_WATER: usize = MAX_TRANSACTION_RECORDS * 2;
+const TRANSACTION_RING_LOW_WATER: usize = MAX_TRANSACTION_RECORDS;
 
 /// How many hot frame records the run retains (re-review item 51). Sized
 /// like the transaction ring: enough to answer "what was frame:N?" for a
@@ -355,6 +360,21 @@ pub struct RunContext {
     pub coverage_delta_cursor: u64,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
+    /// Audit P1-46: artifacts that could NOT be restored, with the reason —
+    /// a damaged run comes back usable but DEGRADED, and the agent must
+    /// know its evidence is incomplete. Populated only by `restore`;
+    /// a live run always starts empty.
+    restore_warnings: Vec<RestoreWarning>,
+}
+
+/// One artifact the restorer could not bring back (audit P1-46).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RestoreWarning {
+    /// Which artifact failed (path relative to the run dir, or a ledger
+    /// line range).
+    pub artifact: String,
+    /// Why it was skipped.
+    pub error: String,
 }
 
 /// One native coverage entry (Wave F item 64): an app-declared coverage
@@ -493,11 +513,16 @@ impl RunContext {
         // Declared eviction (P0 fix 5) — for persistent runs this trims the
         // memory window only (disk already holds the records); for
         // ephemeral runs it is a real loss, which the manifest declares.
-        if self.transactions.len() >= MAX_TRANSACTION_RECORDS + 512 {
-            let drop = MAX_TRANSACTION_RECORDS / 2;
-            let new_first = self.transactions[drop].seq;
-            self.transactions.drain(..drop);
-            self.dropped_records += drop as u64;
+        // Audit P1-48: the old high-water trigger (`MAX + 512`) let the
+        // ring hold ~2x its declared bound, and the trim only dropped half
+        // the nominal limit — the comments' "bounded to 512" was false. Now
+        // a true high-water/low-water pair: trim fires at 1024 (HIGH) and
+        // drains back to 512 (LOW), both named constants.
+        if self.transactions.len() >= TRANSACTION_RING_HIGH_WATER {
+            let excess = self.transactions.len() - TRANSACTION_RING_LOW_WATER;
+            let new_first = self.transactions[excess].seq;
+            self.transactions.drain(..excess);
+            self.dropped_records += excess as u64;
             self.first_available_seq = Some(new_first);
         }
     }
@@ -759,12 +784,41 @@ mod tests {
         assert_eq!(first.action, "key");
     }
 
+    /// Audit P1-48: the ledger's memory window honors its declared bound —
+    /// the ring never exceeds HIGH WATER, trims back to LOW WATER, and the
+    /// eviction is declared (dropped_records / first_available_seq).
+    #[test]
+    fn transaction_ring_enforces_declared_bound() {
+        let mut run = RunContext::ephemeral();
+        for _ in 0..(TRANSACTION_RING_HIGH_WATER + 200) {
+            let _ = run.record_event("ring-sess", "wait");
+        }
+        assert!(
+            run.transactions().len() <= TRANSACTION_RING_HIGH_WATER,
+            "ring must not exceed its high-water bound: {} > {}",
+            run.transactions().len(),
+            TRANSACTION_RING_HIGH_WATER
+        );
+        assert!(
+            run.transactions().len() >= TRANSACTION_RING_LOW_WATER,
+            "trim drains to low-water, not below: {} < {}",
+            run.transactions().len(),
+            TRANSACTION_RING_LOW_WATER
+        );
+        assert!(run.dropped_records > 0, "eviction is declared, not silent");
+        assert_eq!(
+            run.first_available_seq,
+            Some(run.transactions()[0].seq),
+            "first_available_seq matches the oldest resident record"
+        );
+        assert!(!run.history_complete(), "an evicted window is incomplete");
+    }
+
     /// Wave B item 14: a PERSISTENT run appends each ledger record to
     /// transactions.jsonl immediately — the file grows with the run, so a
     /// crash cannot lose the unflushed tail.
     #[test]
-    fn persistent_ledger_appends_incrementally() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
+    fn persistent_ledger_appends_incrementally() {        let tmp = tempfile::tempdir().expect("tmpdir");
         let mut run = RunContext::persistent(tmp.path()).expect("run");
 
         // Records stream to the background journal writer; drain-wait for
@@ -1418,6 +1472,47 @@ mod tests {
         );
     }
 
+    /// Audit P1-46: a corrupt artifact file makes restore DEGRADED, not
+    /// silently incomplete — the warning names the artifact and the reason,
+    /// and the usable artifacts still come back.
+    #[test]
+    fn restore_of_corrupt_artifact_is_degraded_with_warning() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        // Corrupt two artifacts: findings.json becomes invalid JSON;
+        // coverage.json becomes valid JSON of the wrong shape.
+        std::fs::write(root.join("findings.json"), b"{not json").expect("corrupt findings");
+        std::fs::write(root.join("coverage.json"), b"[1,2,3]").expect("wrong-shape coverage");
+        // A third artifact stays intact so we can assert the good half came
+        // back too.
+        let restored = RunContext::restore(&root).expect("restore succeeds despite damage");
+        let warnings = restored.restore_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.artifact == "findings.json" && w.error.starts_with("corrupt")),
+            "findings.json corruption must be named: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.artifact == "coverage.json" && w.error.starts_with("corrupt")),
+            "coverage.json shape mismatch must be named: {warnings:?}"
+        );
+        // Absent-but-normal artifacts warn nothing.
+        assert!(
+            !warnings.iter().any(|w| w.artifact == "state_graph.json"),
+            "a missing state graph is not damage: {warnings:?}"
+        );
+        let health = restored.restore_health();
+        assert_eq!(health["degraded"], serde_json::json!(true));
+        assert_eq!(health["warnings"].as_array().map(Vec::len), Some(2));
+        // A healthy run reports clean.
+        let fresh = RunContext::ephemeral();
+        assert!(fresh.restore_warnings().is_empty());
+        assert_eq!(fresh.restore_health()["degraded"], serde_json::json!(false));
+    }
+
     #[test]
     fn resolve_run_dir_accepts_both_root_shapes() {
         let base = tempfile::tempdir().expect("base");
@@ -1513,6 +1608,7 @@ mod tests {
             send_ms: 0,
             settle_ms: 0,
             render: None,
+            transition_capture: None,
         };
         assert!(run.record_interaction("s", &tx).is_err());
         assert!(run.record_event("s", "wait").is_err());

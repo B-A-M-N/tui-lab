@@ -427,7 +427,16 @@ fn fused_identity_of(
 pub fn current_mode_states_pub(
     session: &mut Session,
 ) -> Vec<(String, crate::protocol::KnownModeState)> {
-    let (bytes, cap, dropped) = session.raw_output_window();
+    let (bytes, cap, dropped) = match session.raw_output_window() {
+        Ok(w) => w,
+        // Audit P1-44: a failed read loses the mode dimension for this step
+        // (same honest outcome as a zero-retention engine), with the cause
+        // on stderr.
+        Err(e) => {
+            eprintln!("[exploration] raw output window read failed: {e}");
+            return Vec::new();
+        }
+    };
     if cap == 0 {
         return Vec::new();
     }

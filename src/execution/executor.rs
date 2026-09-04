@@ -10,6 +10,7 @@
 use crate::backend::{CanonicalFrame, CaptureOutcome, WaitCond};
 use crate::capture::CompletionPolicy;
 use crate::session::state::Session;
+use rmcp::serde_json::json;
 
 use super::guard::MutationGuard;
 use super::record::{CanonicalAction, InputVisibility, ObservationAnchor, SettleStatus};
@@ -134,6 +135,7 @@ pub fn execute_act_with_guard(
         no_wait,
         visibility,
         completion,
+        None,
     )
 }
 
@@ -146,7 +148,10 @@ fn execute_act_inner(
     no_wait: bool,
     visibility: InputVisibility,
     completion: CompletionPolicy,
+    transition_capture_frames: Option<usize>,
 ) -> Result<InteractionTransaction, anyhow::Error> {
+    // Transition-capture evidence lands on the transaction (audit P0-16).
+    let mut transition_frames_evidence: Option<serde_json::Value> = None;
     let before = match session.last().cloned() {
         Some(s) => s,
         None => session.observe(0)?,
@@ -253,6 +258,42 @@ fn execute_act_inner(
         (SettleStatus::Skipped, 0, s, None, None)
     } else {
         let budget = settle_budget_ms.max(quiet_ms.saturating_add(1000));
+        // Transition capture (audit P0-16): when armed, the FIRST distinct
+        // screen edges after the send are collected HERE — at the
+        // transition, before the settle wait — so the redraw/flicker frames
+        // the capture exists to diagnose are in the evidence. Each edge
+        // wait resolves quickly (quiet_for: 0), then the completion plan
+        // independently decides the settled after-frame.
+        if let Some(count) = transition_capture_frames {
+            let anchor_seq = baseline.screen_seq;
+            let t0 = std::time::Instant::now();
+            let outcome = crate::capture::capture_frame_sequence(
+                window.sess().backend_mut(),
+                count,
+                anchor_seq,
+                std::time::Duration::from_millis(budget.min(2000)),
+            );
+            let frames_json = outcome
+                .frames
+                .iter()
+                .map(|f| {
+                    json!({
+                        "structure_hash": f.structure_hash,
+                        "visual_hash": f.visual_hash,
+                        "viewport_text": f.viewport_text,
+                    })
+                })
+                .collect::<Vec<_>>();
+            transition_frames_evidence = Some(json!({
+                "requested": outcome.requested,
+                "captured": outcome.captured,
+                "completed": outcome.completed,
+                "reason": outcome.reason.name(),
+                "elapsed_ms": outcome.elapsed_ms,
+                "at_ms_from_send": t0.elapsed().as_millis() as u64,
+                "frames": frames_json,
+            }));
+        }
         // The ONE compiler (re-review P0): every policy becomes a
         // CompletionPlan here; there is no second interpretation anywhere.
         let outcome = run_completion_plan(window.sess(), plan, &baseline, quiet_ms, budget)?;
@@ -396,6 +437,7 @@ fn execute_act_inner(
         send_ms,
         settle_ms,
         render,
+        transition_capture: transition_frames_evidence,
     })
 }
 

@@ -69,6 +69,11 @@ pub struct InteractionTransaction {
     /// the engine cannot retain raw bytes (the honest answer is "no protocol
     /// evidence", not an empty trace).
     pub render: Option<RenderTransaction>,
+    /// Transition-capture evidence (audit P0-16): the first distinct screen
+    /// edges AFTER the send, collected at the transition (before the settle
+    /// wait), each with its capture-time metadata. `None` unless the caller
+    /// armed a transition capture.
+    pub transition_capture: Option<serde_json::Value>,
 }
 
 /// The causal render record of ONE action (re-review item 19): "pressing
@@ -168,7 +173,16 @@ pub(super) fn build_render_transaction(
         // Engine retains no raw bytes: no protocol evidence, honestly none.
         return None;
     }
-    let (bytes, _cap, _dropped) = session.raw_output_window();
+    // Audit P1-44: a failed ring read yields NO protocol evidence (same
+    // honest outcome as a zero-retention engine), with the failure visible
+    // in stderr rather than silently decoded from empty bytes.
+    let (bytes, _cap, _dropped) = match session.raw_output_window() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[transaction] raw output window read failed: {e}");
+            return None;
+        }
+    };
     let lo = offset_before.max(window_start) as usize;
     let hi = offset_after.min(window_end) as usize;
     let complete = window_start <= offset_before && offset_after <= window_end;

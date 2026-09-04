@@ -79,7 +79,14 @@ impl ActionVerb {
     /// raise this (a button labelled "Delete" mutates), never lower it.
     pub fn base_risk(&self) -> ActionRisk {
         match self {
-            ActionVerb::Focus => ActionRisk::Safe,
+            // Audit P0-4: `focus` plans as a MOUSE CLICK in this engine —
+            // and a click on a button is an activation, not mere focus
+            // traversal. Claiming Safe while sending a click let a
+            // `max_risk=safe` explorer mutate the app while believing it
+            // was only moving focus. Until a genuinely non-activating
+            // focus primitive exists (a native focus event or verified
+            // Tab traversal), the honest class is Mutating.
+            ActionVerb::Focus => ActionRisk::Mutating,
             // Activation/click runs the control's action — mutating unless
             // proven otherwise.
             ActionVerb::Activate | ActionVerb::Click | ActionVerb::Toggle | ActionVerb::Select => {
@@ -232,14 +239,14 @@ pub struct ResolvedIntent {
 }
 
 /// Classify the risk of acting on one control: label and kind evidence can
-/// raise the verb's base risk, never lower it (item 33). Focus movement
-/// runs nothing, so label evidence never raises it past `Safe`.
+/// raise the verb's base risk, never lower it (item 33).
 pub fn classify_risk(verb: &ActionVerb, control: Option<&Control>) -> ActionRisk {
     let base = verb.base_risk();
     let Some(c) = control else { return base };
     // Focus/open never execute the control's action; label signals do not
-    // apply to them.
-    if matches!(verb, ActionVerb::Focus) {
+    // apply to them. (Audit P0-4: focus is already Mutating at the base —
+    // its click CAN activate — so there is no Safe shortcut to restore.)
+    if matches!(verb, ActionVerb::Focus | ActionVerb::Open) {
         return base;
     }
     let label = c.label.to_lowercase();

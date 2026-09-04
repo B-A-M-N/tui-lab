@@ -49,6 +49,7 @@ impl RunContext {
             coverage_seq: 0,
             coverage_delta_cursor: 0,
             closed: false,
+            restore_warnings: Vec::new(),
         }
     }
 
@@ -75,6 +76,24 @@ impl RunContext {
     /// The artifact root, if this run persists.
     pub fn run_dir(&self) -> Option<&PathBuf> {
         self.run_dir.as_ref()
+    }
+
+    /// Audit P1-46: what `restore` could not bring back. Empty for a live
+    /// run; a restored run carries its damage report for the rest of its
+    /// life so every status/summary can say "degraded, here is what is
+    /// missing".
+    pub fn restore_warnings(&self) -> &[RestoreWarning] {
+        &self.restore_warnings
+    }
+
+    /// The restore health block for status/resume responses: fully restored
+    /// vs degraded with the warnings inline.
+    pub fn restore_health(&self) -> serde_json::Value {
+        let warnings = self.restore_warnings();
+        serde_json::json!({
+            "degraded": !warnings.is_empty(),
+            "warnings": warnings,
+        })
     }
 
     /// Wave G item 74/75 helper: resolve a run id to its directory under
@@ -244,41 +263,79 @@ impl RunContext {
             run.ledger_flushed_upto = run.transaction_count;
         }
 
-        // Findings.
-        if let Ok(bytes) = std::fs::read(run_dir.join("findings.json")) {
-            if let Ok(f) = serde_json::from_slice::<Vec<crate::audit::Finding>>(&bytes) {
-                run.findings = f;
-            }
+        // Findings. Audit P1-46: a present-but-unparseable artifact is a
+        // restore WARNING, not a silent skip — a forensic harness must be
+        // able to see that its evidence is incomplete.
+        // Helper: read + parse one JSON artifact, recording a warning on
+        // either failure (present-but-unreadable / corrupt). Absent files
+        // are normal (a run may never have produced one) and warn nothing.
+        macro_rules! load_json {
+            ($file:expr, $ty:ty, $slot:expr) => {
+                match std::fs::read(run_dir.join($file)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => run.restore_warnings.push(RestoreWarning {
+                        artifact: $file.to_string(),
+                        error: format!("unreadable: {e}"),
+                    }),
+                    Ok(bytes) => match serde_json::from_slice::<$ty>(&bytes) {
+                        Ok(v) => {
+                            $slot = v;
+                        }
+                        Err(e) => run.restore_warnings.push(RestoreWarning {
+                            artifact: $file.to_string(),
+                            error: format!("corrupt: {e}"),
+                        }),
+                    },
+                }
+            };
         }
+        load_json!(
+            "findings.json",
+            Vec<crate::audit::Finding>,
+            run.findings
+        );
         // Focus graphs (both ledgers).
-        if let Ok(bytes) = std::fs::read(run_dir.join("focus_graph.json")) {
-            if let Ok(t) =
-                serde_json::from_slice::<Vec<(u64, String, Option<String>, Option<String>)>>(&bytes)
-            {
-                run.focus_transitions = t;
-            }
-        }
-        if let Ok(bytes) = std::fs::read(run_dir.join("focus_graph_ids.json")) {
-            if let Ok(g) =
-                serde_json::from_slice::<crate::semantic::focus_graph::FocusGraph>(&bytes)
-            {
-                run.focus_graph = g;
-            }
-        }
+        load_json!(
+            "focus_graph.json",
+            Vec<(u64, String, Option<String>, Option<String>)>,
+            run.focus_transitions
+        );
+        load_json!(
+            "focus_graph_ids.json",
+            crate::semantic::focus_graph::FocusGraph,
+            run.focus_graph
+        );
         // State graph (from its export snapshot; keeps the default budget).
-        if let Ok(bytes) = std::fs::read(run_dir.join("state_graph.json")) {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                run.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
+        // Parsed as raw JSON, then converted — a conversion failure after a
+        // successful parse is still a corrupt artifact worth naming.
+        let state_graph_json: Option<serde_json::Value> = None;
+        let state_graph_json = {
+            let mut slot = state_graph_json;
+            match std::fs::read(run_dir.join("state_graph.json")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => run.restore_warnings.push(RestoreWarning {
+                    artifact: "state_graph.json".to_string(),
+                    error: format!("unreadable: {e}"),
+                }),
+                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(v) => slot = Some(v),
+                    Err(e) => run.restore_warnings.push(RestoreWarning {
+                        artifact: "state_graph.json".to_string(),
+                        error: format!("corrupt: {e}"),
+                    }),
+                },
             }
+            slot
+        };
+        if let Some(v) = state_graph_json {
+            run.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
         }
         // Coverage ledger.
-        if let Ok(bytes) = std::fs::read(run_dir.join("coverage.json")) {
-            if let Ok(l) =
-                serde_json::from_slice::<std::collections::BTreeMap<String, CoverageEntry>>(&bytes)
-            {
-                run.coverage_ledger = l;
-            }
-        }
+        load_json!(
+            "coverage.json",
+            std::collections::BTreeMap<String, CoverageEntry>,
+            run.coverage_ledger
+        );
         // Saved scenarios from the durable dir (id-keyed; name index rebuilt).
         let scen_dir = run_dir.join("scenarios");
         if let Ok(entries) = std::fs::read_dir(&scen_dir) {
@@ -287,12 +344,28 @@ impl RunContext {
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(sc) =
-                        serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes)
-                    {
-                        run.saved_scenarios.insert(sc.id.clone(), sc);
-                    }
+                match std::fs::read(&path) {
+                    Ok(bytes) => match serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes) {
+                        Ok(sc) => {
+                            run.saved_scenarios.insert(sc.id.clone(), sc);
+                        }
+                        Err(e) => run.restore_warnings.push(RestoreWarning {
+                            artifact: path
+                                .strip_prefix(run_dir)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .to_string(),
+                            error: format!("corrupt scenario: {e}"),
+                        }),
+                    },
+                    Err(e) => run.restore_warnings.push(RestoreWarning {
+                        artifact: path
+                            .strip_prefix(run_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string(),
+                        error: format!("unreadable scenario: {e}"),
+                    }),
                 }
             }
         }

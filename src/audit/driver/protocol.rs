@@ -26,7 +26,30 @@ use crate::audit::Finding;
 ///   "did nothing"
 pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let (bytes, cap, dropped) = session.raw_output_window();
+    // Audit P1-44: a failed ring read is a finding (MODE-RDFAIL), not
+    // evidence that the engine retains nothing — those are different
+    // diagnoses with different remedies.
+    let (bytes, cap, dropped) = match session.raw_output_window() {
+        Ok(w) => w,
+        Err(e) => {
+            findings.push(Finding {
+                id: "MODE-RDFAIL".into(),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "terminal_modes".into(),
+                summary: format!("raw output window read FAILED: {e} — mode timeline unavailable"),
+                evidence: vec![ev_other(
+                    "raw_ring_read_failed",
+                    "the backend's raw-output getter errored",
+                    json!({ "error": e.to_string() }),
+                )],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            return findings;
+        }
+    };
     if cap == 0 {
         findings.push(Finding {
             id: "MODE-NOSRC".into(),
@@ -397,10 +420,14 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     };
     let _ = raw;
     {
-        let (bytes, _, _) = session.raw_output_window();
-        for needle in ["\x1b]10;?".as_bytes(), "\x1b]11;?".as_bytes()] {
-            if bytes.windows(needle.len()).any(|w| w == needle) {
-                osc_color_query += 1;
+        // Audit P1-44: ring already proven readable at the top of this
+        // audit; a read failing NOW means the window is unstable — count
+        // nothing rather than scanning empty bytes.
+        if let Ok((bytes, _, _)) = session.raw_output_window() {
+            for needle in ["\x1b]10;?".as_bytes(), "\x1b]11;?".as_bytes()] {
+                if bytes.windows(needle.len()).any(|w| w == needle) {
+                    osc_color_query += 1;
+                }
             }
         }
     }

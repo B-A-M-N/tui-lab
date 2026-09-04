@@ -55,6 +55,27 @@ pub(crate) async fn tui_explore(
     let run = s.run.clone();
     let explore = p.clone();
     let server = s.clone();
+    // Audit P0-5 (second half): the typed selector must also REFUSE the
+    // unknown arm. An unrecognized `max_risk` used to fall through
+    // `known()` → default, which for a SAFETY selector means a typo could
+    // change what the explorer was allowed to do (the old free-string
+    // fallback even widened it to Mutating). A safety knob is not
+    // forward-compatible by nature — refuse and name the accepted values.
+    let max_risk_allowed = match p.max_risk.as_ref() {
+        None => crate::intent::ActionRisk::Safe,
+        Some(crate::mcp::params::Known::Known(r)) => r.to_risk(),
+        Some(crate::mcp::params::Known::Other(o)) => {
+            return err(
+                ErrorCategory::InvalidRequest,
+                format!(
+                    "unknown max_risk '{}' (expected one of: {})",
+                    o,
+                    <crate::mcp::params::ExploreRisk as crate::mcp::params::EnumVariants>::VARIANTS
+                        .join(", ")
+                ),
+            );
+        }
+    };
     // Wave G item 76: random/semantic exploration drives the app, so the
     // human control lease blocks them. guided_candidates and state_graph
     // only read state and stay allowed — they were filtered above (the
@@ -99,11 +120,10 @@ pub(crate) async fn tui_explore(
                         action_history: &action_history,
                         coverage: &coverage,
                         contract,
-                        allowed_risk: p
-                            .max_risk
-                            .as_deref()
-                            .and_then(crate::intent::ActionRisk::parse)
-                            .unwrap_or(crate::intent::ActionRisk::Mutating),
+                        // Audit P0-5: typed selector; the default is SAFE —
+                        // mutation is explicit, and the unknown arm was
+                        // refused before the actor boundary.
+                        allowed_risk: max_risk_allowed,
                     };
                     crate::exploration::candidates::suggest(&screen, &sem, &ctx)
                 };
@@ -125,11 +145,14 @@ pub(crate) async fn tui_explore(
                 // default (mutating) keeps Escape (unknown) out.
                 let budget = {
                     let run = run.lock().unwrap();
+                    // Audit P0-5: typed selector, safe default (see
+                    // guided_candidates above).
                     let allowed_risk = p
                         .max_risk
-                        .as_deref()
-                        .and_then(crate::intent::ActionRisk::parse)
-                        .unwrap_or(crate::intent::ActionRisk::Mutating);
+                        .as_ref()
+                        .and_then(|r| r.known().copied())
+                        .map(|r| r.to_risk())
+                        .unwrap_or(crate::intent::ActionRisk::Safe);
                     crate::exploration::random::Budget {
                         max_actions: p.actions.unwrap_or(run.state_graph.budget().max_actions),
                         allowed_risk,
@@ -196,11 +219,10 @@ pub(crate) async fn tui_explore(
                 // keys from the graph, unreached controls) and executes it
                 // through the canonical executor. Focus edges land in the
                 // run's ID-keyed FocusGraph with the acting key as via.
-                let max_risk = p
-                    .max_risk
-                    .as_deref()
-                    .and_then(crate::intent::ActionRisk::parse)
-                    .unwrap_or(crate::intent::ActionRisk::Mutating);
+                // Audit P0-5: typed selector, safe default (see
+                // guided_candidates above); the unknown arm was refused
+                // before the actor boundary.
+                let max_risk = max_risk_allowed;
                 let (graph_budget, run_graph_summary, contract) = {
                     let run = run.lock().unwrap();
                     (

@@ -114,9 +114,38 @@ where
     let verify_ms = verify_started.elapsed().as_millis() as u64;
     let total_ms = started.elapsed().as_millis() as u64;
 
-    if let Some(residue) = residue {
-        if residue.has_residue() {
-            findings.push(residue_finding(profile, &pre, &residue));
+    match residue {
+        Some(residue) => {
+            if residue.has_residue() {
+                findings.push(residue_finding(profile, &pre, &residue));
+            }
+        }
+        // Audit P0-26: `None` used to be silently treated as "clean". A
+        // verify whose observe FAILED proves nothing — that is an
+        // unverifiable audit, and pretending it passed hides residue
+        // behind a broken observation. Honest outcome: an explicit
+        // AUDIT-UNVERIFIED finding so the caller knows restoration was
+        // never checked.
+        None => {
+            findings.push(Finding {
+                id: "AUDIT-UNVERIFIED".into(),
+                rule_id: None,
+                severity: "warn".into(),
+                category: "audit".into(),
+                summary: format!(
+                    "post-driver verification for '{}' could not observe the screen — restoration was NOT verified, not proven clean",
+                    profile
+                ),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "audit_verify_failed",
+                    "verify observe returned Err; residue state unknown",
+                )
+                .with_detail(json!({ "profile": profile }))],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
         }
     }
     // Stamp the metrics onto the LAST finding's evidence (the residue
@@ -188,6 +217,10 @@ pub fn verify(session: &mut Session, pre: &PreState) -> Option<StateResidue> {
 }
 
 /// The honest finding: the audit could not fully restore what it changed.
+/// Audit P0-27: `structure_changed` stays out of the DEFECT decision (the
+/// app may legitimately animate) but it is no longer silently dropped —
+/// the finding names it as evidence context so a driver that rearranged
+/// the layout is visible in the record.
 pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) -> Finding {
     let mut parts: Vec<String> = Vec::new();
     if let Some((from, to)) = &residue.focus_moved {
@@ -212,6 +245,11 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
             from.clone().unwrap_or_default(),
             to.clone().unwrap_or_default()
         ));
+    }
+    if parts.is_empty() && residue.structure_changed {
+        // Only-structure residue: still a finding — the layout moved and
+        // the caller should know the audit's window onto the app changed.
+        parts.push("screen structure changed during the driver (possibly legitimate animation; verify the app settled)".to_string());
     }
     Finding {
         id: "AUDIT-RESIDUE".into(),

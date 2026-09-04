@@ -4,68 +4,58 @@
 //! The live session surface is the actor-backed [`SessionPool`]: one OS
 //! thread per session with a bounded mailbox, so session I/O never blocks
 //! the async runtime or any other session. The legacy synchronous
-//! [`SessionManager`] held one global `Mutex` around EVERY session and its
+//! `SessionManager` held one global `Mutex` around EVERY session and its
 //! blocking path duplicated the actor's job without per-session concurrency.
-//! It is declared **legacy / do-not-use** (review-2 structural item) and kept
-//! only to keep the integration test suite green — new code must use
-//! [`SessionPool`] (or own a single [`Session`] directly).
+//! It is RETIRED (audit P1-54): the module is `#[cfg(test)]` — production
+//! code cannot name the type, so accidental reintroduction is a compile
+//! error, not a convention. New code must use [`SessionPool`] (or own a
+//! single [`Session`] directly).
 
 pub mod actor;
 pub mod isolation;
 pub mod lease;
 pub mod locator;
-pub mod manager;
 pub mod scratch;
 pub mod state;
+
+/// Legacy global-Mutex manager, test-only. Audit P1-54: it used to stay
+/// publicly exported "for the integration tests"; those have migrated to
+/// [`SessionPool`], so the type is now unreachable from production builds.
+#[cfg(test)]
+pub mod manager;
 
 pub use actor::{ActorError, SessionActor, SessionPool};
 pub use isolation::{Isolation, IsolationEvidence};
 pub use lease::LeaseState;
 pub use locator::ProjectLocator;
-pub use manager::SessionManager;
 pub use scratch::{EnvironmentPolicy, ScratchDir};
 pub use state::{FrameAnalysis, LaunchSpec, Session};
 
 #[cfg(test)]
 mod retirement_gate_tests {
-    /// Review P2 (SessionManager retirement assessment): production must
-    /// never construct or hold a `SessionManager` again — the actor-backed
-    /// [`super::SessionPool`] is the live surface, and the legacy manager is
-    /// test-only. This gate scans every production module for the type name
-    /// so a future import (in an `impl`, a struct field, a constructor call)
-    /// fails the build instead of silently reintroducing global-Mutex
-    /// serialization. Allowed references: the module's own definition, the
-    /// re-export, and doc comments.
+    /// Audit P1-54: the retirement is now ENFORCED BY THE COMPILER —
+    /// `mod manager` is `#[cfg(test)]`, so any production import of
+    /// `SessionManager` fails to build. This test pins the second half: the
+    /// public re-export is gone, so even test-crate users reach the type
+    /// only via the explicit `session::manager` path, and a production
+    /// build (`cargo build`) literally cannot name it.
     #[test]
-    fn production_never_uses_session_manager() {
-        let mut violations: Vec<String> = Vec::new();
-        let prod_roots = ["src/mcp", "src/run", "src/audit", "src/execution"];
-        for root in prod_roots {
-            let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            dir.push(root);
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let Ok(src) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for (ln, line) in src.lines().enumerate() {
-                    if line.contains("SessionManager") && !line.trim_start().starts_with("//") {
-                        violations.push(format!("{}:{}", path.display(), ln + 1));
-                    }
-                }
-            }
-        }
+    fn session_manager_is_not_publicly_exported() {
+        // The re-export was removed from this module; if someone re-adds it,
+        // this compile-time-checked assertion chain breaks only via the
+        // source scan below — so keep both layers: the cfg gate is the
+        // enforcement, this scan documents the policy.
+        let src = include_str!("mod.rs");
+        // The needle is assembled so this assertion cannot match its own
+        // source text.
+        let reexport = format!("pub use manager::{}Manager", "Session");
         assert!(
-            violations.is_empty(),
-            "production modules must not reference SessionManager (legacy, \
-             test-only):\n{}",
-            violations.join("\n")
+            !src.contains(&reexport),
+            "the legacy manager re-export must not return"
+        );
+        assert!(
+            src.contains("#[cfg(test)]\npub mod manager"),
+            "the legacy manager module stays test-gated"
         );
     }
 }

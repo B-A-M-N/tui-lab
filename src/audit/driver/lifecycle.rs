@@ -252,7 +252,33 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         // The reader thread parked the exit bytes in pending ingest; wait()
         // does not drain it.
         session.absorb_ingest_now();
-        session.raw_output_window()
+        // Audit P1-44: a failed teardown-window read means the teardown
+        // analysis has no bytes to judge — report unrestored as UNKNOWN
+        // (empty) rather than decoding an empty trace into "restored
+        // nothing".
+        match session.raw_output_window() {
+            Ok(w) => w,
+            Err(e) => {
+                findings.push(Finding {
+                    id: "TEARDOWN-WINDOW-UNREADABLE".into(),
+                    rule_id: None,
+                    severity: "warn".into(),
+                    category: "lifecycle".into(),
+                    summary: format!(
+                        "raw output window read failed ({e}) — teardown mode restoration UNKNOWN, not verified"
+                    ),
+                    evidence: vec![ev_other(
+                        "raw_ring_read_failed",
+                        "the final-stream read errored",
+                        json!({ "error": e.to_string() }),
+                    )],
+                    confidence: 1.0,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                });
+                (Vec::new(), 0, 0)
+            }
+        }
     };
     let final_trace = crate::protocol::ProtocolTrace::decode(&final_bytes);
     // Teardown map: for each engaged mode, did the final stream contain the
@@ -409,7 +435,31 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         }
         let (bytes_s, _c, dropped_s) = {
             session.absorb_ingest_now();
-            session.raw_output_window()
+            // Audit P1-44: an unreadable window is an honest empty window
+            // (0 resets claimed) only with the failure said out loud.
+            match session.raw_output_window() {
+                Ok(w) => w,
+                Err(e) => {
+                    findings.push(Finding {
+                        id: "LCX-SIGNAL-WINDOW-UNREADABLE".into(),
+                        rule_id: None,
+                        severity: "warn".into(),
+                        category: "lifecycle".into(),
+                        summary: format!(
+                            "raw output window read failed after SIG{sig} ({e}) — final-stream mode resets UNKNOWN"
+                        ),
+                        evidence: vec![ev_other(
+                            "raw_ring_read_failed",
+                            "post-signal stream read errored",
+                            json!({ "signal": sig, "error": e.to_string() }),
+                        )],
+                        confidence: 1.0,
+                        reproduction: None,
+                        source_refs: Vec::new(),
+                    });
+                    (Vec::new(), 0, 0)
+                }
+            }
         };
         let trace_s = crate::protocol::ProtocolTrace::decode(&bytes_s);
         let resets = trace_s.modes.iter().filter(|m| !m.set).count();

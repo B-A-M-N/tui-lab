@@ -41,7 +41,9 @@ serde_yaml = "0.9"
 
 [features]
 default = []
-# Enables the tui-test-rs adapter once that crate stabilizes. Off by default.
+# INTENT marker only (audit P1-53): no code is gated on this today — it does
+# NOT mean Microsoft tui-test is a supported backend. Remove or implement;
+# do not advertise.
 tui_test_backend = []
 
 [dev-dependencies]

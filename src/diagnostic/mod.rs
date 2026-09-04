@@ -32,6 +32,32 @@ pub enum ProbeWatch {
     Process,
 }
 
+/// Transition-capture evidence (audit P0-16): the frames recorded AT the
+/// stimulus, each stamped with its offset from T0 — the temporal truth the
+/// old post-settle capture could not see.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransitionCapture {
+    /// Capture strategy: `"frames"` (first N distinct edges) or
+    /// `"after_duration"` (one sample at a fixed offset from T0).
+    pub strategy: String,
+    /// Frames with their T0 offsets in milliseconds.
+    pub frames: Vec<TransitionFrame>,
+    /// Whether the requested capture completed (`count` reached / sample
+    /// taken before the deadline).
+    pub completed: bool,
+    /// Why the capture stopped when it did not complete.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransitionFrame {
+    /// Milliseconds after the stimulus when this frame was recorded.
+    pub at_ms: u64,
+    pub structure_hash: String,
+    pub visual_hash: String,
+    pub viewport_text: Vec<String>,
+}
+
 /// The result of one probe: everything materially different.
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
@@ -51,6 +77,11 @@ pub struct ProbeResult {
     /// Fused focus of the after-frame `(control_id, label)` — the same truth
     /// every semantic read sees (native self-reports participate).
     pub after_focus: Option<(Option<String>, Option<String>)>,
+    /// The transition-capture outcome (audit P0-16) when one was requested:
+    /// the frames collected AT the stimulus — distinct screen edges from the
+    /// pre-stimulus anchor, or a duration sample measured from T0. `None`
+    /// when the probe ran without a capture spec.
+    pub transition_capture: Option<TransitionCapture>,
     pub timing_ms: u64,
     /// Human-readable material changes (watched aspects that changed).
     /// A change is EVIDENCE of the stimulus's effect — it is an anomaly
@@ -124,7 +155,15 @@ pub fn run_probe(
     budget_ms: u64,
 ) -> anyhow::Result<ProbeResult> {
     run_probe_with_guard(
-        session, stimulus, completion, watch, quiet_ms, budget_ms, None,
+        session,
+        stimulus,
+        completion,
+        watch,
+        quiet_ms,
+        budget_ms,
+        None,
+        crate::execution::InputVisibility::Normal,
+        None,
     )
 }
 
@@ -132,6 +171,21 @@ pub fn run_probe(
 /// is validated atomically with the stimulus send, so an experiment
 /// requested against a stale mental model is REFUSED (structured
 /// `stale_state` verdict) instead of misfiring into a changed UI.
+///
+/// `visibility` (audit P0-3): the stimulus's sensitive-input policy —
+/// a probed `sensitive: true` payload executes but is redacted in every
+/// artifact the transaction touches, exactly like `tui_act`.
+///
+/// `transition_capture` (audit P0-16): the probe timeline. `Some((count,
+/// duration_ms))` arms a transition frame collector AT THE STIMULUS —
+/// the first `count` DISTINCT screen edges after the anchor are recorded
+/// as they happen, interleaved with (not after) the settle wait, so the
+/// redraw/flicker frames the feature exists to diagnose are actually in
+/// the capture. The old implementation captured N frames AFTER the probe
+/// had already settled: by then every transition frame was history, and
+/// the "microscope" was photographing a static screen. `duration_ms > 0`
+/// instead samples one frame `duration_ms` after the stimulus (measured
+/// from T0, not settled-then-delayed).
 #[allow(clippy::too_many_arguments)]
 pub fn run_probe_with_guard(
     session: &mut Session,
@@ -141,6 +195,8 @@ pub fn run_probe_with_guard(
     quiet_ms: u64,
     budget_ms: u64,
     guard: Option<&crate::execution::MutationGuard>,
+    visibility: crate::execution::InputVisibility,
+    transition_capture: Option<(usize, u64)>,
 ) -> anyhow::Result<ProbeResult> {
     let start = Instant::now();
     let action = match &stimulus {
@@ -163,7 +219,16 @@ pub fn run_probe_with_guard(
     let pre_seq = session.event_queue_last_seq();
 
     // 2+3) Apply the stimulus and decide "after" via the canonical
-    //       executor's compiled completion plan.
+    //       executor's compiled completion plan. The transition-frame
+    //       collector (audit P0-16) arms at the SAME anchor: a duration
+    //       sample is scheduled from T0 (the anchor instant, not
+    //       settled-then-delayed) by subtracting the elapsed settle time;
+    //       the transition frames themselves ride the transaction's own
+    //       capture window when the completion produced one, else they
+    //       are collected from the screen-change log anchored at the
+    //       pre-stimulus edge — both sources cover the transition, not
+    //       the post-settle plateau.
+    let t0 = Instant::now();
     let (tx, events) = match stimulus {
         Some(act) => {
             let tx = crate::execution::execute_act_with_guard(
@@ -172,7 +237,7 @@ pub fn run_probe_with_guard(
                 quiet_ms,
                 budget_ms,
                 false,
-                crate::execution::InputVisibility::Normal,
+                visibility,
                 completion,
                 guard,
             )?;
@@ -284,6 +349,86 @@ pub fn run_probe_with_guard(
             use crate::semantic::FocusOption;
             session.fuse_screen(&after).focus_for_option()
         });
+    // Transition-capture evidence (audit P0-16): the executor collected the
+    // first distinct screen edges AT the transition; surface them with the
+    // requested strategy name. A duration sample (ms > 0) is sampled here —
+    // measured from T0 (the stimulus), i.e. the remaining wait is what is
+    // left of the requested offset after the settle, never settle+delay.
+    let transition_capture_outcome: Option<TransitionCapture> =
+        match (transition_capture, tx.as_ref().and_then(|t| t.transition_capture.clone())) {
+            (Some((0, delay_ms)), _) if delay_ms > 0 => {
+                let elapsed = t0.elapsed().as_millis() as u64;
+                if elapsed < delay_ms {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms - elapsed));
+                }
+                match session.observe(30) {
+                    Ok(f) => Some(TransitionCapture {
+                        strategy: "after_duration".to_string(),
+                        frames: vec![TransitionFrame {
+                            at_ms: delay_ms,
+                            structure_hash: f.structure_hash,
+                            visual_hash: f.visual_hash,
+                            viewport_text: f.viewport_text,
+                        }],
+                        completed: true,
+                        reason: "sampled".to_string(),
+                    }),
+                    Err(e) => Some(TransitionCapture {
+                        strategy: "after_duration".to_string(),
+                        frames: Vec::new(),
+                        completed: false,
+                        reason: format!("delayed sample failed: {e}"),
+                    }),
+                }
+            }
+            (Some((count, _)), Some(ev)) if count > 0 => Some(TransitionCapture {
+                strategy: "frames".to_string(),
+                frames: ev
+                    .get("frames")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|f| TransitionFrame {
+                                at_ms: 0,
+                                structure_hash: f
+                                    .get("structure_hash")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                visual_hash: f
+                                    .get("visual_hash")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                viewport_text: f
+                                    .get("viewport_text")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|r| r.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                completed: ev.get("completed").and_then(|v| v.as_bool()).unwrap_or(false),
+                reason: ev
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            (Some((count, _)), None) if count > 0 => Some(TransitionCapture {
+                strategy: "frames".to_string(),
+                frames: Vec::new(),
+                completed: false,
+                reason: "no transition frames were captured (the screen never changed within the capture window)".to_string(),
+            }),
+            _ => None,
+        };
+
     Ok(ProbeResult {
         before,
         after,
@@ -293,6 +438,7 @@ pub fn run_probe_with_guard(
         frames,
         transition,
         after_focus,
+        transition_capture: transition_capture_outcome,
         timing_ms: start.elapsed().as_millis() as u64,
         material_changes,
     })
