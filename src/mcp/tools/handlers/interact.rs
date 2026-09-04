@@ -1,9 +1,21 @@
 //! tui_act / tui_checkpoint: canonical driving and checkpoint comparison.
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{err, err_invalid_selector, lease_refused, ok};
+use crate::mcp::helpers::{err, err_invalid_selector, err_with_details, lease_refused, ok};
 use crate::mcp::params::*;
 use rmcp::serde_json::json;
+
+/// Recover the guard's structured `stale_state` payload from the anyhow
+/// error [`crate::execution::execute_act_with_guard`] wraps it in. Returns
+/// `None` for any other failure. Parsing our own structured marker is the
+/// one deliberate string hop left at this boundary — the alternative was
+/// widening the execution API to carry the JSON typed, which the review
+/// declined as churn.
+fn guard_stale_details(e: &anyhow::Error) -> Option<serde_json::Value> {
+    let msg = e.to_string();
+    let rest = msg.strip_prefix("stale_state: ")?;
+    serde_json::from_str(rest).ok()
+}
 
 /// Body of `tui_checkpoint` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
@@ -157,11 +169,17 @@ pub(crate) async fn tui_act(
                 Err(e) => {
                     // A guard refusal is not a backend failure: classify it
                     // so the agent knows to re-observe, not to retry blind.
-                    let msg = e.to_string();
-                    if msg.starts_with("stale_state") {
-                        return err(ErrorCategory::StaleState, msg);
+                    // The guard's own JSON (check/expected/actual) rides in
+                    // `details`; the prose summary is the message.
+                    if let Some(stale) = guard_stale_details(&e) {
+                        let summary = stale
+                            .get("summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("expected state no longer holds")
+                            .to_string();
+                        return err_with_details(ErrorCategory::StaleState, summary, stale);
                     }
-                    return err(ErrorCategory::BackendError, msg);
+                    return err(ErrorCategory::BackendError, e.to_string());
                 }
             };
             // Scenario recording in progress? Append this act (audit: scenarios
@@ -296,4 +314,204 @@ pub(crate) async fn tui_act(
         })
         .await
         .unwrap_or_else(|e| e)
+}
+
+/// Body of `tui_intent`: resolve a semantic target + verb into a
+/// focus-secured execution plan (review item — the intent system was
+/// engine-complete but had no MCP surface). Plan-only by default: the
+/// response names the exact steps and the risk class BEFORE anything is
+/// sent. `execute=true` runs the plan through the canonical executor —
+/// EnsureFocus as a real click, AssertFocus as a MutationGuard validated
+/// atomically with the payload send, Act through `execute_act`.
+pub(crate) async fn tui_intent(
+    s: &crate::mcp::tools::TuiLabServer,
+    p: rmcp::handler::server::wrapper::Parameters<TuiIntentParams>,
+) -> rmcp::model::CallToolResult {
+    let p = p.0;
+    let verb = match p.verb.parse() {
+        Ok(v) => v,
+        Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
+    };
+    let execute = p.execute.unwrap_or(false);
+    let selector = p.id.clone();
+    let target = p.target.clone();
+    s.with_sess(selector.as_deref(), move |sess| {
+        // Plan against the session's LAST fused frame (observe-before-act):
+        // the semantic truth the agent would have seen from tui_observe
+        // mode=semantic. No forced settle — a caller that wants fresh state
+        // observes first; planning reuses what it saw.
+        let Some(analysis) = sess.analyze_last() else {
+            return err(
+                ErrorCategory::InvalidRequest,
+                "no observed frame yet — observe the session (tui_observe) before planning an intent, or the target has nothing to resolve against",
+            );
+        };
+        let plan = match crate::intent::plan_intent(&analysis.semantic, &target, verb.clone()) {
+            Ok(pl) => pl,
+            // Target resolution failures are refinement-loop payloads, not
+            // malformed requests: category=target_error with the
+            // candidates/matches structured in `details` (review §14).
+            Err(e) => {
+                let details = match &e {
+                    crate::intent::IntentError::Ambiguous { matches, .. } => {
+                        json!({ "reason": "ambiguous_target", "matches": matches })
+                    }
+                    crate::intent::IntentError::NotFound { candidates, .. } => {
+                        json!({ "reason": "target_not_found", "candidates": candidates })
+                    }
+                    crate::intent::IntentError::VerbMismatch { target, verb } => {
+                        json!({ "reason": "verb_mismatch", "target": target, "verb": verb })
+                    }
+                };
+                return err_with_details(ErrorCategory::TargetError, e.message(), details);
+            }
+        };
+        let plan_json = plan_to_json(&plan);
+        if !execute {
+            return ok(json!({
+                "mode": "planned",
+                "control": plan_json["control"],
+                "verb": plan.verb.name(),
+                "risk": plan.risk.name(),
+                "steps": plan_json["steps"],
+                "note": "plan only — nothing was sent; pass execute=true to run these steps in order",
+            }));
+        }
+        // A live human lease blocks execution (planning stays allowed — it
+        // sends nothing).
+        if let Some(refused) = lease_refused(sess) {
+            return refused;
+        }
+        // Execute the plan's steps in order. EnsureFocus/AssertFocus are
+        // plan-level abstractions: the click goes through the executor as
+        // an ordinary action; AssertFocus becomes a focus MutationGuard
+        // validated atomically with the NEXT send.
+        let mut pending_focus_guard: Option<String> = None;
+        let mut executed: Vec<serde_json::Value> = Vec::new();
+        for step in &plan.steps {
+            match step {
+                crate::intent::PlannedStep::EnsureFocus { click, target_id } => {
+                    // Skip the focus click when the target already holds
+                    // focus (the executor's own contract).
+                    let already =
+                        analysis.semantic.focus.control_id.as_deref() == Some(target_id.as_str());
+                    if !already {
+                        // A generous quiet window: the redraw that proves
+                        // the focus move landed must be committed before
+                        // the AssertFocus guard reads it — a focus move
+                        // that half-arrived SHOULD fail the plan, but not
+                        // because we sampled before the app answered.
+                        match crate::execution::execute_act(sess, click, 300, 1300, false) {
+                            Ok(_) => {
+                                executed.push(json!({
+                                    "step": "ensure_focus", "how": "mouse_click",
+                                    "target": target_id, "ok": true,
+                                }))
+                            }
+                            Err(e) => {
+                                return err(ErrorCategory::BackendError, format!(
+                                    "ensure_focus failed before the payload action: {e}"
+                                ))
+                            }
+                        }
+                        // The executor's settle observes through the
+                        // backend's wait path and does NOT refresh the
+                        // session's last frame — the guard below reads
+                        // `analyze_last()`, so observe once to make the
+                        // post-click screen the one it validates against.
+                        // Without this the guard would re-check the
+                        // PRE-click screen and the plan could never pass
+                        // its own focus assertion.
+                        if let Err(e) = sess.observe(0) {
+                            return err(ErrorCategory::BackendError, format!(
+                                "post-focus observe failed: {e}"
+                            ));
+                        }
+                    }
+                }
+                crate::intent::PlannedStep::AssertFocus { target_id } => {
+                    pending_focus_guard = Some(target_id.clone());
+                }
+                crate::intent::PlannedStep::Act(action) => {
+                    let guard = pending_focus_guard.take().map(|tid| {
+                        crate::execution::MutationGuard {
+                            focus_control_id: Some(tid),
+                            ..Default::default()
+                        }
+                    });
+                    match crate::execution::execute_act_with_guard(
+                        sess,
+                        action,
+                        150,
+                        1150,
+                        false,
+                        crate::execution::InputVisibility::Normal,
+                        crate::capture::CompletionPolicy::StableScreen,
+                        guard.as_ref(),
+                    ) {
+                        Ok(tx) => executed.push(json!({
+                            "step": "act", "action": action.name(),
+                            "settled": tx.settled(),
+                            "settle": format!("{:?}", tx.settle).to_lowercase(),
+                        })),
+                        Err(e) => {
+                            if guard_stale_details(&e).is_some() {
+                                return err(ErrorCategory::StaleState, format!(
+                                    "focus-securing guard refused the payload action: {e}"
+                                ));
+                            }
+                            return err(ErrorCategory::BackendError, e.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Record the interaction in the run (same shape as tui_act).
+        ok(json!({
+            "mode": "executed",
+            "control": plan_json["control"],
+            "verb": plan.verb.name(),
+            "risk": plan.risk.name(),
+            "steps": executed,
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| e)
+}
+
+/// JSON shape of a plan: the resolved control plus every step in execution
+/// order, so the agent sees exactly what will happen before it happens.
+fn plan_to_json(plan: &crate::intent::IntentPlan) -> serde_json::Value {
+    let control = &plan.control;
+    let steps: Vec<serde_json::Value> = plan
+        .steps
+        .iter()
+        .map(|s| match s {
+            crate::intent::PlannedStep::EnsureFocus { target_id, click } => json!({
+                "step": "ensure_focus",
+                "target": target_id,
+                "how": serde_json::to_value(click).unwrap_or(json!(click.name())),
+                "skipped_when": "target already focused",
+            }),
+            crate::intent::PlannedStep::AssertFocus { target_id } => json!({
+                "step": "assert_focus",
+                "target": target_id,
+                "on_drift": "stale_state — the payload action is refused",
+            }),
+            crate::intent::PlannedStep::Act(action) => json!({
+                "step": "act",
+                "action": serde_json::to_value(action).unwrap_or(json!(action.name())),
+            }),
+        })
+        .collect();
+    json!({
+        "control": {
+            "id": control.id,
+            "label": control.label,
+            "kind": format!("{:?}", control.kind).to_lowercase(),
+            "focusable": control.focusable,
+            "focused": control.focused,
+        },
+        "steps": steps,
+    })
 }

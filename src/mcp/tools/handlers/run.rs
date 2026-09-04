@@ -146,6 +146,18 @@ pub(crate) async fn tui_run(
         // machine-readable answer to "what can this server do".
         RA::Context => ok(json!({
             "registry": crate::mcp::registry::to_json(),
+            // Review follow-up (coverage honesty): say what the native
+            // coverage path is worth on its own, so an agent without the
+            // optional tuicov executable knows the ledger is not a stub.
+            "coverage": {
+                "provider": "native-events",
+                "mode": "continuous",
+                "description": "coverage events from cooperative apps accumulate continuously into the run ledger (tui_coverage action=summary/ledger/delta) — no executable required",
+                "tuicov": {
+                    "available": crate::coverage::tuicov::is_available(),
+                    "role": "optional point-in-time snapshot correlation; absent tuicov degrades only that view, never the ledger",
+                },
+            },
         })),
         // Wave G item 75: enumerate persisted runs under a resolved
         // root (explicit root, else the primary session's cwd; neither

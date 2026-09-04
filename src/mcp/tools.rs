@@ -77,6 +77,9 @@ impl TuiLabServer {
     async fn resolve_resource(&self, uri: &str) -> Result<String, rmcp::model::ErrorData> {
         use crate::semantic;
         let not_found = |msg: String| rmcp::model::ErrorData::resource_not_found(msg, None);
+        // Findings: the feed and (review P1: evidence-addressability) one
+        // finding by instance id, rendered like tui_explain — evidence
+        // refs joined to their sources, capabilities conditioning applied.
         if uri == "tui://findings" {
             let run = self.run.lock().unwrap();
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -86,10 +89,38 @@ impl TuiLabServer {
             }))
             .unwrap_or_default());
         }
+        if let Some(fid) = uri.strip_prefix("tui://findings/") {
+            let fid = fid.trim_end_matches('/');
+            let run = self.run.lock().unwrap();
+            let finding = run.findings().iter().find(|f| f.id == fid).ok_or_else(|| {
+                not_found(format!(
+                    "no finding '{fid}' in run '{}' (tui://findings lists the {} available)",
+                    run.id,
+                    run.findings().len()
+                ))
+            })?;
+            // Same explanation shape `tui_explain` renders, minus the live
+            // session conditioning (a resource read stays observationally
+            // pure — it never touches a session actor).
+            let joined = run.join_source_refs_if_known(finding);
+            let explanation = crate::terminal::explain::explain_finding(&joined, None, None);
+            return Ok(serde_json::to_string_pretty(&explanation).unwrap_or_default());
+        }
         if let Some(rest) = uri.strip_prefix("tui://runs/") {
             let rest = rest.trim_end_matches('/');
             if rest.is_empty() {
                 return Err(not_found("empty run id".to_string()));
+            }
+            // Run-scoped evidence: scenarios and ledger transactions
+            // (review P1: citable evidence must be addressable, not just
+            // inlined into run status). Match these BEFORE the bare run
+            // id so `<run>/scenarios/<sid>` never falls through to it.
+            if let Some((run_id, sub)) = rest.split_once('/') {
+                let (kind, key) = match sub.split_once('/') {
+                    Some((k, key)) => (k, Some(key.trim_end_matches('/'))),
+                    None => (sub, None),
+                };
+                return self.resolve_run_scoped(run_id, kind, key, not_found);
             }
             // The live run first (it carries live session state)…
             {
@@ -217,9 +248,60 @@ impl TuiLabServer {
         }
         Err(not_found(format!(
             "unknown resource URI '{uri}' (templates: tui://runs/{{run_id}}, \
+             tui://runs/{{run_id}}/scenarios/{{scenario_id}}, \
+             tui://runs/{{run_id}}/transactions/{{seq}}, \
              tui://sessions/{{session_id}}/semantic, tui://sessions/{{session_id}}/screen, \
-             tui://findings)"
+             tui://findings, tui://findings/{{finding_id}})"
         )))
+    }
+
+    /// Run-scoped evidence read: `tui://runs/<id>/scenarios[/<key>]` and
+    /// `tui://runs/<id>/transactions[/<seq>]` (review P1: evidence-
+    /// addressability — citable evidence gets its own URI, live or
+    /// restored read-only from disk). `kind`/`key` are the path segments
+    /// after the run id.
+    fn resolve_run_scoped(
+        &self,
+        run_id: &str,
+        kind: &str,
+        key: Option<&str>,
+        not_found: impl Fn(String) -> rmcp::model::ErrorData,
+    ) -> Result<String, rmcp::model::ErrorData> {
+        // Resolve the run: live first (borrowed, short lock — this fn is
+        // sync and never awaits under it), then any persisted one restored
+        // read-only from disk.
+        let live_is_target = self.run.lock().unwrap().id == run_id;
+        let rendered = if live_is_target {
+            let run = self.run.lock().unwrap();
+            run_scoped_payload(&run, run_id, kind, key)
+        } else {
+            let mut bases = self.run.lock().unwrap().browser_bases();
+            if let Ok(cwd) = std::env::current_dir() {
+                if !bases.contains(&cwd) {
+                    bases.push(cwd);
+                }
+            }
+            let mut restored: Option<crate::run::RunContext> = None;
+            for base in &bases {
+                if let Some(dir) = crate::run::RunContext::resolve_run_dir(base, run_id) {
+                    restored = Some(
+                        crate::run::RunContext::restore(&dir)
+                            .map_err(|e| not_found(format!("run '{run_id}' unreadable: {e}")))?,
+                    );
+                    break;
+                }
+            }
+            let run = restored.ok_or_else(|| {
+                not_found(format!(
+                    "no run '{run_id}' in this server or under its runs roots"
+                ))
+            })?;
+            run_scoped_payload(&run, run_id, kind, key)
+        };
+        match rendered {
+            Ok(text) => Ok(text),
+            Err(msg) => Err(not_found(msg)),
+        }
     }
 
     /// Run a closure against one session inside its actor, mapping actor
@@ -339,6 +421,17 @@ impl TuiLabServer {
     )]
     pub async fn tui_act(&self, p: Parameters<TuiActRequest>) -> rmcp::model::CallToolResult {
         crate::mcp::tools::handlers::interact::tui_act(self, p).await
+    }
+
+    /// Semantic intents (review P1): resolve a target + verb into a
+    /// focus-secured plan; execute=true runs it. The agent sees the exact
+    /// steps and risk BEFORE anything is sent.
+    #[tool(
+        name = "tui_intent",
+        description = "Act by semantic intent: resolve a target ({by:id|text|role|focused}) + verb (activate/focus/click/toggle/select/open/type) into a focus-secured execution plan and report its exact steps and risk. Plan-only by default — pass execute=true to run the steps in order (focus click, focus guard, payload action) under the same lease rules as tui_act."
+    )]
+    pub async fn tui_intent(&self, p: Parameters<TuiIntentParams>) -> rmcp::model::CallToolResult {
+        crate::mcp::tools::handlers::interact::tui_intent(self, p).await
     }
 
     /// The troubleshooting primitive (re-review Wave-2): run one small
@@ -844,6 +937,77 @@ impl ServerHandler for TuiLabServer {
         let uri = request.uri.clone();
         let contents = self.resolve_resource(&uri).await?;
         Ok(ReadResourceResult::new(vec![ResourceContents::text(contents, uri)]).into())
+    }
+}
+
+/// The payload for a run-scoped evidence URI, rendered against whichever
+/// run context the caller resolved (live-borrowed or restored). `Err` is
+/// the honest not-found message naming what would have been accepted.
+fn run_scoped_payload(
+    run: &crate::run::RunContext,
+    run_id: &str,
+    kind: &str,
+    key: Option<&str>,
+) -> Result<String, String> {
+    match (kind, key) {
+        // The collection listing (no key): ids + shapes, so a client can
+        // address a specific one next.
+        ("scenarios", None) => {
+            let ids = run.list_saved_scenarios().map_err(|e| e.to_string())?;
+            let items: Vec<serde_json::Value> = ids
+                .iter()
+                .filter_map(|k| run.load_scenario(k).ok())
+                .map(|sc| {
+                    serde_json::json!({
+                        "id": sc.id, "name": sc.name,
+                        "steps": sc.steps.len(),
+                        "uri": format!("tui://runs/{run_id}/scenarios/{}", sc.id),
+                    })
+                })
+                .collect();
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "run": run_id, "scenarios": items, "count": items.len(),
+            }))
+            .unwrap_or_default())
+        }
+        // One scenario by id (or unambiguous name — load_scenario's own
+        // resolution order, shared with tui_scenario action=run).
+        ("scenarios", Some(key)) => {
+            let sc = run.load_scenario(key).map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string_pretty(&sc).unwrap_or_default())
+        }
+        // The ledger listing (no key): bounded to the retained window.
+        ("transactions", None) => {
+            let txs = run.transactions();
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "run": run_id,
+                "retained": txs.len(),
+                "lifetime": run.transaction_total(),
+                "note": "the ledger is a bounded window; the manifest names any evicted head (history_complete=false)",
+                "transactions": txs,
+            }))
+            .unwrap_or_default())
+        }
+        // One transaction by ledger seq.
+        ("transactions", Some(key)) => {
+            let seq: u64 = key.parse().map_err(|_| {
+                format!(
+                    "transaction key '{key}' is not a ledger seq (integer); tui://runs/{run_id}/transactions lists the retained window"
+                )
+            })?;
+            let tx = run.transactions().iter().find(|t| t.seq == seq).ok_or_else(
+                || {
+                    format!(
+                        "no transaction with seq {seq} in run '{run_id}' (retained window: {} records; the ledger may have evicted old records)",
+                        run.transactions().len()
+                    )
+                },
+            )?;
+            Ok(serde_json::to_string_pretty(tx).unwrap_or_default())
+        }
+        (other, _) => Err(format!(
+            "unknown run-scoped resource '{other}' under run '{run_id}' (expected 'scenarios' or 'transactions', each optionally followed by an id/seq)"
+        )),
     }
 }
 

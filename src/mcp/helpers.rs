@@ -28,6 +28,18 @@ pub fn err(cat: ErrorCategory, msg: impl Into<String>) -> CallToolResult {
     from_envelope_json(&env.to_json(), true)
 }
 
+/// Hard failure with a structured remediation payload (review §14): the
+/// same shape [`err`] renders, plus `details` for the agent to read
+/// without parsing prose.
+pub fn err_with_details(
+    cat: ErrorCategory,
+    msg: impl Into<String>,
+    details: serde_json::Value,
+) -> CallToolResult {
+    let env: Envelope<()> = Envelope::<()>::fail_with(cat, msg, details);
+    from_envelope_json(&env.to_json(), true)
+}
+
 /// Wrap an already-rendered envelope JSON string into a CallToolResult.
 fn from_envelope_json(json: &str, is_error: bool) -> CallToolResult {
     let value: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
@@ -51,6 +63,7 @@ pub fn err_continued(cat: ErrorCategory, detail: String) -> CallToolResult {
     let env = Envelope {
         category: cat,
         error: Some(detail),
+        details: None,
         data: Some(serde_json::json!({ "passed": false })),
     };
     from_envelope_json(&env.to_json(), false)
@@ -63,21 +76,31 @@ pub fn err_continued(cat: ErrorCategory, detail: String) -> CallToolResult {
 /// taken after this check cannot interleave before the input lands.
 pub fn lease_refused(sess: &mut crate::session::state::Session) -> Option<CallToolResult> {
     sess.driving_blocked().map(|lease| {
-        err(
+        let remaining = lease.remaining_ms();
+        let holder = lease.holder.clone();
+        let json = serde_json::json!({
+            "session": sess.id,
+            "holder": holder,
+            "retry_after_ms": remaining,
+        });
+        err_with_details(
             ErrorCategory::ControlLeased,
             format!(
                 "session '{}' is leased by '{}' for another {} ms — machine driving (act/explore/audit/replay) refuses while the lease is live; observe and status stay allowed",
                 sess.id,
-                lease.holder,
-                lease.remaining_ms()
+                holder,
+                remaining
             ),
+            json,
         )
     })
 }
 
 /// Uniform `invalid_request` for an unrecognized selector value: names what
 /// was passed and every accepted variant (Wave G item 70 — the agent can
-/// self-correct from the message alone).
+/// self-correct from the message alone), with the accepted list also
+/// structured in `details.alternatives` so no client ever has to parse the
+/// prose (review §14).
 pub fn err_invalid_selector(
     what: &str,
     got: &crate::mcp::params::Known<impl std::any::Any>,
@@ -87,7 +110,7 @@ pub fn err_invalid_selector(
         crate::mcp::params::Known::Other(s) => s.clone(),
         _ => String::new(),
     };
-    err(
+    err_with_details(
         ErrorCategory::InvalidRequest,
         format!(
             "unknown {} '{}' (expected one of: {})",
@@ -95,6 +118,11 @@ pub fn err_invalid_selector(
             shown,
             variants.join(", ")
         ),
+        serde_json::json!({
+            "field": what,
+            "got": shown,
+            "alternatives": variants,
+        }),
     )
 }
 

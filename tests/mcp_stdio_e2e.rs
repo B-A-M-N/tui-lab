@@ -201,7 +201,7 @@ fn stdio_e2e_full_lifecycle() {
     assert_eq!(names, declared, "tools/list == capability registry");
     assert_eq!(
         names.len(),
-        16,
+        17,
         "registry count matches the wire: {names:?}"
     );
     for expected in [
@@ -221,6 +221,7 @@ fn stdio_e2e_full_lifecycle() {
         "tui_run",
         "tui_contract",
         "tui_explain",
+        "tui_intent",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -1256,6 +1257,118 @@ fn resources_list_and_read_live_state() {
     );
     let ftext = find["result"]["contents"][0]["text"].as_str().unwrap_or("");
     assert!(ftext.contains("\"findings\""), "findings payload: {ftext}");
+
+    // --- Review P1: evidence-addressable resources. ---
+
+    // A finding id that does not exist: not_found naming how many ARE
+    // available (self-correction payload, not a bare 404).
+    let badf = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": "tui://findings/absent@00000000" }),
+    );
+    assert_eq!(badf["error"]["code"], -32002, "bad finding: {badf}");
+
+    // The transaction ledger collection for the live run.
+    let txs = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/transactions") }),
+    );
+    let txtext = txs["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(txtext.contains("\"retained\""), "ledger listing: {txtext}");
+    // At least one transaction exists? Drive one to be sure, then re-read.
+    let _ = mcp.tool(
+        "tui_act",
+        serde_json::json!({ "action": "key", "key": "x", "id": sid }),
+    );
+    let txs2 = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/transactions") }),
+    );
+    let txv: serde_json::Value =
+        serde_json::from_str(txs2["result"]["contents"][0]["text"].as_str().unwrap_or(""))
+            .expect("ledger JSON");
+    assert!(
+        txv["retained"].as_u64().unwrap_or(0) >= 1,
+        "one act → at least one ledger record: {txv}"
+    );
+    // One transaction by seq: the first record's fields are legible.
+    let seq0 = txv["transactions"][0]["seq"].as_u64().expect("ledger seq");
+    let tx1 = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/transactions/{seq0}") }),
+    );
+    let t1v: serde_json::Value =
+        serde_json::from_str(tx1["result"]["contents"][0]["text"].as_str().unwrap_or(""))
+            .expect("transaction JSON");
+    assert_eq!(t1v["seq"], seq0, "single transaction read: {t1v}");
+    assert!(t1v["action"].is_string(), "{t1v}");
+    // A wrong seq is an honest not_found with the retained window size.
+    let badseq = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/transactions/99999") }),
+    );
+    assert_eq!(badseq["error"]["code"], -32002, "bad seq: {badseq}");
+    let badmsg = badseq["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        badmsg.contains("retained window"),
+        "not-found names the window: {badmsg}"
+    );
+
+    // The scenario collection (empty at this point, but shape must hold).
+    let scn = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/scenarios") }),
+    );
+    let sv: serde_json::Value =
+        serde_json::from_str(scn["result"]["contents"][0]["text"].as_str().unwrap_or(""))
+            .expect("scenarios JSON");
+    assert_eq!(sv["count"], 0, "no scenarios yet: {sv}");
+
+    // Record + stop a scenario, then address it as a resource.
+    let rec = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "record_start", "name": "res-scen", "id": sid }),
+    );
+    assert_eq!(rec["category"], "success", "record: {rec}");
+    let rec_id = rec["data"]["recording_id"].as_str().expect("recording id");
+    let _ = mcp.tool(
+        "tui_act",
+        serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+    );
+    let stop = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "record_stop", "recording_id": rec_id, "id": sid }),
+    );
+    assert_eq!(stop["category"], "success", "record_stop: {stop}");
+    let scen_id = stop["data"]["scenario_id"].as_str().expect("scenario id");
+    let scn2 = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/scenarios") }),
+    );
+    let sv2: serde_json::Value =
+        serde_json::from_str(scn2["result"]["contents"][0]["text"].as_str().unwrap_or(""))
+            .expect("scenarios JSON");
+    assert_eq!(sv2["count"], 1, "one scenario: {sv2}");
+    assert_eq!(
+        sv2["scenarios"][0]["id"], scen_id,
+        "collection carries the id and its uri: {sv2}"
+    );
+    // One scenario by id → the full step list.
+    let one = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/scenarios/{scen_id}") }),
+    );
+    let ov: serde_json::Value =
+        serde_json::from_str(one["result"]["contents"][0]["text"].as_str().unwrap_or(""))
+            .expect("scenario JSON");
+    assert_eq!(ov["id"], scen_id, "{ov}");
+    assert!(!ov["steps"].as_array().expect("steps").is_empty(), "{ov}");
+    // Unknown scenario key → not_found from load_scenario's own resolution.
+    let badscn = mcp.request(
+        "resources/read",
+        serde_json::json!({ "uri": format!("tui://runs/{run_id}/scenarios/absent") }),
+    );
+    assert_eq!(badscn["error"]["code"], -32002, "bad scenario: {badscn}");
 
     // unknown session id → protocol-level resource_not_found (code -32002),
     // NOT a success envelope with empty content.

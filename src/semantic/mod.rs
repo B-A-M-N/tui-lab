@@ -637,7 +637,16 @@ mod authority_gate_tests {
     /// never bare-re-infer. Adding a file here is a commitment that its
     /// `semantic::analyze` calls are all fused-fallback.
     const LIVE_DRIVER_FILES: &[&str] = &[
-        "src/audit/driver.rs",
+        // src/audit/driver.rs split into driver/ family files (review §15 follow-up)
+        "src/audit/driver/interaction.rs",
+        "src/audit/driver/keyboard.rs",
+        "src/audit/driver/layout.rs",
+        "src/audit/driver/lifecycle.rs",
+        "src/audit/driver/protocol.rs",
+        "src/audit/driver/resize.rs",
+        "src/audit/driver/shell_cli.rs",
+        "src/audit/driver/states.rs",
+        "src/audit/driver/visual.rs",
         "src/execution/mod.rs",
         "src/mcp/tools.rs",
         "src/mcp/helpers.rs",

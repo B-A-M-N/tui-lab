@@ -1,7 +1,7 @@
 //! tui_coverage: native coverage ledger views.
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{err, ok};
+use crate::mcp::helpers::{err, err_with_details, ok};
 use crate::mcp::params::*;
 use rmcp::serde_json::json;
 
@@ -120,10 +120,15 @@ pub(crate) async fn tui_coverage(
             // HONEST unsupported: without a denominator (what the app
             // COULD cover) we cannot say what is uncovered. Inventing one
             // would be theater, so this is an explicit refusal (review
-            // P0.7). Native coverage only knows what was hit.
-            err(
+            // P0.7). Native coverage only knows what was hit. The working
+            // views are named in `details.alternatives` (review §14).
+            err_with_details(
                     ErrorCategory::Unsupported,
                     "coverage action 'uncovered' is unsupported: tui-lab has no denominator of what the app *could* cover, so it reports hits honestly and refuses to fabricate a gap; use delta (what changed since the last read) instead",
+                    json!({
+                        "action": "uncovered",
+                        "alternatives": ["summary", "ledger", "delta", "collect"],
+                    }),
                 )
         }
         // detect (and anything unexpected) dispatches through the

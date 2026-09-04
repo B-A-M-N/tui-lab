@@ -10,6 +10,7 @@ pub(crate) mod explore;
 pub(crate) mod framework;
 pub(crate) mod interact;
 pub(crate) mod observe;
+pub(crate) mod observe_modes;
 pub(crate) mod probe;
 pub(crate) mod run;
 pub(crate) mod scenario;

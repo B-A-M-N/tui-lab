@@ -42,6 +42,13 @@ pub const TOOLS: &[ToolCapability] = &[
         selector: None,
     },
     ToolCapability {
+        name: "tui_intent",
+        // The verb is an open-ish set (name string or {"verb":"type","text":...}),
+        // not a closed selector enum — like `tui_act`.
+        summary: "Act by semantic intent: resolve a target (by=id|text|role|focused) + verb (activate/focus/click/toggle/select/open/type) into a focus-secured execution plan; the response names every step and the risk class before anything is sent. execute=true runs the plan; unresolved targets return target_error with structured candidates (details), not prose.",
+        selector: None,
+    },
+    ToolCapability {
         name: "tui_wait",
         summary: "Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.",
         selector: Some(("condition", <crate::mcp::params::WaitCondition as EnumVariants>::VARIANTS)),
@@ -127,6 +134,26 @@ pub const RESOURCES: &[ResourceCapability] = &[
             "Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).",
     },
     ResourceCapability {
+        uri: "tui://runs/{run_id}/scenarios",
+        description:
+            "Saved scenarios in a run (review P1 evidence-addressability): ids, names, step counts, and the per-scenario URI. Live runs read memory+disk; persisted runs are restored read-only.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/scenarios/{scenario_id}",
+        description:
+            "One scenario by id (or unambiguous name) — the full recorded step list, addressable as evidence.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/transactions",
+        description:
+            "The declared-replay transaction ledger (bounded retained window + lifetime count). Citable as the run's interaction history.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/transactions/{seq}",
+        description:
+            "One transaction by ledger seq: action, settle verdict, before/after structure, changed cells, render evidence.",
+    },
+    ResourceCapability {
         uri: "tui://sessions/{session_id}/semantic",
         description: "Live semantic screen: regions, controls, focus, affordances, components.",
     },
@@ -142,6 +169,11 @@ pub const RESOURCES: &[ResourceCapability] = &[
     ResourceCapability {
         uri: "tui://findings",
         description: "Findings accumulated this run (audits, contracts, exploration).",
+    },
+    ResourceCapability {
+        uri: "tui://findings/{finding_id}",
+        description:
+            "One finding by instance id, rendered as its explanation (review P1 evidence-addressability): evidence refs traced to sources — the tui_explain shape, as a read-only resource.",
     },
 ];
 
@@ -189,6 +221,48 @@ pub fn skill_resource_section() -> String {
         out.push_str(&format!("- `{}` — {}\n", r.uri, r.description));
     }
     out
+}
+
+/// Splice the generated Tools and Resources sections into a SKILL.md
+/// document, replacing whatever currently sits under those two headings.
+/// Everything between a generated section's heading and the next `## `
+/// heading (or EOF) is generated content; all other prose is preserved
+/// byte-for-byte. This is what `cargo run -- skill --write` applies to the
+/// file on disk — the fix loop for the drift the parity test catches,
+/// without hand-splicing. Returns `None` when a heading is missing (the
+/// caller should not invent structure that was never there).
+pub fn splice_skill_sections(doc: &str) -> Option<String> {
+    let after_tools = splice_one(doc, "## Tools", &skill_tool_section())?;
+    splice_one(
+        &after_tools,
+        "## Resources (tui://)",
+        &skill_resource_section(),
+    )
+}
+
+/// Replace the section from `heading` to the next `\n## ` (or EOF) with
+/// `generated` (which starts with that same heading and ends with a
+/// newline), preserving everything before and after. The blank-line
+/// separator between the replaced section and the next heading is the
+/// document's own convention and is kept as-is.
+fn splice_one(doc: &str, heading: &str, generated: &str) -> Option<String> {
+    let start = doc.find(heading)?;
+    let end = doc[start + heading.len()..]
+        .find("\n## ")
+        .map(|i| start + heading.len() + i + 1) // keep the newline that opens the next heading
+        .unwrap_or(doc.len());
+    let body = &doc[start..end];
+    // `generated` carries one trailing newline; reproduce any blank line
+    // the old body had beyond that.
+    let blank_lines = body.len() - body.trim_end_matches('\n').len();
+    let mut out = String::with_capacity(doc.len() + generated.len());
+    out.push_str(&doc[..start]);
+    out.push_str(generated);
+    for _ in 1..blank_lines {
+        out.push('\n');
+    }
+    out.push_str(&doc[end..]);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -246,6 +320,28 @@ mod tests {
         served.sort();
         declared.sort();
         assert_eq!(declared, served, "registry TOOLS != router tools/list set");
+    }
+
+    #[test]
+    fn splice_preserves_prose_and_is_idempotent() {
+        let doc = "intro prose\n\n## Tools\n\n- `stale_tool` — old\n\n## Middle\n\nhand-written\n\n## Resources (tui://)\n\n- `tui://gone` — old\n";
+        let spliced = splice_skill_sections(doc).expect("both headings present");
+        assert!(spliced.contains("intro prose"));
+        assert!(spliced.contains("## Middle\n\nhand-written"));
+        assert!(!spliced.contains("stale_tool"), "old tools replaced");
+        assert!(spliced.contains(&skill_tool_section()));
+        assert!(spliced.contains(&skill_resource_section()));
+        // Splicing an already-current doc is a no-op.
+        assert_eq!(
+            splice_skill_sections(&spliced).as_deref(),
+            Some(spliced.as_str())
+        );
+    }
+
+    #[test]
+    fn splice_rejects_missing_headings() {
+        assert!(splice_skill_sections("no headings here").is_none());
+        assert!(splice_skill_sections("## Tools\n\nok only").is_none());
     }
 
     #[test]

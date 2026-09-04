@@ -97,7 +97,8 @@ pub(crate) async fn tui_audit(
     // Wave G item 76 (revised, review §5): the lease gate asks whether
     // the profile DRIVES (sends UI input / resizes / consumes the
     // process), not merely whether it needs a live session. One boolean
-    // (`is_active`) previously conflated those, so color/terminal-modes/
+    // (the old `is_active`, now `needs_live_session`) previously conflated
+    // those, so color/terminal-modes/
     // rendering/input-protocol/shell-cli/lifecycle/query_response — all
     // passive readers — wrongly refused while a human held the lease.
     // The engine's requires_exclusive_control() is the single authority

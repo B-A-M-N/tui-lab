@@ -67,3 +67,37 @@ Phase 5: Integration + tests
   through MCP (a `tui_act` semantic branch or `tui_interact` tool would carry
   it); the review's precondition — multi-step focus-secured plans — is met.
 
+## Post-review P1 round (2026-09)
+
+All nine P1 items from the re-review are implemented:
+
+1. **§14 structured error payloads** — `Envelope.details`
+   (`Option<serde_json::Value>`) populated at the lease gate
+   (holder/retry_after_ms), stale-state guards (expected/actual), target
+   resolution (candidates/matches), and invalid selectors (field/got/
+   alternatives).
+2. **`tui_intent` MCP tool** — plan/execute surface over `plan_intent`:
+   plan-only returns steps + risk before anything is sent; `execute=true`
+   runs the focus-secured sequence (EnsureFocus → observe → AssertFocus →
+   Act). `tests/intent_mcp_test.rs` covers the wire contract.
+3. **Evidence-addressable resources** — `tui://findings/{id}`,
+   `tui://runs/{id}/scenarios[/{sid}]`,
+   `tui://runs/{id}/transactions[/{seq}]`; live and persisted runs both
+   resolve (persisted read-only).
+4. **God-object residue splits** — `src/audit/driver.rs` (3,669 lines) →
+   `driver/` family files + `shared.rs` helpers; `src/execution/mod.rs`
+   (1,945) → `record`/`transaction`/`executor`/`wait`; `src/intent.rs`
+   (1,026) → `vocab`/`plan`/`keys`; `handlers/observe.rs` (702) →
+   `observe.rs` dispatcher + `observe_modes.rs`. All `crate::…` paths
+   preserved via re-exports; the semantic authority gate's file list now
+   names the split driver files.
+5. **`cargo run -- skill --write`** — splices the generated Tools/Resources
+   sections into SKILL.md on disk (idempotent; drift loop closed).
+6. (dup of 2)
+7. **Coverage honesty in `tui_run action=context`** — the registry context
+   names the ledger/NSP path alongside the optional tuicov executable.
+8. **`is_active()` → `needs_live_session()`** — §5 vocabulary finished.
+9. **wave3c flake** — `wave3c_profiles_read_real_traffic` settles with an
+   observe cycle after pool.start, same treatment as the earlier
+   query_response fix.
+

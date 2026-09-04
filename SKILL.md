@@ -9,6 +9,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_observe` — Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state, protocol trace + mode timeline (portable-pty/line engines), pipe stdout/stderr streams.
   - mode: summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history, protocol, streams, terminal_modes
 - `tui_act` — Drive input through the canonical executor: key, keys, type, paste, raw, mouse_click/press/release/move/drag/scroll, resize, signal (tagged union schema). Optional `completion` declares how "done" means (stable_screen/first_change/any_change/text_appears/text_disappears/process_exit/command_done/bell/semantic_change/may_be_silent/no_wait) so a silent/exit action is never misreported as settled=false.
+- `tui_intent` — Act by semantic intent: resolve a target (by=id|text|role|focused) + verb (activate/focus/click/toggle/select/open/type) into a focus-secured execution plan; the response names every step and the risk class before anything is sent. execute=true runs the plan; unresolved targets return target_error with structured candidates (details), not prose.
 - `tui_wait` — Block until a condition holds; conditions anchor on causality (action baselines) or shell-integration command edges.
   - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output, event
 - `tui_probe` — Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched material changes. stimulus {kind:none} = drift probe.
@@ -94,7 +95,12 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 ## Resources (tui://)
 
 - `tui://runs/{run_id}` — Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).
+- `tui://runs/{run_id}/scenarios` — Saved scenarios in a run (review P1 evidence-addressability): ids, names, step counts, and the per-scenario URI. Live runs read memory+disk; persisted runs are restored read-only.
+- `tui://runs/{run_id}/scenarios/{scenario_id}` — One scenario by id (or unambiguous name) — the full recorded step list, addressable as evidence.
+- `tui://runs/{run_id}/transactions` — The declared-replay transaction ledger (bounded retained window + lifetime count). Citable as the run's interaction history.
+- `tui://runs/{run_id}/transactions/{seq}` — One transaction by ledger seq: action, settle verdict, before/after structure, changed cells, render evidence.
 - `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
 - `tui://sessions/{session_id}/screen` — Live screen text + geometry.
 - `tui://sessions/{session_id}/terminal-profile` — Evidence-backed terminal capability report (review §12): reads the live backend capabilities without forcing a screen settle — observationally pure, unlike the screen-backed views.
 - `tui://findings` — Findings accumulated this run (audits, contracts, exploration).
+- `tui://findings/{finding_id}` — One finding by instance id, rendered as its explanation (review P1 evidence-addressability): evidence refs traced to sources — the tui_explain shape, as a read-only resource.

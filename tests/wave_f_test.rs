@@ -408,20 +408,41 @@ fn session_injects_env_and_overlays_native_tree() {
     let path = sess.native_channel().path.clone().expect("channel created");
     assert!(path.exists(), "channel file exists");
 
-    // Drive focus to the second button and give the app a moment to
-    // declare its tree.
+    // Phase 1: wait for the STARTUP declaration (#save focused) — proof
+    // the child has drawn and entered raw-mode read_key(). Sending the key
+    // earlier races app startup under load and the escape sequence is
+    // swallowed by the canonical line discipline.
+    let mut ready = false;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        sess.observe(40).expect("observe");
+        if sess.native_channel().latest.is_some() {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "app's startup declaration arrived (child ready)");
+
+    // Phase 2: drive focus to the second button and wait for the
+    // REDECLARATION — not merely any snapshot. Poll until the latest
+    // declaration itself names #cancel focused.
     sess.send(Input::Key(KeyEvent::new(KeyCode::Right)))
         .expect("focus move");
     let mut declared = false;
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(100));
         sess.observe(40).expect("observe");
-        if sess.native_channel().latest.is_some() {
+        let cancel_focused = sess.native_channel().latest.as_ref().is_some_and(|n| {
+            n.children
+                .iter()
+                .any(|c| c.id == "#cancel" && c.focused == Some(true))
+        });
+        if cancel_focused {
             declared = true;
             break;
         }
     }
-    assert!(declared, "app declared a native snapshot");
+    assert!(declared, "app re-declared focus on #cancel");
 
     let screen = sess.observe(40).expect("observe");
     let mut tree = tui_lab::semantic::build_tree(&screen);
@@ -728,24 +749,42 @@ fn fused_semantic_truth_across_all_shapes() {
     sess.start_with_spec(spec).expect("start");
     let path = sess.native_channel().path.clone().expect("channel created");
 
-    // Drive focus to Cancel (the second button) and wait for the app to
-    // declare its tree.
+    // Phase 1: wait for the STARTUP declaration (#save focused). The app
+    // only reaches read_key() after its first draw+declare, so seeing that
+    // frame proves the child is in raw mode and ready for input — sending
+    // earlier races app startup under load, and the escape sequence lands
+    // in the canonical buffer where it is swallowed.
+    let mut ready = false;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        sess.observe(40).expect("observe");
+        if sess.native_channel().latest.is_some() {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "app's startup declaration arrived (child ready)");
+
+    // Phase 2: drive focus to Cancel and wait for the RE-declaration —
+    // not merely "any snapshot with a focus", which the startup #save
+    // frame already satisfies and which races the pre-keypress frame.
     sess.send(Input::Key(KeyEvent::new(KeyCode::Right)))
         .expect("focus move");
     let mut declared = false;
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(100));
         sess.observe(40).expect("observe");
-        if let Some(latest) = &sess.native_channel().latest {
-            // The app declares focus in its snapshot.
-            let flat = latest.flatten();
-            if flat.iter().any(|(_, n)| n.focused == Some(true)) {
-                declared = true;
-                break;
-            }
+        let cancel_focused = sess.native_channel().latest.as_ref().is_some_and(|n| {
+            n.children
+                .iter()
+                .any(|c| c.id == "#cancel" && c.focused == Some(true))
+        });
+        if cancel_focused {
+            declared = true;
+            break;
         }
     }
-    assert!(declared, "app declared a native snapshot with focus");
+    assert!(declared, "app re-declared focus on Cancel");
 
     // One fused call: all three shapes from one detection pass + overlay.
     let (sem, tree, report) = sess.fused_frame().expect("fused frame");
