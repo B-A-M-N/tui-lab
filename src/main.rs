@@ -24,7 +24,14 @@ enum Commands {
     /// Print version information.
     Version,
     /// Generate skill documentation.
-    Skill,
+    Skill {
+        /// Splice the generated Tools and Resources sections into SKILL.md
+        /// on disk (between their headings, preserving all other prose)
+        /// instead of printing. This is the fix loop for the drift the
+        /// registry parity test catches.
+        #[arg(long)]
+        write: bool,
+    },
     /// Print a persisted run's history from disk (item 74): manifest,
     /// declared-replay ledger, findings summary, graphs. Read-only —
     /// replay renders what the run recorded; it does not relaunch
@@ -54,8 +61,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Version => {
             println!("hermes-tui-lab {}", env!("CARGO_PKG_VERSION"));
         }
-        Commands::Skill => {
-            println!("{}", tui_lab::SKILL_DOC);
+        Commands::Skill { write } => {
+            if write {
+                skill_write()?;
+            } else {
+                println!("{}", tui_lab::SKILL_DOC);
+            }
         }
         Commands::Replay { run_id, root, full } => {
             replay(&run_id, root.as_deref(), full)?;
@@ -232,6 +243,23 @@ async fn start_mcp() -> anyhow::Result<()> {
     let transport = stdio();
     let service = server.serve(transport).await?;
     service.waiting().await?;
+    Ok(())
+}
+
+/// `skill --write`: regenerate the generated sections into SKILL.md on
+/// disk. The SKILL.md path resolves relative to the crate root via
+/// CARGO_MANIFEST_DIR so the command works from any working directory.
+fn skill_write() -> anyhow::Result<()> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("SKILL.md");
+    let doc = std::fs::read_to_string(&path)?;
+    let spliced = tui_lab::mcp::registry::splice_skill_sections(&doc)
+        .ok_or_else(|| anyhow::anyhow!("SKILL.md is missing a generated section heading"))?;
+    if spliced == doc {
+        eprintln!("SKILL.md already current — nothing to write.");
+        return Ok(());
+    }
+    std::fs::write(&path, spliced)?;
+    eprintln!("SKILL.md updated: Tools and Resources sections regenerated from the registry.");
     Ok(())
 }
 

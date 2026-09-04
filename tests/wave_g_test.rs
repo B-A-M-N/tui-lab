@@ -518,6 +518,17 @@ async fn lease_blocks_driving_and_allows_observing() {
             msg.contains("ana"),
             "refusal must name the lease holder: {msg}"
         );
+        // Review §14: the machine-usable facts ride in `details` — the
+        // agent branches on `retry_after_ms` without parsing the message.
+        assert_eq!(
+            e["details"]["holder"], "ana",
+            "{tool} must attach the holder in details: {e}"
+        );
+        let retry = e["details"]["retry_after_ms"].as_u64().unwrap_or(0);
+        assert!(
+            retry > 0,
+            "{tool} must attach a positive retry_after_ms: {e}"
+        );
     }
 
     // Scenario replay refuses too.
@@ -569,7 +580,8 @@ async fn lease_blocks_driving_and_allows_observing() {
 
     // Review §5: passive LIVE-SESSION audits observe the raw ring and fused
     // frame but send nothing — they must stay available under a human lease
-    // (the old is_active() gate wrongly refused them). allow_mutation is
+    // (the old is_active() gate, now needs_live_session, wrongly refused
+    // them when it also gated the lease). allow_mutation is
     // passed to prove the lease refusal did not previously depend on it.
     for passive in [
         "color",

@@ -18,8 +18,8 @@
 //! The MCP layer calls [`run_profile`] and reports the returned mode; it no
 //! longer interprets profile names. For the human control lease the MCP
 //! layer asks `requires_exclusive_control()` (drives/resizes/consumes), NOT
-//! `is_active()` (needs a live session) — passive diagnostics stay available
-//! under a human lease.
+//! `needs_live_session()` (needs a live session) — passive diagnostics stay
+//! available under a human lease.
 
 use crate::audit::{EvidenceKind, EvidenceRef, Finding};
 use crate::session::state::Session;
@@ -117,10 +117,10 @@ impl AuditProfile {
 
     /// Does this profile need a live `Session` (raw ring / fused frame /
     /// process access) rather than one detached frame? This is the
-    /// orchestrator's static-vs-active ROUTING split only — it says
+    /// orchestrator's static-vs-live ROUTING split only — it says
     /// nothing about whether the profile drives the app. For the human
     /// control lease, use [`Self::requires_exclusive_control`].
-    pub fn is_active(&self) -> bool {
+    pub fn needs_live_session(&self) -> bool {
         !matches!(
             self,
             AuditProfile::Discoverability | AuditProfile::Unicode | AuditProfile::Controls
@@ -674,7 +674,7 @@ fn run_profile_with_contract_impl(
 
     // The static profiles (single frame, no driving): discoverability plus
     // the Wave-3 subsystem audits (unicode, controls).
-    if !profile.is_active() {
+    if !profile.needs_live_session() {
         // Fused truth (re-review Wave-2 item 16).
         let (screen, sem, _, _) = session
             .observe_fused(40)
@@ -919,12 +919,13 @@ mod tests {
     use super::*;
 
     /// P0 fix 2: `full` must parse as the composite profile and must be
-    /// treated as active — the exact regression this module exists for.
+    /// routed to the live session — the exact regression this module
+    /// exists for.
     #[test]
-    fn full_is_active_and_parseable() {
+    fn full_is_live_routed_and_parseable() {
         let p = AuditProfile::parse("full").expect("full parses");
         assert_eq!(p, AuditProfile::Full);
-        assert!(p.is_active(), "full must read the live app");
+        assert!(p.needs_live_session(), "full must read the live app");
         assert!(p.wants_static_composite(), "full includes static passes");
     }
 
@@ -1200,6 +1201,18 @@ mod tests {
             )
             .await
             .expect("start");
+        // The child emits its DECSET negotiation at startup; under
+        // full-suite parallel PTY load those bytes can still be in flight
+        // when the profile reads the raw ring — same class as the wave3c
+        // flake. A plain observe settles the stream first (the profile is
+        // a ring read and deliberately does not wait itself).
+        {
+            let _ = pool
+                .with_session(Some(&id), |s| {
+                    let _ = s.observe(300);
+                })
+                .await;
+        }
         let report = pool
             .with_session(Some(&id), |s| run_profile(s, "terminal_modes"))
             .await
@@ -1255,6 +1268,19 @@ mod tests {
             )
             .await
             .expect("start");
+        // The child emits its whole flicker signature (alt screen, erase
+        // cycles, cursor toggles) at startup; under full-suite parallel PTY
+        // load those bytes can still be in flight when the first audit's
+        // ring read runs — same class as the query_response flake. A plain
+        // observe settles the stream before any audit reads the ring (the
+        // audits are ring reads and deliberately do not wait themselves).
+        {
+            let _ = pool
+                .with_session(Some(&id), |s| {
+                    let _ = s.observe(300);
+                })
+                .await;
+        }
 
         let render = pool
             .with_session(Some(&id), |s| run_profile(s, "rendering"))

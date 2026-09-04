@@ -15,8 +15,9 @@ pub enum ErrorCategory {
     NoSession,
     /// A semantic action target failed to resolve: `ambiguous_target`,
     /// `target_not_found`, or a verb/kind mismatch (Wave D item 31). The
-    /// agent can self-correct from the message (matches/candidates are
-    /// attached) — this is not a malformed request, it is a refinement loop.
+    /// agent can self-correct from the payload (`details.candidates` /
+    /// `details.matches` list the resolutions) — this is not a malformed
+    /// request, it is a refinement loop.
     TargetError,
     BackendError,
     InternalError,
@@ -62,6 +63,15 @@ pub struct Envelope<T> {
     pub category: ErrorCategory,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Structured remediation payload (review §14): the machine-usable
+    /// fields the prose `error` also names — `retry_after_ms` at the lease
+    /// gate, `expected`/`actual` for stale-state, `candidates` for target
+    /// resolution, `alternatives` for unsupported paths. Optional and
+    /// free-form so a category can carry exactly what its remediation
+    /// needs; agents branch on `category`, then read this without
+    /// regex-matching the message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
 }
@@ -71,6 +81,7 @@ impl<T> Envelope<T> {
         Envelope {
             category: ErrorCategory::Success,
             error: None,
+            details: None,
             data: Some(data),
         }
     }
@@ -78,6 +89,20 @@ impl<T> Envelope<T> {
         Envelope {
             category: cat,
             error: Some(msg.into()),
+            details: None,
+            data: None,
+        }
+    }
+    /// Fail with a structured remediation payload alongside the prose.
+    pub fn fail_with(
+        cat: ErrorCategory,
+        msg: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Envelope<()> {
+        Envelope {
+            category: cat,
+            error: Some(msg.into()),
+            details: Some(details),
             data: None,
         }
     }
@@ -107,4 +132,34 @@ pub fn to_error_data(cat: ErrorCategory, msg: impl Into<String>) -> ErrorData {
         _ => ErrorCode::INTERNAL_ERROR,
     };
     ErrorData::new(code, msg.into(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review §14: the structured remediation payload rides beside the
+    /// prose, round-trips, and stays absent when there is nothing to say.
+    #[test]
+    fn details_payload_round_trips_and_stays_optional() {
+        let plain = Envelope::<()>::fail(ErrorCategory::StaleState, "focus moved");
+        assert!(plain.details.is_none());
+        let json = plain.to_json();
+        assert!(!json.contains("details"), "absent details must not appear");
+
+        let rich = Envelope::<()>::fail_with(
+            ErrorCategory::ControlLeased,
+            "session 's' is leased",
+            serde_json::json!({
+                "session": "s",
+                "holder": "human",
+                "retry_after_ms": 1234,
+            }),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rich.to_json()).expect("envelope parses");
+        assert_eq!(parsed["category"], "control_leased");
+        assert_eq!(parsed["details"]["retry_after_ms"], 1234);
+        assert_eq!(parsed["details"]["holder"], "human");
+    }
 }
