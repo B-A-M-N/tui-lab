@@ -157,10 +157,20 @@ pub(crate) fn observe_mode_arm(
             }))
         }
         OM::Scrollback => {
-            let lines = sess
-                .backend_scrollback()
-                .map_err(|e| err(ErrorCategory::BackendError, e.to_string()))
-                .unwrap_or_default();
+            // Audit P1-43: a backend ERROR used to be swallowed by
+            // `unwrap_or_default()`, so a failed read reported
+            // `supported: true` with an empty array — indistinguishable from
+            // a genuinely empty history. An error is surfaced as an error;
+            // only a SUCCESSFUL read of nothing is an empty array.
+            let lines = match sess.backend_scrollback() {
+                Ok(lines) => lines,
+                Err(e) => {
+                    return err(
+                        ErrorCategory::BackendError,
+                        format!("scrollback read failed: {e}"),
+                    )
+                }
+            };
             let supported = sess.capabilities().scrollback;
             ok(json!({
                 "supported": supported,
@@ -220,7 +230,17 @@ pub(crate) fn observe_mode_arm(
             }))
         }
         OM::Protocol => {
-            let (bytes, cap, dropped) = sess.raw_output_window();
+            // Audit P1-44: a failed raw-window read is an error, not an
+            // empty window dressed up as "no capture".
+            let (bytes, cap, dropped) = match sess.raw_output_window() {
+                Ok(w) => w,
+                Err(e) => {
+                    return err(
+                        ErrorCategory::BackendError,
+                        format!("raw output window read failed: {e}"),
+                    )
+                }
+            };
             if cap == 0 {
                 return err(
                     ErrorCategory::Unsupported,
@@ -261,7 +281,15 @@ pub(crate) fn observe_mode_arm(
             }
         }
         OM::TerminalModes => {
-            let (bytes, cap, dropped) = sess.raw_output_window();
+            let (bytes, cap, dropped) = match sess.raw_output_window() {
+                Ok(w) => w,
+                Err(e) => {
+                    return err(
+                        ErrorCategory::BackendError,
+                        format!("raw output window read failed: {e}"),
+                    )
+                }
+            };
             if cap == 0 {
                 return err(
                     ErrorCategory::Unsupported,

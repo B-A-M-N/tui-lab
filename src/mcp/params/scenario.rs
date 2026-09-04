@@ -37,6 +37,12 @@ pub struct TuiScenarioParams {
     pub recording_id: Option<String>,
     #[serde(default)]
     pub steps: Option<Vec<serde_json::Value>>,
+    /// Sensitive-parameter values for `run` (audit P0-18): `{"PASSWORD":
+    /// "..."}` substitutes the scenario's declared `${NAME}` references at
+    /// replay time. Values are used in-memory only — they are never
+    /// persisted into the scenario, the run ledger, or any artifact.
+    #[serde(default)]
+    pub parameters: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]

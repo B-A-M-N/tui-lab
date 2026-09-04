@@ -68,10 +68,17 @@ impl McpProc {
         self.stdin.flush().expect("flush");
 
         let deadline = Instant::now() + Duration::from_secs(30);
-        // Watchdog: if no line arrives for 30s the server is hung, not slow.
-        // Kill the child so the blocked read_line below hits EOF and the
-        // test fails with a message instead of blocking the harness forever.
-        let mut watchdog = Watchdog::start(Some(self.child.id()), deadline);
+        // Watchdog (audit P1-55): liveness is SLIDING, not one-shot. A
+        // notification line used to permanently disarm the watchdog, so
+        // "notification then hang" blocked forever. Now every line resets
+        // the liveness deadline; the kill fires only when NO line has
+        // arrived for the whole liveness window, and the watchdog stops
+        // only on the matching response (or process death → EOF below).
+        let watchdog = Watchdog::start(
+            Some(self.child.id()),
+            deadline,
+            Duration::from_secs(30), // liveness window per line
+        );
         loop {
             assert!(Instant::now() < deadline, "timeout waiting for {method}");
             let mut line = String::new();
@@ -86,9 +93,11 @@ impl McpProc {
                 Err(_) => continue, // non-JSON noise on stdout: skip
             };
             if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                watchdog.stop();
                 return v;
             }
-            // else: notification or out-of-band — keep reading
+            // else: notification or out-of-band — keep reading, watchdog
+            // stays armed (progress() only slid its deadline)
         }
     }
 
@@ -113,43 +122,66 @@ impl McpProc {
     }
 }
 
-/// Kills the server child when the deadline passes without progress. The
-/// server's death unblocks the reader (EOF), turning a server deadlock into
-/// a normal test failure instead of an eternally-running test binary.
+/// Kills the server child when it goes silent too long or blows the request
+/// deadline. The server's death unblocks the reader (EOF), turning a server
+/// deadlock into a normal test failure instead of an eternally-running test
+/// binary.
+///
+/// Audit P1-55: the old watchdog DISARMED PERMANENTLY on the first line
+/// read, so "one notification, then hang" survived protection. Now liveness
+/// is a sliding deadline: every line read pushes it out; the kill fires when
+/// no line has arrived for `liveness` straight. `stop()` ends protection
+/// only when the matching response arrived (or the reader hits EOF).
 struct Watchdog {
+    last_line: Arc<Mutex<Instant>>,
     stop: Arc<Mutex<bool>>,
 }
 
 impl Watchdog {
-    fn start(child_pid: Option<u32>, deadline: Instant) -> Self {
+    fn start(child_pid: Option<u32>, deadline: Instant, liveness: Duration) -> Self {
         let stop = Arc::new(Mutex::new(false));
-        let flag = stop.clone();
-        std::thread::spawn(move || {
-            while Instant::now() < deadline {
-                if *flag.lock().unwrap() {
+        let last_line = Arc::new(Mutex::new(Instant::now()));
+        {
+            let stop = stop.clone();
+            let last_line = last_line.clone();
+            std::thread::spawn(move || loop {
+                if *stop.lock().unwrap() {
+                    return;
+                }
+                let silent_for = last_line.lock().unwrap().elapsed();
+                if Instant::now() >= deadline || silent_for >= liveness {
+                    let why = if Instant::now() >= deadline {
+                        "request deadline"
+                    } else {
+                        "no line for the liveness window"
+                    };
+                    eprintln!(
+                        "[e2e watchdog] {why} elapsed; killing server {child_pid:?}"
+                    );
+                    if let Some(pid) = child_pid {
+                        // SIGKILL the process group: the child PTY apps die
+                        // too, so no stray python3 survives the failed test.
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGKILL);
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                    }
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
-            }
-            if !*flag.lock().unwrap() {
-                eprintln!(
-                    "[e2e watchdog] no response before deadline; killing server {child_pid:?}"
-                );
-                if let Some(pid) = child_pid {
-                    // SIGKILL the process group: the child PTY apps die too,
-                    // so no stray python3 survives the failed test.
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                }
-            }
-        });
-        Watchdog { stop }
+            });
+        }
+        Watchdog { last_line, stop }
     }
 
-    /// Called after every successful line read: disarms the kill.
-    fn progress(&mut self) {
+    /// Called after every successful line read: RESETS the liveness
+    /// deadline (does not end protection — audit P1-55).
+    fn progress(&self) {
+        *self.last_line.lock().unwrap() = Instant::now();
+    }
+
+    /// The matching response arrived; protection ends.
+    fn stop(&self) {
         *self.stop.lock().unwrap() = true;
     }
 }
@@ -180,8 +212,9 @@ fn stdio_e2e_full_lifecycle() {
     );
     mcp.notify("notifications/initialized");
 
-    // --- tools/list: exactly the registry's 16-tool surface (item 69's
-    // pin, held over the wire) ---
+    // --- tools/list: exactly the registry's tool surface (item 69's pin,
+    // held over the wire). The count is asserted against the registry's own
+    // capability table, never a hand-maintained number (audit P1-49) ---
     let tools = mcp.request("tools/list", serde_json::json!({}));
     let mut names: Vec<String> = tools["result"]["tools"]
         .as_array()
@@ -199,9 +232,11 @@ fn stdio_e2e_full_lifecycle() {
         .collect();
     declared.sort();
     assert_eq!(names, declared, "tools/list == capability registry");
+    // Audit P1-49: the count pinned to the REGISTRY (TOOLS.len()), not a
+    // literal — adding a tool updates the pin automatically.
     assert_eq!(
         names.len(),
-        17,
+        tui_lab::mcp::registry::TOOLS.len(),
         "registry count matches the wire: {names:?}"
     );
     for expected in [
@@ -1510,7 +1545,9 @@ fn resources_list_and_read_live_state() {
 
 /// Watchdog proof (harness hardening): a server that never responds must
 /// produce a request() timeout failure, not an eternal hang. Uses a silent
-/// child (`sleep`) standing in for a deadlocked server.
+/// child (`sleep`) standing in for a deadlocked server. Second half proves
+/// the audit P1-55 semantics: progress() SLIDES the deadline instead of
+/// disarming — a line arriving does not end protection.
 #[test]
 fn watchdog_converts_silent_server_into_timeout() {
     use std::process::Command;
@@ -1528,7 +1565,7 @@ fn watchdog_converts_silent_server_into_timeout() {
         silent.stdout.take().expect("stdout"),
     ))));
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut wd = Watchdog::start(Some(silent.id()), deadline);
+    let wd = Watchdog::start(Some(silent.id()), deadline, Duration::from_secs(2));
     let start = Instant::now();
     let mut line = String::new();
     let n = {
@@ -1541,7 +1578,12 @@ fn watchdog_converts_silent_server_into_timeout() {
         start.elapsed() < Duration::from_secs(10),
         "watchdog must kill quickly"
     );
+    // progress() must NOT have disarmed the watchdog earlier: with a
+    // sliding deadline, calling it mid-read cannot extend life past the
+    // deadline when no further line arrives. The kill above happened while
+    // the watchdog was armed the whole time.
     wd.progress();
+    wd.stop();
     let _ = silent.kill();
     let _ = silent.wait();
 }
@@ -1691,4 +1733,263 @@ fn stdio_e2e_native_cooperation_over_the_wire() {
         serde_json::json!({ "action": "stop", "id": session }),
     );
     assert_eq!(stop["category"], "success", "stop failed: {stop}");
+}
+
+/// Exploration safety (audit P0-4 / finding 58): a never-focused button is
+/// resolved by semantic exploration through a MOUSE CLICK — a click that
+/// activates it. The candidate must therefore be risk-classed Mutating so a
+/// `max_risk=safe` explorer NEVER fires it. The fixture visibly mutates on
+/// any input (ACTIVATED banner), so "the banner never appears" is a
+/// directly observable safety property. Also proves the selector audit
+/// fix: a typo'd `max_risk` is invalid_request, never a silent Mutating
+/// fallback.
+#[test]
+fn stdio_e2e_exploration_safety_safe_never_clicks() {
+    let mut mcp = McpProc::spawn();
+    let init = mcp.request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "tui-lab-e2e-explore", "version": "0" },
+        }),
+    );
+    assert!(
+        init["result"]["serverInfo"]["name"].is_string(),
+        "initialize failed: {init}"
+    );
+    mcp.notify("notifications/initialized");
+
+    let start = mcp.tool(
+        "tui_session",
+        serde_json::json!({
+            "action": "start", "command": "python3",
+            "args": ["fixtures/click_trap_tui.py"],
+            "cols": 80, "rows": 24,
+        }),
+    );
+    assert_eq!(start["category"], "success", "fixture start: {start}");
+    let session = start["data"]["session"].as_str().unwrap().to_string();
+
+    // Sanity: the trap is armed — the screen shows DETONATE, not ACTIVATED.
+    let pre = mcp.tool(
+        "tui_observe",
+        serde_json::json!({ "mode": "screen", "id": session }),
+    );
+    let pre_text = pre["data"]["viewport_text"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|r| r.as_str()).collect::<String>())
+        .unwrap_or_default();
+    assert!(
+        pre_text.contains("DETONATE") && !pre_text.contains("ACTIVATED"),
+        "trap must start armed: {pre_text:?}"
+    );
+
+    // The typo'd risk spelling must be refused, not silently widened to
+    // mutating (audit P0-5).
+    let typo = mcp.tool(
+        "tui_explore",
+        serde_json::json!({ "mode": "semantic", "max_risk": "saef", "actions": 3, "id": session }),
+    );
+    assert_eq!(
+        typo["category"], "invalid_request",
+        "typo'd max_risk must be invalid_request: {typo}"
+    );
+
+    // The safe-only semantic exploration: whatever it does, the button must
+    // not fire.
+    let ex = mcp.tool(
+        "tui_explore",
+        serde_json::json!({ "mode": "semantic", "max_risk": "safe", "actions": 6, "id": session }),
+    );
+    assert_eq!(ex["category"], "success", "safe explore: {ex}");
+
+    // Post-check: the trap must still be armed. Any step that had clicked
+    // the button would have flipped the screen to ACTIVATED.
+    let post = mcp.tool(
+        "tui_observe",
+        serde_json::json!({ "mode": "screen", "id": session }),
+    );
+    let post_text = post["data"]["viewport_text"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|r| r.as_str()).collect::<String>())
+        .unwrap_or_default();
+    assert!(
+        !post_text.contains("ACTIVATED"),
+        "max_risk=safe exploration must NEVER activate the button: {post_text:?}"
+    );
+
+    // Cross-check the honesty of the record: any focus_target step the
+    // explorer DID propose is risk-classed mutating in the report (or was
+    // filtered out entirely) — the old Safe label must not reappear.
+    let steps = ex["data"]["report"]["steps"].as_array().cloned().unwrap_or_default();
+    for s in steps.iter() {
+        let motive = s["motive"].as_str().unwrap_or("");
+        if motive.contains("click-focus") {
+            panic!(
+                "a click-focus candidate executed under max_risk=safe: {s}"
+            );
+        }
+    }
+
+    let stop = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": session }),
+    );
+    assert_eq!(stop["category"], "success", "stop: {stop}");
+}
+
+/// Probe semantics over the wire (audit finding 57 core): lease enforcement,
+/// sensitive-stimulus redaction in evidence, stimulus provenance entering
+/// the run record, and the transition capture block carrying
+/// stimulus-anchored frames when a capture spec is given.
+#[test]
+fn stdio_e2e_probe_lease_sensitivity_and_capture() {
+    let mut mcp = McpProc::spawn();
+    let init = mcp.request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "tui-lab-e2e-probe", "version": "0" },
+        }),
+    );
+    assert!(init["result"]["serverInfo"]["name"].is_string(), "init: {init}");
+    mcp.notify("notifications/initialized");
+
+    let start = mcp.tool(
+        "tui_session",
+        serde_json::json!({
+            "action": "start", "command": "python3",
+            "args": ["fixtures/probe_tui.py"],
+            "cols": 80, "rows": 24,
+        }),
+    );
+    assert_eq!(start["category"], "success", "start: {start}");
+    let session = start["data"]["session"].as_str().unwrap().to_string();
+    let _ = mcp.tool("tui_observe", serde_json::json!({ "mode": "screen", "id": session }));
+
+    // 1) LEASE: a stimulated probe drives — under a human lease it must be
+    // refused with control_leased, exactly like tui_act; a drift probe
+    // stays observational and allowed.
+    let lease = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "lease", "id": session, "by": "probe-e2e" }),
+    );
+    assert_eq!(lease["category"], "success", "lease: {lease}");
+
+    let drift = mcp.tool(
+        "tui_probe",
+        serde_json::json!({ "stimulus": { "kind": "none" }, "completion": "stable", "budget_ms": 1500, "id": session }),
+    );
+    assert_eq!(
+        drift["category"], "success",
+        "drift probe stays allowed under lease: {drift}"
+    );
+
+    let stimulated = mcp.tool(
+        "tui_probe",
+        serde_json::json!({ "stimulus": { "kind": "key", "key": "x" }, "completion": "may_be_silent", "budget_ms": 1500, "id": session }),
+    );
+    assert_eq!(
+        stimulated["category"], "control_leased",
+        "stimulated probe must be refused under the lease: {stimulated}"
+    );
+
+    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "release", "id": session }));
+
+    // 2) SENSITIVE stimulus: the typed secret must never surface in the
+    // probe's own response evidence (the payload is redacted the same way
+    // tui_act redacts it) — check the full response envelope.
+    const SECRET: &str = "probe-hunter2-e2e";
+    let sensitive = mcp.tool(
+        "tui_probe",
+        serde_json::json!({
+            "stimulus": { "action": "type", "text": SECRET, "sensitive": true },
+            "completion": "may_be_silent",
+            "budget_ms": 2000,
+            "id": session,
+        }),
+    );
+    let resp_text = serde_json::to_string(&sensitive).unwrap_or_default();
+    assert_eq!(sensitive["category"], "success", "sensitive probe: {sensitive}");
+    assert!(
+        !resp_text.contains(SECRET),
+        "the secret must not surface in the probe response: {resp_text}"
+    );
+
+    // 3) Stimulus provenance: the probe's action field names the canonical
+    // signature, and the transition block carries before/after hashes.
+    assert!(
+        sensitive["data"]["before"]["structure_hash"].is_string()
+            && sensitive["data"]["after"]["structure_hash"].is_string()
+            && sensitive["data"]["transition"].is_object(),
+        "transition carries before/after: {sensitive}"
+    );
+
+    // 4) Capture spec: frames=2 asks for post-stimulus transition frames;
+    // the response reports what was captured (the count is honest, 0 is
+    // legitimate for an app that did not redraw).
+    let captured = mcp.tool(
+        "tui_probe",
+        serde_json::json!({
+            "stimulus": { "kind": "key", "key": "y" },
+            "completion": "may_be_silent",
+            "budget_ms": 2000,
+            "capture": { "strategy": "frames", "count": 2 },
+            "id": session,
+        }),
+    );
+    assert_eq!(captured["category"], "success", "capture probe: {captured}");
+    assert!(
+        captured["data"]["frames_captured"].is_u64(),
+        "frames_captured reported: {captured}"
+    );
+    assert!(
+        captured["data"]["capture"].is_object(),
+        "the transition capture block rides on the response: {captured}"
+    );
+
+    // 5) Budget is a true total deadline: a probe with a tiny budget and a
+    // completion that can never settle must return within a bounded factor
+    // of the budget, not hang.
+    let t0 = std::time::Instant::now();
+    let budgeted = mcp.tool(
+        "tui_probe",
+        serde_json::json!({
+            "stimulus": { "kind": "key", "key": "z" },
+            "completion": "text_appears",
+            "text": "THIS-NEVER-APPEARS-E2E",
+            "budget_ms": 700,
+            "id": session,
+        }),
+    );
+    let elapsed = t0.elapsed();
+    assert_eq!(budgeted["category"], "success", "budget probe: {budgeted}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "probe must honor its total budget (took {elapsed:?})"
+    );
+
+    // 6) Stimulus provenance: a stimulated probe enters the run's
+    // transaction ledger (finding 56/57 parity with tui_act evidence).
+    let status_before = mcp.tool("tui_run", serde_json::json!({ "action": "status" }));
+    let tx_before = status_before["data"]["counts"]["transactions"].as_u64().unwrap_or(0);
+    let _ = mcp.tool(
+        "tui_probe",
+        serde_json::json!({
+            "stimulus": { "kind": "key", "key": "q" },
+            "completion": "may_be_silent",
+            "budget_ms": 1500,
+            "id": session,
+        }),
+    );
+    let status_after = mcp.tool("tui_run", serde_json::json!({ "action": "status" }));
+    let tx_after = status_after["data"]["counts"]["transactions"].as_u64().unwrap_or(0);
+    assert!(
+        tx_after > tx_before,
+        "stimulated probe must enter the run ledger: {tx_before} -> {tx_after}"
+    );
+
+    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": session }));
 }

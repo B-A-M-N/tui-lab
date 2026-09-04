@@ -582,6 +582,81 @@ pub fn run_profile_checked(
     let profile = AuditProfile::parse(profile_name)?;
     if !policy.allows(&profile) {
         let risk = profile.risk();
+        // Audit P0-24: a gated composite is DECOMPOSED, not dismissed.
+        // `full` under safe-only used to produce one ORCH-GATED and zero
+        // checks — an empty audit that looked like "ran, nothing found".
+        // The honest report: every OBSERVATIONAL member of the composite
+        // actually runs now, and each withheld member is named with its
+        // risk and its driver role, so the caller sees what ran, what
+        // didn't, and why.
+        if profile == AuditProfile::Full {
+            let mut findings: Vec<Finding> = Vec::new();
+            // 1. The static composite (discoverability/unicode/controls) —
+            //    observational, always permitted.
+            {
+                let (screen, sem, _, _) = session
+                    .observe_fused(40)
+                    .map_err(|e| format!("observe failed: {e}"))?;
+                findings.extend(crate::audit::run("full", &screen, &sem).map_err(|e| e.to_string())?);
+            }
+            // 2. Every observational member of full that has a driver —
+            //    these read live state without touching the app.
+            for d in PROFILES.iter().filter(|d| {
+                d.included_in_full && d.risk == MutationRisk::Observational
+            }) {
+                let f = d.driver;
+                findings.extend(f(session, &mut crate::semantic::focus_graph::FocusGraph::new()));
+            }
+            // 3. The withheld list: every invasive member, named.
+            let withheld: Vec<serde_json::Value> = PROFILES
+                .iter()
+                .filter(|d| d.included_in_full && d.risk.is_invasive())
+                .map(|d| {
+                    json!({
+                        "profile": d.id,
+                        "risk": d.risk.name(),
+                        "reason": "invasive under safe-only policy",
+                    })
+                })
+                .collect();
+            findings.push(Finding {
+                id: "ORCH-GATED".into(),
+                rule_id: None,
+                severity: "info".into(),
+                category: "orchestration".into(),
+                summary: format!(
+                    "'full' ran its observational members only ({} finding(s) above): {} member(s) withheld — {}. Pass allow_mutation=true (or attach a restartable launch) to permit them.",
+                    findings.len(),
+                    withheld.len(),
+                    PROFILES
+                        .iter()
+                        .filter(|d| d.included_in_full && d.risk.is_invasive())
+                        .map(|d| d.id)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                evidence: vec![EvidenceRef::point(
+                    EvidenceKind::Other,
+                    "safe_only_gate",
+                    "invasive profile members withheld under safe-only policy; observational members RAN (decomposed report)",
+                )
+                .with_detail(json!({
+                    "profile": profile.name(),
+                    "policy": "safe_only",
+                    "withheld": withheld,
+                    "how_to_allow": "tui_audit allow_mutation=true, or launch the session through tui_session so restart-replay can isolate it",
+                }))],
+                confidence: 1.0,
+                reproduction: None,
+                source_refs: Vec::new(),
+            });
+            return Ok(ProfileReport {
+                profile,
+                mode: "partial",
+                findings,
+                focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+            });
+        }
         return Ok(ProfileReport {
             profile: profile.clone(),
             mode: "withheld",
@@ -729,26 +804,57 @@ fn run_profile_with_contract_impl(
         })
     };
 
-    // Wave 4 item 35: restart-replay between PotentiallyMutating drivers.
-    // Under DeepIsolation, before each mutating driver the session is
-    // restarted from its LaunchSpec so the driver sees a fresh app and
-    // leaves nothing behind for the next one — order dependence is removed
-    // at the orchestration layer instead of assumed away per driver.
-    // Without a LaunchSpec (attached brownfield), DeepIsolation degrades to
-    // AllowMutation and says so once, honestly.
+    // Wave 4 item 35 + audit P0-11: restart-replay between
+    // PotentiallyMutating drivers. Under DeepIsolation, before each
+    // mutating driver the session is restarted from its LaunchSpec so the
+    // driver sees a fresh app and leaves nothing behind for the next one.
+    // DeepIsolation is a CONTRACT, not an optimization: when isolation is
+    // impossible (no LaunchSpec — attached brownfield), the audit refuses
+    // invasive profiles outright instead of degrading to in-place
+    // mutation. Observational-only profiles still run: they never touch
+    // the app, so isolation is irrelevant to them.
     let deep = policy == SafetyPolicy::DeepIsolation && session.launch().is_some();
     let mut orchestration_notes: Vec<Finding> = Vec::new();
     if policy == SafetyPolicy::DeepIsolation && !deep {
+        let requested_risk = descriptor(&profile).risk;
+        if requested_risk.is_invasive() {
+            // The requested profile can mutate and isolation is
+            // impossible: refuse. The old behavior "ran in place" — a
+            // deep-isolation request silently mutating the live target is
+            // exactly the failure the policy exists to prevent.
+            let profile_name = profile.name();
+            return Ok(ProfileReport {
+                profile,
+                mode: "refused",
+                findings: vec![Finding {
+                    id: "ORCH-DEEP-REFUSED".into(),
+                    rule_id: None,
+                    severity: "warn".into(),
+                    category: "orchestration".into(),
+                    summary: "deep isolation requested but unattainable (no launch spec — attached brownfield): the requested profile is invasive, so it was REFUSED, not run in place. Re-run with a launched session, allow_mutation (explicit in-place consent), or an observational profile.".to_string(),
+                    evidence: vec![EvidenceRef::point(
+                        EvidenceKind::Other,
+                        "deep_isolation_unavailable",
+                        "restart-replay needs a recorded LaunchSpec; invasive profiles are refused rather than degraded",
+                    )
+                    .with_detail(json!({ "profile": profile_name, "risk": requested_risk.name() }))],
+                    confidence: 1.0,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                }],
+                focus_graph: graph,
+            });
+        }
         orchestration_notes.push(Finding {
             id: "ORCH-NO-RESTART".into(),
             rule_id: None,
             severity: "info".into(),
             category: "orchestration".into(),
-            summary: "deep isolation requested but this session has no launch spec (attached brownfield) — running in place; mutating drivers share app state.".to_string(),
+            summary: "deep isolation requested but this session has no launch spec (attached brownfield) — the requested profile is observational (no mutation), so it runs unaffected.".to_string(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Other,
                 "deep_isolation_unavailable",
-                "restart-replay needs a recorded LaunchSpec",
+                "restart-replay needs a recorded LaunchSpec; observational profiles do not need it",
             )
             .with_detail(json!({ "profile": profile.name() }))],
             confidence: 1.0,
@@ -758,7 +864,11 @@ fn run_profile_with_contract_impl(
     }
     let restart_between = deep;
     let mut restarts = 0u32;
+    let mut aborted = false;
     // Restart helper: only used when a launch spec exists (checked above).
+    // Audit P0-11: a FAILED restart aborts the remaining active members —
+    // continuing "on the live app" meant driving an app in unknown state
+    // after isolation was already promised.
     let do_restart = |session: &mut Session, before: &str, after: &str| -> Option<Finding> {
         match session.restart() {
             Ok(()) => {
@@ -793,7 +903,7 @@ fn run_profile_with_contract_impl(
                 severity: "warn".into(),
                 category: "orchestration".into(),
                 summary: format!(
-                    "restart between {before} and {after} failed: {e} — continuing on the live app"
+                    "restart between {before} and {after} failed: {e} — remaining active drivers ABORTED (deep isolation broken; the app is in unknown state)"
                 ),
                 evidence: vec![EvidenceRef::point(
                     EvidenceKind::Other,
@@ -829,7 +939,14 @@ fn run_profile_with_contract_impl(
                 if d.risk > MutationRisk::Reversible || d.full_group >= 4 {
                     if let Some(f) = do_restart(session, "previous group", d.id) {
                         restarts += 1;
+                        let failed = f.id == "ORCH-RESTART-FAILED";
                         fs.push(f);
+                        if failed {
+                            // Isolation already promised: do not drive an
+                            // app of unknown state. Abort the rest.
+                            aborted = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -842,24 +959,45 @@ fn run_profile_with_contract_impl(
             }
         }
         if restarts > 0 {
-            fs.push(Finding {
-                id: "ORCH-DEEP-SUMMARY".into(),
-                rule_id: None,
-                severity: "info".into(),
-                category: "orchestration".into(),
-                summary: format!(
-                    "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
-                ),
-                evidence: vec![EvidenceRef::point(
-                    EvidenceKind::Other,
-                    "deep_isolation_summary",
-                    "restart count for this composite run",
-                )
-                .with_detail(json!({ "restarts": restarts }))],
-                confidence: 1.0,
-                reproduction: None,
-                source_refs: Vec::new(),
-            });
+            if aborted {
+                fs.push(Finding {
+                    id: "ORCH-DEEP-ABORTED".into(),
+                    rule_id: None,
+                    severity: "warn".into(),
+                    category: "orchestration".into(),
+                    summary: format!(
+                        "deep isolation: run ABORTED after {restarts} restart gap(s) — a restart failed and the remaining active drivers were not run against the un-isolated app"
+                    ),
+                    evidence: vec![EvidenceRef::point(
+                        EvidenceKind::Other,
+                        "deep_isolation_aborted",
+                        "restart failure aborts remaining active members (audit P0-11)",
+                    )
+                    .with_detail(json!({ "restarts": restarts }))],
+                    confidence: 1.0,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                });
+            } else {
+                fs.push(Finding {
+                    id: "ORCH-DEEP-SUMMARY".into(),
+                    rule_id: None,
+                    severity: "info".into(),
+                    category: "orchestration".into(),
+                    summary: format!(
+                        "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
+                    ),
+                    evidence: vec![EvidenceRef::point(
+                        EvidenceKind::Other,
+                        "deep_isolation_summary",
+                        "restart count for this composite run",
+                    )
+                    .with_detail(json!({ "restarts": restarts }))],
+                    confidence: 1.0,
+                    reproduction: None,
+                    source_refs: Vec::new(),
+                });
+            }
         }
     } else {
         // Single profile: dispatch through the table, with the standalone

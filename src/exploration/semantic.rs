@@ -254,12 +254,23 @@ fn build_action(
         };
         match resolve_target(sem, &ActionTarget::Id { id: id.to_string() }) {
             Ok(control) => {
-                // Focusing by click may not work on all apps; the safe
-                // fallback is activation via Enter after the control is
-                // reachable — but click-focus is the only direct route, so
-                // use it and record honestly.
+                // Audit P0-4: this IS a click — on a button it activates.
+                // The candidate's risk class now says Mutating (the gate
+                // keeps it out of safe-only runs); the motive records the
+                // mechanism honestly instead of dressing a click up as
+                // "focus".
+                let mut motive = format!(
+                    "mouse click at control '{}' (click-focus: the click can \
+                     activate the control — this candidate is risk-classed \
+                     mutating)",
+                    control.id
+                );
+                if !reason_text.is_empty() {
+                    motive.push_str("; ");
+                    motive.push_str(&reason_text);
+                }
                 match crate::intent::plan_action(&ActionVerb::Click, &control) {
-                    Ok(a) => (Some(a), Some(control.id.clone()), reason_text),
+                    Ok(a) => (Some(a), Some(control.id.clone()), motive),
                     Err(e) => (None, Some(control.id.clone()), e.message()),
                 }
             }

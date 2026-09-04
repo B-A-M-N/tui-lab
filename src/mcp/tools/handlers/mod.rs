@@ -6,6 +6,7 @@
 pub(crate) mod audit;
 pub(crate) mod contract;
 pub(crate) mod coverage;
+pub(crate) mod drive;
 pub(crate) mod explore;
 pub(crate) mod framework;
 pub(crate) mod interact;

@@ -46,6 +46,31 @@ impl ProbeStimulus {
             ProbeStimulus::Legacy(_) => None,
         }
     }
+
+    /// The stimulus's sensitive-input policy (audit P0-3): a canonical
+    /// request can carry `sensitive=true`, and that policy must reach the
+    /// executor — the probe used to hardcode `InputVisibility::Normal`,
+    /// so a probed password was persisted verbatim everywhere `tui_act`
+    /// would have redacted it. The legacy form never carries secrets
+    /// beyond literal `type` text (which is Normal by the caller's choice).
+    pub fn visibility(&self) -> crate::execution::InputVisibility {
+        match self {
+            ProbeStimulus::Canonical(req) if req.sensitive() => {
+                crate::execution::InputVisibility::Sensitive
+            }
+            _ => crate::execution::InputVisibility::Normal,
+        }
+    }
+
+    /// Whether this stimulus is a REAL action (drives the TUI) as opposed
+    /// to a drift probe. Audit P0-2: real stimuli are machine driving and
+    /// must honor the human control lease; drift probes stay observational.
+    pub fn drives(&self) -> bool {
+        !matches!(
+            self,
+            ProbeStimulus::Legacy(crate::mcp::params::LegacyStimulus::None)
+        )
+    }
 }
 
 /// `tui_probe` legacy compact stimulus vocabulary. Retained for wire

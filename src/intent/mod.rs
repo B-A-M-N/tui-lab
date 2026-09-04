@@ -321,16 +321,18 @@ mod tests {
             classify_risk(&ActionVerb::Activate, Some(&next)),
             ActionRisk::Mutating
         );
-        // Focus stays safe even on a destructive-labelled control: focusing
-        // runs nothing (the earlier Mutating expectation was wrong).
+        // Audit P0-4: focus plans as a mouse click — which ACTIVATES. It is
+        // Mutating even on a destructive-labelled control (label evidence
+        // does not apply: the click risk comes from the mechanism, not the
+        // label), and never claims Safe again.
         assert_eq!(
             classify_risk(&ActionVerb::Focus, Some(&del)),
-            ActionRisk::Safe
+            ActionRisk::Mutating
         );
-        // Focus is safe on a neutral control.
+        // Focus is mutating on a neutral control too.
         assert_eq!(
             classify_risk(&ActionVerb::Focus, Some(&next)),
-            ActionRisk::Safe
+            ActionRisk::Mutating
         );
         // Risk ordering supports gating.
         assert!(ActionRisk::Safe < ActionRisk::Mutating);

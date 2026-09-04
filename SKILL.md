@@ -14,7 +14,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
   - condition: text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output, event
 - `tui_probe` — Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched material changes. stimulus {kind:none} = drift probe.
   - completion: stable, first_change, any_change, text_appears, text_disappears, process_exit, semantic_change, may_be_silent
-- `tui_assert` — Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
+- `tui_assert` — Assert UI facts (text, text_absent, position, focus, focused_not, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists); unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.
   - assertion: text, text_absent, position, focus, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, focused_not, oracle
 - `tui_checkpoint` — Save and compare named UI state checkpoints (durable under persistent runs).
   - action: save, compare, list, delete
@@ -22,7 +22,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
   - action: list, record_start, record_stop, save, export, run
 - `tui_record` — Capture terminal output: asciicast .cast lifecycle (start/stop) plus one-shot SVG/PNG screen captures.
   - format: start, stop, cast, svg, png
-- `tui_explore` — Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph. Driving: blocked while a human lease is live.
+- `tui_explore` — Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph (modes: random, guided_candidates, semantic, state_graph). Driving: blocked while a human lease is live. Replay of discovered flows is tui_scenario's job.
   - mode: random, guided_candidates, semantic, state_graph
 - `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.
   - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes, rendering, input_protocol, shell_cli, lifecycle, lifecycle_exit, query_response

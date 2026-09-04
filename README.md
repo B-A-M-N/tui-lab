@@ -104,7 +104,7 @@ honest `resource_not_found` errors naming what was accepted.
 
 ## MCP Tools
 
-16 tools over two resources surfaces (see "Run lifecycle" for `tui_run` and
+The tool set spans two resources surfaces (see "Run lifecycle" for `tui_run` and
 "MCP resources" for the `tui://` reads; the count is registry-derived —
 `tui_run action=context` reports it, and a CI test pins the registry to the
 wire router. This prose is not the contract). The authoritative selector
@@ -368,7 +368,7 @@ integrated until the real MCP path can exercise it.
 | Semantic model | v3 (border graph + SemanticNode tree, modal layering, widget families, provenance-tracked enabled, OSC8 hyperlinks) |
 | Native semantic protocol | working (TUI_LAB_SEMANTIC NDJSON side-channel: app-declared trees overlay inference with source=native/confidence=1.0; adapters + `tui_framework action=adapter_snippet` for Ratatui/Textual/Python) |
 | Screen capture | working (SVG with style runs + PNG via dependency-free encoder; `tui_record format=svg\|png`) |
-| MCP surface | working (16 tools + tui:// resources, stdio E2E-proven; tool/resource docs generated from the capability registry, count pinned to the router by test) |
+| MCP surface | working (registry-derived tool count + tui:// resources, stdio E2E-proven; tool/resource docs generated from the capability registry, count pinned to the router by test) |
 | Human control lease | working (TTL grant, exclusive; every driving path refuses with control_leased, observation stays allowed) |
 | Isolation profiles | working (local/clean/strict with IsolationEvidence; strict wraps the child in unshare --net) |
 | Run lifecycle | working (ephemeral default, persist keeps identity, close, list, resume restores ledger/findings/checkpoints/scenarios/graphs — not sessions; tui://runs reads closed runs read-only) |

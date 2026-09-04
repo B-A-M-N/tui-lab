@@ -1,4 +1,6 @@
-//! MCP surface: the 16 tools the agent sees (spec section 13 + later waves).
+//! MCP surface: the tools the agent sees (spec section 13 + later waves).
+//! The authoritative count lives in [`crate::mcp::registry::TOOLS`] — never
+//! a hand-maintained number here (audit P1-49).
 //! Internally there are hundreds of operations; the agent sees `tui_session`,
 //! `tui_observe`, `tui_act`, `tui_wait`, `tui_assert`, `tui_checkpoint`,
 //! `tui_scenario`, `tui_record`, `tui_explore`, `tui_audit`, `tui_explain`,
@@ -454,10 +456,13 @@ impl TuiLabServer {
         crate::mcp::tools::handlers::observe::tui_wait(self, p).await
     }
 
-    /// Assertions against screen/state.
+    /// Assertions against screen/state. Audit P1-51: the description is
+    /// generated from the authoritative assertion enum (same expression the
+    /// registry uses) — a new assertion variant updates the wire description
+    /// without anyone remembering this string.
     #[tool(
         name = "tui_assert",
-        description = "Assert UI facts: text, text_absent, position, focus, not_clipped, dimensions, exit_code."
+        description = "Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). Assertions: text, text_absent, position, focus, focused_not, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, oracle (the shared contract oracle language)."
     )]
     pub async fn tui_assert(&self, p: Parameters<TuiAssertParams>) -> rmcp::model::CallToolResult {
         crate::mcp::tools::handlers::observe::tui_assert(self, p).await
@@ -635,7 +640,7 @@ impl TuiLabServer {
     /// Exploration: random / guided_candidates / coverage_guided / replay (spec section 4/25).
     #[tool(
         name = "tui_explore",
-        description = "Seeded random exploration, candidate generation, or replay. Returns evidence, not another reasoning loop."
+        description = "Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, or the exploration state graph (modes: random, guided_candidates, semantic, state_graph). Driving modes are blocked while a human lease is live. Replay of discovered flows is tui_scenario's job — exploration returns evidence, not another reasoning loop."
     )]
     pub async fn tui_explore(
         &self,
@@ -687,7 +692,7 @@ impl TuiLabServer {
     /// adopts in its own source.
     #[tool(
         name = "tui_framework",
-        description = "Detect the TUI framework, run native probes, and fetch NativeSemanticProtocol adapter snippets (action=adapter_snippet)."
+        description = "Detect the TUI framework (detect), report backend capability probes and the NativeSemanticProtocol channel status (capabilities), and fetch adapter snippets (adapter_snippet; Ratatui/Textual/Python)."
     )]
     async fn tui_framework(
         &self,

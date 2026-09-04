@@ -31,22 +31,43 @@ pub(crate) async fn tui_run(
         unreachable!()
     };
     match run_action {
-        // Review P0.1/2: begin a fresh ephemeral run. This is the clean
-        // next-run operation — it does NOT touch sessions (they belong
-        // to whatever run launched them and become foreign owners under
-        // the new run, refused until stopped or re-launched).
+        // Review P0.1/2 + audit P0-6: begin a fresh ephemeral run. A
+        // PERSISTENT current run is flushed BEFORE replacement and a
+        // flush failure aborts the swap — `new` must never silently
+        // destroy unflushed evidence. An ephemeral run has nothing on
+        // disk to lose (held artifacts move nowhere; the response says
+        // so), so it swaps directly.
         RA::New => {
-            let mut guard = s.run.lock().unwrap();
-            let old_id = guard.id.clone();
-            *guard = crate::run::RunContext::ephemeral();
-            let new_id = guard.id.clone();
-            let mode = "ephemeral".to_string();
-            ok(json!({
-                "new_run_id": new_id,
-                "previous_run": old_id,
-                "mode": mode,
-                "note": "fresh ephemeral run begun; sessions from the previous run were not touched and now belong to a foreign run",
-            }))
+            let mut old = {
+                let mut guard = s.run.lock().unwrap();
+                std::mem::replace(&mut *guard, crate::run::RunContext::ephemeral())
+            };
+            let flush_result = match old.run_dir() {
+                Some(_) => old.flush(),
+                None => Ok(()),
+            };
+            match flush_result {
+                Ok(()) => {
+                    let new_id = s.run.lock().unwrap().id.clone();
+                    ok(json!({
+                        "new_run_id": new_id,
+                        "previous_run": old.id,
+                        "previous_flushed": old.run_dir().is_some(),
+                        "mode": "ephemeral",
+                        "note": "fresh ephemeral run begun; sessions from the previous run were not touched and now belong to a foreign run",
+                    }))
+                }
+                Err(e) => {
+                    // Swap back: the old run stays live when its flush
+                    // fails — evidence is never dropped on the floor.
+                    let mut guard = s.run.lock().unwrap();
+                    *guard = old;
+                    err(
+                        ErrorCategory::InternalError,
+                        format!("run flush failed before starting a new run; the current run is UNCHANGED: {e}"),
+                    )
+                }
+            }
         }
         RA::Status => {
             let sessions = s.sessions.list();
@@ -96,14 +117,35 @@ pub(crate) async fn tui_run(
             }
         }
         RA::Close => {
-            // Drain terminal-event queues into the run (Wave B item 14)
-            // before the flush so the event logs land in the artifacts.
-            // Wave G item 73: each drain is one actor call — no guard is
-            // held across the loop, so there is no re-entrancy dance and
-            // no close-path deadlock to avoid.
-            for sid in s.sessions.list() {
-                if let Ok(events) = s.sessions.drain_events(&sid).await {
-                    let _ = s.run.lock().unwrap().hold_events(&sid, events);
+            // Audit P0-9: this run's sessions, not every session in the
+            // process. Previous-run sessions may legitimately still be
+            // alive after `tui_run new` (they are foreign); closing run B
+            // must neither absorb their events nor kill them.
+            let run_id = s.run.lock().unwrap().id.clone();
+            let owned: Vec<String> = {
+                let owners = s.session_owners.lock().unwrap();
+                s.sessions
+                    .list()
+                    .into_iter()
+                    .filter(|sid| owners.get(sid).map(|o| o.as_str()) == Some(run_id.as_str()))
+                    .collect()
+            };
+            let foreign: Vec<String> = {
+                let owners = s.session_owners.lock().unwrap();
+                s.sessions
+                    .list()
+                    .into_iter()
+                    .filter(|sid| owners.get(sid).map(|o| o.as_str()) != Some(run_id.as_str()))
+                    .collect()
+            };
+            // Drain terminal-event queues of OWNED sessions into the run
+            // (Wave B item 14) before the flush so the event logs land in
+            // the artifacts. Wave G item 73: each drain is one actor call
+            // — no guard is held across the loop, so there is no
+            // re-entrancy dance and no close-path deadlock to avoid.
+            for sid in &owned {
+                if let Ok(events) = s.sessions.drain_events(sid).await {
+                    let _ = s.run.lock().unwrap().hold_events(sid, events);
                 }
             }
             let already;
@@ -113,13 +155,8 @@ pub(crate) async fn tui_run(
             {
                 let mut run = s.run.lock().unwrap();
                 already = run.is_closed();
-                let sessions = s.sessions.list();
-                summary = run.status(
-                    sessions
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                );
+                summary = run
+                    .status(owned.iter().map(|s| serde_json::Value::String(s.clone())).collect());
                 kill = p.kill_sessions.unwrap_or(false);
                 result = run.close();
             }
@@ -129,15 +166,25 @@ pub(crate) async fn tui_run(
                     format!("close flush failed: {e}"),
                 );
             }
-            // Sessions survive close unless explicitly requested.
+            // OWNED sessions survive close unless explicitly requested;
+            // foreign sessions are NEVER touched by another run's close.
             let stopped: Vec<String> = if kill {
-                s.sessions.stop_all().await
+                let mut out = Vec::new();
+                for sid in &owned {
+                    if s.sessions.stop(sid).await.is_ok() {
+                        s.session_owners.lock().unwrap().remove(sid);
+                        out.push(sid.clone());
+                    }
+                }
+                out
             } else {
                 Vec::new()
             };
             ok(json!({
                 "closed": true,
                 "already_closed": already,
+                "owned_sessions": owned,
+                "foreign_live_sessions": foreign,
                 "sessions_stopped": stopped,
                 "final": summary,
             }))
@@ -177,17 +224,15 @@ pub(crate) async fn tui_run(
                     },
                 };
             match crate::run::RunContext::list_persisted(std::path::Path::new(&base)) {
-                Ok(mut entries) => {
-                    // A directory with no run.json lands here with its
-                    // `skipped` reason; keep it — corruption is evidence.
-                    let runs: Vec<_> = entries
-                        .drain(..)
-                        .filter(|e| e.get("run_id").is_some())
-                        .collect();
-                    let skipped: Vec<_> = entries
+                Ok(entries) => {
+                    // Audit P0-45: partition ONCE. The old code drained
+                    // into `runs` first, so `skipped` was always empty —
+                    // corrupt entries silently vanished. A directory with
+                    // no run.json lands here with its `skipped` reason;
+                    // keep it — corruption is evidence.
+                    let (runs, skipped): (Vec<_>, Vec<_>) = entries
                         .into_iter()
-                        .filter(|e| e.get("skipped").is_some())
-                        .collect();
+                        .partition(|e| e.get("run_id").is_some());
                     ok(json!({
                         "base": base,
                         "runs": runs,
@@ -198,13 +243,16 @@ pub(crate) async fn tui_run(
                 Err(e) => err(ErrorCategory::InvalidRequest, e.to_string()),
             }
         }
-        // Wave G item 74: restore a persisted run as the live run. The
-        // live run is flushed first (identity-preserving; an ephemeral
-        // run with nothing durable simply ends), sessions are left
-        // untouched (they belonged to the old run; the restored run
-        // starts with none — the manifest's launch specs are on disk
-        // for re-creation), and the restored run continues the same
-        // id, ledger, findings, graphs, scenarios, and checkpoints.
+        // Wave G item 74 + audit P0-7/P0-8: restore a persisted run as
+        // the live run. ORDER MATTERS: the target is fully restored into
+        // a temporary RunContext FIRST (a malformed target is refused
+        // before anything is disturbed), then the live run is flushed
+        // (audit P0-7: the old comment claimed this flush; it never
+        // happened), and only THEN are foreign sessions detached —
+        // destructive cleanup is the last pre-commit stage, never
+        // validation. Sessions are left untouched otherwise (they belong
+        // to the old run; the restored run starts with none — the
+        // manifest's launch specs are on disk for re-creation).
         RA::Resume => {
             // Resolve the target directory: explicit run_dir wins, else
             // run_id under the resolved base.
@@ -240,48 +288,8 @@ pub(crate) async fn tui_run(
                     "resume requires 'run_id' (from tui_run action=list) or 'run_dir'",
                 );
             };
-            // Review P0.2 provenance guard: sessions launched under a
-            // DIFFERENT run must not survive into the resumed run — their
-            // future traffic would land in the wrong evidence bundle. The
-            // default refuses; `detach_existing_sessions=true` stops them
-            // first. Sessions owned by the TARGET run carry over (they
-            // already belong to the run being resumed) — only sessions
-            // owned by neither the target nor the current run block.
-            let target_run = running_id(&run_dir);
-            let foreign: Vec<String> = {
-                let owners = s.session_owners.lock().unwrap();
-                s.sessions
-                    .list()
-                    .into_iter()
-                    .filter(|sid| {
-                        match owners.get(sid) {
-                            // Owned by the run we're resuming: fine.
-                            Some(o) => o != &target_run,
-                            // Unowned sessions: treat as foreign (must be
-                            // re-launched under the resumed run).
-                            None => true,
-                        }
-                    })
-                    .collect()
-            };
-            if !foreign.is_empty() {
-                if !p.detach_existing_sessions.unwrap_or(false) {
-                    return err(
-                            ErrorCategory::InvalidRequest,
-                            format!(
-                                "resume refused: {} live session(s) do not belong to target run {} ({:?}); stop them or pass detach_existing_sessions=true",
-                                foreign.len(),
-                                target_run,
-                                foreign
-                            ),
-                        );
-                }
-                for sid in &foreign {
-                    let _ = s.sessions.stop(sid).await;
-                    s.session_owners.lock().unwrap().remove(sid);
-                }
-            }
-            let restored = match crate::run::RunContext::restore(&run_dir) {
+            // 1. PROVE the target is restorable BEFORE anything destructive.
+            let mut restored = match crate::run::RunContext::restore(&run_dir) {
                 Ok(mut r) => {
                     // Resume is the designated re-open operation: a run
                     // restored while `closed` becomes live again so the
@@ -300,9 +308,62 @@ pub(crate) async fn tui_run(
                     )
                 }
             };
-            // Swap under a short lock (never across an await). The old
-            // run is dropped after its Drop-less flush attempt; sessions
-            // stay live regardless — resume never kills anything.
+            // Review P0.2 provenance guard: sessions launched under a
+            // DIFFERENT run must not survive into the resumed run — their
+            // future traffic would land in the wrong evidence bundle. The
+            // default refuses; `detach_existing_sessions=true` stops them
+            // later, after the flush. Sessions owned by the TARGET run
+            // carry over (they already belong to the run being resumed).
+            let target_run = running_id(&run_dir);
+            let foreign: Vec<String> = {
+                let owners = s.session_owners.lock().unwrap();
+                s.sessions
+                    .list()
+                    .into_iter()
+                    .filter(|sid| {
+                        match owners.get(sid) {
+                            // Owned by the run we're resuming: fine.
+                            Some(o) => o != &target_run,
+                            // Unowned sessions: treat as foreign (must be
+                            // re-launched under the resumed run).
+                            None => true,
+                        }
+                    })
+                    .collect()
+            };
+            if !foreign.is_empty() && !p.detach_existing_sessions.unwrap_or(false) {
+                return err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "resume refused: {} live session(s) do not belong to target run {} ({:?}); stop them or pass detach_existing_sessions=true",
+                            foreign.len(),
+                            target_run,
+                            foreign
+                        ),
+                    );
+            }
+            // 2. FLUSH the live run (audit P0-7) — an ephemeral run with
+            // nothing durable flushes trivially. On failure the current
+            // run stays live and the restore is abandoned (the restored
+            // context is dropped; nothing was mutated).
+            let flush = {
+                let mut guard = s.run.lock().unwrap();
+                guard.flush()
+            };
+            if let Err(e) = flush {
+                return err(
+                    ErrorCategory::InternalError,
+                    format!("current run flush failed before resume; resume ABORTED and the current run is unchanged: {e}"),
+                );
+            }
+            // 3. DETACH foreign sessions (audit P0-8: only after the
+            // target proved restorable and the live run's evidence is
+            // safely persisted).
+            for sid in &foreign {
+                let _ = s.sessions.stop(sid).await;
+                s.session_owners.lock().unwrap().remove(sid);
+            }
+            // 4. ATOMIC swap under a short lock (never across an await).
             let manifest_like = {
                 let mut guard = s.run.lock().unwrap();
                 let prev_id = guard.id.clone();
@@ -312,12 +373,21 @@ pub(crate) async fn tui_run(
                     .map(|d| d.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let summary = restored.status(Vec::new());
-                *guard = restored;
+                // Audit P1-46: the resume response names what the restore
+                // could not bring back — a damaged run is usable but the
+                // agent must see the evidence is incomplete.
+                let restore_health = restored.restore_health();
+                *guard = std::mem::replace(
+                    &mut restored,
+                    crate::run::RunContext::ephemeral(),
+                );
                 json!({
                     "resumed": true,
                     "run_id": restored_id,
                     "previous_run": prev_id,
+                    "flushed_previous": true,
                     "artifact_root": restored_dir,
+                    "restore": restore_health,
                     "status": summary,
                     "note": "sessions are not restored; re-create them with tui_session start and the run will correlate them. history_complete=false runs replay only from their declared first_available_seq",
                 })

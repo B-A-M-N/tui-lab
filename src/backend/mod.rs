@@ -1,9 +1,11 @@
 //! Terminal backend abstraction (spec section 2 / 36).
 //!
-//! `TerminalBackend` is the contract Hermes talks to. We ship a Rust-native
-//! `portable-pty` + `vt100` implementation (the sanctioned fallback engine) and
-//! leave a `tui_test_backend` feature slot for Microsoft `tui-test` once it
-//! stabilizes. No `tui-test` types leak through this trait.
+//! `TerminalBackend` is the contract Hermes talks to. We ship Rust-native
+//! `portable-pty` + `vt100` and line-CLI and tmux-attach engines. The empty
+//! `tui_test_backend` Cargo feature is an INTENT marker only — it enables
+//! no code today and does not mean Microsoft `tui-test` is supported (audit
+//! P1-53: an empty feature must never be counted as a borrowed
+//! capability).
 //!
 //! IMPORTANT (spec P0): the types below describe *working* behavior. Capability
 //! flags must only be set when the corresponding primitive is actually

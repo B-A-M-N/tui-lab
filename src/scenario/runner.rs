@@ -40,7 +40,20 @@ impl ScenarioRunner {
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
     ) -> ScenarioRunReport {
-        Self::run_with_parameters(scenario, session, &[])
+        Self::run_in_run(scenario, session, &[], None)
+    }
+
+    /// Run a scenario inside a run context (audit P0-21): every executed
+    /// act step lands in the transaction ledger / frame evidence through
+    /// the shared [`crate::execution::drive`] pipeline, so replay leaves
+    /// the same reconstructable evidence live acts do.
+    pub fn run_in_run(
+        scenario: &Scenario,
+        session: &mut crate::session::state::Session,
+        values: &[ParameterValue],
+        run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+    ) -> ScenarioRunReport {
+        Self::run_with_parameters_inner(scenario, session, values, run)
     }
 
     /// Run a scenario with caller-supplied sensitive-parameter values
@@ -53,6 +66,15 @@ impl ScenarioRunner {
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
         values: &[ParameterValue],
+    ) -> ScenarioRunReport {
+        Self::run_with_parameters_inner(scenario, session, values, None)
+    }
+
+    fn run_with_parameters_inner(
+        scenario: &Scenario,
+        session: &mut crate::session::state::Session,
+        values: &[ParameterValue],
+        run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
     ) -> ScenarioRunReport {
         let mut results = Vec::new();
         let mut passed = 0;
@@ -82,23 +104,45 @@ impl ScenarioRunner {
                 failed += 1;
                 continue;
             }
-            // Mutation guard (re-review Wave-2): a recorded precondition is
-            // verified against the LIVE screen before the step's input
-            // lands. A drift verdict fails the step without touching the
-            // app — the alternative (send into the wrong UI) corrupts both.
-            if let Some(expect) = &step.expect {
-                let (guard_ok, guard_detail) = check_expect(session, expect);
-                if !guard_ok {
-                    results.push(StepResult {
-                        index: i,
-                        kind: format!("{:?}", step.kind),
-                        passed: false,
-                        detail: format!("stale_state: {guard_detail}"),
-                    });
-                    failed += 1;
-                    continue;
+            // Mutation guard (re-review Wave-2 + audit P0-19): a recorded
+            // precondition is verified against the LIVE screen BEFORE the
+            // step's input lands. For Act steps it is compiled into the
+            // executor's MutationGuard — validated atomically with the
+            // send, closing the old TOCTOU window where the precondition
+            // was checked from a possibly-seconds-old frame and the input
+            // went out afterward. Wait/Assert steps send nothing, so the
+            // direct check below has no window to close.
+            let expect_guard: Option<crate::execution::MutationGuard> = match &step.expect {
+                Some(expect) if step.kind == StepKind::Act => {
+                    let (guard_ok, guard_detail, guard) = compile_expect_guard(session, expect);
+                    if !guard_ok {
+                        results.push(StepResult {
+                            index: i,
+                            kind: format!("{:?}", step.kind),
+                            passed: false,
+                            detail: format!("stale_state: {guard_detail}"),
+                        });
+                        failed += 1;
+                        continue;
+                    }
+                    guard
                 }
-            }
+                Some(expect) => {
+                    let (guard_ok, guard_detail) = check_expect(session, expect);
+                    if !guard_ok {
+                        results.push(StepResult {
+                            index: i,
+                            kind: format!("{:?}", step.kind),
+                            passed: false,
+                            detail: format!("stale_state: {guard_detail}"),
+                        });
+                        failed += 1;
+                        continue;
+                    }
+                    None
+                }
+                None => None,
+            };
             let (step_passed, detail) =
                 match step.kind {
                     StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
@@ -130,15 +174,44 @@ impl ScenarioRunner {
                             let (step_passed, detail) =
                                 match crate::execution::CanonicalAction::from_request(&req) {
                                     Ok(action) => {
-                                        match crate::execution::execute_act_with_completion(
-                                            session,
-                                            &action,
-                                            quiet,
-                                            quiet.saturating_add(1000),
-                                            req.no_wait(),
-                                            vis,
-                                            completion,
-                                        ) {
+                                        // Audit P0-21: when the replay runs inside a
+                                        // run context, the act goes through the ONE
+                                        // driving pipeline — frames, ledger
+                                        // transaction, event/coverage fold — exactly
+                                        // like a live tui_act. Scenario capture stays
+                                        // off (the step IS the scenario); the
+                                        // envelope-sensitive visibility still rides.
+                                        let outcome = match run {
+                                            Some(run) => {
+                                                let spec = crate::execution::CoreDriveSpec {
+                                                    action: &action,
+                                                    quiet_ms: quiet,
+                                                    budget_ms: quiet.saturating_add(1000),
+                                                    no_wait: req.no_wait(),
+                                                    visibility: vis,
+                                                    completion,
+                                                    guard: expect_guard.as_ref(),
+                                                    scenario: None,
+                                                };
+                                                crate::execution::drive_pipeline(
+                                                    session, run, spec,
+                                                )
+                                                .map(|o| o.tx)
+                                            }
+                                            None => {
+                                                crate::execution::execute_act_with_guard(
+                                                    session,
+                                                    &action,
+                                                    quiet,
+                                                    quiet.saturating_add(1000),
+                                                    req.no_wait(),
+                                                    vis,
+                                                    completion,
+                                                    expect_guard.as_ref(),
+                                                )
+                                            }
+                                        };
+                                        match outcome {
                                             Ok(tx) => (
                                                 tx.settled(),
                                                 format!(
@@ -286,6 +359,35 @@ impl ScenarioRunner {
             step_results: results,
         }
     }
+}
+
+/// Compile a recorded precondition into an executor [`MutationGuard`]
+/// (audit P0-19). Returns `(holds_now, detail, guard)`: `holds_now` is a
+/// fast pre-check (a precondition already violated fails the step without
+/// attempting the send), and `guard` carries the structural/focus
+/// expectations into the executor for re-validation ATOMICALLY WITH THE
+/// SEND — the screen cannot drift between check and input anymore.
+/// `text_present` has no guard slot; it is checked here (pre-send) and
+/// re-checked implicitly by the guard's structure hash when layout
+/// tracks content, which is the honest best available.
+fn compile_expect_guard(
+    session: &mut crate::session::state::Session,
+    expect: &super::model::StepExpect,
+) -> (
+    bool,
+    String,
+    Option<crate::execution::MutationGuard>,
+) {
+    let (ok, detail) = check_expect(session, expect);
+    if !ok {
+        return (false, detail, None);
+    }
+    let guard = crate::execution::MutationGuard {
+        structure_hash: expect.structure_hash.clone(),
+        focus_control_id: expect.focus_control_id.clone(),
+        ..Default::default()
+    };
+    (true, detail, Some(guard))
 }
 
 /// Verify one recorded precondition against the live session. The screen is

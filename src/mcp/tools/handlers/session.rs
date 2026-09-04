@@ -195,6 +195,40 @@ pub(crate) async fn tui_session(
                 Some(i) => i,
                 None => return err(ErrorCategory::NoSession, "no session to restart"),
             };
+            // Audit P0-10: authorize BEFORE mutating. Restart kills the
+            // child process; doing that before the run-closed / ownership
+            // checks let a foreign-run session be restarted (or a closed
+            // run's guard fire after the process was already gone). The
+            // same rules `with_sess` enforces for driving apply here, in
+            // the same order, before the destructive call.
+            if s.run.lock().unwrap().is_closed() {
+                let run_id = s.run.lock().unwrap().id.clone();
+                return err(
+                    ErrorCategory::RunClosed,
+                    format!(
+                        "current run {run_id} is closed; resume it (tui_run action=resume) or start a fresh run before restarting sessions"
+                    ),
+                );
+            }
+            {
+                let cur_run = s.run.lock().unwrap().id.clone();
+                let bound = s
+                    .session_owners
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&id).cloned());
+                if let Some(own) = bound {
+                    if own != cur_run {
+                        return err(
+                            ErrorCategory::NoSession,
+                            format!(
+                                "session '{}' is bound to run {own}, not the current run {cur_run}; it cannot be restarted from here",
+                                id
+                            ),
+                        );
+                    }
+                }
+            }
             // Restart the SAME logical session: same id, next generation,
             // reusing the stored LaunchSpec (spec section 13).
             match s.sessions.restart(&id).await {

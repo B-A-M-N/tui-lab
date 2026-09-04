@@ -439,6 +439,7 @@ mod tests {
             frames: vec![],
             transition,
             after_focus: None,
+            transition_capture: None,
             timing_ms: 42,
             material_changes: vec!["focus moved".into()],
         }

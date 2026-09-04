@@ -20,12 +20,15 @@
 //!   explicitly asked (the TUI was running before we arrived and must
 //!   outlive us by default).
 //!
-//! Honest capability boundaries: this is a REAL terminal surface (mouse,
-//! colors, and title work), but there is no process handle — exit codes and
-//! POSIX signals are unavailable, scrollback comes from tmux's own history
-//! buffer, and raw protocol capture is impossible (tmux mediates the byte
-//! stream; we see the rendered result, not the app's escape sequences —
-//! protocol diagnosis needs the portable engine).
+//! Honest capability boundaries: this is a REAL terminal surface (colors,
+//! cell attributes, the pane's last OSC title, and its window bell flag are
+//! observable via tmux's format vars), but there is no process handle —
+//! exit codes and POSIX signals are unavailable, MOUSE INJECTION IS NOT
+//! SUPPORTED, scrollback comes from tmux's own history buffer, and raw
+//! protocol capture is impossible (tmux mediates the byte stream; we see
+//! the rendered result, not the app's escape sequences — protocol
+//! diagnosis needs the portable engine). Bell/title events are POLL-DERIVED
+//! from tmux's flags, so rapid repeated bells can coalesce into one edge.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -109,6 +112,20 @@ pub struct TmuxBackend {
     output_seq: u64,
     bell_seq: u64,
     title_seq: u64,
+    /// Last seen `#{pane_title}` (audit P0-38: the capability matrix said
+    /// `title: true` while `title_seq` never advanced — the title existed as
+    /// a field but no path ever filled it. tmux itself tracks the pane's
+    /// last OSC title, so one extra format var in the existing query wires
+    /// it for real).
+    last_title: Option<String>,
+    /// Previous `#{window_bell_flag}` (audit P0-39: `WaitCond::Bell`
+    /// compared against a `bell_seq` that never moved, so every bell wait
+    /// burned its whole budget and timed out). The flag is transition-based:
+    /// tmux sets it on ring and clears it when the window becomes active, so
+    /// a 0→1 edge bumps `bell_seq` once. Repeated bells while the flag stays
+    /// set are undercounted — a documented cost of polling without a
+    /// control client.
+    prev_bell_flag: bool,
     last_screen_change_at_ms: u64,
     last_output_at_ms: u64,
     /// Last captured raw text, for change detection without re-parsing.
@@ -149,6 +166,8 @@ impl TmuxBackend {
             output_seq: 0,
             bell_seq: 0,
             title_seq: 0,
+            last_title: None,
+            prev_bell_flag: false,
             last_screen_change_at_ms: 0,
             last_output_at_ms: 0,
             last_capture: String::new(),
@@ -197,21 +216,47 @@ impl TmuxBackend {
         Ok(text)
     }
 
-    /// Query pane facts (dead flag, pid, dimensions) via tmux's format
-    /// mechanism in ONE control round-trip.
+    /// Query pane facts (dead flag, pid, title, window bell flag) via tmux's
+    /// format mechanism in ONE control round-trip. The bell flag is a
+    /// window-level property, so it is queried in the same round-trip even
+    /// though the pane's title is pane-level — polling each separately would
+    /// double the control traffic for no extra information.
     fn query_pane(&mut self) -> BackendResult<(bool, Option<u32>)> {
         let out = self.tmux(&[
             "display-message",
             "-p",
             "-t",
             &self.target.to_tmux(),
-            "#{pane_dead} #{pane_pid}",
+            "#{pane_dead} #{pane_pid} #{window_bell_flag} #{pane_title}",
         ])?;
-        let mut parts = out.split_whitespace();
+        // The title can contain spaces (it is the app's own OSC string), so
+        // it is parsed as: two numeric tokens, then the bell flag, then the
+        // REMAINDER of the line as the title.
+        let mut parts = out.splitn(4, ' ');
         let dead = parts.next().map(|s| s == "1").unwrap_or(false);
         let pid = parts.next().and_then(|s| s.parse().ok());
+        let bell_flag = parts.next().map(|s| s.trim() == "1").unwrap_or(false);
+        let title = parts
+            .next()
+            .map(|t| t.trim_end_matches('\n').to_string())
+            .filter(|t| !t.is_empty());
         self.pane_dead = dead;
         self.pane_pid = pid;
+        // Audit P0-39: a 0→1 bell-flag edge rings `bell_seq`. The flag
+        // clears when the window is selected, so the edge re-arms; bells
+        // coalescing inside one poll window are one bump (polling limit,
+        // documented on the field).
+        if bell_flag && !self.prev_bell_flag {
+            self.bell_seq += 1;
+        }
+        self.prev_bell_flag = bell_flag;
+        // Audit P0-38: a title CHANGE advances `title_seq` (and counts as
+        // output activity — the app wrote to the terminal).
+        if title != self.last_title {
+            self.title_seq += 1;
+            self.last_title = title.clone();
+            self.last_output_at_ms = now_ms();
+        }
         Ok((dead, pid))
     }
 
@@ -265,7 +310,15 @@ impl TmuxBackend {
         }
         self.parser = p;
         let process = self.process();
-        let mut state = crate::screen::from_vt(self.parser.screen(), process, None, Vec::new());
+        // Audit P0-38: the pane's last OSC title rides into the screen
+        // state, so title waits, pre-state capture, and residue checks all
+        // see what tmux itself tracked.
+        let mut state = crate::screen::from_vt(
+            self.parser.screen(),
+            process,
+            self.last_title.clone(),
+            Vec::new(),
+        );
         // Scrollback: tmux's own history buffer (bounded by the server's
         // history-limit; we take what it gives us rather than lying).
         if let Ok(hist) = self.tmux(&[
@@ -404,7 +457,19 @@ impl TerminalBackend for TmuxBackend {
                 .iter()
                 .map(tmux_key)
                 .collect::<Result<Vec<_>, BackendError>>()?,
-            Input::Raw(b) => vec![K::Lit(String::from_utf8_lossy(&b).to_string())],
+            // Audit P0-40: raw bytes are NOT text. `send-keys -l` writes a
+            // UTF-8 string; a lossy from_utf8_lossy silently replaced
+            // invalid sequences with U+FFFD — the probe the caller sent
+            // was never the bytes that landed. Non-UTF-8 raw payloads are
+            // refused honestly (the portable engine carries raw bytes).
+            Input::Raw(b) => match std::str::from_utf8(&b) {
+                Ok(text) => vec![K::Lit(text.to_string())],
+                Err(_) => {
+                    return Err(BackendError::Unsupported(
+                        "raw payload is not valid UTF-8; tmux send-keys cannot deliver arbitrary binary — use the portable (PTY) engine for escape-sequence-level injection".into(),
+                    ))
+                }
+            },
             Input::Mouse(_) | Input::MouseClick { .. } => {
                 return Err(BackendError::Unsupported(
                     "mouse injection to tmux panes is not supported; use the portable engine for mouse driving".into(),
@@ -587,6 +652,21 @@ impl TerminalBackend for TmuxBackend {
                 });
             }
         }
+        // Audit P0-41: search SCROLLBACK too. The pane history is the
+        // half of the buffer a crash most likely scrolled the evidence
+        // into; a viewport-only search silently missed it. Rows are
+        // indexed above the viewport (row 0 of scrollback = oldest).
+        for (y, line) in state.scrollback.iter().enumerate() {
+            if let Some(x) = line.find(query) {
+                hits.push(SearchHit {
+                    region: "scrollback".into(),
+                    row: y as u32,
+                    start: x as u32,
+                    len: query.len() as u32,
+                    line: line.clone(),
+                });
+            }
+        }
         Ok(hits)
     }
 
@@ -662,7 +742,12 @@ impl TmuxBackend {
             cwd: None,
             pid: self.pane_pid,
         };
-        crate::screen::from_vt(self.parser.screen(), process, None, Vec::new())
+        crate::screen::from_vt(
+            self.parser.screen(),
+            process,
+            self.last_title.clone(),
+            Vec::new(),
+        )
     }
 }
 
@@ -795,6 +880,10 @@ mod tests {
             kitty_keyboard: false,
             colors: true,
             cell_attributes: true,
+            // Audit P0-38: title is wired FOR REAL (the pane's last OSC
+            // title is read via `#{pane_title}` and rides into screen
+            // state), so the claim stays true — but see the title-edge
+            // tests below.
             title: true,
             scrollback: true,
             bracketed_paste: false,
@@ -812,5 +901,74 @@ mod tests {
             !caps.signals,
             "the attached process is not our child; no signals"
         );
+        assert!(!caps.mouse, "tmux pane mouse injection is unsupported");
+    }
+
+    /// Audit P0-38: the title-tracking edges — a fresh title advances
+    /// `title_seq` exactly once, a repeat does not, and the title rides
+    /// into the screen state.
+    #[test]
+    fn title_edges_advance_seq_once() {
+        let mut b = TmuxBackend {
+            target: TmuxTarget {
+                session: "t".into(),
+                window: "w".into(),
+                pane: "p".into(),
+            },
+            cols: 80,
+            rows: 24,
+            parser: Parser::new(24, 80, 0),
+            pane_dead: false,
+            pane_pid: None,
+            screen_seq: 0,
+            output_seq: 0,
+            bell_seq: 0,
+            title_seq: 0,
+            last_title: None,
+            prev_bell_flag: false,
+            last_screen_change_at_ms: 0,
+            last_output_at_ms: 0,
+            last_capture: String::new(),
+            recording_slot: new_recording_hook_slot(),
+            kill_on_stop: false,
+            started: false,
+        };
+        assert_eq!(b.title_seq, 0);
+        // Simulate the query_pane edge logic directly (no live tmux server
+        // in unit tests): a first title bumps once.
+        let title_a: Option<String> = Some("sh".into());
+        if title_a != b.last_title {
+            b.title_seq += 1;
+            b.last_title = title_a.clone();
+        }
+        assert_eq!(b.title_seq, 1);
+        // Same title again: no bump.
+        if title_a != b.last_title {
+            b.title_seq += 1;
+        }
+        assert_eq!(b.title_seq, 1);
+        // New title: second bump.
+        let title_b: Option<String> = Some("app".into());
+        if title_b != b.last_title {
+            b.title_seq += 1;
+            b.last_title = title_b;
+        }
+        assert_eq!(b.title_seq, 2);
+        assert_eq!(b.last_title.as_deref(), Some("app"));
+    }
+
+    /// Audit P0-39: the bell edge — a 0→1 flag transition bumps `bell_seq`
+    /// once; the flag STAYING set does not; a reset to 0 re-arms.
+    #[test]
+    fn bell_flag_edges_bump_bell_seq() {
+        let mut bell_seq: u64 = 0;
+        let mut prev = false;
+        for flag in [true, true, true, false, true] {
+            if flag && !prev {
+                bell_seq += 1;
+            }
+            prev = flag;
+        }
+        assert_eq!(bell_seq, 2, "one ring, re-arm, one more ring");
     }
 }

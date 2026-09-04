@@ -60,7 +60,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_assert",
-        summary: "Assert UI facts; unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.",
+        summary: "Assert UI facts (text, text_absent, position, focus, focused_not, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists); unknown assertions are invalid_request (caller error), never assertion_failed (UI failure). `oracle` evaluates the shared Wave E language.",
         selector: Some(("assertion", <crate::mcp::params::AssertAssertion as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -80,7 +80,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_explore",
-        summary: "Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph. Driving: blocked while a human lease is live.",
+        summary: "Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph (modes: random, guided_candidates, semantic, state_graph). Driving: blocked while a human lease is live. Replay of discovered flows is tui_scenario's job.",
         selector: Some(("mode", <crate::mcp::params::ExploreMode as EnumVariants>::VARIANTS)),
     },
     ToolCapability {
@@ -320,6 +320,138 @@ mod tests {
         served.sort();
         declared.sort();
         assert_eq!(declared, served, "registry TOOLS != router tools/list set");
+    }
+
+    #[test]
+    fn registry_selectors_match_the_wire_schema() {
+        // Audit P1-50: names parity was never behavior parity. For every
+        // tool declaring a selector, the selector's VALUES must be exactly
+        // the enum values the tool's real JSON schema advertises — a
+        // summary that names a mode the schema rejects (or omits one it
+        // accepts) is the drift class that survived name-only parity. The
+        // schema walk finds the selector property under the params struct
+        // and compares its `enum` (or anyOf/oneOf const members) to the
+        // registry's VARIANTS.
+        let router = crate::mcp::TuiLabServer::tool_router();
+        for t in TOOLS {
+            let Some((field, values)) = t.selector else {
+                continue;
+            };
+            let tool = router
+                .get(t.name)
+                .unwrap_or_else(|| panic!("router lost {}", t.name));
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let selector_schema = find_property(&schema, field)
+                .unwrap_or_else(|| panic!("{}: schema has no '{}'", t.name, field));
+            // schemars emits shared wrappers as `$ref`s into `$defs`
+            // (`Known<T>` is one generic definition, and the property may
+            // be an anyOf of [ref, string]); resolve refs recursively so
+            // the walk below sees the real variants.
+            let defs = schema.get("$defs").cloned().unwrap_or_default();
+            let selector_schema = resolve_refs(&selector_schema, &defs);
+            let served_values = enum_consts(&selector_schema)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: selector '{}' schema carries no enumerable constants: {selector_schema}",
+                        t.name, field
+                    )
+                });
+            let mut a: Vec<&str> = values.to_vec();
+            let mut b: Vec<String> = served_values;
+            a.sort_unstable();
+            b.sort();
+            assert_eq!(
+                a, b,
+                "{}: registry selector '{}' drifted from the wire schema",
+                t.name, field
+            );
+        }
+    }
+
+    /// Recursively resolve `$ref` pointers into `defs` (schemars hoists
+    /// shared wrappers like `Known<T>` there); every other value is
+    /// rewritten in place so nested anyOf members resolve too.
+    fn resolve_refs(v: &serde_json::Value, defs: &serde_json::Value) -> serde_json::Value {
+        if let Some(ref_path) = v.get("$ref").and_then(|r| r.as_str()) {
+            let def_name = ref_path.trim_start_matches("#/$defs/");
+            if let Some(target) = defs.get(def_name) {
+                return resolve_refs(target, defs);
+            }
+        }
+        match v {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, val)| (k.clone(), resolve_refs(val, defs)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(|c| resolve_refs(c, defs)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Depth-first search for a property named `field` anywhere in a JSON
+    /// schema (params are nested structs; the selector enum may sit one or
+    /// two levels down).
+    fn find_property(v: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
+        match v {
+            serde_json::Value::Object(map) => {
+                if let Some(props) = map.get("properties").and_then(|p| p.as_object()) {
+                    if let Some(found) = props.get(field) {
+                        return Some(found.clone());
+                    }
+                }
+                for (_k, child) in map {
+                    if let Some(found) = find_property(child, field) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|c| find_property(c, field)),
+            _ => None,
+        }
+    }
+
+    /// Extract the string constants a schema offers for one property:
+    /// direct `enum`, or `anyOf`/`oneOf` members with `const`/`enum` of a
+    /// single string (the shapes schemars emits for untagged Known<T>
+    /// enums).
+    fn enum_consts(schema: &serde_json::Value) -> Option<Vec<String>> {
+        if let Some(vals) = schema.get("enum").and_then(|e| e.as_array()) {
+            return Some(
+                vals.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(variants) = schema.get(key).and_then(|v| v.as_array()) {
+                let mut out = Vec::new();
+                for variant in variants {
+                    if let Some(c) = variant.get("const").and_then(|c| c.as_str()) {
+                        out.push(c.to_string());
+                    } else if let Some(vals) = variant.get("enum").and_then(|e| e.as_array()) {
+                        // The Known<T> shape: one anyOf member carries the
+                        // FULL variant enum; the other is the free-string
+                        // arm (no enum). Collect every string it offers.
+                        out.extend(
+                            vals.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string)),
+                        );
+                    } else if let Some(nested) = enum_consts(variant) {
+                        // Option<Known<T>> nests a Known anyOf INSIDE the
+                        // Option anyOf — recurse into the member.
+                        out.extend(nested);
+                    }
+                }
+                if !out.is_empty() {
+                    return Some(out);
+                }
+            }
+        }
+        None
     }
 
     #[test]

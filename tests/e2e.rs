@@ -9,10 +9,13 @@
 //!   * fixed `thread::sleep` waits are replaced by state-aware `wait(...)`
 //!     calls, which both speeds up the test and exercises the synchronization
 //!     layer that the audit flags as broken.
+//!
+//! Migrated off the legacy `SessionManager` (audit P1-54): the actor-backed
+//! `SessionPool` is the production surface.
 
 use tui_lab::backend::{Input, KeyCode, KeyEvent};
 use tui_lab::semantic;
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
 fn fixture() -> String {
     // absolute path to the dialog fixture checked into the repo
@@ -23,26 +26,52 @@ fn fixture() -> String {
         .to_string()
 }
 
-#[test]
-fn e2e_launch_observe_semantic_act() {
-    let mut mgr = SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn e2e_launch_observe_semantic_act() {
+    let pool = SessionPool::new();
+    let id = pool
         .start("python3", &[fixture()], None, &[], 80, 24, "auto", "local")
+        .await
         .expect("session start");
 
     // Wait for the dialog to actually draw (state-aware, not a fixed sleep).
     {
-        let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
-        let out = sess
-            .wait(tui_lab::backend::WaitCond::Text("Settings".into()), 5000)
-            .expect("wait for dialog");
-        assert!(out.met, "dialog title never appeared");
+        let met = pool
+            .with_session(Some(&id), {
+                let id = id.clone();
+                move |sess| {
+                    let _ = &id;
+                    sess.wait(tui_lab::backend::WaitCond::Text("Settings".into()), 5000)
+                        .map(|out| out.met)
+                        .unwrap_or(false)
+                }
+            })
+            .await
+            .expect("wait job");
+        assert!(met, "dialog title never appeared");
     }
 
-    let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
-    let screen = sess.observe(80).expect("observe");
+    let (text, region_title_ok, has_save, save_source) = pool
+        .with_session(Some(&id), move |sess| {
+            let screen = sess.observe(80).expect("observe");
+            let text = screen.text_view();
+            let sem = semantic::analyze(&screen);
+            let region_ok = sem
+                .regions
+                .first()
+                .map(|r| r.title.as_deref() == Some("Settings") && r.confidence.score > 0.5)
+                .unwrap_or(false);
+            let save = sem.controls.iter().find(|c| c.label == "Save");
+            (
+                text,
+                region_ok,
+                save.is_some(),
+                save.map(|s| s.confidence.source.to_string()),
+            )
+        })
+        .await
+        .expect("observe job");
 
-    let text = screen.text_view();
     assert!(text.contains("Settings"), "dialog title missing: {text}");
     assert!(
         text.contains("Host:") || text.contains("Host"),
@@ -50,102 +79,99 @@ fn e2e_launch_observe_semantic_act() {
     );
     assert!(text.contains("Port:"), "port field missing");
 
-    // Semantic inference: a bordered region + focused Save button.
-    let sem = semantic::analyze(&screen);
-    assert!(
-        !sem.regions.is_empty(),
-        "expected at least one bordered region"
-    );
-    let region = &sem.regions[0];
-    assert_eq!(region.title.as_deref(), Some("Settings"));
-    assert!(region.confidence.score > 0.5);
-
-    let save = sem
-        .controls
-        .iter()
-        .find(|c| c.label == "Save")
-        .expect("expected Save button");
-    assert_eq!(save.confidence.source, "inferred");
-
-    // Focus may or may not be detected depending on terminal state.
-    // The fixture uses reverse video for the focused button.
-    let _ = sem.focus.control.clone();
-
-    let focus_before = sem.focus.control.clone();
+    // Semantic inference: a bordered region titled Settings + a Save button.
+    assert!(region_title_ok, "expected the bordered Settings region");
+    assert!(has_save, "expected a Save button control");
+    assert_eq!(save_source.as_deref(), Some("inferred"));
 
     // Act: press Enter (the fixture writes "saved." on keypress).
-    let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
-    sess.send(Input::Key(KeyEvent::new(KeyCode::Enter)))
-        .expect("send enter");
+    pool.with_session(Some(&id), move |sess| {
+        sess.send(Input::Key(KeyEvent::new(KeyCode::Enter)))
+            .expect("send enter")
+    })
+    .await
+    .expect("act job");
 
     // Wait for the resulting "saved." text (state-aware).
     {
-        let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
-        let out = sess
-            .wait(tui_lab::backend::WaitCond::Text("saved.".into()), 5000)
-            .expect("wait for saved");
-        assert!(out.met, "Enter did not produce 'saved.' on screen");
+        let met = pool
+            .with_session(Some(&id), move |sess| {
+                sess.wait(tui_lab::backend::WaitCond::Text("saved.".into()), 5000)
+                    .map(|out| out.met)
+                    .unwrap_or(false)
+            })
+            .await
+            .expect("wait job");
+        assert!(met, "Enter did not produce 'saved.' on screen");
     }
-    let after = mgr
-        .resolve_mut(Some(&id))
-        .expect("resolve")
-        .observe(80)
-        .expect("observe after");
+    let after_text = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(80)
+                .map(|s| s.text_view())
+                .unwrap_or_else(|e| panic!("observe after: {e}"))
+        })
+        .await
+        .expect("observe job");
     assert!(
-        after.text_view().contains("saved."),
+        after_text.contains("saved."),
         "Enter did not produce 'saved.' on screen"
     );
 
-    // Focus detection depends on reverse video being visible in the PTY frame.
-    // The fixture uses \x1b[7m which may or may not be captured in the parsed state.
-    let _ = focus_before;
-
-    mgr.stop(&id).expect("stop");
+    pool.stop(&id).await.expect("stop");
 }
 
-#[test]
-fn e2e_transition_diff_after_key() {
-    let mut mgr = SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn e2e_transition_diff_after_key() {
+    let pool = SessionPool::new();
+    let id = pool
         .start("python3", &[fixture()], None, &[], 80, 24, "auto", "local")
+        .await
         .expect("start");
     {
-        let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
-        let out = sess
-            .wait(tui_lab::backend::WaitCond::Text("Settings".into()), 5000)
-            .expect("wait for dialog");
-        assert!(out.met);
+        let met = pool
+            .with_session(Some(&id), move |sess| {
+                sess.wait(tui_lab::backend::WaitCond::Text("Settings".into()), 5000)
+                    .map(|out| out.met)
+                    .unwrap_or(false)
+            })
+            .await
+            .expect("wait job");
+        assert!(met);
     }
-    {
-        let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
+    pool.with_session(Some(&id), move |sess| {
         sess.observe(120).expect("observe");
-    }
+    })
+    .await
+    .expect("observe job");
     // Send a printable char (the fixture ignores it on screen but the action
     // still exercises send_input + vt100 round-trip + transition diff).
-    let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
-    sess.send(Input::Key(KeyEvent::new(KeyCode::Char('x'))))
-        .expect("send");
-    {
-        let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
+    pool.with_session(Some(&id), move |sess| {
+        sess.send(Input::Key(KeyEvent::new(KeyCode::Char('x'))))
+            .expect("send");
         sess.observe(120).expect("observe");
-    }
+    })
+    .await
+    .expect("act job");
     // Structural hash must be stable/idempotent for identical screens.
-    let a = mgr.resolve(Some(&id)).expect("resolve").last().cloned();
-    {
-        let sess = mgr.resolve_mut(Some(&id)).expect("resolve");
+    let a = pool
+        .with_session(Some(&id), move |sess| sess.last().cloned())
+        .await
+        .expect("snapshot job")
+        .expect("first snapshot present");
+    pool.with_session(Some(&id), move |sess| {
         sess.observe(120).expect("observe");
-    }
-    let b = mgr
-        .resolve_mut(Some(&id))
-        .expect("resolve")
-        .observe(120)
-        .ok();
-    let a = a.expect("first snapshot present");
-    let b = b.expect("second snapshot present");
+    })
+    .await
+    .expect("observe job");
+    let b = pool
+        .with_session(Some(&id), move |sess| sess.observe(120).ok())
+        .await
+        .expect("observe job")
+        .expect("second snapshot present");
     // No volatile content in this fixture, so structure hashes should match.
     assert_eq!(
         a.structure_hash, b.structure_hash,
         "structure hash not stable"
     );
-    mgr.stop(&id).expect("stop");
+    pool.stop(&id).await.expect("stop");
 }

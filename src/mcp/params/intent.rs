@@ -1,6 +1,7 @@
 //! tui_intent parameters: the semantic intent system (plan_intent) at the
 //! MCP surface.
 
+use super::interact::TuiCompletionParam;
 use serde::{Deserialize, Serialize};
 
 /// `tui_intent` — resolve a semantic target + verb into a focus-secured
@@ -22,9 +23,23 @@ pub struct TuiIntentParams {
     /// Plan only (default) or plan AND execute. Planning is
     /// observational — it resolves the target and reports the exact steps
     /// and risk without sending input, so the agent can preview what will
-    /// happen first.
+    /// happen first. Execution re-observes FRESH before the first click
+    /// (audit P0-13): the plan is re-resolved against the live frame, not
+    /// the last cached one, so a UI change between planning and executing
+    /// cannot land a focus click on stale geometry.
     #[serde(default)]
     pub execute: Option<bool>,
+    /// Mark a `type` verb's payload sensitive (audit P0-14): the text is
+    /// redacted in every artifact — run ledger, scenario recordings, the
+    /// same policy `tui_act sensitive=true` applies.
+    #[serde(default)]
+    pub sensitive: Option<bool>,
+    /// Completion override for the payload action (audit P0-15): the same
+    /// spec `tui_act` takes, so semantic verbs can express `process_exit`,
+    /// `may_be_silent`, exact-text oracles, or a deliberate quiet window
+    /// instead of the hard-coded stable-screen default.
+    #[serde(default)]
+    pub completion: Option<TuiCompletionParam>,
 }
 
 /// Wire shape for the verb: a bare string for the payload-free verbs, or

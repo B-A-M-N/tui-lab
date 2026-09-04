@@ -147,6 +147,13 @@ impl RunContext {
                 "summary": a.summary,
             })).collect::<Vec<_>>(),
             "journal": journal,
+            // Audit P1-46: restored runs report their damage — what the
+            // restorer could not bring back. Absent on fresh runs (null).
+            "restore": if self.restore_warnings.is_empty() {
+                serde_json::Value::Null
+            } else {
+                self.restore_health()
+            },
         })
     }
 

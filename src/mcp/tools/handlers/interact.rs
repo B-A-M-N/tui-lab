@@ -1,21 +1,12 @@
-//! tui_act / tui_checkpoint: canonical driving and checkpoint comparison.
+//! tui_act / tui_intent / tui_checkpoint: canonical driving through the
+//! shared [`super::drive`] boundary, and checkpoint comparison.
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{err, err_invalid_selector, err_with_details, lease_refused, ok};
+use crate::mcp::helpers::{err, err_invalid_selector, err_with_details, ok};
 use crate::mcp::params::*;
 use rmcp::serde_json::json;
 
-/// Recover the guard's structured `stale_state` payload from the anyhow
-/// error [`crate::execution::execute_act_with_guard`] wraps it in. Returns
-/// `None` for any other failure. Parsing our own structured marker is the
-/// one deliberate string hop left at this boundary — the alternative was
-/// widening the execution API to carry the JSON typed, which the review
-/// declined as churn.
-fn guard_stale_details(e: &anyhow::Error) -> Option<serde_json::Value> {
-    let msg = e.to_string();
-    let rest = msg.strip_prefix("stale_state: ")?;
-    serde_json::from_str(rest).ok()
-}
+use super::drive::{act_request_json, drive, DriveSpec, ScenarioCapture};
 
 /// Body of `tui_checkpoint` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
@@ -147,134 +138,34 @@ pub(crate) async fn tui_act(
         .completion()
         .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
     s.with_sess(selector.as_deref(), move |sess| {
-            // Wave G item 76: a live human control lease blocks driving.
-            if let Some(refused) = lease_refused(sess) {
-                return refused;
-            }
-            let tx = match crate::execution::execute_act_with_guard(
+            // The ONE driving pipeline (audit P0-1): lease refusal, guarded
+            // canonical execution, frame commits, ledger record, scenario
+            // capture, event/coverage fold — all in the shared boundary.
+            let outcome = match drive(
                 sess,
-                &action,
-                quiet,
-                quiet.saturating_add(1000),
-                p.no_wait(),
-                visibility,
-                completion,
-                // Re-review P0.9: an agent-declared expected-state guard is
-                // validated atomically with the send. Drift refuses the
-                // action with a structured stale_state verdict instead of
-                // landing input in a changed UI.
-                p.guard().map(|g| g.to_guard()).as_ref(),
+                &run,
+                DriveSpec {
+                    action: &action,
+                    quiet_ms: quiet,
+                    budget_ms: quiet.saturating_add(1000),
+                    no_wait: p.no_wait(),
+                    visibility,
+                    completion,
+                    // Re-review P0.9: an agent-declared expected-state guard is
+                    // validated atomically with the send. Drift refuses the
+                    // action with a structured stale_state verdict instead of
+                    // landing input in a changed UI.
+                    guard: p.guard().map(|g| g.to_guard()).as_ref(),
+                    scenario: Some(ScenarioCapture {
+                        params: serde_json::to_value(&p).unwrap_or_default(),
+                        sensitive,
+                    }),
+                },
             ) {
-                Ok(t) => t,
-                Err(e) => {
-                    // A guard refusal is not a backend failure: classify it
-                    // so the agent knows to re-observe, not to retry blind.
-                    // The guard's own JSON (check/expected/actual) rides in
-                    // `details`; the prose summary is the message.
-                    if let Some(stale) = guard_stale_details(&e) {
-                        let summary = stale
-                            .get("summary")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("expected state no longer holds")
-                            .to_string();
-                        return err_with_details(ErrorCategory::StaleState, summary, stale);
-                    }
-                    return err(ErrorCategory::BackendError, e.to_string());
-                }
+                Ok(o) => o,
+                Err(refused) => return refused,
             };
-            // Scenario recording in progress? Append this act (audit: scenarios
-            // capture real tool traffic; sensitive payloads are not recorded —
-            // and for a sensitive step the *params* are stripped to a redacted
-            // placeholder so replay still works shape-wise without the secret).
-            // Scoped to the resolved session generation (re-review item 5): a
-            // recording for session A never absorbs session B's traffic.
-            let frame_refs = {
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = run.lock().unwrap();
-                // Frame commit pipeline (re-review item 40): both frames go
-                // through the ONE commit path — id + provenance + incremental
-                // frames.jsonl append for persistent runs.
-                let b = run
-                    .commit_frame(
-                        &mut {
-                            let mut f = tx.before_frame.clone();
-                            f.session_id = Some(sid.clone());
-                            f.generation = Some(gen);
-                            f
-                        },
-                        Some(&sid),
-                    )
-                    .unwrap_or_default();
-                let a = run
-                    .commit_frame(
-                        &mut {
-                            let mut f = tx.after_frame.clone();
-                            f.session_id = Some(sid.clone());
-                            f.generation = Some(gen);
-                            f
-                        },
-                        Some(&sid),
-                    )
-                    .unwrap_or_default();
-                // Run ledger (Wave-2 item 15): the reconstructable transaction
-                // record, not just a counter. The ledger projects the action
-                // through the visibility policy — sensitive payloads are stored
-                // as Redacted(kind, byte_len), never verbatim.
-                let _ = run.record_interaction(&sid, &tx);
-                // Scenario capture (see block comment above): sensitive steps
-                // are recorded as ${PARAM} references with the parameter
-                // declared on the scenario — never with the payload (re-review
-                // P0.3). The recorded step stays replayable: a caller that
-                // supplies the parameter gets an exact replay; one that
-                // doesn't gets a structured `unresolved_parameter` step
-                // failure instead of a corrupt scenario.
-                if sensitive {
-                    // The canonical payload field for the two string-payload
-                    // actions; raw bytes are recorded as an opaque redacted
-                    // step (no string field to reference).
-                    let (payload_field, params_json) = match serde_json::to_value(&p) {
-                        Ok(v) => match tx.canonical() {
-                            crate::execution::CanonicalAction::Type { .. } => ("text".to_string(), v),
-                            crate::execution::CanonicalAction::Paste { .. } => ("paste".to_string(), v),
-                            _ => (String::new(), v),
-                        },
-                        Err(_) => (String::new(), json!({})),
-                    };
-                    if !payload_field.is_empty() {
-                        let byte_len = tx.canonical().payload_len();
-                        let _ = run.record_scenario_act_sensitive(
-                            &sid,
-                            gen,
-                            params_json,
-                            &payload_field,
-                            crate::scenario::model::SensitiveKind::Secret,
-                            byte_len,
-                        );
-                    } else {
-                        // Raw-bytes (or exotic) sensitive action: keep the
-                        // opaque redacted placeholder — structurally a valid
-                        // act step is impossible without the payload, and the
-                        // scenario declares it unreplayable-by-shape.
-                        let _ = run.record_scenario_act(
-                            &sid,
-                            gen,
-                            json!({
-                                "action": tx.name(),
-                                "sensitive": true,
-                                "redacted": true,
-                                "payload_bytes": tx.canonical().payload_len(),
-                            }),
-                        );
-                    }
-                } else {
-                    let _ = run.record_scenario_act(
-                        &sid,
-                        gen,
-                        serde_json::to_value(&p).unwrap_or_default(),
-                    );
-                }
-                serde_json::json!({ "before": format!("frame:{b}"), "after": format!("frame:{a}") })
-            };
+            let tx = outcome.tx;
             // Causal render evidence (re-review item 19): the exact
             // protocol bytes the action produced, decoded — the answer to
             // "pressing Down caused WHICH escape sequences?".
@@ -302,7 +193,7 @@ pub(crate) async fn tui_act(
                 "settle_status": tx.settle,
                 "settle_reason": tx.settle_reason(),
                 "elapsed_ms": tx.elapsed_ms,
-                "frames": frame_refs,
+                "frames": outcome.frames,
                 "warnings": if tx.settled() { Vec::<String>::new() } else if tx.settle == crate::execution::SettleStatus::Skipped {
                     vec!["settlement was not tested (no_wait=true); reported honestly as skipped".to_string()]
                 } else {
@@ -320,9 +211,12 @@ pub(crate) async fn tui_act(
 /// focus-secured execution plan (review item — the intent system was
 /// engine-complete but had no MCP surface). Plan-only by default: the
 /// response names the exact steps and the risk class BEFORE anything is
-/// sent. `execute=true` runs the plan through the canonical executor —
-/// EnsureFocus as a real click, AssertFocus as a MutationGuard validated
-/// atomically with the payload send, Act through `execute_act`.
+/// sent. `execute=true` re-resolves against a FRESH observation (audit
+/// P0-13: the cached frame's geometry can predate a UI change, and the
+/// EnsureFocus click would land on stale coordinates), then runs every
+/// step through the shared [`super::drive`] boundary (audit P0-12: intent
+/// actions are evidenced exactly like `tui_act` — frames, ledger
+/// transactions, scenario steps — under one `intent:<id>` linkage record).
 pub(crate) async fn tui_intent(
     s: &crate::mcp::tools::TuiLabServer,
     p: rmcp::handler::server::wrapper::Parameters<TuiIntentParams>,
@@ -333,20 +227,46 @@ pub(crate) async fn tui_intent(
         Err(msg) => return err(ErrorCategory::InvalidRequest, msg),
     };
     let execute = p.execute.unwrap_or(false);
+    let sensitive = p.sensitive.unwrap_or(false);
+    let visibility = if sensitive {
+        crate::execution::InputVisibility::Sensitive
+    } else {
+        crate::execution::InputVisibility::Normal
+    };
+    // Completion override (audit P0-15): a caller-supplied spec governs
+    // the payload action; the default stays stable-screen.
+    let completion = p
+        .completion
+        .as_ref()
+        .map(|c| c.to_policy())
+        .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
+    let intent_id = format!("intent-{}", uuid::Uuid::new_v4().simple());
     let selector = p.id.clone();
     let target = p.target.clone();
+    let run = s.run.clone();
     s.with_sess(selector.as_deref(), move |sess| {
-        // Plan against the session's LAST fused frame (observe-before-act):
-        // the semantic truth the agent would have seen from tui_observe
-        // mode=semantic. No forced settle — a caller that wants fresh state
-        // observes first; planning reuses what it saw.
-        let Some(analysis) = sess.analyze_last() else {
+        // Planning reads the session's LAST fused frame (observe-before-act):
+        // the semantic truth the agent would have seen from tui_observe.
+        // Execution below re-observes fresh instead.
+        let plan_frame = if execute {
+            // Audit P0-13: fresh observation BEFORE any click. The plan the
+            // agent saw may be stale; this frame is what actually executes.
+            match sess.observe_fused(40) {
+                Ok((_, sem, _, _)) => Some(sem),
+                Err(e) => {
+                    return err(ErrorCategory::BackendError, format!("pre-execute observe failed: {e}"))
+                }
+            }
+        } else {
+            sess.analyze_last().map(|a| a.semantic)
+        };
+        let Some(semantic) = plan_frame else {
             return err(
                 ErrorCategory::InvalidRequest,
                 "no observed frame yet — observe the session (tui_observe) before planning an intent, or the target has nothing to resolve against",
             );
         };
-        let plan = match crate::intent::plan_intent(&analysis.semantic, &target, verb.clone()) {
+        let plan = match crate::intent::plan_intent(&semantic, &target, verb.clone()) {
             Ok(pl) => pl,
             // Target resolution failures are refinement-loop payloads, not
             // malformed requests: category=target_error with the
@@ -378,42 +298,52 @@ pub(crate) async fn tui_intent(
             }));
         }
         // A live human lease blocks execution (planning stays allowed — it
-        // sends nothing).
-        if let Some(refused) = lease_refused(sess) {
+        // sends nothing). Checked here AND inside `drive` per action.
+        if let Some(refused) = crate::mcp::helpers::lease_refused(sess) {
             return refused;
         }
-        // Execute the plan's steps in order. EnsureFocus/AssertFocus are
-        // plan-level abstractions: the click goes through the executor as
-        // an ordinary action; AssertFocus becomes a focus MutationGuard
-        // validated atomically with the NEXT send.
+        // Execute the plan's steps in order, EVERY send through the shared
+        // boundary (audit P0-12): frames, ledger, scenario capture, event
+        // fold — with the plan's steps linked under one intent id.
         let mut pending_focus_guard: Option<String> = None;
         let mut executed: Vec<serde_json::Value> = Vec::new();
         for step in &plan.steps {
             match step {
                 crate::intent::PlannedStep::EnsureFocus { click, target_id } => {
                     // Skip the focus click when the target already holds
-                    // focus (the executor's own contract).
+                    // focus in the frame the plan resolved against.
                     let already =
-                        analysis.semantic.focus.control_id.as_deref() == Some(target_id.as_str());
+                        semantic.focus.control_id.as_deref() == Some(target_id.as_str());
                     if !already {
                         // A generous quiet window: the redraw that proves
                         // the focus move landed must be committed before
                         // the AssertFocus guard reads it — a focus move
                         // that half-arrived SHOULD fail the plan, but not
                         // because we sampled before the app answered.
-                        match crate::execution::execute_act(sess, click, 300, 1300, false) {
-                            Ok(_) => {
-                                executed.push(json!({
-                                    "step": "ensure_focus", "how": "mouse_click",
-                                    "target": target_id, "ok": true,
-                                }))
-                            }
-                            Err(e) => {
-                                return err(ErrorCategory::BackendError, format!(
-                                    "ensure_focus failed before the payload action: {e}"
-                                ))
-                            }
-                        }
+                        let focus_outcome = match drive(
+                            sess,
+                            &run,
+                            DriveSpec {
+                                action: click,
+                                quiet_ms: 300,
+                                budget_ms: 1300,
+                                no_wait: false,
+                                visibility: crate::execution::InputVisibility::Normal,
+                                completion: crate::capture::CompletionPolicy::StableScreen,
+                                guard: None,
+                                // Internal plan step: evidenced in the ledger,
+                                // but not a caller-authored scenario act.
+                                scenario: None,
+                            },
+                        ) {
+                            Ok(o) => o,
+                            Err(refused) => return refused,
+                        };
+                        executed.push(json!({
+                            "step": "ensure_focus", "how": "mouse_click",
+                            "target": target_id, "ok": true,
+                            "frames": focus_outcome.frames,
+                        }));
                         // The executor's settle observes through the
                         // backend's wait path and does NOT refresh the
                         // session's last frame — the guard below reads
@@ -439,36 +369,64 @@ pub(crate) async fn tui_intent(
                             ..Default::default()
                         }
                     });
-                    match crate::execution::execute_act_with_guard(
+                    let outcome = match drive(
                         sess,
-                        action,
-                        150,
-                        1150,
-                        false,
-                        crate::execution::InputVisibility::Normal,
-                        crate::capture::CompletionPolicy::StableScreen,
-                        guard.as_ref(),
+                        &run,
+                        DriveSpec {
+                            action,
+                            quiet_ms: 150,
+                            budget_ms: 1150,
+                            no_wait: false,
+                            visibility,
+                            completion: completion.clone(),
+                            guard: guard.as_ref(),
+                            scenario: Some(ScenarioCapture {
+                                params: act_request_json(action),
+                                sensitive,
+                            }),
+                        },
                     ) {
-                        Ok(tx) => executed.push(json!({
-                            "step": "act", "action": action.name(),
-                            "settled": tx.settled(),
-                            "settle": format!("{:?}", tx.settle).to_lowercase(),
-                        })),
-                        Err(e) => {
-                            if guard_stale_details(&e).is_some() {
-                                return err(ErrorCategory::StaleState, format!(
-                                    "focus-securing guard refused the payload action: {e}"
-                                ));
-                            }
-                            return err(ErrorCategory::BackendError, e.to_string());
-                        }
-                    }
+                        Ok(o) => o,
+                        Err(refused) => return refused,
+                    };
+                    executed.push(json!({
+                        "step": "act", "action": action.name(),
+                        "signature": action.signature(),
+                        "settled": outcome.tx.settled(),
+                        "settle": format!("{:?}", outcome.tx.settle).to_lowercase(),
+                        "frames": outcome.frames,
+                    }));
                 }
             }
         }
-        // Record the interaction in the run (same shape as tui_act).
+        // Intent linkage record (audit P0-12): one ledger entry tying the
+        // plan's transactions together causally — id, target identity,
+        // risk, and the executed step list — so diagnosis reconstructs an
+        // intent as ONE unit, not orphaned sends.
+        {
+            let (sid, gen) = (sess.id.clone(), sess.generation);
+            let mut run = run.lock().unwrap();
+            let _ = run.record_event(
+                &sid,
+                &json!({
+                    "intent": intent_id,
+                    "kind": "intent_executed",
+                    "target": plan_json["control"],
+                    "verb": plan.verb.name(),
+                    "risk": plan.risk.name(),
+                    "steps": executed,
+                })
+                .to_string(),
+            );
+            let _ = run.record_scenario_wait(
+                &sid,
+                gen,
+                json!({ "condition": "screen_stable", "note": format!("intent {intent_id} completed") }),
+            );
+        }
         ok(json!({
             "mode": "executed",
+            "intent_id": intent_id,
             "control": plan_json["control"],
             "verb": plan.verb.name(),
             "risk": plan.risk.name(),

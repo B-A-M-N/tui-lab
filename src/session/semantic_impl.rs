@@ -136,11 +136,15 @@ impl Session {
 
     /// Wave-2 (protocol diagnostics): the backend's retained raw output
     /// window — `(bytes, ring_capacity, bytes_dropped)` — for the protocol
-    /// decoder. `(0, 0)` capacity means the engine retains nothing.
-    pub fn raw_output_window(&mut self) -> (Vec<u8>, usize, u64) {
-        let bytes = self.backend.recent_raw_output().unwrap_or_default();
+    /// decoder. `(0, 0)` capacity means the engine retains nothing; a
+    /// failed READ is an `Err`, not silent empty bytes (audit P1-44: the
+    /// old `unwrap_or_default()` made "the ring errored" look like "the
+    /// engine captured nothing", and a protocol trace was decoded from
+    /// zero bytes and reported as truth).
+    pub fn raw_output_window(&mut self) -> crate::backend::BackendResult<(Vec<u8>, usize, u64)> {
+        let bytes = self.backend.recent_raw_output()?;
         let (cap, dropped) = self.backend.raw_output_stats();
-        (bytes, cap, dropped)
+        Ok((bytes, cap, dropped))
     }
 
     /// The absolute byte offset of the child's output stream at this instant
