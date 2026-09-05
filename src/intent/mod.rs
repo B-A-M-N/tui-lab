@@ -62,6 +62,14 @@ mod tests {
     }
 
     fn sem(controls: Vec<Control>, focused: Option<&str>) -> SemanticScreen {
+        // Mirror real analysis: the focused control's flag is set on the
+        // Control, not only named in FocusInfo (the flat shape both agree).
+        let mut controls = controls;
+        if let Some(id) = focused {
+            for c in controls.iter_mut() {
+                c.focused = c.id == id;
+            }
+        }
         SemanticScreen {
             cols: 80,
             rows: 24,
@@ -501,6 +509,84 @@ mod tests {
         // Focused target.
         let f = resolve_target(&s, &ActionTarget::Focused).expect("focused");
         assert_eq!(f.id, "button/cancel");
+    }
+
+    /// Finding 28: the role slug is the SERDE wire name — `menu_item`
+    /// (snake_case), not Debug's `menuitem`. A `role: "menu_item"` target
+    /// must resolve; the same slug must appear in ControlSummary.kind so
+    /// ambiguous/not-found error payloads echo what the caller sent.
+    #[test]
+    fn role_slug_is_the_serde_wire_name_not_debug_spelling() {
+        let s = sem(
+            vec![
+                control("menu/open", ControlKind::MenuItem, "Open File", 0, 0),
+                control("menu/quit", ControlKind::MenuItem, "Quit", 0, 1),
+            ],
+            None,
+        );
+        let c = resolve_target(
+            &s,
+            &ActionTarget::Role {
+                role: "menu_item".into(),
+                text: Some("Open File".into()),
+            },
+        )
+        .expect("menu_item must match — snake_case, the wire name");
+        assert_eq!(c.id, "menu/open");
+        // Debug's "menuitem" is NOT accepted: it was the drift surface.
+        assert!(matches!(
+            resolve_target(
+                &s,
+                &ActionTarget::Role {
+                    role: "menuitem".into(),
+                    text: None
+                }
+            ),
+            Err(IntentError::NotFound { .. })
+        ));
+        // Error payloads carry the wire slug too.
+        let err = resolve_target(
+            &s,
+            &ActionTarget::Role {
+                role: "menu_item".into(),
+                text: None,
+            },
+        );
+        match err {
+            Err(IntentError::Ambiguous { matches, .. }) => {
+                assert!(
+                    matches.iter().all(|m| m.kind == "menu_item"),
+                    "summaries echo the wire slug: {matches:?}"
+                );
+            }
+            other => panic!("two menu items → ambiguous, got {other:?}"),
+        }
+    }
+
+    /// Finding 28: nearest candidates are FOCUSED FIRST — the doc always
+    /// promised it; the sort now delivers it even when the focused control
+    /// is textually farther from the target.
+    #[test]
+    fn nearest_candidates_sort_focused_first() {
+        let s = sem(
+            vec![
+                control("button/save", ControlKind::Button, "Save", 0, 0),
+                control("button/close", ControlKind::Button, "Close", 0, 1),
+            ],
+            Some("button/close"),
+        );
+        // "sve" matches nothing exactly or by substring → NotFound with
+        // candidates; the focused "Close" must still lead.
+        let err = resolve_target(&s, &ActionTarget::Text { text: "sve".into() })
+            .expect_err("no 'sve' control → NotFound");
+        let IntentError::NotFound { candidates, .. } = err else {
+            panic!("expected NotFound, got {err:?}")
+        };
+        assert!(
+            candidates.first().map(|c| c.focused).unwrap_or(false),
+            "focused control sorts first: {candidates:?}"
+        );
+        assert_eq!(candidates.len(), 2, "both interactive controls offered");
     }
 
     /// Item 33: risk classification — the label raises the verb's base risk.
