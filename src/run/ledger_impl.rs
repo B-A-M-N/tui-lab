@@ -191,7 +191,7 @@ impl RunContext {
             ("transactions", self.evidence.transactions.total()),
             ("events_unwritten", events_unwritten),
             ("checkpoints", self.checkpoints.count() as u64),
-            ("scenarios", self.saved_scenarios.len() as u64),
+            ("scenarios", self.scenarios.len() as u64),
             ("findings", self.findings.len() as u64),
             ("held_recordings", self.held_recordings.len() as u64),
             (
@@ -230,7 +230,7 @@ impl RunContext {
             "events_persisted_incrementally": self.evidence.events.flushed_total(),
             "events_held_for_flush": self.evidence.events.held_count(),
             "checkpoints": self.checkpoints.count(),
-            "scenarios": self.saved_scenarios.len(),
+            "scenarios": self.scenarios.len(),
             "findings": self.findings.len(),
             "held_recordings": self.held_recordings.len(),
             "focus_transitions": self.graphs.focus_transitions.len(),

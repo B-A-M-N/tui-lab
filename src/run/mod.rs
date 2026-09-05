@@ -42,6 +42,7 @@ mod launch_impl;
 mod ledger_impl;
 mod persistence_impl;
 mod scenario_impl;
+mod scenario_store;
 
 pub use artifacts::{ArtifactKind, ArtifactRef};
 pub use formats::StreamHeader;
@@ -251,18 +252,10 @@ pub struct RunContext {
     run_dir: Option<PathBuf>,
     /// Checkpoints recorded during this run.
     pub checkpoints: CheckpointStore,
-    /// In-progress scenario recordings by opaque id (re-review item 5:
-    /// session+generation scoped; names are not identities).
-    recorders: HashMap<String, recording_scope::ScenarioRecording>,
-    /// Completed scenarios for this run, keyed by [`Scenario::id`] (re-review
-    /// Wave-1 item 9: names are display metadata and may collide; ids are the
-    /// storage key). Memory is canonical during the live run (so ephemeral
-    /// runs still list/export); persistence to the run dir is an artifact
-    /// layer on top, not the source of truth. The secondary name index only
-    /// maps *unambiguous* names — a name held by two scenarios resolves
-    /// through neither.
-    saved_scenarios: HashMap<String, crate::scenario::model::Scenario>,
-    scenario_names: HashMap<String, String>,
+    /// Scenario recorders + id-keyed saved set + unambiguous-name index.
+    /// Round-2 (G1): moved into [`scenario_store::ScenarioStore`]; the
+    /// name-index invariant is store policy now. RunContext delegates.
+    scenarios: scenario_store::ScenarioStore,
     /// Completed PTY recordings retained in memory (run promotion must carry
     /// them into the durable root even when they were stopped while
     /// ephemeral). Keyed by suggested file name.
@@ -363,22 +356,6 @@ pub struct CoverageEntry {
 }
 
 impl RunContext {
-    /// Rebuild the unambiguous-name index over the in-memory scenario set.
-    /// A name that maps to exactly one scenario resolves; a name held by two
-    /// or more resolves through neither (callers must use the id).
-    fn rebuild_scenario_name_index(&mut self) {
-        self.scenario_names.clear();
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for sc in self.saved_scenarios.values() {
-            *counts.entry(sc.name.as_str()).or_insert(0) += 1;
-        }
-        for sc in self.saved_scenarios.values() {
-            if counts.get(sc.name.as_str()).copied().unwrap_or(0) == 1 {
-                self.scenario_names.insert(sc.name.clone(), sc.id.clone());
-            }
-        }
-    }
-
     fn scenario_dir(&self) -> anyhow::Result<PathBuf> {
         let dir = self
             .run_dir
@@ -1183,7 +1160,7 @@ mod tests {
         assert!(v["payload"].is_object(), "payload holds the old shape");
         // The restore path reads the envelope back into a Scenario.
         let restored = RunContext::restore(run.run_dir().unwrap()).expect("restore");
-        assert!(restored.saved_scenarios.contains_key(&sc_id));
+        assert!(restored.scenarios.all().contains_key(&sc_id));
 
         // The ledger stream opens with its header line.
         let ledger = std::fs::read_to_string(run.run_dir().unwrap().join("transactions.jsonl"))
@@ -1234,7 +1211,7 @@ mod tests {
         run.save_scenario(a).expect("save a");
         run.save_scenario(b).expect("save b");
 
-        assert_eq!(run.saved_scenarios.len(), 2, "both scenarios kept");
+        assert_eq!(run.scenarios.len(), 2, "both scenarios kept");
         // Ambiguous name resolves through neither…
         assert!(run.load_scenario("login").is_err());
         // …but each id resolves to its own steps.

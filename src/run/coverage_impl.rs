@@ -26,7 +26,7 @@ impl RunContext {
         &mut self,
         session: &str,
         target: &str,
-        mut source_ref: crate::semantic::source_ref::SourceRef,
+        source_ref: crate::semantic::source_ref::SourceRef,
     ) -> anyhow::Result<()> {
         self.record_coverage_event(session, target)?;
         self.coverage.attach_source_ref(target, source_ref);
