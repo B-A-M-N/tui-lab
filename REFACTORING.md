@@ -123,7 +123,7 @@ test --all-features) verified green on the formatted tree.
 | 20 | ~~Fake `AUDIT-METRICS` finding on clean runs; findings still carry passes/metrics~~ FIXED (`a1349b7`) | — |
 | 21 | ~~`rule_id` landed, but severity/category remain `String`; no occurrence_id/sorted-key fingerprints~~ FIXED (`5d60884`) | — |
 | 22 | Audit uncertainty: no Unverified/LowConfidence/Ambiguous verdicts | drivers |
-| 23 | `NextObservation` is prose (`suggestion`/`rationale`), no structured tool+arguments | `src/audit/repair.rs:128` |
+| 23 | ~~`NextObservation` is prose (`suggestion`/`rationale`), no structured tool+arguments~~ FIXED (`1dc4bbc`) | — |
 | 25 | `action + dozens of Option<T>` request shapes (tagged unions) | `src/mcp/params/*` |
 | 28 | Target resolution: `format!("{kind:?}")` wire slug (`vocab.rs:440`); comment-priority mismatch in nearest_candidates | `src/intent/vocab.rs` |
 | 29 | Risk classification: label heuristics remain the authority; no native/contract risk attestation | `src/intent/vocab.rs` |
@@ -156,8 +156,9 @@ test --all-features) verified green on the formatted tree.
 - **16/17** Native resolution: relaxed matches (suffix/label) are uniqueness-gated — ambiguity is reported (`NativeOverlayReport.ambiguous`), never first-hit; focus is exclusive (`clear_tree_focus_except` on the tree, flat mirror follows `sem.focus.control_id`) (`ca9af5d`)
 - **20** Audit timing is report metadata: `run_verified` returns `(findings, AuditMetrics)`; clean runs produce zero findings (no synthetic AUDIT-METRICS row, no stamping onto finding evidence); `ProfileReport.metrics` + `metrics` on the tui_audit response carry the numbers (`a1349b7`)
 - **21** Typed severity/category + occurrence identity: `Severity` closed ordered enum (wire-compatible slugs, typos are parse errors), `Category` typed domain set + lossless `Other(String)` for contract groups, `Finding.occurrence_id` = versioned hash over SORTED key material (rule, category, all evidence targets) assigned at `instance()`; `compare::fingerprint` delegates to it (`5d60884`)
+- **23** NextObservation structured: every observation names its MCP tool (`tui_probe` / `tui_act` / `tui_run`) + ready-to-send arguments in the canonical grammar; prose stays for display (`1dc4bbc`)
 
 ### Priority order (implementation sequence)
 
-Remaining P0: none. Next: P1/P2 — 23 (structured NextObservation) → 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
+Remaining P0: none. Next: P1/P2 — 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
 
