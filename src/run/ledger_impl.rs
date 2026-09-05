@@ -10,12 +10,12 @@ use super::*;
 impl RunContext {
     /// Count one observation/wait event.
     pub fn bump_event(&mut self) {
-        self.event_count += 1;
+        self.evidence.events.bump();
     }
 
     /// Count one interaction transaction (act or wait).
     pub fn bump_transaction(&mut self) {
-        self.transaction_count += 1;
+        self.evidence.transactions.bump();
     }
 
     /// Record one settled interaction transaction into the run's ledger
@@ -33,8 +33,7 @@ impl RunContext {
         tx: &crate::execution::InteractionTransaction,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        let seq = self.transaction_count;
-        self.transaction_count += 1;
+        let seq = self.evidence.transactions.bump();
         let mut record = TransactionRecord::from_interaction(seq, session, tx);
         record.seq = seq;
         self.push_ledger(record);
@@ -75,8 +74,7 @@ impl RunContext {
     /// (P0 fix 5) — one bounded path, not one bounded and one unbounded.
     pub fn record_event(&mut self, session: &str, action: &str) -> anyhow::Result<()> {
         self.ensure_open()?;
-        let seq = self.transaction_count;
-        self.transaction_count += 1;
+        let seq = self.evidence.transactions.bump();
         self.push_ledger(TransactionRecord {
             seq,
             at: now_ms(),
@@ -99,12 +97,12 @@ impl RunContext {
 
     /// The transaction ledger (bounded; see [`Self::record_transaction`]).
     pub fn transactions(&self) -> &[TransactionRecord] {
-        &self.transactions
+        self.evidence.transactions.records()
     }
 
     /// True transaction count, including ledger entries already evicted.
     pub fn transaction_total(&self) -> u64 {
-        self.transaction_count
+        self.evidence.transactions.total()
     }
 
     /// Status snapshot for `tui_run status` (goal spec shape).
@@ -130,9 +128,9 @@ impl RunContext {
             // FrameAnalysis storage (re-review item 51): hot ring health —
             // what's resident, what was evicted to the cold log.
             "frames": {
-                "hot_resident": self.frame_hot.len(),
-                "hot_evicted": self.frame_hot_evicted,
-                "next_frame_id": self.next_frame_id,
+                "hot_resident": self.evidence.frames.resident(),
+                "hot_evicted": self.evidence.frames.evicted(),
+                "next_frame_id": self.evidence.frames.next_id(),
             },
             "contract": self.contract.contract().map(|c| json!({
                 "name": c.schema.name,
@@ -174,13 +172,17 @@ impl RunContext {
     /// recordings, focus/state-graph edges) — bookkeeping like artifact
     /// refs or contract baselines never blocks a `new`.
     pub fn unsaved_evidence(&self) -> serde_json::Value {
-        let incremental_persisted: u64 = self.event_flushed_counts.values().sum();
+        let incremental_persisted: u64 = self.evidence.events.flushed_total();
         // Events that were counted but never written anywhere yet (an
         // ephemeral run's whole event history, or a persistent run's
         // held tail): counted events minus those already flushed.
-        let events_unwritten = self.event_count.saturating_sub(incremental_persisted);
+        let events_unwritten = self
+            .evidence
+            .events
+            .count()
+            .saturating_sub(incremental_persisted);
         let counts = [
-            ("transactions", self.transaction_count),
+            ("transactions", self.evidence.transactions.total()),
             ("events_unwritten", events_unwritten),
             ("checkpoints", self.checkpoints.count() as u64),
             ("scenarios", self.saved_scenarios.len() as u64),
@@ -208,16 +210,15 @@ impl RunContext {
 
     /// Counts for `tui_run status`.
     pub fn counts(&self) -> serde_json::Value {
-        let held: u64 = self.held_events.iter().map(|(_, e)| e.len() as u64).sum();
         json!({
-            "transactions": self.transaction_count,
-            "transactions_in_ledger": self.transactions.len(),
+            "transactions": self.evidence.transactions.total(),
+            "transactions_in_ledger": self.transactions().len(),
             "history_complete": self.history_complete(),
-            "dropped_records": self.dropped_records,
-            "first_available_seq": self.first_available_seq,
-            "events": self.event_count,
-            "events_persisted_incrementally": self.event_flushed_counts.values().sum::<u64>(),
-            "events_held_for_flush": held,
+            "dropped_records": self.evidence.transactions.dropped_records(),
+            "first_available_seq": self.evidence.transactions.first_available_seq(),
+            "events": self.evidence.events.count(),
+            "events_persisted_incrementally": self.evidence.events.flushed_total(),
+            "events_held_for_flush": self.evidence.events.held_count(),
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.saved_scenarios.len(),
             "findings": self.findings.len(),
@@ -226,7 +227,7 @@ impl RunContext {
             "focus_graph_edges": self.focus_graph.edges.len(),
             "state_graph_states": self.state_graph.state_count(),
             "state_graph_transitions": self.state_graph.transition_count(),
-            "frames": self.next_frame_id,
+            "frames": self.evidence.frames.next_id(),
             "artifacts": self.artifacts.len(),
         })
     }

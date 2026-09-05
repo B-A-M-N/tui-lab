@@ -32,6 +32,7 @@ mod contract_impl;
 mod contract_state;
 mod coverage_impl;
 mod evidence_impl;
+mod evidence_store;
 mod finding_store;
 mod findings_impl;
 mod launch_impl;
@@ -47,6 +48,7 @@ pub use manifest::RunManifest;
 use crate::checkpoint::store::CheckpointStore;
 use crate::exploration::state_graph::{ExplorationBudget, StateGraph};
 use contract_state::ContractState;
+use evidence_store::EvidenceStore;
 use finding_store::FindingStore;
 use serde_json::json;
 use std::collections::HashMap;
@@ -246,12 +248,6 @@ pub struct RunContext {
     session_specs: HashMap<String, crate::session::state::LaunchSpec>,
     /// First session recorded — the run's primary for cwd/root resolution.
     primary_session: Option<String>,
-    /// How many ledger records were evicted before flush (P0 fix 5): when
-    /// nonzero, the durable run is *not* replay-complete and says so.
-    dropped_records: u64,
-    /// Sequence number of the oldest record still in the ledger; `None`
-    /// when nothing was evicted (equivalent to 0).
-    first_available_seq: Option<u64>,
     /// Checkpoints recorded during this run.
     pub checkpoints: CheckpointStore,
     /// In-progress scenario recordings by opaque id (re-review item 5:
@@ -287,30 +283,11 @@ pub struct RunContext {
     /// Findings + labeled baselines. Round-2 (G1): moved into
     /// [`FindingStore`]; RunContext delegates.
     findings: FindingStore,
-    /// Transaction ledger (re-review Wave-2 item 15): a serializable record
-    /// of every interaction transaction, so the run can *reconstruct* what
-    /// happened (`transactions: 47` without 47 reconstructable transactions
-    /// was the old shape). Bounded to MAX_TRANSACTION_RECORDS; full frames
-    /// stay in the callers' hands — this is the evidence-level record.
-    transactions: Vec<TransactionRecord>,
-    /// Interaction transactions executed in this run (act/wait counters).
-    transaction_count: u64,
-    /// Events observed in this run (observe/wait calls).
-    event_count: u64,
-    /// Per-run frame id allocator (Wave B item 11): every CanonicalFrame
-    /// registered with the run gets a citable `frame:N` identity.
-    next_frame_id: u64,
-    /// FrameAnalysis storage (re-review item 51): a bounded HOT ring of
-    /// per-frame records — ids, sequences, hashes, capture time, commit
-    /// timing — queryable by citable id without touching the filesystem.
-    /// The COLD half (the full `ScreenState` grid) never lives here: it
-    /// stays with the frame's owner (session/transaction) and, for
-    /// persistent runs, in `frames.jsonl`. Ring eviction is FIFO past
-    /// [`FRAME_HOT_RING`] entries; evicted ids remain resolvable through
-    /// the cold log, and the ring reports its own eviction count so a
-    /// miss is diagnosable, not silent.
-    frame_hot: std::collections::VecDeque<FrameRecord>,
-    frame_hot_evicted: u64,
+    /// Citable execution evidence — transaction, frame, and event ledgers.
+    /// Round-2 (G1): the nine flat evidence fields moved into
+    /// [`EvidenceStore`] (internally: TransactionLedger / FrameLedger /
+    /// EventLedger); RunContext delegates.
+    evidence: EvidenceStore,
     /// Artifact registry (Wave B item 15): typed references to every large
     /// artifact the run produced (recordings, event logs). Tools return an
     /// [`ArtifactRef`] instead of inlining multi-kilobyte payloads.
@@ -332,14 +309,6 @@ pub struct RunContext {
     /// terminal write error) — surfaced by `flush` and status instead of
     /// silently degrading to memory-only.
     persistence_unhealthy: bool,
-    /// Terminal-event batches drained from sessions (Wave B item 12/14):
-    /// (session id, events). Filled by the MCP layer before flush; written
-    /// to `events/<session>.jsonl` when the run persists. Persistent runs
-    /// bypass this backlog (item 38: incremental appends at hold time).
-    held_events: Vec<(String, Vec<crate::events::TerminalEvent>)>,
-    /// Events already written durably per session (item 38) — evidence for
-    /// status: "events persisted incrementally" vs "held in memory".
-    event_flushed_counts: HashMap<String, u64>,
     /// The loaded project contract + conformance baselines (Wave E).
     /// Round-2 (G1): moved into [`ContractState`] so the contract domain has
     /// its own cohesive holder; RunContext delegates.
@@ -462,8 +431,8 @@ impl RunContext {
             sessions: self.session_specs.clone(),
             primary_session: self.primary_session.clone(),
             history_complete: self.history_complete(),
-            first_available_seq: self.first_available_seq,
-            dropped_records: self.dropped_records,
+            first_available_seq: self.evidence.transactions.first_available_seq(),
+            dropped_records: self.evidence.transactions.dropped_records(),
             closed: self.closed,
             resume_epoch: self.resume_epoch,
         };
@@ -492,7 +461,10 @@ impl RunContext {
         Ok(())
     }
 
-    /// Shared bounded push with declared eviction (P0 fix 5).
+    /// Shared bounded push with declared eviction (P0 fix 5). Round-2
+    /// (G1): the ledger policy (window bounds, declared eviction) lives in
+    /// [`evidence_store::TransactionLedger`]; this facade method keeps the
+    /// journal plumbing (writer thread handoff / lazy spawn).
     fn push_ledger(&mut self, record: TransactionRecord) {
         // Background journal (audit item: run-journal writer): persistent
         // runs hand the serialized record to the writer thread and never
@@ -523,22 +495,7 @@ impl RunContext {
                 }
             }
         }
-        self.transactions.push(record);
-        // Declared eviction (P0 fix 5) — for persistent runs this trims the
-        // memory window only (disk already holds the records); for
-        // ephemeral runs it is a real loss, which the manifest declares.
-        // Audit P1-48: the old high-water trigger (`MAX + 512`) let the
-        // ring hold ~2x its declared bound, and the trim only dropped half
-        // the nominal limit — the comments' "bounded to 512" was false. Now
-        // a true high-water/low-water pair: trim fires at 1024 (HIGH) and
-        // drains back to 512 (LOW), both named constants.
-        if self.transactions.len() >= TRANSACTION_RING_HIGH_WATER {
-            let excess = self.transactions.len() - TRANSACTION_RING_LOW_WATER;
-            let new_first = self.transactions[excess].seq;
-            self.transactions.drain(..excess);
-            self.dropped_records += excess as u64;
-            self.first_available_seq = Some(new_first);
-        }
+        self.evidence.transactions.push(record);
     }
 
     /// Resolve the per-run artifact directory from a caller-supplied base.
@@ -884,9 +841,12 @@ mod tests {
             run.transactions().len(),
             TRANSACTION_RING_LOW_WATER
         );
-        assert!(run.dropped_records > 0, "eviction is declared, not silent");
+        assert!(
+            run.dropped_records() > 0,
+            "eviction is declared, not silent"
+        );
         assert_eq!(
-            run.first_available_seq,
+            run.first_available_seq(),
             Some(run.transactions()[0].seq),
             "first_available_seq matches the oldest resident record"
         );
@@ -1054,7 +1014,7 @@ mod tests {
         let _ = run.hold_events("incr-sess", vec![ev.clone(), ev.clone()]);
         // The batch must already be on disk (incremental, not held).
         assert!(
-            run.held_events.is_empty(),
+            run.counts()["events_held_for_flush"] == 0,
             "persistent runs must not hold events for flush"
         );
         let path = run
@@ -1066,7 +1026,6 @@ mod tests {
         // +1: the finding-31 stream header line.
         assert_eq!(log.lines().count(), 3, "both events appended (+header)");
         // And the counter says so.
-        assert_eq!(run.event_flushed_counts.get("incr-sess"), Some(&2));
         assert_eq!(run.counts()["events_persisted_incrementally"], 2);
         assert_eq!(run.counts()["events_held_for_flush"], 0);
 
@@ -1078,7 +1037,11 @@ mod tests {
         // An ephemeral run keeps the old hold-for-flush contract.
         let mut eph = RunContext::ephemeral();
         let _ = eph.hold_events("eph-sess", vec![ev.clone()]);
-        assert_eq!(eph.held_events.len(), 1, "ephemeral holds for flush");
+        assert_eq!(
+            eph.counts()["events_held_for_flush"],
+            1,
+            "ephemeral holds for flush"
+        );
         assert_eq!(eph.counts()["events_held_for_flush"], 1);
     }
 
@@ -1248,7 +1211,7 @@ mod tests {
             "ledger stream self-describes: {first}"
         );
         // And restore still sees the record past the header.
-        assert_eq!(restored.transaction_count, 1, "header is not a record");
+        assert_eq!(restored.transaction_total(), 1, "header is not a record");
 
         // A mismatched-version artifact is a NAMED restore warning.
         let wrong = crate::run::formats::Envelope::wrap(
@@ -1619,7 +1582,8 @@ mod tests {
         let restored = RunContext::restore(&root).expect("restore still succeeds");
         assert_eq!(restored.transactions().len(), 1, "only the good line");
         assert_eq!(
-            restored.dropped_records, 1,
+            restored.dropped_records(),
+            1,
             "the torn line is DECLARED, not dropped silently"
         );
         assert!(
@@ -1824,8 +1788,12 @@ mod tests {
         assert!(run.extend_findings_with_source_refs(Vec::new()).is_err());
 
         // And nothing actually landed.
-        assert_eq!(run.transaction_count, 0, "no post-close ledger entries");
-        assert_eq!(run.next_frame_id, 0, "no post-close frames");
+        assert_eq!(run.transaction_total(), 0, "no post-close ledger entries");
+        assert_eq!(
+            run.frame_hot_evicted() + run.frame_hot_records().count() as u64,
+            0,
+            "no post-close frames"
+        );
         assert!(run.findings().is_empty(), "no post-close findings");
         assert!(run.artifacts().is_empty(), "no post-close artifacts");
         assert!(run.coverage_ledger.is_empty(), "no post-close coverage");
