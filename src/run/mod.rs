@@ -1399,8 +1399,8 @@ mod tests {
         let _ = run.extend_findings(vec![crate::audit::Finding {
             id: "RESTORE-ME".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "test".into(),
+            severity: crate::audit::Severity::Warn,
+            category: crate::audit::Category::Other("test".into()),
             summary: "finding that must survive restore".into(),
             evidence: vec![crate::audit::EvidenceRef::point(
                 crate::audit::EvidenceKind::Other,
@@ -1410,6 +1410,7 @@ mod tests {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         }]);
         run.record_focus_transition("sess-fix", None, Some("file".into()));
         let sc = crate::scenario::model::Scenario::new("restored-flow")
@@ -1727,8 +1728,8 @@ mod source_ref_tests {
         Finding {
             id: "TEST-001".into(),
             rule_id: None,
-            severity: "error".into(),
-            category: "focus".into(),
+            severity: crate::audit::Severity::Error,
+            category: crate::audit::Category::Focus,
             summary: "test finding".into(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Control,
@@ -1738,6 +1739,7 @@ mod source_ref_tests {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         }
     }
 

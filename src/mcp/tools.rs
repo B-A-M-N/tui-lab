@@ -14,6 +14,7 @@ use rmcp::tool;
 use rmcp::tool_router;
 use rmcp::ServerHandler;
 
+use crate::audit::{Category, Severity};
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, lease_refused, ok};
 use crate::mcp::params::*;
@@ -591,8 +592,8 @@ impl TuiLabServer {
             let _ = run.extend_findings(vec![crate::audit::Finding {
                 id: format!("EXPLORE-CRASH-{}", exit.action_index),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "exploration".into(),
+                severity: Severity::Warn,
+                category: Category::Other("exploration".into()),
                 summary: format!(
                     "Exploration crash at action {} ({}): original trace ({} steps) did not reproduce on a clean restart — not minimized, no scenario fabricated",
                     exit.action_index,
@@ -615,6 +616,7 @@ impl TuiLabServer {
                 confidence: 0.9,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             }]);
             return json!({
                 "reproduced": false,
@@ -637,8 +639,8 @@ impl TuiLabServer {
             let _ = run.extend_findings(vec![crate::audit::Finding {
                 id: format!("EXPLORE-CRASH-{}", exit.action_index),
                 rule_id: None,
-                severity: "error".into(),
-                category: "exploration".into(),
+                severity: Severity::Error,
+                category: Category::Other("exploration".into()),
                 summary: format!(
                     "Exploration crash at action {} ({}): minimized to {} step(s), saved as scenario {}",
                     exit.action_index,
@@ -663,6 +665,7 @@ impl TuiLabServer {
                 confidence: 1.0,
                 reproduction: Some(scenario_id.clone()),
                 source_refs: Vec::new(),
+                occurrence_id: None,
             }]);
             scenario_id.clone()
         };

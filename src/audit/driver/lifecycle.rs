@@ -9,7 +9,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{decode_raw, ev_other};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Item 29 — lifecycle/restoration audit. What state survives a restart,
 /// and what state the app leaves dangling when it dies: alternate screen,
@@ -30,17 +30,20 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
     // engine's own teardown restores the host terminal, so these become
     // info instead of warn.
     let (sev_dangling, note_lifecycle) = if alive {
-        ("warn", "app is running")
+        (Severity::Warn, "app is running")
     } else {
-        ("info", "app has exited (engine teardown restored the host)")
+        (
+            Severity::Info,
+            "app has exited (engine teardown restored the host)",
+        )
     };
 
     let Some((trace, nbytes, dropped)) = decode_raw(session) else {
         findings.push(Finding {
             id: "LC-NOSRC".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: "engine retains no raw output; mode-restoration evidence unavailable".into(),
             evidence: vec![ev_other(
                 "raw_ring_absent",
@@ -50,6 +53,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     };
@@ -94,8 +98,8 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "LC-DANGLING".into(),
             rule_id: None,
-            severity: sev_dangling.into(),
-            category: "lifecycle".into(),
+            severity: sev_dangling,
+            category: Category::Lifecycle,
             summary: format!(
                 "the app holds {dangling_len} terminal mode(s) it negotiated ({modes_list}) — {note_lifecycle}. If it dies without restoring them, the user's terminal is left broken (mouse reporting on, paste mangled, alt screen stuck).",
                 dangling_len = dangling.len(),
@@ -121,13 +125,14 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else {
         findings.push(Finding {
             id: "LC-CLEAN".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: "no dangling terminal modes in the retained window — the app negotiated nothing it still holds.".into(),
             evidence: vec![ev_other(
                 "mode_fold_clean",
@@ -137,6 +142,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -146,8 +152,8 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "LC-WINDOW".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: format!(
                 "the raw window dropped its head ({dropped} bytes of {cap} retained) — a mode set before the window may be invisible to this fold.",
                 dropped = dropped,
@@ -161,6 +167,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -196,8 +203,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "LCX-NOSRC".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: "engine retains no raw output; exit teardown evidence unavailable".into(),
             evidence: vec![ev_other(
                 "raw_ring_absent",
@@ -207,6 +214,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     };
@@ -233,8 +241,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "LCX-NOEXIT".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: "the app did not exit on the probe stimulus (quit + EOF); exit teardown untested — the standing dangling-mode audit still applies".into(),
             evidence: vec![ev_other(
                 "exit_timeout",
@@ -244,6 +252,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     }
@@ -262,8 +271,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                 findings.push(Finding {
                     id: "TEARDOWN-WINDOW-UNREADABLE".into(),
                     rule_id: None,
-                    severity: "warn".into(),
-                    category: "lifecycle".into(),
+                    severity: Severity::Warn,
+                    category: Category::Lifecycle,
                     summary: format!(
                         "raw output window read failed ({e}) — teardown mode restoration UNKNOWN, not verified"
                     ),
@@ -275,6 +284,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
                 (Vec::new(), 0, 0)
             }
@@ -313,8 +323,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "LCX-TEARDOWN-MISSING".into(),
             rule_id: None,
-            severity: "error".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Error,
+            category: Category::Lifecycle,
             summary: format!(
                 "on clean exit the app did NOT restore {} engaged mode(s): {} — the app failed its teardown duty. (The host may still look fine because the PTY was destroyed; that is the host's mercy, not the app's correctness.)",
                 unrestored.len(),
@@ -334,13 +344,14 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             confidence: if window_complete { 0.95 } else { 0.6 },
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else if !engaged.is_empty() {
         findings.push(Finding {
             id: "LCX-TEARDOWN-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: format!(
                 "clean exit restored every engaged mode: {} — the app performed its own terminal restoration.",
                 engaged.join(", ")
@@ -358,13 +369,14 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             confidence: if window_complete { 0.95 } else { 0.6 },
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else {
         findings.push(Finding {
             id: "LCX-NOTHING-ENGAGED".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: "the app engaged no restorable terminal modes during its run; exit teardown is trivially satisfied.".into(),
             evidence: vec![ev_other(
                 "no_modes_engaged",
@@ -374,6 +386,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -389,8 +402,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "LCX-NORESTART".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "lifecycle".into(),
+                severity: Severity::Info,
+                category: Category::Lifecycle,
                 summary: format!(
                     "session is not restartable; signal {sig} teardown untested (relaunch failed)"
                 ),
@@ -402,6 +415,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             break;
         }
@@ -415,8 +429,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "LCX-SIGNAL-IGNORED".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "lifecycle".into(),
+                severity: Severity::Info,
+                category: Category::Lifecycle,
                 summary: format!(
                     "the app survived SIG{sig} — it traps the signal (a full-screen TUI commonly ignores or handles it). Not a defect; recorded as observed behavior."
                 ),
@@ -428,6 +442,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.9,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             // Stop the relaunched app so the session is not left running.
             let _ = session.stop();
@@ -443,8 +458,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                     findings.push(Finding {
                         id: "LCX-SIGNAL-WINDOW-UNREADABLE".into(),
                         rule_id: None,
-                        severity: "warn".into(),
-                        category: "lifecycle".into(),
+                        severity: Severity::Warn,
+                        category: Category::Lifecycle,
                         summary: format!(
                             "raw output window read failed after SIG{sig} ({e}) — final-stream mode resets UNKNOWN"
                         ),
@@ -456,6 +471,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                         confidence: 1.0,
                         reproduction: None,
                         source_refs: Vec::new(),
+                        occurrence_id: None,
                     });
                     (Vec::new(), 0, 0)
                 }
@@ -466,8 +482,8 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "LCX-SIGNAL-EXIT".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "lifecycle".into(),
+            severity: Severity::Info,
+            category: Category::Lifecycle,
             summary: format!(
                 "SIG{sig} terminated the app; the final stream contained {resets} mode reset(s). No resets means the signal path skipped terminal restoration (common for untrapped default handlers)."
             ),
@@ -484,6 +500,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 

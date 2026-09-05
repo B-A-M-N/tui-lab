@@ -9,7 +9,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{decode_raw, ev_other, ev_other_empty};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Item 30 — shell/CLI audit. For line-oriented CLIs (no alternate screen):
 /// prompt detection, shell-integration marks (OSC 133), and exit-status
@@ -24,8 +24,8 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "SH-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "shell_cli".into(),
+                severity: Severity::Error,
+                category: Category::ShellCli,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "shell_observe_failed",
@@ -34,6 +34,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -49,8 +50,8 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "SH-CMDSTATE".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "shell_cli".into(),
+            severity: Severity::Info,
+            category: Category::ShellCli,
             summary: format!(
                 "shell-integration marks present: phase={}, running={}, last exit {:?}. Command edges are exact — tui_wait condition=command_done is trustworthy here.",
                 cs.phase, cs.running, cs.last_exit
@@ -67,6 +68,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -91,8 +93,8 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "SH-NOMARKS".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "shell_cli".into(),
+            severity: Severity::Info,
+            category: Category::ShellCli,
             summary: if prompt_hint.unwrap_or(false) {
                 "no shell-integration marks; the last line looks like a prompt — text/regex waits are the only command-completion signal here.".to_string()
             } else {
@@ -110,6 +112,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -118,8 +121,8 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "SH-EXIT".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "shell_cli".into(),
+            severity: Severity::Info,
+            category: Category::ShellCli,
             summary: format!(
                 "process has exited (code {:?}, signal {:?}); further input sends will fail.",
                 proc_state.exit_code, proc_state.exit_signal
@@ -135,6 +138,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -152,8 +156,8 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "SH-ALTSCREEN".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "shell_cli".into(),
+                severity: Severity::Info,
+                category: Category::ShellCli,
                 summary: "alternate screen is active — this is a full-screen TUI, not a line CLI; prompt/completion heuristics do not apply.".into(),
                 evidence: vec![ev_other(
                     "alt_screen_active",
@@ -163,6 +167,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.95,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }

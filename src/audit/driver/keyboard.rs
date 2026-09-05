@@ -11,7 +11,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{ev_other, ev_other_empty};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Run keyboard audit: traverse focus using Tab (item 52). Upgraded for
 /// Wave D (items 36–37): every transition is recorded into the run's
@@ -30,8 +30,8 @@ pub fn keyboard_audit(
             findings.push(Finding {
                 id: "KB-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "keyboard".into(),
+                severity: Severity::Error,
+                category: Category::Keyboard,
                 summary: format!("Cannot observe baseline: {}", e),
                 evidence: vec![ev_other_empty(
                     "baseline_observe_failed",
@@ -40,6 +40,7 @@ pub fn keyboard_audit(
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -75,8 +76,8 @@ pub fn keyboard_audit(
                 findings.push(Finding {
                     id: "KB-ERR".into(),
                     rule_id: None,
-                    severity: "error".into(),
-                    category: "keyboard".into(),
+                    severity: Severity::Error,
+                    category: Category::Keyboard,
                     summary: format!("Tab send failed at step {}", i),
                     evidence: vec![ev_other(
                         "tab_send_failed",
@@ -86,6 +87,7 @@ pub fn keyboard_audit(
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
                 break;
             }
@@ -116,8 +118,8 @@ pub fn keyboard_audit(
                 findings.push(Finding {
                     id: "KB-TRAP".into(),
                     rule_id: None,
-                    severity: "warn".into(),
-                    category: "keyboard".into(),
+                    severity: Severity::Warn,
+                    category: Category::Keyboard,
                     summary: format!(
                         "Tab at step {} did not change focus although {} focusable controls are visible",
                         i, focusable_count
@@ -135,13 +137,14 @@ pub fn keyboard_audit(
                     confidence: 0.85,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
             } else {
                 findings.push(Finding {
                     id: "KB-SINGLE-FOCUSABLE".into(),
                     rule_id: None,
-                    severity: "info".into(),
-                    category: "keyboard".into(),
+                    severity: Severity::Info,
+                    category: Category::Keyboard,
                     summary: format!(
                         "Tab at step {} did not move focus: {} focusable control(s) visible — not a trap",
                         i, focusable_count
@@ -157,6 +160,7 @@ pub fn keyboard_audit(
                     confidence: 0.9,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
             }
         }
@@ -167,8 +171,8 @@ pub fn keyboard_audit(
             findings.push(Finding {
                 id: "KB-CYCLE".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "keyboard".into(),
+                severity: Severity::Info,
+                category: Category::Keyboard,
                 summary: format!(
                     "Tab traversal returned to a previously seen state at step {}",
                     i
@@ -184,6 +188,7 @@ pub fn keyboard_audit(
                 confidence: 0.9,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             break;
         }
@@ -234,8 +239,8 @@ pub fn keyboard_audit(
             findings.push(Finding {
                 id: "KB-REVERSE-GAP".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "keyboard".into(),
+                severity: Severity::Warn,
+                category: Category::Keyboard,
                 summary: format!(
                     "Shift+Tab does not reverse Tab: {} transition(s) lack the inverse edge",
                     gaps.len()
@@ -251,14 +256,15 @@ pub fn keyboard_audit(
                 confidence: 0.85,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
         if successful_tabs > 0 && reverse_ok {
             findings.push(Finding {
                 id: "KB-OK".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "keyboard".into(),
+                severity: Severity::Info,
+                category: Category::Keyboard,
                 summary: format!(
                     "Tab traversal: {} states visited, reverse traversal succeeded ({} graph edges{})",
                     successful_tabs,
@@ -281,6 +287,7 @@ pub fn keyboard_audit(
                 confidence: 0.85,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -304,8 +311,8 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "FOCUS-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "focus".into(),
+                severity: Severity::Error,
+                category: Category::Focus,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "focus_observe_failed",
@@ -314,6 +321,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -327,8 +335,8 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "FOCUS-001".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "focus".into(),
+            severity: Severity::Warn,
+            category: Category::Focus,
             summary: "No detectable focus target on this screen.".into(),
             evidence: vec![ev_other(
                 "focus_missing",
@@ -338,6 +346,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -366,8 +375,8 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "FOCUS-002".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "focus".into(),
+                severity: Severity::Warn,
+                category: Category::Focus,
                 summary: "Tab did not change focus target.".into(),
                 evidence: vec![ev_other(
                     "tab_no_focus_change",
@@ -380,13 +389,14 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.85,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         } else {
             findings.push(Finding {
                 id: "FOCUS-OK".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "focus".into(),
+                severity: Severity::Info,
+                category: Category::Focus,
                 summary: format!(
                     "Focus on '{}'; Tab changes focus (confidence {:.2})",
                     ctrl, sem.focus.confidence
@@ -403,6 +413,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: sem.focus.confidence,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }

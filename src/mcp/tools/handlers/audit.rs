@@ -1,5 +1,6 @@
 //! tui_audit / tui_explain: audit orchestration and finding explanation.
 
+use crate::audit::Severity;
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, lease_refused, ok};
 use crate::mcp::params::*;
@@ -249,14 +250,26 @@ pub(crate) async fn tui_audit(
                 // a finding row.)
                 "finding_count": report.findings.len(),
                 "findings_by_severity": {
-                    "error": report.findings.iter().filter(|f| f.severity == "error").count(),
-                    "warn": report.findings.iter().filter(|f| f.severity == "warn").count(),
-                    "info": report.findings.iter().filter(|f| f.severity == "info").count(),
+                    "error": report
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity == Severity::Error)
+                        .count(),
+                    "warn": report
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity == Severity::Warn)
+                        .count(),
+                    "info": report
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity == Severity::Info)
+                        .count(),
                 },
                 "defect_count": report
                     .findings
                     .iter()
-                    .filter(|f| f.severity != "info")
+                    .filter(|f| f.severity != Severity::Info)
                     .count(),
                 "findings": report.findings,
                 // Finding 20: per-driver timing lives here — run metadata,

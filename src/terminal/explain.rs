@@ -123,8 +123,8 @@ pub fn explain_finding(
 
     FindingExplanation {
         id: finding.id.clone(),
-        category: finding.category.clone(),
-        severity: finding.severity.clone(),
+        category: finding.category.as_str().to_string(),
+        severity: finding.severity.as_str().to_string(),
         gist,
         steps,
         trace_confidence,
@@ -144,7 +144,7 @@ fn build_gist(
     // profile has NOT confirmed? If so, say so — the finding may be an artifact
     // of missing capability, not a real defect.
     if let Some(p) = profile {
-        let relevant = feature_for_category(&finding.category, p);
+        let relevant = feature_for_category(finding.category.as_str(), p);
         if let Some(f) = relevant {
             if f.state != CapabilityState::Supported {
                 return format!(
@@ -403,15 +403,15 @@ impl EvidenceRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{EvidenceRef, Finding};
+    use crate::audit::{Category, EvidenceRef, Finding, Severity};
     use crate::screen::diff;
 
     fn finding() -> Finding {
         Finding {
             id: "EXPL-1".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "discoverability".into(),
+            severity: Severity::Warn,
+            category: Category::Discoverability,
             summary: "focus affordance has no visible cue".into(),
             evidence: vec![
                 EvidenceRef::screen("h123", "frame at observation"),
@@ -420,6 +420,7 @@ mod tests {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         }
     }
 
@@ -485,7 +486,7 @@ mod tests {
         // A finding in a category that depends on scrollback (navigation) is
         // conditional on it; a default profile has scrollback UNVERIFIED.
         let mut f = finding();
-        f.category = "navigation".into();
+        f.category = crate::audit::Category::Navigation;
         let profile = TerminalProfile::default();
         let exp = explain_finding(&f, None, Some(&profile));
         assert!(

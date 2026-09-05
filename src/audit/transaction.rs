@@ -14,7 +14,7 @@
 
 use serde_json::json;
 
-use crate::audit::{EvidenceKind, EvidenceRef, Finding};
+use crate::audit::{Category, EvidenceKind, EvidenceRef, Finding, Severity};
 use crate::session::state::Session;
 
 /// The observable pre-state one audit run commits to restoring.
@@ -147,8 +147,8 @@ where
             findings.push(Finding {
                 id: "AUDIT-UNVERIFIED".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "audit".into(),
+                severity: Severity::Warn,
+                category: Category::Audit,
                 summary: format!(
                     "post-driver verification for '{}' could not observe the screen — restoration was NOT verified, not proven clean",
                     profile
@@ -162,6 +162,7 @@ where
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -235,8 +236,8 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
     Finding {
         id: "AUDIT-RESIDUE".into(),
         rule_id: None,
-        severity: "warn".into(),
-        category: "audit".into(),
+        severity: Severity::Warn,
+        category: Category::Audit,
         summary: format!(
             "audit '{}' left residue: {} (pre-state was {}x{}, focus {:?})",
             profile,
@@ -269,6 +270,7 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
         confidence: 0.95,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     }
 }
 

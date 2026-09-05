@@ -26,7 +26,7 @@
 
 use super::oracle::{self, ActiveArgs, OracleOutcome};
 use super::schema::{ComponentContract, InteractionContract, LayoutConstraint, ProjectContract};
-use crate::audit::{EvidenceKind, EvidenceRef, Finding};
+use crate::audit::{Category, EvidenceKind, EvidenceRef, Finding, Severity};
 use crate::execution::{execute_act_as, CanonicalAction};
 use crate::semantic::{self, node::Role};
 use crate::session::state::Session;
@@ -189,9 +189,9 @@ impl ContractReport {
         let mut out = Vec::new();
         for r in &self.results {
             let severity = match (r.verdict, r.required) {
-                (Verdict::Fail, true) => "error",
-                (Verdict::Fail, false) | (Verdict::Warn, _) => "warn",
-                (Verdict::Unverified, _) | (Verdict::Unsupported, _) => "info",
+                (Verdict::Fail, true) => Severity::Error,
+                (Verdict::Fail, false) | (Verdict::Warn, _) => Severity::Warn,
+                (Verdict::Unverified, _) | (Verdict::Unsupported, _) => Severity::Info,
                 (Verdict::Pass, _) => continue,
             };
             let id = format!(
@@ -208,8 +208,8 @@ impl ContractReport {
             out.push(Finding {
                 id: id.to_string(),
                 rule_id: None,
-                severity: severity.into(),
-                category: format!("contract/{}", r.group),
+                severity,
+                category: Category::Other(format!("contract/{}", r.group)),
                 summary: format!("[{}] {}: {}", r.verdict.as_str(), r.name, r.detail),
                 evidence: vec![EvidenceRef::point(
                     EvidenceKind::Other,
@@ -226,6 +226,7 @@ impl ContractReport {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
         out
@@ -1376,7 +1377,11 @@ mod wave5_verdict_tests {
         let findings = report.findings();
         assert_eq!(findings.len(), 2);
         for f in &findings {
-            assert_eq!(f.severity, "info", "non-failure verdicts are info: {f:?}");
+            assert_eq!(
+                f.severity,
+                crate::audit::Severity::Info,
+                "non-failure verdicts are info: {f:?}"
+            );
         }
     }
 

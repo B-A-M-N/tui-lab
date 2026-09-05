@@ -12,7 +12,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{ev_other, ev_other_empty};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Run the states audit (Wave G item 66): find disabled controls and probe
 /// whether they can still be focused via Tab (a disabled-but-focusable
@@ -26,8 +26,8 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             findings.push(Finding {
                 id: "STATES-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "states".into(),
+                severity: Severity::Error,
+                category: Category::States,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "states_observe_failed",
@@ -36,6 +36,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -51,8 +52,8 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         findings.push(Finding {
             id: "STATES-DISABLED".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "states".into(),
+            severity: Severity::Info,
+            category: Category::States,
             summary: format!(
                 "{} disabled control(s) on this screen: {}",
                 disabled.len(),
@@ -77,14 +78,15 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     if !empty_like.is_empty() {
         findings.push(Finding {
             id: "STATES-EMPTY-CONTROLS".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "states".into(),
+            severity: Severity::Info,
+            category: Category::States,
             summary: format!(
                 "{} enabled control(s) carry an empty label — state may be unreadable to agents",
                 empty_like.len()
@@ -103,6 +105,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             confidence: 0.6,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -142,8 +145,8 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             findings.push(Finding {
                 id: "STATES-DISABLED-FOCUSABLE".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "states".into(),
+                severity: Severity::Error,
+                category: Category::States,
                 summary: format!(
                     "Tab reached {} disabled control(s): disabled controls must not take focus",
                     focused_disabled.len()
@@ -159,6 +162,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
                 confidence: 0.75,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -167,8 +171,8 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         findings.push(Finding {
             id: "STATES-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "states".into(),
+            severity: Severity::Info,
+            category: Category::States,
             summary: format!(
                 "No disabled, empty-labeled, or unfocusable-state issues across {} control(s)",
                 sem.controls.len()
@@ -181,6 +185,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     findings
@@ -202,8 +207,8 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
             findings.push(Finding {
                 id: "ERR-AUDIT-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "errors".into(),
+                severity: Severity::Error,
+                category: Category::Errors,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "errors_observe_failed",
@@ -212,6 +217,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -266,8 +272,8 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
         findings.push(Finding {
             id: "ERR-CRASH".into(),
             rule_id: None,
-            severity: "error".into(),
-            category: "errors".into(),
+            severity: Severity::Error,
+            category: Category::Errors,
             summary: format!(
                 "App exited during a {}-key safe burst (arrows/tab/escape only) — crash resistance failed",
                 sent
@@ -285,6 +291,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         // Skip the error scan on a dead screen; the crash IS the finding.
         return findings;
@@ -332,8 +339,8 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
             findings.push(Finding {
                 id: "ERR-ON-SCREEN".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "errors".into(),
+                severity: Severity::Error,
+                category: Category::Errors,
                 summary: format!(
                     "App-failure text visible on screen: strong marker(s) found ({})",
                     strong.join(", ")
@@ -351,13 +358,14 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 confidence: 0.9,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         } else if !weak.is_empty() {
             findings.push(Finding {
                 id: "ERR-TEXT-HINT".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "errors".into(),
+                severity: Severity::Info,
+                category: Category::Errors,
                 summary: format!(
                     "error-shaped text visible ({}) with NO strong app-failure marker — could be a log viewer, docs, or compiler output; verify against process state before treating it as a crash.",
                     weak.join(", ")
@@ -375,13 +383,14 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 confidence: 0.4,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         } else {
             findings.push(Finding {
                 id: "ERR-OK".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "errors".into(),
+                severity: Severity::Info,
+                category: Category::Errors,
                 summary: format!(
                     "Survived {} safe keys with no exit and no error text on screen",
                     sent
@@ -397,6 +406,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 confidence: 0.9,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }

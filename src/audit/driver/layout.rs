@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::keyboard::keyboard_audit;
 use super::shared::{ev_other, ev_other_empty, has_incomplete_border};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Run clipping audit: detect real clipping (item 55).
 pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
@@ -24,8 +24,8 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "CLIP-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "clipping".into(),
+                severity: Severity::Error,
+                category: Category::Clipping,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "clipping_observe_failed",
@@ -34,6 +34,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -51,8 +52,8 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "CLIP-001".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "clipping".into(),
+                severity: Severity::Error,
+                category: Category::Clipping,
                 summary: format!("Region '{}' bounds exceed terminal", rg.id),
                 evidence: vec![ev_other(
                     "region_bounds_exceed_terminal",
@@ -66,6 +67,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.96,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
 
@@ -74,8 +76,8 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "CLIP-002".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "clipping".into(),
+                severity: Severity::Error,
+                category: Category::Clipping,
                 summary: format!("Region '{}' clipped: {:?}", rg.id, rg.clipping_state),
                 evidence: vec![ev_other(
                     "region_border_clipped",
@@ -89,6 +91,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.95,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -103,8 +106,8 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "CLIP-003".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "clipping".into(),
+                severity: Severity::Warn,
+                category: Category::Clipping,
                 summary: "Top border has possible clipping at viewport edge".into(),
                 evidence: vec![ev_other(
                     "border_open_at_top_edge",
@@ -114,6 +117,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.6,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
 
@@ -122,8 +126,8 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "CLIP-004".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "clipping".into(),
+                severity: Severity::Warn,
+                category: Category::Clipping,
                 summary: "Bottom border has possible clipping at viewport edge".into(),
                 evidence: vec![ev_other(
                     "border_open_at_bottom_edge",
@@ -133,6 +137,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.6,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -141,8 +146,8 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "CLIP-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "clipping".into(),
+            severity: Severity::Info,
+            category: Category::Clipping,
             summary: format!("No clipping detected ({} regions)", sem.regions.len()),
             evidence: vec![ev_other(
                 "no_clipping_detected",
@@ -152,6 +157,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -179,8 +185,8 @@ pub fn navigation_audit(
         findings.push(Finding {
             id: "NAV-NO-TRAVERSAL".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "navigation".into(),
+            severity: Severity::Warn,
+            category: Category::Navigation,
             summary: "No Tab traversal observed: the screen exposes no keyboard navigation order."
                 .into(),
             evidence: vec![ev_other(
@@ -191,6 +197,7 @@ pub fn navigation_audit(
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     }
@@ -203,8 +210,8 @@ pub fn navigation_audit(
     findings.push(Finding {
         id: "NAV-ORDER".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "navigation".into(),
+        severity: Severity::Info,
+        category: Category::Navigation,
         summary: format!(
             "Tab order observed over {} edge(s){}",
             tab_edges.len(),
@@ -225,14 +232,15 @@ pub fn navigation_audit(
         confidence: 0.9,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     if !gaps.is_empty() {
         findings.push(Finding {
             id: "NAV-REVERSE-GAP".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "navigation".into(),
+            severity: Severity::Warn,
+            category: Category::Navigation,
             summary: format!(
                 "Reverse traversal is not the true inverse: {} Tab edge(s) have no Shift+Tab counterpart",
                 gaps.len()
@@ -245,13 +253,14 @@ pub fn navigation_audit(
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else {
         findings.push(Finding {
             id: "NAV-REVERSE-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "navigation".into(),
+            severity: Severity::Info,
+            category: Category::Navigation,
             summary: "Shift+Tab exactly reverses Tab (every forward edge has its inverse).".into(),
             evidence: vec![ev_other(
                 "reverse_proven",
@@ -261,6 +270,7 @@ pub fn navigation_audit(
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -396,8 +406,8 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             findings.push(Finding {
                 id: format!("NAV-{}-UNUSED", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
-                severity: "info".into(),
-                category: "navigation".into(),
+                severity: Severity::Info,
+                category: Category::Navigation,
                 summary: format!(
                     "{} navigation produced no focus transitions in {} steps — either the app does not use these keys or focus does not visibly track them.",
                     class.name, steps_per_class
@@ -410,6 +420,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 confidence: 0.7,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             continue;
         }
@@ -418,8 +429,8 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             findings.push(Finding {
                 id: format!("NAV-{}-TRAP", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "navigation".into(),
+                severity: Severity::Warn,
+                category: Category::Navigation,
                 summary: format!(
                     "{} stopped changing focus at step {} although multiple focusable controls are visible — a navigation trap for this key class.",
                     class.name, step
@@ -432,6 +443,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 confidence: 0.8,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
 
@@ -453,8 +465,8 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             findings.push(Finding {
                 id: format!("NAV-{}-REVERSE-OK", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
-                severity: "info".into(),
-                category: "navigation".into(),
+                severity: Severity::Info,
+                category: Category::Navigation,
                 summary: format!(
                     "{} navigation is reversible: {} forward transition(s) and each has its {} inverse.",
                     class.name, moved, class.inverse_via
@@ -467,13 +479,14 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 confidence: 0.85,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         } else {
             findings.push(Finding {
                 id: format!("NAV-{}-REVERSE-GAP", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "navigation".into(),
+                severity: Severity::Warn,
+                category: Category::Navigation,
                 summary: format!(
                     "{} navigation is not reversible: {} forward edge(s) lack a {} inverse — keyboard users navigating back land elsewhere.",
                     class.name, gaps.len(), class.inverse_via
@@ -486,6 +499,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 confidence: 0.85,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
 
@@ -511,8 +525,8 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             findings.push(Finding {
                 id: format!("NAV-{}-UNREACHABLE", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
-                severity: "info".into(),
-                category: "navigation".into(),
+                severity: Severity::Info,
+                category: Category::Navigation,
                 summary: format!(
                     "{} focusable control(s) were never reached by {} navigation: {} — reachable by other means (Tab/mouse) or genuinely stranded.",
                     unreachable.len(), class.name, unreachable.join(", ")
@@ -525,6 +539,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 confidence: 0.7,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -535,8 +550,8 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
     findings.push(Finding {
         id: "NAV-KEYS-SUMMARY".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "navigation".into(),
+        severity: Severity::Info,
+        category: Category::Navigation,
         summary: format!(
             "extended navigation coverage: {} edge(s) recorded across arrows/home-end/pageup-pagedown classes.",
             graph.edges.len()
@@ -549,6 +564,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
         confidence: 1.0,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     findings

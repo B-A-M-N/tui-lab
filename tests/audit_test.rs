@@ -42,7 +42,7 @@ async fn test_keyboard_audit_detects_states() {
         !findings.is_empty(),
         "keyboard audit should produce findings"
     );
-    assert_eq!(findings[0].category, "keyboard");
+    assert_eq!(findings[0].category.as_str(), "keyboard");
     pool.stop(&id).await.expect("stop");
 }
 
@@ -61,7 +61,7 @@ async fn test_focus_audit_detects_focus() {
         .expect("job");
 
     assert!(!findings.is_empty(), "focus audit should produce findings");
-    assert_eq!(findings[0].category, "focus");
+    assert_eq!(findings[0].category.as_str(), "focus");
     pool.stop(&id).await.expect("stop");
 }
 
@@ -83,7 +83,7 @@ async fn test_clipping_audit_no_regions() {
         !findings.is_empty(),
         "clipping audit should produce findings"
     );
-    assert_eq!(findings[0].category, "clipping");
+    assert_eq!(findings[0].category.as_str(), "clipping");
     pool.stop(&id).await.expect("stop");
 }
 
@@ -107,7 +107,7 @@ async fn test_resize_audit_restores_dimensions() {
         .expect("job");
 
     assert!(!findings.is_empty(), "resize audit should produce findings");
-    assert_eq!(findings[0].category, "resize");
+    assert_eq!(findings[0].category.as_str(), "resize");
     assert_eq!(cols, 80, "dimensions restored");
     assert_eq!(rows, 24, "dimensions restored");
     pool.stop(&id).await.expect("stop");

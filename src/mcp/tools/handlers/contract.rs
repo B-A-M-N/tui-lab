@@ -1,6 +1,7 @@
 //! tui_contract: project-contract load/validate/compare/scaffold.
 
 use super::super::{contract_mode_override, diff_contract_reports};
+use crate::audit::{Category, Severity};
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, ok};
 use crate::mcp::params::*;
@@ -198,8 +199,8 @@ pub(crate) async fn tui_contract(
                             .map(|(name, before, after)| crate::audit::Finding {
                                 id: "CONTRACT-REGRESSION".into(),
                                 rule_id: None,
-                                severity: "error".into(),
-                                category: "contract/compare".into(),
+                                severity: Severity::Error,
+                                category: Category::Other("contract/compare".into()),
                                 summary: format!(
                                     "{name}: was {} ({}), now {} ({})",
                                     before.verdict.as_str(),
@@ -222,6 +223,7 @@ pub(crate) async fn tui_contract(
                                 confidence: 1.0,
                                 reproduction: None,
                                 source_refs: Vec::new(),
+                                occurrence_id: None,
                             })
                             .collect();
                         let _ = run.extend_findings(findings);

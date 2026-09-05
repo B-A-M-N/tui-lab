@@ -183,7 +183,9 @@ async fn conformance_drives_the_modal_fixture() {
     let findings = report.findings();
     if report.verdict != design::Verdict::Pass {
         assert!(
-            findings.iter().any(|f| f.category.starts_with("contract/")),
+            findings
+                .iter()
+                .any(|f| f.category.as_str().starts_with("contract/")),
             "non-pass reports must carry findings"
         );
     }
@@ -333,8 +335,8 @@ fn crate_shim_finding(rule: &str, inst: &str) -> tui_lab::audit::Finding {
     tui_lab::audit::Finding {
         id: inst.into(),
         rule_id: Some(rule.into()),
-        severity: "warn".into(),
-        category: "layout".into(),
+        severity: tui_lab::audit::Severity::Warn,
+        category: tui_lab::audit::Category::Clipping,
         summary: "clipped".into(),
         evidence: vec![tui_lab::audit::EvidenceRef::point(
             tui_lab::audit::EvidenceKind::Region,
@@ -344,6 +346,7 @@ fn crate_shim_finding(rule: &str, inst: &str) -> tui_lab::audit::Finding {
         confidence: 0.9,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     }
 }
 
@@ -469,8 +472,8 @@ fn coverage_event_with_identity_attests_source_locus() {
     let f = tui_lab::audit::Finding {
         id: "MOUSE-001".into(),
         rule_id: Some("MOUSE-001".into()),
-        severity: "warn".into(),
-        category: "mouse".into(),
+        severity: tui_lab::audit::Severity::Warn,
+        category: tui_lab::audit::Category::Mouse,
         summary: "unresponsive".into(),
         evidence: vec![tui_lab::audit::EvidenceRef::point(
             tui_lab::audit::EvidenceKind::Control,
@@ -480,6 +483,7 @@ fn coverage_event_with_identity_attests_source_locus() {
         confidence: 0.8,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     };
     let joined = run.join_source_refs_if_known(&f);
     assert!(
