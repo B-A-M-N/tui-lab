@@ -50,6 +50,26 @@ pub fn handle(p: &TuiCoverageParams) -> Result<String, anyhow::Error> {
             }))
             .to_json())
         }
+        // Audit finding 31: the point-in-time snapshot is now a real MCP
+        // action, not a described-only capability. It returns the provider
+        // report plus the metadata needed to correlate it with the run's
+        // native ledger.
+        Some(CoverageAction::Snapshot) => {
+            if !is_available() {
+                return Ok(Envelope::<()>::fail(
+                    ErrorCategory::Unsupported,
+                    "tui_coverage snapshot requires the optional 'tuicov' executable on PATH; the run ledger's native coverage views (summary/collect/delta/ledger) work without it",
+                )
+                .to_json());
+            }
+            let snap = snapshot().map_err(anyhow::Error::msg)?;
+            Ok(Envelope::ok(serde_json::json!({
+                "provider": "tuicov",
+                "snapshot": snap,
+                "correlation": "join tuicov's file/widget hits against the run ledger's coverage targets by name (tui_coverage action=ledger); the native ledger carries per-target hit counts and source_refs",
+            }))
+            .to_json())
+        }
         // The run-ledger views are answered by the MCP layer (run-scoped);
         // if one reaches here the dispatch drifted — say so honestly.
         Some(CoverageAction::Ledger)

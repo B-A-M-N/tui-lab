@@ -9,7 +9,7 @@ use rmcp::serde_json::json;
 /// `super` decodes params and delegates here. `s` is the server,
 /// whose private fields this child module can see unchanged.
 pub(crate) async fn tui_framework(
-    _s: &crate::mcp::tools::TuiLabServer,
+    s: &crate::mcp::tools::TuiLabServer,
     p: rmcp::handler::server::wrapper::Parameters<TuiFrameworkParams>,
 ) -> rmcp::model::CallToolResult {
     let p = p.0;
@@ -51,23 +51,61 @@ pub(crate) async fn tui_framework(
     }) else {
         unreachable!()
     };
+    // Audit finding 34: "framework detected", "an adapter module exists",
+    // and "this app is cooperating right now" are THREE different facts.
+    // `det.framework()` answers the first (a framework-class candidate);
+    // `det.native_adapter` answers the second (an adapter snippet ships for
+    // its name); the channel state below answers the third — only a LIVE
+    // session can attest it, so it rides on the optional `id` selector.
+    let fw_name = det.framework().map(str::to_string);
+    let adapter_status = match p.id.as_deref() {
+        None => None,
+        Some(sel) => match s
+            .with_sess(Some(sel), |sess| sess.adapter_status())
+            .await
+        {
+            Ok(st) => Some(st),
+            Err(_e) => None,
+        },
+    };
+    let capability_json = json!({
+        // The audit's distinct-axis contract (finding 34).
+        "framework_detected": fw_name.is_some(),
+        "framework": fw_name,
+        "native_adapter_supported": det.native_adapter,
+        "native_adapter_installed": det.native_adapter,
+        "native_channel_available": adapter_status
+            .as_ref()
+            .map(|st| st.adapter_available)
+            .unwrap_or(false),
+        "native_channel_active": adapter_status
+            .as_ref()
+            .map(|st| st.native_channel_active)
+            .unwrap_or(false),
+        "native_channel_healthy": adapter_status.as_ref().map(|st| st.healthy).unwrap_or(false),
+        "frames_received": adapter_status.as_ref().map(|st| st.frames_received).unwrap_or(0),
+        "frames_invalid": adapter_status.as_ref().map(|st| st.frames_invalid).unwrap_or(0),
+        "note": if p.id.is_none() {
+            "channel state is empty: pass `id` to attest whether the app cooperated"
+        } else {
+            "channel state is live for the named session"
+        },
+    });
     match fw_action {
         FA::Detect => ok(json!({ "framework": det, "project_context": ctx })),
         FA::Capabilities => ok(
-            json!({ "framework": det, "project_context": ctx, "note": "native probes invoke project-local tooling" }),
+            json!({ "framework": det, "project_context": ctx, "capabilities": capability_json }),
         ),
         FA::AdapterSnippet => {
+            // Audit finding 35: adapter selection uses the FRAMEWORK
+            // candidate (det.framework()), not the highest-ranked generic
+            // primary — a tree whose primary is terminal-I/O (crossterm)
+            // must not be handed a random framework adapter. An explicit
+            // `source` still wins (the caller knows better).
             let fw = p
                 .source
                 .clone()
-                .or_else(|| {
-                    // Item 33: adapters exist for FRAMEWORKS; a terminal-I/O
-                    // or styling candidate is not an adapter target.
-                    det.primary
-                        .as_ref()
-                        .filter(|c| c.class == "framework")
-                        .map(|c| c.name.clone())
-                })
+                .or_else(|| fw_name.clone())
                 .unwrap_or_else(|| "python".into());
             match crate::framework::adapters::snippet_for(&fw.to_lowercase()) {
                     Some(code) => ok(json!({

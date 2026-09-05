@@ -43,6 +43,25 @@ pub struct FrameworkDetection {
     pub native_adapter: bool,
     pub coverage_adapter: bool,
     pub evidence: Vec<String>,
+    /// Audit finding 36: a manifest that EXISTS but failed to parse is
+    /// evidence for an agent debugging a project — never collapsed into
+    /// "not detected". `parse_failures` names each broken manifest with a
+    /// one-line reason; `warnings` carries softer observations (probes
+    /// that could not run, paths that were skipped).
+    #[serde(default)]
+    pub parse_failures: Vec<FrameworkParseFailure>,
+    /// `searched_paths` — the directories actually scanned (the resolved
+    /// project root and, for monorepos, the workspace root), so a caller
+    /// can tell WHERE detection looked.
+    #[serde(default)]
+    pub searched_paths: Vec<String>,
+}
+
+/// One manifest that existed but could not be parsed (audit finding 36).
+#[derive(Debug, serde::Serialize)]
+pub struct FrameworkParseFailure {
+    pub file: String,
+    pub reason: String,
 }
 
 impl FrameworkDetection {
@@ -135,6 +154,8 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
     // with ratatui AND crossterm kept whichever matched last, and the
     // class distinction (framework vs terminal I/O vs styling) was lost.
     let mut candidates: Vec<FrameworkCandidate> = Vec::new();
+    // Audit finding 36: manifest parse failures are evidence, not absence.
+    let mut parse_failures: Vec<FrameworkParseFailure> = Vec::new();
     // Record (or reinforce) one candidate. Reinforcement raises
     // confidence (two independent loci agreeing is stronger evidence).
     fn note(
@@ -163,48 +184,61 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
     // Parse package.json properly.
     if file_set.contains("package.json") {
         let txt = read_file(cwd, "package.json");
-        let pkg: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
-        let all_deps = collect_json_dep_keys(&pkg);
-        for (fw, class, _cargo, npm, _go, _pip) in FRAMEWORKS {
-            for npm_pkg in *npm {
-                if all_deps.iter().any(|d| d.as_str() == *npm_pkg) {
-                    let confidence = if *npm_pkg == "@opentui/core" || *npm_pkg == "@opentui/react"
-                    {
-                        1.0
-                    } else {
-                        0.9
-                    };
-                    note(
-                        &mut candidates,
-                        fw,
-                        class,
-                        confidence,
-                        format!("package.json dependency '{}'", npm_pkg),
-                    );
+        match serde_json::from_str::<serde_json::Value>(&txt) {
+            Ok(pkg) => {
+                let all_deps = collect_json_dep_keys(&pkg);
+                for (fw, class, _cargo, npm, _go, _pip) in FRAMEWORKS {
+                    for npm_pkg in *npm {
+                        if all_deps.iter().any(|d| d.as_str() == *npm_pkg) {
+                            let confidence =
+                                if *npm_pkg == "@opentui/core" || *npm_pkg == "@opentui/react" {
+                                    1.0
+                                } else {
+                                    0.9
+                                };
+                            note(
+                                &mut candidates,
+                                fw,
+                                class,
+                                confidence,
+                                format!("package.json dependency '{}'", npm_pkg),
+                            );
+                        }
+                    }
                 }
             }
+            Err(e) => parse_failures.push(FrameworkParseFailure {
+                file: format!("{}/package.json", cwd),
+                reason: format!("parse failed: {e}"),
+            }),
         }
     }
 
     // Parse Cargo.toml properly (including workspace dependency tables).
     if file_set.contains("Cargo.toml") {
         let txt = read_file(cwd, "Cargo.toml");
-        if let Ok(toml_val) = txt.parse::<toml::Value>() {
-            let all_deps = collect_toml_dep_keys(&toml_val);
-            for (fw, class, cargo, _npm, _go, _pip) in FRAMEWORKS {
-                for crate_name in *cargo {
-                    if all_deps.iter().any(|d| d.as_str() == *crate_name) {
-                        let confidence = if *crate_name == "ratatui" { 1.0 } else { 0.9 };
-                        note(
-                            &mut candidates,
-                            fw,
-                            class,
-                            confidence,
-                            format!("Cargo.toml dependency '{}'", crate_name),
-                        );
+        match txt.parse::<toml::Value>() {
+            Ok(toml_val) => {
+                let all_deps = collect_toml_dep_keys(&toml_val);
+                for (fw, class, cargo, _npm, _go, _pip) in FRAMEWORKS {
+                    for crate_name in *cargo {
+                        if all_deps.iter().any(|d| d.as_str() == *crate_name) {
+                            let confidence = if *crate_name == "ratatui" { 1.0 } else { 0.9 };
+                            note(
+                                &mut candidates,
+                                fw,
+                                class,
+                                confidence,
+                                format!("Cargo.toml dependency '{}'", crate_name),
+                            );
+                        }
                     }
                 }
             }
+            Err(e) => parse_failures.push(FrameworkParseFailure {
+                file: format!("{}/Cargo.toml", cwd),
+                reason: format!("parse failed: {e}"),
+            }),
         }
         // Workspace manifests declare deps in [workspace.dependencies]; a
         // workspace root is a perfectly good detection locus (item 46).
@@ -264,7 +298,8 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         // — line-guessing them misfires (a comment naming "textual" is not a
         // dependency).
         let txt = read_file(cwd, "pyproject.toml");
-        if let Ok(py) = txt.parse::<toml::Value>() {
+        match txt.parse::<toml::Value>() {
+        Ok(py) => {
             let mut py_deps: Vec<String> = Vec::new();
             if let Some(deps) = py
                 .get("project")
@@ -311,6 +346,11 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
                 }
             }
         }
+        Err(e) => parse_failures.push(FrameworkParseFailure {
+            file: format!("{}/pyproject.toml", cwd),
+            reason: format!("parse failed: {e}"),
+        }),
+    }
     }
     // requirements.txt stays line-based (it IS a line format). A name
     // pyproject already reported gets REINFORCED here (two loci agreeing
@@ -387,6 +427,8 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         native_adapter,
         coverage_adapter,
         evidence,
+        parse_failures,
+        searched_paths: vec![cwd.to_string()],
     }
 }
 
@@ -436,4 +478,72 @@ fn list_files(cwd: &str) -> Vec<String> {
 
 fn read_file(cwd: &str, name: &str) -> String {
     std::fs::read_to_string(format!("{}/{}", cwd, name)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit finding 36: a manifest that EXISTS but is malformed is
+    /// surfaced as a parse failure, not collapsed into "framework not
+    /// detected". A broken package.json must appear in `parse_failures`.
+    #[test]
+    fn malformed_manifest_is_reported_not_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "tui-fw-detect-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A package.json that is NOT valid JSON.
+        std::fs::write(dir.join("package.json"), "{ this is not json").unwrap();
+
+        let det = detect(dir.to_str().unwrap());
+        assert!(
+            det.parse_failures
+                .iter()
+                .any(|f| f.file.ends_with("package.json")),
+            "broken package.json must surface: {:?}",
+            det.parse_failures
+        );
+        assert!(
+            det.searched_paths.iter().any(|p| *p == dir.to_str().unwrap()),
+            "searched_paths must name where detection looked: {:?}",
+            det.searched_paths
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit finding 36: these same latches did NOT hold before — the bug
+    /// was the silent `unwrap_or_default`. Doubly assert the honest case:
+    /// a valid project still detects, and a clean tree has no failures.
+    #[test]
+    fn clean_manifest_has_no_parse_failures() {
+        let dir = std::env::temp_dir().join(format!(
+            "tui-fw-clean-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A Cargo.toml with a recognizable framework.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n[dependencies]\nratatui = \"0.28\"\n",
+        )
+        .unwrap();
+
+        let det = detect(dir.to_str().unwrap());
+        assert!(
+            det.parse_failures.is_empty(),
+            "a valid manifest must not be reported as broken: {:?}",
+            det.parse_failures
+        );
+        assert!(
+            det.framework().is_some(),
+            "a valid Cargo.toml naming ratatui must detect: framework()={:?}",
+            det.framework()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

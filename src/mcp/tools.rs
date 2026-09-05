@@ -677,7 +677,7 @@ impl TuiLabServer {
     /// coverage events the run ledger accumulates.
     #[tool(
         name = "tui_coverage",
-        description = "Native coverage: run ledger (native events) plus optional tuicov executable. Actions: detect, summary, collect, delta (since_seq cursor), uncovered, ledger."
+        description = "Native coverage: run ledger (native events) plus optional tuicov executable. Actions: detect, summary, collect, delta (since_seq cursor), ledger, snapshot (requires tuicov on PATH; unsupported error otherwise). 'uncovered' is explicitly unsupported — there is no denominator of what the app COULD cover; do not call it."
     )]
     pub async fn tui_coverage(
         &self,

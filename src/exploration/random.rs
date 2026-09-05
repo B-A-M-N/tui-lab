@@ -202,6 +202,21 @@ pub fn run(
     budget: Budget,
     recording_path: Option<&Path>,
 ) -> anyhow::Result<ExploreReport> {
+    run_evidenced(session, seed, budget, recording_path, None)
+}
+
+/// Ledger-evidenced variant (audit finding 22): when `run_ctx` is given,
+/// every executed action ALSO enters the run's canonical transaction
+/// ledger — one history, not two. `graph` lives inside the caller's
+/// `RunContext`, so the merge stays the caller's concern.
+#[allow(clippy::too_many_arguments)]
+pub fn run_evidenced(
+    session: &mut Session,
+    seed: u64,
+    budget: Budget,
+    recording_path: Option<&Path>,
+    mut run_ctx: Option<&mut crate::run::RunContext>,
+) -> anyhow::Result<ExploreReport> {
     let started = Instant::now();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut identities: Vec<crate::exploration::state_graph::StateIdentity> = Vec::new();
@@ -256,7 +271,7 @@ pub fn run(
             Err(_e) => {
                 exits.push(ProcessExit {
                     action_index: i,
-                    action_name: name.to_string(),
+                    action_name: format!("{name}:{}", action.signature()),
                     classification: ExitClassification::Unknown,
                     exit_code: None,
                     exit_signal: None,
@@ -270,6 +285,15 @@ pub fn run(
         let settled = tx.settle;
         let after = tx.after().clone();
         let elapsed_ms = tx.elapsed_ms;
+        // Audit finding 23: the step's identity is the exact canonical
+        // signature, not the pool's generic kind name — `key` and `mouse_click`
+        // collapse distinct actions; `mouse:left:click@12,3` does not.
+        // Finding 22: the transaction also enters the run ledger when a sink
+        // is present, linked as exploration evidence.
+        let action_sig = action.signature();
+        if let Some(run) = run_ctx.as_deref_mut() {
+            let _ = run.record_interaction(&session.id, &tx);
+        }
 
         // Layered identity for both frames (re-review P0 fix 3): semantic
         // analysis runs per step so interaction state (focus/selection)
@@ -325,7 +349,7 @@ pub fn run(
         // Ordered step record — emitted while the action happened (item 12).
         steps.push(ExplorationStep {
             seq: i as u64,
-            action: name.to_string(),
+            action: action_sig.clone(),
             before: before_identity,
             after: after_identity,
             changed: tx.before().structure_hash != after.structure_hash,
@@ -343,7 +367,7 @@ pub fn run(
             );
             exits.push(ProcessExit {
                 action_index: i,
-                action_name: name.to_string(),
+                action_name: action_sig.clone(),
                 classification,
                 exit_code: after.process.exit_code,
                 exit_signal: after.process.exit_signal.clone(),
