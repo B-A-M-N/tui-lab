@@ -1121,11 +1121,17 @@ async fn run_list_resume_restores_identity_and_artifacts() {
     let ledger =
         std::fs::read_to_string(std::path::Path::new(&artifact_root).join("transactions.jsonl"))
             .expect("ledger");
+    // The versioned stream's header line is not a transaction.
+    let ledger_records = ledger.lines().filter(|l| !l.contains("\"schema\"")).count() as u64;
     assert_eq!(
-        ledger.lines().count() as u64,
+        ledger_records,
         tx_before + 1,
         "resumed run appends to the SAME ledger file"
     );
+    // Finding 32: resume reopened the persisted run — the response names
+    // the epoch and the run's status carries it.
+    assert_eq!(resumed["resume_epoch"], 1, "{resumed}");
+    assert_eq!(resumed["status"]["resume_epoch"], 1);
 
     // Resuming a run id that does not exist is an honest invalid_request.
     let bad = unwrap_err(

@@ -37,6 +37,12 @@ pub struct RunManifest {
     /// True once `tui_run close` marked the run finished.
     #[serde(default)]
     pub closed: bool,
+    /// Resume epoch (finding 32): how many times the persisted run was
+    /// `reopen()`ed across process boundaries before this manifest was
+    /// written. 0 = the original process's run. Defaults to 0 for v1
+    /// manifests written before the field existed.
+    #[serde(default)]
+    pub resume_epoch: u64,
 }
 
 fn default_true() -> bool {
@@ -68,6 +74,7 @@ mod tests {
             first_available_seq: Some(257),
             dropped_records: 256,
             closed: false,
+            resume_epoch: 2,
         };
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(
@@ -85,6 +92,7 @@ mod tests {
         assert!(!loaded.history_complete, "gap must survive the round-trip");
         assert_eq!(loaded.dropped_records, 256);
         assert_eq!(loaded.first_available_seq, Some(257));
+        assert_eq!(loaded.resume_epoch, 2, "epoch must survive the round-trip");
     }
 
     /// A v1 manifest without the new fields loads with honest defaults:
@@ -108,5 +116,6 @@ mod tests {
         assert!(loaded.history_complete);
         assert!(loaded.sessions.is_empty());
         assert!(loaded.primary_session.is_none());
+        assert_eq!(loaded.resume_epoch, 0, "v1 manifests are epoch 0");
     }
 }

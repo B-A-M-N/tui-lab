@@ -49,6 +49,7 @@ impl RunContext {
             coverage_seq: 0,
             coverage_delta_cursor: 0,
             closed: false,
+            resume_epoch: 0,
             restore_warnings: Vec::new(),
         }
     }
@@ -188,6 +189,7 @@ impl RunContext {
                     "run_id": manifest.run_id,
                     "started_at": manifest.started_at,
                     "closed": manifest.closed,
+                    "resume_epoch": manifest.resume_epoch,
                     "history_complete": manifest.history_complete,
                     "dropped_records": manifest.dropped_records,
                     "sessions": manifest.sessions.keys().cloned().collect::<Vec<_>>(),
@@ -223,6 +225,7 @@ impl RunContext {
         run.id = manifest.run_id.clone();
         run.started_at = manifest.started_at;
         run.closed = manifest.closed;
+        run.resume_epoch = manifest.resume_epoch;
         run.dropped_records = manifest.dropped_records;
         run.first_available_seq = manifest.first_available_seq;
         run.session_specs = manifest.sessions.clone();
@@ -501,10 +504,24 @@ impl RunContext {
     /// Re-open a closed run so it accepts driving and evidence again. This
     /// is the `tui_run resume` path: resuming a persisted run is the
     /// designated way to make it live once more (review P0.1). A persisted
-    /// run that was closed on disk stays durable; reopen only flips the
-    /// in-memory gate so the resumed session can drive it.
+    /// run that was closed on disk stays durable.
+    ///
+    /// Finding 32: reopen is not invisible. Each reopen bumps the run's
+    /// `resume_epoch` — 0 for the original process's run, 1 after the first
+    /// resume, and so on — and the manifest is written BEFORE anything else
+    /// runs, so a reader can always tell which epoch a record belongs to.
+    /// A reopened run is NOT the original process's run: its later records
+    /// live after a process boundary it did not choose, and evidence taken
+    /// across that boundary is distinguishable via the epoch.
     pub fn reopen(&mut self) {
+        self.resume_epoch += 1;
         self.closed = false;
+        // Persist the epoch before returning: if the resumed process dies
+        // mid-transaction, the manifest still names the epoch everything
+        // after it belongs to.
+        if let Err(e) = self.write_manifest() {
+            tracing::warn!(run = %self.id, error = %e, "reopen: manifest write failed");
+        }
     }
 
     /// Mark the run closed and flush durable state. Does NOT touch sessions —

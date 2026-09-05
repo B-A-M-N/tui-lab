@@ -122,6 +122,9 @@ impl RunContext {
             "sessions": sessions,
             "started_at": self.started_at,
             "closed": self.closed,
+            // Finding 32: which resume epoch this run is in (0 = the
+            // original process's run; >0 = reopened that many times).
+            "resume_epoch": self.resume_epoch,
             "primary_session_cwd": self.primary_session_cwd().map(str::to_string),
             "counts": self.counts(),
             // FrameAnalysis storage (re-review item 51): hot ring health —

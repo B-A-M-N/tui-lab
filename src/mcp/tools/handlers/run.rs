@@ -415,6 +415,10 @@ pub(crate) async fn tui_run(
                     "previous_run": prev_id,
                     "flushed_previous": true,
                     "artifact_root": restored_dir,
+                    // Finding 32: the reopened run is a new epoch of the
+                    // persisted run — records written from here on are
+                    // distinguishable from the original process's history.
+                    "resume_epoch": summary["resume_epoch"].clone(),
                     "restore": restore_health,
                     "status": summary,
                     "note": "sessions are not restored; re-create them with tui_session start and the run will correlate them. history_complete=false runs replay only from their declared first_available_seq",
