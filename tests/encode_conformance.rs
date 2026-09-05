@@ -24,9 +24,9 @@ use tui_lab::backend::{Input, KeyCode, KeyEvent, KeyModifiers, MouseButton, Mous
 /// The python waits on read(N) until exactly N bytes arrive.
 fn spawn_hex_reader(n: usize) -> PortablePtyBackend {
     let mut b = PortablePtyBackend::new(80, 24);
-    // Script: sleep, setraw, read N bytes, print hex.
+    // Script: sleep, setraw, announce, read N bytes, print hex.
     let full_script = format!(
-        "import time,time as _t;time.sleep(0.2)\nimport sys,tty\ntty.setraw(0)\ndata=sys.stdin.buffer.read({n})\nprint('HEX:'+data.hex(),flush=True)",
+        "import time,time as _t;time.sleep(0.2)\nimport sys,tty\ntty.setraw(0)\nprint('HEX-READY',flush=True)\ndata=sys.stdin.buffer.read({n})\nprint('HEX:'+data.hex(),flush=True)",
         n = n
     );
     b.start(
@@ -41,14 +41,28 @@ fn spawn_hex_reader(n: usize) -> PortablePtyBackend {
     b
 }
 
+/// Block until the child has entered raw mode. `tty.setraw(0)` defaults to
+/// TCSAFLUSH — it DISCARDS input that arrives before it runs — so an input
+/// sent on a fixed sleep can be flushed when the host is loaded (the child
+/// boots slower than the sleep). The child now announces HEX-READY after
+/// setraw; waiting on that makes the handshake load-independent.
+fn wait_ready(b: &mut PortablePtyBackend) {
+    let out = b
+        .wait(WaitCond::Text("HEX-READY".into()), Duration::from_secs(10))
+        .expect("child ready");
+    assert!(out.met, "child never entered raw mode: {:?}", out.state.viewport_text);
+}
+
 /// Spawn a python3 child that first writes init bytes to stdout (terminal
 /// negotiation escapes like DECCKM, mouse modes, bracketed paste), then reads
 /// N raw bytes from stdin and prints hex.
 fn spawn_hex_reader_with_init(init_bytes: &[u8], read_n: usize) -> PortablePtyBackend {
     let mut b = PortablePtyBackend::new(80, 24);
-    // Build python script: sleep, write init to stdout, setraw, read N bytes, print hex.
+    // Build python script: sleep, write init to stdout, setraw, announce,
+    // read N bytes, print hex.
     let mut escaped = String::from("import time,time as _t;time.sleep(0.2)\n");
     escaped.push_str("import sys,tty;tty.setraw(0)\n");
+    escaped.push_str("print('HEX-READY',flush=True)\n");
     // Write init bytes to stdout.buffer (raw bytes, not text).
     escaped.push_str("sys.stdout.buffer.write(b'");
     for &byte in init_bytes {
@@ -80,7 +94,7 @@ fn spawn_hex_reader_with_init(init_bytes: &[u8], read_n: usize) -> PortablePtyBa
 #[test]
 fn encode_ctrl_c_emits_control_byte() {
     let mut b = spawn_hex_reader(1);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::with_modifiers(
         KeyCode::Char('c'),
         KeyModifiers::CTRL,
@@ -106,7 +120,7 @@ fn encode_ctrl_c_emits_control_byte() {
 #[test]
 fn encode_ctrl_d_emits_0x04() {
     let mut b = spawn_hex_reader(1);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::with_modifiers(
         KeyCode::Char('d'),
         KeyModifiers::CTRL,
@@ -132,7 +146,7 @@ fn encode_ctrl_d_emits_0x04() {
 #[test]
 fn encode_ctrl_z_emits_0x1a() {
     let mut b = spawn_hex_reader(1);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::with_modifiers(
         KeyCode::Char('z'),
         KeyModifiers::CTRL,
@@ -158,7 +172,7 @@ fn encode_ctrl_z_emits_0x1a() {
 #[test]
 fn keys_sequence_delivers_all_bytes() {
     let mut b = spawn_hex_reader(3);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Keys(vec![
         KeyEvent::new(KeyCode::Char('a')),
         KeyEvent::new(KeyCode::Char('b')),
@@ -188,7 +202,7 @@ fn arrows_use_ss3_in_application_cursor_mode() {
     // the Rust VT100 parser picks up application_cursor=true.
     // The child then reads 3 raw bytes (the SS3 sequence).
     let mut b = spawn_hex_reader_with_init(b"\x1b[?1h", 3);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::new(KeyCode::Up)))
         .expect("send up");
     let out = b
@@ -211,7 +225,7 @@ fn arrows_use_ss3_in_application_cursor_mode() {
 #[test]
 fn arrows_use_csi_without_application_cursor() {
     let mut b = spawn_hex_reader(3);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::new(KeyCode::Up)))
         .expect("send up");
     let out = b
@@ -241,7 +255,7 @@ fn mouse_sgr_click_press_and_release() {
     // SGR press = "ESC[<0;X;YM" = 11 bytes; release uses lowercase 'm'.
     // Read 11 bytes for press + 11 for release = 22 total.
     let mut b = spawn_hex_reader_with_init(b"\x1b[?1002;1006h", 22);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_ready(&mut b);
     b.send_input(Input::MouseClick {
         button: MouseButton::Left,
         x: 10,
@@ -284,7 +298,7 @@ fn mouse_x10_click_three_raw_bytes() {
     // Use ?1002h (ButtonMotion mode) so releases are allowed — ?1000h
     // is Press-only and MouseClick would reject the release.
     let mut b = spawn_hex_reader_with_init(b"\x1b[?1002h", 12);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_ready(&mut b);
     b.send_input(Input::MouseClick {
         button: MouseButton::Left,
         x: 10,
@@ -324,7 +338,7 @@ fn mouse_x10_click_three_raw_bytes() {
 fn mouse_press_mode_rejects_release() {
     // Use a reader fixture: python reads 1 byte, prints hex.
     let mut b = spawn_hex_reader(1);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
 
     // Send a Release via Mouse — should fail because mouse reporting is
     // not enabled (no DECSET was negotiated). The backend must return Err.
@@ -364,7 +378,7 @@ fn mouse_press_mode_rejects_release() {
 fn bracketed_paste_wraps_when_negotiated() {
     // Enable bracketed paste via DECSET 2004.
     let mut b = spawn_hex_reader_with_init(b"\x1b[?2004h", 14);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_ready(&mut b);
     b.send_input(Input::Paste("hi".into())).expect("send paste");
     let out = b
         .wait(WaitCond::Text("HEX".into()), Duration::from_secs(5))
@@ -395,7 +409,7 @@ fn bracketed_paste_wraps_when_negotiated() {
 #[test]
 fn paste_raw_when_not_negotiated() {
     let mut b = spawn_hex_reader(2);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Paste("hi".into())).expect("send paste");
     let out = b
         .wait(WaitCond::Text("HEX:6869".into()), Duration::from_secs(5))
@@ -562,7 +576,7 @@ fn mouse_utf8_encoding_emits_utf8_coords() {
     // MouseClick can emit a release; ?1000h is Press-only.
     // Press + release are each 6 bytes (ESC[M + Cb X Y) = 12 total.
     let mut b = spawn_hex_reader_with_init(b"\x1b[?1002;1005h", 12);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_ready(&mut b);
     b.send_input(Input::MouseClick {
         button: MouseButton::Left,
         x: 10,
@@ -599,7 +613,7 @@ fn mouse_utf8_encoding_emits_utf8_coords() {
 #[test]
 fn alt_key_gets_esc_prefix() {
     let mut b = spawn_hex_reader(2);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::with_modifiers(
         KeyCode::Char('x'),
         KeyModifiers::ALT,
@@ -620,7 +634,7 @@ fn alt_key_gets_esc_prefix() {
 #[test]
 fn shift_letter_emits_uppercase() {
     let mut b = spawn_hex_reader(1);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::with_modifiers(
         KeyCode::Char('a'),
         KeyModifiers::SHIFT,
@@ -642,7 +656,7 @@ fn shift_letter_emits_uppercase() {
 fn ctrl_special_chars_map_to_c0() {
     // Three bytes in one read: 00 1b 1c.
     let mut b = spawn_hex_reader(3);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Keys(vec![
         KeyEvent::with_modifiers(KeyCode::Char(' '), KeyModifiers::CTRL),
         KeyEvent::with_modifiers(KeyCode::Char('['), KeyModifiers::CTRL),
@@ -664,7 +678,7 @@ fn ctrl_special_chars_map_to_c0() {
 #[test]
 fn shift_tab_emits_csi_z() {
     let mut b = spawn_hex_reader(3);
-    std::thread::sleep(Duration::from_millis(400));
+    wait_ready(&mut b);
     b.send_input(Input::Key(KeyEvent::with_modifiers(
         KeyCode::Tab,
         KeyModifiers::SHIFT,
@@ -693,7 +707,7 @@ fn shift_tab_emits_csi_z() {
 #[test]
 fn raw_ring_captures_protocol_traffic_for_decoder() {
     let mut b = spawn_hex_reader_with_init(b"\x1b[?1000;1006h\x1b[?25l", 1);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_ready(&mut b);
     let (bytes, cap, dropped) = b.raw_output_window();
     assert!(cap > 0, "pty backend retains raw output");
     assert!(!bytes.is_empty(), "raw window holds the init bytes");
