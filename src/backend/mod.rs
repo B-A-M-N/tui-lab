@@ -37,6 +37,58 @@ pub struct ObserveResult {
     pub stable_ms: u64,
 }
 
+/// Terminal event kinds a backend can genuinely observe/emit (audit finding 37).
+///
+/// The session layer *infers* `FocusChanged`/`SemanticChanged` from any grid the
+/// backend produces, so those are listed for every backend; the rest (Output,
+/// Bell, Title, Raw) are the backend's own observation channels and are listed
+/// only where the engine genuinely has them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EventCapability {
+    /// The backend observes the child's raw output byte stream.
+    Output,
+    /// The backend can observe a BEL bell event.
+    Bell,
+    /// The backend can observe terminal-title changes (OSC 2).
+    Title,
+    /// Backend-observed focus transitions (native/semantic).
+    FocusChanged,
+    /// Backend-observed semantic output changes.
+    SemanticChanged,
+    /// The backend can emit raw-protocol events (escape/OSC/DCS bytes).
+    Raw,
+}
+
+/// The [`WaitCond`] kinds a backend's `wait()` genuinely satisfies (audit
+/// finding 37). A backend lists a kind only when its wait loop actually makes
+/// that condition resolvable, never as an aspiration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WaitCapability {
+    Text,
+    TextAbsent,
+    ScreenChange,
+    ScreenStable,
+    ProcessExit,
+    Title,
+    Bell,
+    AnyActivity,
+    Idle,
+    /// OSC 133 command-phase waits (`CommandDone`, `CommandOutput`).
+    CommandDone,
+}
+
+/// The [`Input`] families a backend's `send_input()` genuinely accepts (audit
+/// finding 37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InputFamily {
+    Key,
+    Mouse,
+    Paste,
+    RawByte,
+    Resize,
+    Signal,
+}
+
 /// Backend capability flags returned on session start (spec section 41).
 ///
 /// The `supported` boolean encodes *working behavior only*. Optional or
@@ -44,6 +96,14 @@ pub struct ObserveResult {
 /// promoted to `true` only once the backend has evidence they function for the
 /// running process. This prevents Hermes from trusting a capability that the
 /// backend only intends to support.
+///
+/// Audit finding 37 widens the descriptor from terminal-rendering booleans into
+/// operation-oriented facts an MCP agent also needs: raw input, event-type /
+/// wait / input-family coverage, bell/title/exit-code observability, shell
+/// integration, stdout/stderr separation, recording, native semantics, attach,
+/// and query/response probing. Each backend's [`TerminalBackend::capabilities`]
+/// reports ONLY what its code genuinely does; the session profile and the
+/// conformance suite (finding 61) hold it to that.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Capabilities {
     pub mouse: bool,
@@ -62,6 +122,34 @@ pub struct Capabilities {
     /// 17/18 "raw honesty"). Portable/line backends that retain the raw
     /// ring report true.
     pub protocol_capture: bool,
+    // --- audit finding 37: operation-oriented capability facts ---
+    /// Can the backend deliver arbitrary raw bytes to the child? Only the PTY
+    /// engines can; tmux `send-keys -l` rejects non-UTF-8 payloads.
+    pub raw_input: bool,
+    /// Can the backend observe a BEL bell event? (portable/line/pipe track a
+    /// bell edge; tmux reads the window bell flag.)
+    pub bell_observable: bool,
+    /// Can the backend report the child's REAL exit code? The attached tmux
+    /// process is not our child, so its exit code stays unknowable.
+    pub exit_code: bool,
+    /// OSC 133 shell-integration observability (`command_state()`).
+    pub shell_integration: bool,
+    /// stdout and stderr travel separate pipes (pipe backend only).
+    pub stdout_stderr_separation: bool,
+    /// Can the backend record/capture casts (recording hook delivery)?
+    pub recording: bool,
+    /// Native cooperation-protocol support (session-provided side channel).
+    pub native_semantic: bool,
+    /// Does the backend ATTACH an existing TUI rather than spawn a child?
+    pub attach: bool,
+    /// Can the backend do query/response probing (device-query responder)?
+    pub query_response: bool,
+    /// Which terminal event kinds the backend can observe/emit.
+    pub event_types: Vec<EventCapability>,
+    /// Which [`WaitCond`] kinds the backend's `wait()` genuinely satisfies.
+    pub supported_waits: Vec<WaitCapability>,
+    /// Which [`Input`] families the backend's `send_input()` accepts.
+    pub input_families: Vec<InputFamily>,
 }
 
 impl Default for Capabilities {
@@ -78,6 +166,26 @@ impl Default for Capabilities {
             // Conservative: promoted true only by backends that genuinely
             // retain the raw ring. The default profile makes no claim.
             protocol_capture: false,
+            // --- audit finding 37: honest operation-oriented defaults ---
+            // Each is a claim about *working* behavior; the default makes no
+            // claim (false / empty) so a backend that forgets to advertise a
+            // capability it lacks cannot be mistaken for having one.
+            raw_input: false,
+            bell_observable: false,
+            exit_code: false,
+            shell_integration: false,
+            stdout_stderr_separation: false,
+            recording: false,
+            // The native cooperation channel is created at SESSION start for
+            // any backend (the child is launched with the channel env pair),
+            // so it is genuinely a session-provided capability — honest to
+            // advertise once, for every backend, not a per-engine guess.
+            native_semantic: true,
+            attach: false,
+            query_response: false,
+            event_types: Vec::new(),
+            supported_waits: Vec::new(),
+            input_families: Vec::new(),
         }
     }
 }
@@ -89,6 +197,53 @@ impl Capabilities {
     /// emits the corresponding escape traffic; we cannot claim them up front.
     pub fn honest() -> Self {
         Capabilities::default()
+    }
+
+    /// Preflight (audit finding 37): a wait condition whose kind the backend
+    /// does not *intrinsically* support must fail immediately as
+    /// `Unsupported` — never sit through a budget timeout hanging on a
+    /// condition that can never resolve. This checks `supported_waits` (the
+    /// INTRINSIC, per-backend wait capability) rather than a runtime-promoted
+    /// boolean like `title`, precisely so a negotiation-promoted wait on the
+    /// portable engine (title not yet observed, but genuinely watchable) is
+    /// NOT blocked.
+    pub fn require_wait(&self, cond: &WaitCond) -> Result<(), BackendError> {
+        let supported = &self.supported_waits;
+        let missing: Option<&'static str> = match cond {
+            WaitCond::Text(_) | WaitCond::TextAbsent(_) => None,
+            WaitCond::ScreenChange => None,
+            WaitCond::ScreenStable { .. } => None,
+            WaitCond::ProcessExit => None,
+            WaitCond::Title(_) => {
+                if supported.contains(&WaitCapability::Title) {
+                    None
+                } else {
+                    Some("title waits")
+                }
+            }
+            WaitCond::Bell { .. } => {
+                if supported.contains(&WaitCapability::Bell) {
+                    None
+                } else {
+                    Some("bell waits")
+                }
+            }
+            WaitCond::AnyActivity { .. } => None,
+            WaitCond::Idle { .. } => None,
+            WaitCond::CommandDone { .. } | WaitCond::CommandOutput { .. } => {
+                if supported.contains(&WaitCapability::CommandDone) {
+                    None
+                } else {
+                    Some("OSC 133 shell-integration (command) waits")
+                }
+            }
+        };
+        match missing {
+            Some(what) => Err(BackendError::Unsupported(format!(
+                "{what} are unsupported on this backend; the wait was rejected instead of timing out"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 

@@ -1301,6 +1301,7 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        use super::{EventCapability, InputFamily, WaitCapability};
         let mut caps = Capabilities::honest();
         // Promote optional capabilities only when we have observed the running
         // application negotiate them.
@@ -1314,6 +1315,45 @@ impl TerminalBackend for PortablePtyBackend {
         // This engine retains the raw PTY byte ring (`recent_raw_output`),
         // so protocol capture is genuinely available.
         caps.protocol_capture = true;
+        // --- audit finding 37: the portable engine is the reference backend —
+        //     every operation-oriented capability it advertises is backed by a
+        //     real implementation the conformance suite exercises (finding 61).
+        caps.raw_input = true;      // Input::Raw writes arbitrary bytes to the PTY
+        caps.bell_observable = true; // bell_seq tracked in wait()
+        caps.exit_code = true;      // process() reports the real exit code
+        caps.shell_integration = true; // command_state() parses OSC 133
+        caps.stdout_stderr_separation = false; // single PTY master, no split pipes
+        caps.recording = true;      // recording hook delivered on output/input
+        caps.attach = false;        // we spawn the child; we do not attach one
+        caps.query_response = true; // the device-query responder answers CSI queries
+        caps.event_types = vec![
+            EventCapability::Output,
+            EventCapability::Bell,
+            EventCapability::Title,
+            EventCapability::FocusChanged,
+            EventCapability::SemanticChanged,
+            EventCapability::Raw,
+        ];
+        caps.supported_waits = vec![
+            WaitCapability::Text,
+            WaitCapability::TextAbsent,
+            WaitCapability::ScreenChange,
+            WaitCapability::ScreenStable,
+            WaitCapability::ProcessExit,
+            WaitCapability::Title,
+            WaitCapability::Bell,
+            WaitCapability::AnyActivity,
+            WaitCapability::Idle,
+            WaitCapability::CommandDone,
+        ];
+        caps.input_families = vec![
+            InputFamily::Key,
+            InputFamily::Mouse,
+            InputFamily::Paste,
+            InputFamily::RawByte,
+            InputFamily::Resize,
+            InputFamily::Signal,
+        ];
         caps
     }
 

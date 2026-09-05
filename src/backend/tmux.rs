@@ -675,11 +675,15 @@ impl TerminalBackend for TmuxBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        use super::{EventCapability, InputFamily, WaitCapability};
         Capabilities {
             mouse: false,
             kitty_keyboard: false,
             colors: true,
             cell_attributes: true,
+            // Audit P0-38: title is wired FOR REAL — the pane's last OSC title
+            // is read via `#{pane_title}` and rides into screen state, so the
+            // claim stays true.
             title: true,
             scrollback: true,
             bracketed_paste: false,
@@ -690,6 +694,47 @@ impl TerminalBackend for TmuxBackend {
             // Report it in the matrix instead of hiding it (review P1 items
             // 17/18 "raw honesty").
             protocol_capture: false,
+            // --- audit finding 37: operation-oriented matrix ---
+            // tmux send-keys delivers TEXT, not arbitrary bytes: a non-UTF-8
+            // raw payload is refused (audit P0-40), so raw input is NOT
+            // advertised even though UTf-8 text happens to pass through.
+            raw_input: false,
+            bell_observable: true, // window bell flag (audit P0-39)
+            // The attached process is not our child; its real exit code is
+            // unknowable (process() reports exit_code: None).
+            exit_code: false,
+            shell_integration: false, // command_state() returns None
+            stdout_stderr_separation: false,
+            recording: true, // recording hook delivered from pane capture
+            native_semantic: true, // session-provided side channel
+            // Attach semantics: this backend attaches an EXISTING TUI it did
+            // not spawn.
+            attach: true,
+            query_response: false, // no device-query responder behind tmux
+            event_types: vec![
+                EventCapability::Output,
+                EventCapability::Bell,
+                EventCapability::Title,
+                EventCapability::FocusChanged,
+                EventCapability::SemanticChanged,
+            ],
+            supported_waits: vec![
+                WaitCapability::Text,
+                WaitCapability::TextAbsent,
+                WaitCapability::ScreenChange,
+                WaitCapability::ScreenStable,
+                WaitCapability::ProcessExit,
+                WaitCapability::Title,
+                WaitCapability::Bell,
+                WaitCapability::AnyActivity,
+                WaitCapability::Idle,
+            ],
+            input_families: vec![
+                InputFamily::Key,
+                InputFamily::Paste,
+                InputFamily::RawByte,
+                InputFamily::Resize,
+            ],
         }
     }
 
@@ -889,6 +934,19 @@ mod tests {
             bracketed_paste: false,
             signals: false,
             protocol_capture: false,
+            // audit finding 37: the operation-oriented matrix. `attach` and
+            // the observed event kinds are honors we claim explicitly (the
+            // backend attaches panes and observes titles/bells); everything
+            // else not listed restores to the no-claim `honest()` default.
+            attach: true,
+            event_types: vec![
+                crate::backend::EventCapability::Output,
+                crate::backend::EventCapability::Bell,
+                crate::backend::EventCapability::Title,
+                crate::backend::EventCapability::FocusChanged,
+                crate::backend::EventCapability::SemanticChanged,
+            ],
+            ..Capabilities::honest()
         };
         // These are the boundaries the module header promises. If a future
         // change claims tmux can capture raw bytes or signal the child, that
@@ -902,6 +960,26 @@ mod tests {
             "the attached process is not our child; no signals"
         );
         assert!(!caps.mouse, "tmux pane mouse injection is unsupported");
+        // audit finding 37: operation-oriented honesty for the attach engine.
+        assert!(caps.attach, "tmux attaches an existing TUI");
+        assert!(!caps.raw_input, "tmux send-keys cannot deliver raw bytes");
+        assert!(!caps.exit_code, "tmux cannot report the child's exit code");
+        assert!(
+            !caps.shell_integration,
+            "tmux has no OSC 133 command-state observability"
+        );
+        assert!(
+            !caps.supported_waits.contains(&crate::backend::WaitCapability::CommandDone),
+            "tmux command waits return Unsupported"
+        );
+        assert!(
+            !caps.input_families.contains(&crate::backend::InputFamily::Signal),
+            "tmux cannot deliver signals to the attached process"
+        );
+        assert!(
+            caps.event_types.contains(&crate::backend::EventCapability::Title),
+            "tmux observes pane titles"
+        );
     }
 
     /// Audit P0-38: the title-tracking edges — a fresh title advances

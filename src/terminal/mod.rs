@@ -22,7 +22,7 @@
 
 pub mod explain;
 
-use crate::backend::Capabilities;
+use crate::backend::{Capabilities, EventCapability, InputFamily, WaitCapability};
 
 /// One terminal capability's detection verdict, with evidence.
 ///
@@ -112,7 +112,13 @@ impl TerminalProfile {
         evidence: &std::collections::HashMap<&'static str, String>,
     ) -> Self {
         // Per-capability: (id, name, flag, is_baseline, implications).
-        let rows: [(&'static str, &'static str, bool, bool, &'static str); 9] = [
+        // audit finding 37: the row set now covers operation-oriented facts
+        // (raw input, bell/exit-code observability, shell integration, stdout/
+        // stderr separation, recording, native semantics, attach, query/response)
+        // plus representative event/wait/input-coverage rows read from the real
+        // list fields — every row reads a REAL Capabilities field, never an
+        // intent.
+        let rows: Vec<(&'static str, &'static str, bool, bool, &'static str)> = vec![
             (
                 "mouse",
                 "Mouse",
@@ -175,6 +181,113 @@ impl TerminalProfile {
                 caps.protocol_capture,
                 false,
                 "with it: protocol-byte diagnosis is available; without (e.g. tmux attach): only rendered panes are observable",
+            ),
+            // --- audit finding 37: operation-oriented rows ---
+            (
+                "raw_input",
+                "Raw input",
+                caps.raw_input,
+                false,
+                "with it: arbitrary bytes can be injected; without (e.g. tmux): raw escapes degrade to text or are refused",
+            ),
+            (
+                "bell_observable",
+                "Bell observability",
+                caps.bell_observable,
+                false,
+                "with it: a BEL is detectable via a Bell wait; without: bell-driven waits cannot resolve",
+            ),
+            (
+                "exit_code",
+                "Process exit code",
+                caps.exit_code,
+                false,
+                "with it: the child's real exit code is reportable; without (e.g. tmux attach): only running/dead is known",
+            ),
+            (
+                "shell_integration",
+                "Shell integration (OSC 133)",
+                caps.shell_integration,
+                false,
+                "with it: command-phase waits and command_state() work; without: command waits are unsatisfiable",
+            ),
+            (
+                "stdout_stderr_separation",
+                "stdout/stderr separation",
+                caps.stdout_stderr_separation,
+                false,
+                "with it: stdout and stderr are readable separately; without: streams are fused",
+            ),
+            (
+                "recording",
+                "Recording / cast capture",
+                caps.recording,
+                false,
+                "with it: raw casts can be recorded; without: cast export is unavailable",
+            ),
+            (
+                "native_semantic",
+                "Native semantic protocol",
+                caps.native_semantic,
+                false,
+                "with it: the app's native side-channel events are absorbable; without: only inferred semantics",
+            ),
+            (
+                "attach",
+                "Attach semantics",
+                caps.attach,
+                false,
+                "with it: an existing TUI is attached (tmux); without: the session spawns its own child",
+            ),
+            (
+                "query_response",
+                "Query/response probing",
+                caps.query_response,
+                false,
+                "with it: device-query round trips are observable; without: query diagnosis is unavailable",
+            ),
+            (
+                "event_raw",
+                "Raw event observability",
+                caps.event_types.contains(&EventCapability::Raw),
+                false,
+                "with it: raw-protocol events are emitted; without: only rendered output is observable",
+            ),
+            (
+                "wait_title",
+                "Title waits",
+                caps.supported_waits.contains(&WaitCapability::Title),
+                false,
+                "with it: WaitCond::Title resolves; without: title waits time out",
+            ),
+            (
+                "wait_command",
+                "Command waits",
+                caps.supported_waits
+                    .contains(&WaitCapability::CommandDone),
+                false,
+                "with it: WaitCond::CommandDone/CommandOutput resolve; without: command waits error/time out",
+            ),
+            (
+                "input_mouse",
+                "Mouse injection",
+                caps.input_families.contains(&InputFamily::Mouse),
+                false,
+                "with it: mouse events can be injected; without: mouse driving is unavailable",
+            ),
+            (
+                "input_signal",
+                "Signal injection",
+                caps.input_families.contains(&InputFamily::Signal),
+                false,
+                "with it: POSIX signals can be delivered to the child; without: teardown is best-effort",
+            ),
+            (
+                "input_raw",
+                "Raw input injection",
+                caps.input_families.contains(&InputFamily::RawByte),
+                false,
+                "with it: raw bytes can be injected; without: raw injection is refused",
             ),
         ];
 
