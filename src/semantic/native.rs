@@ -445,7 +445,9 @@ impl NativeChannel {
                 }
             }
             if let Some(n) = resolved {
-                apply_native_facts(n, node);
+                // Tree-only path: affordances live on the node; the flat
+                // mirror below does not exist in this entry point.
+                let _ = apply_native_facts(n, node);
                 report.matched.push(node.id.clone());
             } else {
                 report.native_only.push(node.id.clone());
@@ -496,7 +498,7 @@ impl NativeChannel {
                 };
             }
             if let Some(n) = resolved {
-                apply_native_facts(n, node);
+                let affordances = apply_native_facts(n, node);
                 // Mirror the same facts into the flat control with the same
                 // id (control-derived tree nodes keep the control's id, so
                 // the join key survives the tree build).
@@ -538,6 +540,19 @@ impl NativeChannel {
                         }
                     }
                 }
+                // Finding 8, fused: the flat screen's affordance list
+                // carries the same declared verbs the tree node does —
+                // replacing ALL prior entries for this control exactly as
+                // the tree side did (a refreshed frame re-declares, and
+                // verbs the app no longer declares do not survive). A
+                // control the app declares nothing about keeps its
+                // inferred affordances untouched.
+                if !node.actions.is_empty() {
+                    let ctl = resolved_id.clone();
+                    sem.affordances
+                        .retain(|a| a.control_id.as_deref() != ctl.as_deref());
+                    sem.affordances.extend(affordances);
+                }
                 report.matched.push(node.id.clone());
             } else {
                 // Re-review P0 (native-only merge): an unmatched native node
@@ -549,6 +564,22 @@ impl NativeChannel {
                 if inserted {
                     if let Some(c) = native_node_to_control(node) {
                         sem.controls.push(c);
+                    }
+                    // Finding 8: native-only nodes declare affordances too.
+                    if !node.actions.is_empty() {
+                        let label = node.label.clone().unwrap_or_else(|| node.id.clone());
+                        for verb in &node.actions {
+                            sem.affordances
+                                .push(crate::semantic::affordance::Affordance {
+                                    action: label.clone(),
+                                    control_id: Some(node.id.clone()),
+                                    invocation: verb_to_invocation(verb),
+                                    visibility: crate::semantic::affordance::Visibility::Labeled,
+                                    hint_text: node.label.clone(),
+                                    confidence: crate::semantic::Confidence::native(),
+                                    source: "native".to_string(),
+                                });
+                        }
                     }
                     report.native_only.push(node.id.clone());
                 } else {
@@ -626,11 +657,85 @@ fn find_by_id<'a>(
     None
 }
 
+/// Finding 8: the app-declared action verbs become affordances. The
+/// protocol's verb vocabulary is open (apps may declare `actions:
+/// ["export-csv"]`), so mapping is conventional where a verb has a
+/// conventional invocation and honest [`Invocation::Declared`] where it
+/// does not: `activate`/`toggle`/`select`/`open`/`press` are
+/// focus-and-Enter interactions on a TUI, `focus` moves focus, and
+/// everything else is reported as the app stated it rather than guessed
+/// into a wrong invocation shape.
+fn verb_to_invocation(verb: &str) -> crate::semantic::affordance::Invocation {
+    use crate::semantic::affordance::Invocation;
+    match verb {
+        "activate" | "toggle" | "select" | "open" | "press" => Invocation::Activate,
+        "focus" => Invocation::Navigate {
+            key: "tab".to_string(),
+        },
+        other => Invocation::Declared {
+            verb: other.to_string(),
+        },
+    }
+}
+
+/// Finding 8: materialize one native node's declared actions as
+/// affordances on the matched node. The app's declaration replaces
+/// inference for that node: prior native affordances are dropped (a
+/// refreshed frame re-declares), and an inferred activate-affordance the
+/// app did not declare is dropped too — the app knows which verbs its
+/// widget supports. Returns the newly declared affordances so the fused
+/// path can mirror them into the flat screen.
+fn apply_native_actions(
+    n: &mut crate::semantic::node::SemanticNode,
+    node: &NativeNode,
+) -> Vec<crate::semantic::affordance::Affordance> {
+    let declares_activate = node.actions.iter().any(|v| {
+        matches!(
+            verb_to_invocation(v),
+            crate::semantic::affordance::Invocation::Activate
+        )
+    });
+    n.affordances.retain(|a| {
+        if a.source == "native" {
+            return false; // replaced wholesale by this frame's declaration
+        }
+        // Inferred Activate survives only when the app declares nothing
+        // (no actions → no opinion) or declares an activating verb.
+        !(matches!(
+            a.invocation,
+            crate::semantic::affordance::Invocation::Activate
+        ) && !node.actions.is_empty()
+            && !declares_activate)
+    });
+    if node.actions.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for verb in &node.actions {
+        out.push(crate::semantic::affordance::Affordance {
+            action: node.label.clone().unwrap_or_else(|| node.id.clone()),
+            control_id: Some(n.id.clone()),
+            invocation: verb_to_invocation(verb),
+            visibility: crate::semantic::affordance::Visibility::Labeled,
+            hint_text: node.label.clone(),
+            confidence: crate::semantic::Confidence::native(),
+            source: "native".to_string(),
+        });
+    }
+    n.affordances.extend(out.iter().cloned());
+    out
+}
+
 /// Apply one native node's declared facts onto its resolved tree node.
 /// Shared by [`NativeChannel::overlay`] and
 /// [`NativeChannel::overlay_fused`] — the two entry points must never drift
-/// apart in what they write.
-fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &NativeNode) {
+/// apart in what they write. Returns the affordances the node's declared
+/// actions materialized as (finding 8) so the fused path can mirror them
+/// into the flat screen; the tree-only path has them on the node already.
+fn apply_native_facts(
+    n: &mut crate::semantic::node::SemanticNode,
+    node: &NativeNode,
+) -> Vec<crate::semantic::affordance::Affordance> {
     // Role merge (re-review P0: native role is the primary reason the
     // side-channel exists — inference says Unknown, the app says button,
     // the fused tree must say button). Native role wins over Unknown /
@@ -680,6 +785,9 @@ fn apply_native_facts(n: &mut crate::semantic::node::SemanticNode, node: &Native
             }
         }
     }
+    // Finding 8: declared actions are affordances, computed last so the
+    // affordances carry the final label/id facts.
+    apply_native_actions(n, node)
 }
 
 /// Map a native role slug onto the semantic [`Role`] vocabulary. Unknown
@@ -1156,6 +1264,300 @@ mod tests {
         .expect("write full");
         ch.poll();
         assert_eq!(ch.frames_accepted, 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ── Finding 8: NativeNode.actions are consumed, not dead data ──
+
+    /// A tiny two-button screen, the same shape the fused-truth tests use.
+    fn two_button_screen() -> crate::screen::ScreenState {
+        use crate::screen::cell::{Cell, Color, ProcessState};
+        let mut cells = Vec::new();
+        let mut viewport_text = Vec::new();
+        for (y, line) in ["[ Save ]", "[ Cancel ]"].iter().enumerate() {
+            viewport_text.push(line.to_string());
+            for (x, ch) in line.chars().enumerate() {
+                cells.push(Cell {
+                    x: x as u16,
+                    y: y as u16,
+                    text: ch.to_string(),
+                    fg: Color::unknown(),
+                    bg: Color::unknown(),
+                    bold: false,
+                    dim: false,
+                    italic: false,
+                    underline: false,
+                    reverse: false,
+                    strike: false,
+                });
+            }
+        }
+        crate::screen::ScreenState {
+            cols: 40,
+            rows: 2,
+            cursor: crate::screen::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
+            title: None,
+            cells,
+            viewport_text,
+            scrollback: Vec::new(),
+            hyperlinks: Vec::new(),
+            raw_hash: String::new(),
+            visual_hash: String::new(),
+            structure_hash: String::new(),
+            process: ProcessState {
+                running: false,
+                exit_code: None,
+                exit_signal: None,
+                cwd: None,
+                pid: None,
+            },
+        }
+    }
+
+    /// A snapshot declaring #save with two verbs: one conventional, one
+    /// the harness has no invocation for.
+    fn write_save_snapshot(path: &std::path::Path, actions: &str) {
+        let body = format!(
+            r##"{{"v":1,"type":"snapshot","root":{{"id":"#root","role":"screen","children":[{{"id":"#save","role":"button","label":"Save","bounds":[0,0,8,1],"actions":[{actions}]}}]}}}}"##
+        );
+        std::fs::write(path, format!("{body}\n")).expect("write snapshot");
+    }
+
+    #[test]
+    fn declared_actions_become_affordances_in_both_shapes() {
+        let screen = two_button_screen();
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        write_save_snapshot(&path, r#""activate","export-csv""#);
+        ch.poll();
+        let report = ch.overlay_fused(&mut tree, &mut sem);
+        assert!(
+            report.matched.iter().any(|id| id == "#save"),
+            "save resolved: {:?}",
+            report
+        );
+
+        // Which tree node did #save land on? Native ids join by id/suffix/
+        // label — a control-derived node keeps its control id, so find the
+        // matched node via the native id join, not a literal id.
+        fn find_native<'a>(
+            n: &'a crate::semantic::node::SemanticNode,
+            native_id: &str,
+        ) -> Option<&'a crate::semantic::node::SemanticNode> {
+            if n.identity.as_ref().and_then(|i| i.native_id.as_deref()) == Some(native_id) {
+                return Some(n);
+            }
+            n.children.iter().find_map(|c| find_native(c, native_id))
+        }
+        let save = find_native(&tree.root, "#save").expect("native-joined node");
+
+        // Tree shape: both declared verbs are affordances at native
+        // confidence — including the verb with no conventional invocation
+        // (honest Declared, not a guessed shape).
+        let native: Vec<_> = save
+            .affordances
+            .iter()
+            .filter(|a| a.source == "native")
+            .collect();
+        assert_eq!(native.len(), 2, "both declared verbs landed: {native:?}");
+        assert!(native.iter().any(|a| matches!(
+            a.invocation,
+            crate::semantic::affordance::Invocation::Activate
+        )));
+        assert!(native.iter().any(|a| matches!(
+            &a.invocation,
+            crate::semantic::affordance::Invocation::Declared { verb } if verb == "export-csv"
+        )));
+
+        // Flat shape: the same two verbs on the screen affordance list.
+        let flat: Vec<_> = sem
+            .affordances
+            .iter()
+            .filter(|a| a.source == "native" && a.action == "Save")
+            .collect();
+        assert_eq!(flat.len(), 2, "flat shape carries the declared verbs");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn undeclared_activate_affordances_are_dropped_for_declared_nodes() {
+        let screen = two_button_screen();
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        // Pre-state: inference produced at least one Activate affordance on
+        // this screen (the bracket buttons), so the drop below is real.
+        assert!(sem.affordances.iter().any(|a| matches!(
+            a.invocation,
+            crate::semantic::affordance::Invocation::Activate
+        )));
+
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        // The app declares Save supports ONLY export — no activate.
+        write_save_snapshot(&path, r#""export-csv""#);
+        ch.poll();
+        let _ = ch.overlay_fused(&mut tree, &mut sem);
+
+        // Tree shape: no Activate affordance survives on the #save node —
+        // the app said the verb is not supported; its word outranks
+        // inference.
+        fn find_native<'a>(
+            n: &'a crate::semantic::node::SemanticNode,
+            native_id: &str,
+        ) -> Option<&'a crate::semantic::node::SemanticNode> {
+            if n.identity.as_ref().and_then(|i| i.native_id.as_deref()) == Some(native_id) {
+                return Some(n);
+            }
+            n.children.iter().find_map(|c| find_native(c, native_id))
+        }
+        let save = find_native(&tree.root, "#save").expect("native-joined node");
+        assert!(
+            !save.affordances.iter().any(|a| matches!(
+                a.invocation,
+                crate::semantic::affordance::Invocation::Activate
+            )),
+            "inferred activate must not survive an app declaration without it: {:?}",
+            save.affordances
+        );
+        // Flat shape: Save's inferred activate affordance is gone too; only
+        // the declared verb remains.
+        let save_flat: Vec<_> = sem
+            .affordances
+            .iter()
+            .filter(|a| a.action == "Save")
+            .collect();
+        assert!(
+            !save_flat.iter().any(|a| matches!(
+                a.invocation,
+                crate::semantic::affordance::Invocation::Activate
+            )),
+            "flat: inferred activate dropped: {save_flat:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn undeclared_nodes_keep_their_inferred_affordances() {
+        let screen = two_button_screen();
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        let pre_inferred = sem.affordances.len();
+        assert!(pre_inferred > 0, "inference produced affordances");
+
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        write_save_snapshot(&path, r#""activate","export-csv""#);
+        ch.poll();
+        let _ = ch.overlay_fused(&mut tree, &mut sem);
+
+        // Cancel was declared nothing about: its affordances survive.
+        let cancel_id = sem
+            .controls
+            .iter()
+            .find(|c| c.label == "Cancel")
+            .map(|c| c.id.clone())
+            .expect("cancel control exists");
+        assert!(
+            sem.affordances
+                .iter()
+                .any(|a| a.control_id.as_deref() == Some(cancel_id.as_str())),
+            "undeclared controls keep their inferred affordances"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn refreshed_frame_replaces_native_affordances() {
+        let screen = two_button_screen();
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        write_save_snapshot(&path, r#""activate""#);
+        ch.poll();
+        let _ = ch.overlay_fused(&mut tree, &mut sem);
+        // A refreshed frame declares a DIFFERENT verb set: replacement, not
+        // accumulation — on both shapes. (The app appends; it does not
+        // truncate the channel.)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            f.write_all(
+                r##"{"v":1,"type":"snapshot","root":{"id":"#root","role":"screen","children":[{"id":"#save","role":"button","label":"Save","bounds":[0,0,8,1],"actions":["export-csv"]}]}}"##.as_bytes(),
+            )
+            .expect("append refreshed frame");
+            f.write_all(b"\n").expect("newline");
+        }
+        ch.poll();
+        let _ = ch.overlay_fused(&mut tree, &mut sem);
+
+        fn find_native<'a>(
+            n: &'a crate::semantic::node::SemanticNode,
+            native_id: &str,
+        ) -> Option<&'a crate::semantic::node::SemanticNode> {
+            if n.identity.as_ref().and_then(|i| i.native_id.as_deref()) == Some(native_id) {
+                return Some(n);
+            }
+            n.children.iter().find_map(|c| find_native(c, native_id))
+        }
+        let save = find_native(&tree.root, "#save").expect("native-joined node");
+        let native: Vec<_> = save
+            .affordances
+            .iter()
+            .filter(|a| a.source == "native")
+            .collect();
+        assert_eq!(native.len(), 1, "re-declaration replaces: {native:?}");
+        assert!(matches!(
+            &native[0].invocation,
+            crate::semantic::affordance::Invocation::Declared { verb } if verb == "export-csv"
+        ));
+        let flat_native: Vec<_> = sem
+            .affordances
+            .iter()
+            .filter(|a| a.source == "native" && a.action == "Save")
+            .collect();
+        assert_eq!(flat_native.len(), 1, "flat replaced too");
+        assert!(matches!(
+            &flat_native[0].invocation,
+            crate::semantic::affordance::Invocation::Declared { verb } if verb == "export-csv"
+        ));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn native_only_nodes_carry_their_actions_into_the_flat_screen() {
+        let screen = two_button_screen();
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        // A control inference cannot see (no bracket text on screen).
+        let ghost = r##"{"id":"#ghost","role":"button","label":"Ghost","bounds":[30,0,8,1],"actions":["summon"]}"##;
+        let body = format!(
+            r##"{{"v":1,"type":"snapshot","root":{{"id":"#root","role":"screen","children":[{ghost}]}}}}"##
+        );
+        std::fs::write(&path, format!("{body}\n")).expect("write");
+        ch.poll();
+        let report = ch.overlay_fused(&mut tree, &mut sem);
+        assert!(report.native_only.iter().any(|id| id == "#ghost"));
+        let ghost_aff: Vec<_> = sem
+            .affordances
+            .iter()
+            .filter(|a| a.control_id.as_deref() == Some("#ghost"))
+            .collect();
+        assert_eq!(
+            ghost_aff.len(),
+            1,
+            "ghost node's verb is usable, not dead data: {ghost_aff:?}"
+        );
+        assert!(matches!(
+            &ghost_aff[0].invocation,
+            crate::semantic::affordance::Invocation::Declared { verb } if verb == "summon"
+        ));
         std::fs::remove_file(&path).ok();
     }
 
