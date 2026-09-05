@@ -121,7 +121,7 @@ test --all-features) verified green on the formatted tree.
 | 16 | ~~Native suffix match takes first hit, no uniqueness/ambiguity report~~ FIXED with 17 (`ca9af5d`) | — |
 | 17 | ~~Native focus rewrites headline + matched node but never clears stale `focused=true` on other controls~~ FIXED with 16 (`ca9af5d`) | — |
 | 20 | ~~Fake `AUDIT-METRICS` finding on clean runs; findings still carry passes/metrics~~ FIXED (`a1349b7`) | — |
-| 21 | `rule_id` landed, but severity/category remain `String`; no occurrence_id/sorted-key fingerprints | `src/audit/mod.rs:139` |
+| 21 | ~~`rule_id` landed, but severity/category remain `String`; no occurrence_id/sorted-key fingerprints~~ FIXED (`5d60884`) | — |
 | 22 | Audit uncertainty: no Unverified/LowConfidence/Ambiguous verdicts | drivers |
 | 23 | `NextObservation` is prose (`suggestion`/`rationale`), no structured tool+arguments | `src/audit/repair.rs:128` |
 | 25 | `action + dozens of Option<T>` request shapes (tagged unions) | `src/mcp/params/*` |
@@ -155,8 +155,9 @@ test --all-features) verified green on the formatted tree.
 - **15** detection names OpenTUI/Ink/Bubble Tea but integration is tier-1 only — detection-side honesty landed, adapters open (see 36-42)
 - **16/17** Native resolution: relaxed matches (suffix/label) are uniqueness-gated — ambiguity is reported (`NativeOverlayReport.ambiguous`), never first-hit; focus is exclusive (`clear_tree_focus_except` on the tree, flat mirror follows `sem.focus.control_id`) (`ca9af5d`)
 - **20** Audit timing is report metadata: `run_verified` returns `(findings, AuditMetrics)`; clean runs produce zero findings (no synthetic AUDIT-METRICS row, no stamping onto finding evidence); `ProfileReport.metrics` + `metrics` on the tui_audit response carry the numbers (`a1349b7`)
+- **21** Typed severity/category + occurrence identity: `Severity` closed ordered enum (wire-compatible slugs, typos are parse errors), `Category` typed domain set + lossless `Other(String)` for contract groups, `Finding.occurrence_id` = versioned hash over SORTED key material (rule, category, all evidence targets) assigned at `instance()`; `compare::fingerprint` delegates to it (`5d60884`)
 
 ### Priority order (implementation sequence)
 
-Remaining P0: none. Next: P1/P2 — 21 (typed severity/category) → 23 (structured NextObservation) → 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
+Remaining P0: none. Next: P1/P2 — 23 (structured NextObservation) → 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
 
