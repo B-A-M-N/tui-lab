@@ -864,9 +864,10 @@ fn fused_semantic_truth_across_all_shapes() {
 // ─── Wave 6: durability/performance (items 49–52) ────────────────────────
 
 /// Item 49: the audit transaction reports its own timing — driver/verify/
-/// total milliseconds ride on the last finding's evidence, and a clean run
-/// still produces the AUDIT-METRICS info finding so the numbers never
-/// vanish.
+/// total milliseconds ride the returned AuditMetrics beside the findings.
+/// Finding 20: a clean run produces ZERO findings — no synthetic
+/// AUDIT-METRICS row, and timing is never stamped onto real findings'
+/// evidence.
 #[test]
 fn audit_transaction_reports_timing_metrics() {
     let mut s = tui_lab::session::Session::new("w6-metrics".into(), "python3".into());
@@ -882,8 +883,9 @@ fn audit_transaction_reports_timing_metrics() {
     })
     .expect("start");
 
-    // A driver that finds something: metrics attach to the last finding.
-    let findings = tui_lab::audit::transaction::run_verified(&mut s, "probe", |_sess| {
+    // A driver that finds something: findings stay clean of timing; the
+    // metrics ride beside them.
+    let (findings, m) = tui_lab::audit::transaction::run_verified(&mut s, "probe", |_sess| {
         vec![tui_lab::audit::Finding {
             id: "PROBE-1".into(),
             rule_id: None,
@@ -902,23 +904,83 @@ fn audit_transaction_reports_timing_metrics() {
     })
     .expect("run");
     assert_eq!(findings.len(), 1);
-    let m = findings[0].evidence[0].detail["audit_metrics"].clone();
-    assert_eq!(m["profile"], "probe");
-    assert!(m["total_ms"].is_u64(), "timing present on the finding: {m}");
     assert!(
-        m["total_ms"].as_u64().unwrap() >= m["driver_ms"].as_u64().unwrap_or(0),
-        "total covers the driver phase: {m}"
+        findings[0]
+            .evidence
+            .iter()
+            .all(|ev| ev.detail.get("audit_metrics").is_none()),
+        "finding 20: timing never stamped onto a finding's evidence"
+    );
+    assert_eq!(m.profile, "probe");
+    assert!(m.total_ms >= m.driver_ms, "total covers the driver phase");
+    assert_eq!(
+        serde_json::to_value(&m).unwrap()["profile"],
+        serde_json::json!("probe")
     );
 
-    // A clean driver: the AUDIT-METRICS info finding carries the numbers.
-    let clean = tui_lab::audit::transaction::run_verified(&mut s, "noop", |_| Vec::new())
+    // A clean driver: zero findings — the numbers are metadata, not a row.
+    let (clean, cm) = tui_lab::audit::transaction::run_verified(&mut s, "noop", |_| Vec::new())
         .expect("clean run");
-    assert_eq!(clean.len(), 1, "exactly the metrics finding");
-    assert_eq!(clean[0].id, "AUDIT-METRICS");
-    assert_eq!(clean[0].severity, "info");
-    let cm = clean[0].evidence[0].detail["audit_metrics"].clone();
-    assert_eq!(cm["profile"], "noop");
-    assert!(cm["verify_ms"].is_u64(), "verify phase timed: {cm}");
+    assert!(
+        clean.is_empty(),
+        "finding 20: no synthetic AUDIT-METRICS finding"
+    );
+    assert_eq!(cm.profile, "noop");
+    assert!(cm.verify_ms <= cm.total_ms, "verify phase timed: {cm:?}");
+    s.stop().ok();
+}
+
+/// Finding 20, orchestrator level: a live profile whose drivers all come
+/// back clean reports ZERO findings, and the per-driver timing rides
+/// `ProfileReport.metrics` (also surfaced as `metrics` on the tui_audit
+/// response) — not a fake AUDIT-METRICS finding row.
+#[test]
+fn clean_audit_run_has_no_fake_metrics_finding() {
+    let mut s = tui_lab::session::Session::new("w6-clean".into(), "python3".into());
+    s.start_with_spec(tui_lab::session::state::LaunchSpec {
+        command: "python3".into(),
+        args: vec!["-c".into(), "print('w6clean'); input()".into()],
+        cwd: None,
+        env: vec![],
+        cols: 80,
+        rows: 24,
+        backend: "auto".into(),
+        isolation: "local".into(),
+    })
+    .expect("start");
+    s.observe(400).expect("baseline");
+
+    // `keyboard` is transactional and Reversible: its Tab walk restores
+    // focus, so the run is clean (AllowMutation — SafeOnly withholds every
+    // invasive profile, including reversible ones).
+    let report = tui_lab::audit::orchestrator::run_profile_checked(
+        &mut s,
+        "keyboard",
+        None,
+        tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+    )
+    .expect("keyboard runs under allow_mutation");
+
+    assert!(
+        !report.findings.iter().any(|f| f.id == "AUDIT-METRICS"),
+        "finding 20: no synthetic metrics finding: {:?}",
+        report.findings.iter().map(|f| &f.id).collect::<Vec<_>>()
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|f| f.severity != "info" || !f.id.starts_with("AUDIT-")),
+        "timing must not masquerade as an audit finding"
+    );
+    assert!(
+        !report.metrics.is_empty(),
+        "transactional drivers report timing as report metadata"
+    );
+    for m in &report.metrics {
+        assert_eq!(m.profile, "keyboard");
+        assert!(m.total_ms >= m.driver_ms.saturating_add(m.verify_ms));
+    }
     s.stop().ok();
 }
 

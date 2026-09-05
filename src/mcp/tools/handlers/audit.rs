@@ -240,11 +240,13 @@ pub(crate) async fn tui_audit(
                     crate::audit::orchestrator::SafetyPolicy::DeepIsolation => "deep_isolation",
                 },
                 // Info-split (review P1 item 9): `finding_count` has always
-                // counted every row, but many are informational orchestration
-                // records (ORCH-RESTART, AUDIT-METRICS, DISC-001…) — counting
+                // counted every row, and informational orchestration records
+                // (ORCH-RESTART, DISC-001…) still ride the list — counting
                 // them as "findings" makes a clean run look defect-heavy. The
                 // breakdown separates defects from bookkeeping; the totals
                 // stay as they were so nothing downstream changes shape.
+                // (Finding 20: audit timing is report metadata below, never
+                // a finding row.)
                 "finding_count": report.findings.len(),
                 "findings_by_severity": {
                     "error": report.findings.iter().filter(|f| f.severity == "error").count(),
@@ -257,6 +259,9 @@ pub(crate) async fn tui_audit(
                     .filter(|f| f.severity != "info")
                     .count(),
                 "findings": report.findings,
+                // Finding 20: per-driver timing lives here — run metadata,
+                // not a synthetic AUDIT-METRICS finding.
+                "metrics": &report.metrics,
                 "focus_graph": focus_summary,
                 "labeled_as": label,
                 "compare": compare_block,
