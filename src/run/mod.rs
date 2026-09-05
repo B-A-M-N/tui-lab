@@ -32,6 +32,7 @@ mod contract_impl;
 mod contract_state;
 mod coverage_impl;
 mod evidence_impl;
+mod finding_store;
 mod findings_impl;
 mod launch_impl;
 mod ledger_impl;
@@ -46,6 +47,7 @@ pub use manifest::RunManifest;
 use crate::checkpoint::store::CheckpointStore;
 use crate::exploration::state_graph::{ExplorationBudget, StateGraph};
 use contract_state::ContractState;
+use finding_store::FindingStore;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -282,8 +284,9 @@ pub struct RunContext {
     pub focus_graph: crate::semantic::focus_graph::FocusGraph,
     /// Exploration state graph (owned here so audits/exploration share it).
     pub state_graph: StateGraph,
-    /// Findings emitted during this run (audit results).
-    findings: Vec<crate::audit::Finding>,
+    /// Findings + labeled baselines. Round-2 (G1): moved into
+    /// [`FindingStore`]; RunContext delegates.
+    findings: FindingStore,
     /// Transaction ledger (re-review Wave-2 item 15): a serializable record
     /// of every interaction transaction, so the run can *reconstruct* what
     /// happened (`transactions: 47` without 47 reconstructable transactions
@@ -341,11 +344,6 @@ pub struct RunContext {
     /// Round-2 (G1): moved into [`ContractState`] so the contract domain has
     /// its own cohesive holder; RunContext delegates.
     contract: ContractState,
-    /// Wave G item 67: labeled audit-finding baselines for FIXED/REGRESSED/
-    /// NEW comparison. `tui_audit label=X` stores this pass's findings under
-    /// X; `tui_audit compare_to=X` diffs the fresh pass against the stored
-    /// one via finding fingerprints.
-    finding_baselines: HashMap<String, Vec<crate::audit::Finding>>,
     /// Wave F item 64: native coverage ledger. Entries accumulate from
     /// NativeSemanticProtocol `coverage` events: target → (hits, sessions).
     /// This is interaction-correlated coverage: "did my last act exercise

@@ -171,3 +171,51 @@ test --all-features) verified green on the formatted tree.
 
 Remaining P0: none. Remaining P1/P2: construction set 41-42 (36-40 done: inspect/scaffold/workflow/regression-assets/render-diffs), then 25 (tagged-union request shapes), 29 (risk attestation), 43 (full doc generation), 14 (supported/installed honesty).
 
+
+---
+
+## God-object round 2 (2026-09-05) — structural decomposition of the shared-state buckets
+
+Round 1 split method *bodies* across impl-family files but left each object's state
+in one flat bucket. Round 2 is architectural: the struct fields themselves move into
+composed cohesive state holders; the public methods stay as thin delegating facades so
+callers compile unchanged. No new locks: `Arc<Mutex<RunContext>>` and the one actor per
+Session remain — we fix responsibility boundaries, not lock concurrency.
+
+### Verdict
+
+| Area | Verdict | Priority |
+| --- | --- | --- |
+| `run::RunContext` | definite god object — ~35 fields, every run-scoped subsystem | **P0** |
+| `backend::PortablePtyBackend` | definite god object — process+parser+protocol+clock+raw+input+wait | **P0/P1** |
+| `session::Session` | borderline aggregate — keep one actor, compose internal state | P1 |
+| `handlers::run::tui_run()` | god function — one switch, resume alone is domain-sized | P1 |
+| `TuiLabServer` | not a god object — move `minimize_crash_finding`/contract helpers/resource resolver | P2 |
+| `SessionPool`/`SessionActor`, `Capabilities`, `Finding` | NOT god objects — leave alone | — |
+
+### Phases
+
+- **G1** `RunContext` → composed stores: identity, session-registry, evidence
+  (transaction/frame/event ledgers), artifacts (run_dir/journal/warnings/captures/
+  recordings), scenarios, findings, contracts, coverage, graphs. Keep facade delegating.
+  Acceptance: existing callers compile unchanged.
+- **G2** `PortablePtyBackend` → `backend/portable/{process,emulator,protocol,event_clock,
+  raw_capture,input,wait}`; keep ONE canonical pump.
+- **G3** enrich `TerminalBackend` with typed optional methods; drop `downcast_mut`
+  from `Session`.
+- **G4** `Session` internal state → Runtime/Observation/Events/Semantic/Recording/Control;
+  `observe()` stays the orchestrator.
+- **G5** split `tui_run()` match; move ownership/plans/resource/contract helpers out of
+  `TuiLabServer`.
+
+### Invariants that must survive (do not merge unless all hold)
+
+1. One actor owns each Session. 2. No run mutex held across an actor `.await`.
+3. One canonical driving pipeline. 4. One canonical Portable PTY pump.
+5. Native semantic truth fused through one authoritative path. 6. Run close evidence-final.
+7. Resume validates target before disturbing current state. 8. Failed flush prevents
+destructive replacement. 9. Session→run provenance unbypassable.
+10. Scenario identity ID-based, not name-based. 11. Eviction explicitly reported.
+12. Ephemeral→persistent promotion preserves state. 13. Serialization formats unchanged.
+14. Human lease check stays at the central driving boundary. 15. No new lock just because
+a struct became its own type.

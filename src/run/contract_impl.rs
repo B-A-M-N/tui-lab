@@ -37,21 +37,20 @@ impl RunContext {
     }
 
     /// Store (or overwrite) a labeled audit-finding baseline (item 67).
+    /// Round-2 (G1): delegates to [`super::finding_store::FindingStore`].
     pub fn record_finding_baseline(&mut self, label: &str, findings: Vec<crate::audit::Finding>) {
-        self.finding_baselines.insert(label.to_string(), findings);
+        self.findings.record_baseline(label, findings);
     }
 
     /// Fetch a labeled audit-finding baseline.
     pub fn finding_baseline(&self, label: &str) -> Option<&Vec<crate::audit::Finding>> {
-        self.finding_baselines.get(label)
+        self.findings.baseline(label)
     }
 
     /// Labels of all stored finding baselines (for honest "no such label"
     /// errors that name what exists).
     pub fn finding_baseline_labels(&self) -> Vec<String> {
-        let mut l: Vec<String> = self.finding_baselines.keys().cloned().collect();
-        l.sort();
-        l
+        self.findings.baseline_labels()
     }
 
     /// Fingerprints of findings in ANY stored baseline OTHER than
@@ -63,16 +62,7 @@ impl RunContext {
         &self,
         compare_label: &str,
     ) -> std::collections::HashSet<String> {
-        let mut out = std::collections::HashSet::new();
-        for (label, findings) in &self.finding_baselines {
-            if label == compare_label {
-                continue;
-            }
-            for f in findings {
-                out.insert(crate::audit::compare::fingerprint(f));
-            }
-        }
-        out
+        self.findings.resolved_fingerprints(compare_label)
     }
 
     pub fn record_contract_baseline(
