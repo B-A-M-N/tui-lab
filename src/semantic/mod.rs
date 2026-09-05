@@ -32,7 +32,7 @@ pub use components::{
     TreeComponent,
 };
 pub use confidence::Confidence;
-pub use controls::{Control, ControlKind};
+pub use controls::{Control, ControlBounds, ControlKind};
 pub use focus::FocusInfo;
 pub use focus_graph::{FocusEdge, FocusGraph, FocusNode, TransitionSource};
 pub use node::{

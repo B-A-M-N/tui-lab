@@ -2203,3 +2203,103 @@ async fn regression_asset_generates_review_gated_assets() {
         .await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ──────────────── semantic render deltas (finding 40) ────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tui_act_carries_semantic_render_deltas() {
+    // Finding 40: a render change must read as "button/gamma gained focus",
+    // never just changed_cells=N. Driving Tab across a focus ring produces
+    // a transition whose control_deltas name the moved-focus control.
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-rendelta-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start",
+                "command": "python3",
+                "args": ["focus_ring_tui.py"],
+                "cwd": "fixtures", "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+
+    // Settle the initial frame so the first Tab's before-frame is the
+    // focused Alpha screen, not the blank launch screen (a startup race
+    // made the before-frame focus=null under load — the transition then
+    // read as 'blank → Alpha' with style_changes=0).
+    let _ = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "summary", "id": sid }),
+            ))
+            .await,
+        "initial settle observe",
+    );
+
+    // Tab moves focus Alpha → Beta. Under a concurrent host the first act
+    // can still race the initial draw (before-frame focus=null); a settled
+    // transition is one whose before-frame carries a resolved focus. Loop
+    // a few acts until we have one, then assert the honesty contract on it.
+    let mut act = serde_json::Value::Null;
+    for _ in 0..4 {
+        let a = unwrap_ok(
+            &server
+                .tui_act(params_typed(serde_json::json!({
+                    "action": "key", "key": "tab", "id": sid,
+                })))
+                .await,
+            "tab act",
+        );
+        let fb = a["transition"]["semantic_diff"]["focus_before"]
+            .as_str()
+            .unwrap_or("");
+        if !fb.is_empty() {
+            act = a;
+            break;
+        }
+    }
+    let sd = &act["transition"]["semantic_diff"];
+    // Finding 40's honesty contract: `control_deltas` is ALWAYS a present
+    // array (never absent). When the semantic layer resolves control
+    // objects, it names exactly which one changed and how. The reverse-
+    // video focus ring yields focus-level render truth without box-drawn
+    // control objects — so `control_deltas` may be empty, but the render
+    // change MUST still be named: focus_before≠focus_after and
+    // style_changes>0. changed_cells==0 (geometry identical) must never be
+    // the only signal the agent sees.
+    assert!(
+        sd["focus_before"].is_string(),
+        "a settled transition has a resolved before-focus: {act}"
+    );
+    let deltas = sd["control_deltas"].as_array().unwrap_or_else(|| {
+        panic!("control_deltas must be an array (possibly empty, never absent): {act}")
+    });
+    for d in deltas {
+        assert!(!d["summary"].as_str().unwrap_or("").is_empty(), "{d}");
+        assert!(!d["id"].as_str().unwrap_or("").is_empty(), "{d}");
+        // A delta always carries resolved before/after bounds when it moved.
+        if let Some(b) = d["bounds"].as_object() {
+            assert!(b["before"].is_object() && b["after"].is_object(), "{d}");
+        }
+    }
+    let fb = sd["focus_before"].as_str().unwrap_or("");
+    let fa = sd["focus_after"].as_str().unwrap_or("");
+    assert_ne!(fb, fa, "focus moved must still be reported: {act}");
+    assert!(
+        act["transition"]["screen_diff"]["style_changes"].as_u64().unwrap_or(0) > 0,
+        "the reverse-video focus change is a style change, reported alongside the cell count: {act}"
+    );
+
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid }),
+        ))
+        .await;
+    let _ = std::fs::remove_dir_all(&base);
+}
