@@ -12,7 +12,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{ev_other, ev_other_empty};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Run the mouse audit (Wave G item 66): real clicks through the canonical
 /// executor on each visible, enabled, clickable control. Evidence-first:
@@ -31,8 +31,8 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             findings.push(Finding {
                 id: "MOUSE-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "mouse".into(),
+                severity: Severity::Error,
+                category: Category::Mouse,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "mouse_observe_failed",
@@ -41,6 +41,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -50,8 +51,8 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         findings.push(Finding {
             id: "MOUSE-NO-CAPS".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "mouse".into(),
+            severity: Severity::Info,
+            category: Category::Mouse,
             summary: "Backend reports no mouse-encoding capability; clicks are sent but the app may never receive them.".into(),
             evidence: vec![ev_other(
                 "mouse_capability_absent",
@@ -61,6 +62,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         // Continue anyway: an app with mouse support behind a
         // capability-blind backend is still worth probing honestly.
@@ -115,8 +117,8 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         findings.push(Finding {
             id: "MOUSE-COMMIT-FENCED".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "mouse".into(),
+            severity: Severity::Info,
+            category: Category::Mouse,
             summary: format!(
                 "{} clickable control(s) were fenced, not clicked: their labels carry commit/destructive/external evidence (item 27). Pass explicit tui_act clicks to exercise them.",
                 fenced.len()
@@ -134,6 +136,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             confidence: 0.95,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -141,8 +144,8 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         findings.push(Finding {
             id: "MOUSE-NO-TARGETS".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "mouse".into(),
+            severity: Severity::Info,
+            category: Category::Mouse,
             summary: "No auto-clickable controls detected; nothing clicked (commit/destructive/external labels are fenced by the item-27 risk classes).".into(),
             evidence: vec![ev_other(
                 "no_click_targets",
@@ -155,6 +158,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     }
@@ -189,8 +193,8 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
                 findings.push(Finding {
                     id: "MOUSE-SEND-ERR".into(),
                     rule_id: None,
-                    severity: "warn".into(),
-                    category: "mouse".into(),
+                    severity: Severity::Warn,
+                    category: Category::Mouse,
                     summary: format!("Click send failed at ({}, {}): {}", cx, cy, e),
                     evidence: vec![ev_other(
                         "click_send_failed",
@@ -200,6 +204,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
                     confidence: 0.9,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
                 break;
             }
@@ -249,11 +254,11 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             },
             rule_id: None,
             severity: if unresponsive.is_empty() {
-                "info".into()
+                Severity::Info
             } else {
-                "warn".into()
+                Severity::Warn
             },
-            category: "mouse".into(),
+            category: Category::Mouse,
             summary: format!(
                 "Clicked {} control(s): {} responded (focus or screen changed), {} did not",
                 clicked,
@@ -274,6 +279,7 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -300,8 +306,8 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
                 findings.push(Finding {
                     id: "PERF-ERR".into(),
                     rule_id: None,
-                    severity: "error".into(),
-                    category: "performance".into(),
+                    severity: Severity::Error,
+                    category: Category::Performance,
                     summary: format!("Observe failed during sampling: {}", e),
                     evidence: vec![ev_other_empty(
                         "perf_observe_failed",
@@ -310,6 +316,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
                 return findings;
             }
@@ -353,8 +360,12 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
         }
         .into(),
         rule_id: None,
-        severity: if slow_observe { "warn" } else { "info" }.into(),
-        category: "performance".into(),
+        severity: if slow_observe {
+            Severity::Warn
+        } else {
+            Severity::Info
+        },
+        category: Category::Performance,
         summary: format!(
             "observe p50={}ms p95={}ms; settle-to-quiet p50={}ms p95={}ms ({} samples)",
             obs_p50, obs_p95, set_p50, set_p95, samples
@@ -373,13 +384,14 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
         confidence: 0.95,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
     if settle_saturated {
         findings.push(Finding {
             id: "PERF-NEVER-QUIET".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "performance".into(),
+            severity: Severity::Warn,
+            category: Category::Performance,
             summary: "Screen kept changing through most settle windows: waits anchored on screen-stability will burn their budgets (animations, clocks, spinners).".into(),
             evidence: vec![ev_other(
                 "settle_saturation",
@@ -393,6 +405,7 @@ pub fn performance_audit(session: &mut Session, samples: u32) -> Vec<Finding> {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     findings

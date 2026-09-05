@@ -10,7 +10,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{decode_cpr, decode_raw, ev_other, ev_other_empty};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 
 /// Wave-3 (terminal-modes subsystem): what input modes did this app
 /// actually negotiate, and do they agree with what the screen shows? Built
@@ -35,8 +35,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "MODE-RDFAIL".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "terminal_modes".into(),
+                severity: Severity::Warn,
+                category: Category::TerminalModes,
                 summary: format!("raw output window read FAILED: {e} — mode timeline unavailable"),
                 evidence: vec![ev_other(
                     "raw_ring_read_failed",
@@ -46,6 +46,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -54,8 +55,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "MODE-NOSRC".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "terminal_modes".into(),
+            severity: Severity::Info,
+            category: Category::TerminalModes,
             summary: "engine retains no raw output; mode timeline unavailable".into(),
             evidence: vec![ev_other(
                 "raw_ring_absent",
@@ -65,6 +66,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     }
@@ -81,8 +83,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "MODE-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "terminal_modes".into(),
+                severity: Severity::Error,
+                category: Category::TerminalModes,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "modes_observe_failed",
@@ -91,6 +93,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -119,8 +122,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
     findings.push(Finding {
         id: "MODE-INVENTORY".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "terminal_modes".into(),
+        severity: Severity::Info,
+        category: Category::TerminalModes,
         summary: summary.clone(),
         evidence: vec![ev_other(
             "mode_timeline",
@@ -136,6 +139,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         confidence: 0.95,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     // Cross-reference: mouse negotiated but zero mouse affordances visible.
@@ -150,8 +154,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "MODE-MOUSE-HIDDEN".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "terminal_modes".into(),
+            severity: Severity::Warn,
+            category: Category::TerminalModes,
             summary: "mouse reporting is ON but the screen shows no mouse affordance — clickable surfaces a user cannot discover.".into(),
             evidence: vec![ev_other(
                 "mouse_mode_no_affordance",
@@ -164,6 +168,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     // The inverse is informational: affordances shown but mode off means
@@ -172,8 +177,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "MODE-MOUSE-INERT".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "terminal_modes".into(),
+            severity: Severity::Warn,
+            category: Category::TerminalModes,
             summary: "the screen shows mouse affordances but mouse reporting is OFF — clicks are never reported to the app.".into(),
             evidence: vec![ev_other(
                 "affordance_no_mouse_mode",
@@ -185,6 +190,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     // Bracketed paste off + multi-line paste target visible = the
@@ -203,8 +209,8 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "MODE-PASTE-RAW".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "terminal_modes".into(),
+                severity: Severity::Warn,
+                category: Category::TerminalModes,
                 summary: "bracketed paste is OFF near input fields — a multi-line paste executes line-by-line (the destructive enter-per-line trap).".into(),
                 evidence: vec![ev_other(
                     "paste_unbracketed",
@@ -216,6 +222,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.6,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -240,8 +247,8 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "INP-NOSRC".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "input_protocol".into(),
+            severity: Severity::Info,
+            category: Category::InputProtocol,
             summary: "engine retains no raw output; input-encoding evidence unavailable".into(),
             evidence: vec![ev_other(
                 "raw_ring_absent",
@@ -251,6 +258,7 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     };
@@ -265,8 +273,8 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
     findings.push(Finding {
         id: "INP-ENCODING".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "input_protocol".into(),
+        severity: Severity::Info,
+        category: Category::InputProtocol,
         summary: "the key encodings the engine will send, given this app's negotiated modes".into(),
         evidence: vec![ev_other(
             "encoding_plan",
@@ -289,6 +297,7 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
         confidence: 0.95,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     // Kitty keyboard protocol active: legacy keys lose modifier fidelity.
@@ -298,8 +307,8 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "INP-KITTY".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "input_protocol".into(),
+            severity: Severity::Info,
+            category: Category::InputProtocol,
             summary: format!(
                 "kitty keyboard protocol active (flags 0b{:b}): the engine emits CSI-u for keys legacy encodings cannot express (Super-modified, F13+).",
                 modes.kitty_flags
@@ -312,6 +321,7 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.95,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -344,8 +354,8 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "QR-NOSRC".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "query_response".into(),
+            severity: Severity::Info,
+            category: Category::QueryResponse,
             summary: "engine retains no raw output and has no device-query responder; query/response conformance unverifiable here.".into(),
             evidence: vec![ev_other(
                 "no_responder",
@@ -357,6 +367,7 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     };
@@ -453,8 +464,8 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     findings.push(Finding {
         id: "QR-INVENTORY".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "query_response".into(),
+        severity: Severity::Info,
+        category: Category::QueryResponse,
         summary: if asked.is_empty() {
             "the app issued no device queries in the retained window — query/response behavior is unexercised (which is fine; nothing can hang on it).".to_string()
         } else {
@@ -477,6 +488,7 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
         confidence: 0.9,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     // End-to-end CPR probe — MEASURED (item 22), not narrated: feed a real
@@ -531,13 +543,13 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     }
 
     let (id, sev, conf) = if answered && cursor_matches {
-        ("QR-CPR-PROBE", "info", 0.95)
+        ("QR-CPR-PROBE", Severity::Info, 0.95)
     } else if answered {
         // Answered but the reported cursor disagrees with the live one —
         // that is a real conformance defect in the responder.
-        ("QR-CPR-MISMATCH", "error", 0.95)
+        ("QR-CPR-MISMATCH", Severity::Error, 0.95)
     } else {
-        ("QR-CPR-UNANSWERED", "warn", 0.9)
+        ("QR-CPR-UNANSWERED", Severity::Warn, 0.9)
     };
     let summary = if answered && cursor_matches {
         format!(
@@ -555,8 +567,8 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     findings.push(Finding {
         id: id.into(),
         rule_id: None,
-        severity: sev.into(),
-        category: "query_response".into(),
+        severity: sev,
+        category: Category::QueryResponse,
         summary,
         evidence: vec![ev_other(
             if answered {
@@ -570,6 +582,7 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
         confidence: conf,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     findings

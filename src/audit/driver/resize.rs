@@ -10,7 +10,7 @@ use crate::session::state::Session;
 use serde_json::json;
 
 use super::shared::{ev_other, ev_other_empty};
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 const RESIZE_MATRIX: &[(u16, u16)] = &[(60, 20), (80, 24), (100, 30), (120, 40), (160, 50)];
 
 /// Run resize audit: test viewport matrix (item 54).
@@ -24,8 +24,8 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "RESZ-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "resize".into(),
+                severity: Severity::Error,
+                category: Category::Resize,
                 summary: format!("Resize to {}x{} failed: {}", cols, rows, e),
                 evidence: vec![ev_other(
                     "resize_failed",
@@ -35,6 +35,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             continue;
         }
@@ -52,8 +53,8 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 findings.push(Finding {
                     id: "RESZ-ERR".into(),
                     rule_id: None,
-                    severity: "error".into(),
-                    category: "resize".into(),
+                    severity: Severity::Error,
+                    category: Category::Resize,
                     summary: format!("Observe after resize to {}x{} failed: {}", cols, rows, e),
                     evidence: vec![ev_other(
                         "resize_observe_failed",
@@ -63,6 +64,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
                 continue;
             }
@@ -79,8 +81,8 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "RESZ-CLIP".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "resize".into(),
+                severity: Severity::Error,
+                category: Category::Resize,
                 summary: format!(
                     "At {}x{}, {} region(s) clipped",
                     cols,
@@ -99,13 +101,14 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.95,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         } else {
             findings.push(Finding {
                 id: "RESZ-OK".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "resize".into(),
+                severity: Severity::Info,
+                category: Category::Resize,
                 summary: format!(
                     "At {}x{}, no clipping detected ({} regions)",
                     cols,
@@ -124,6 +127,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.9,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -161,8 +165,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "RFLW-TOO-SMALL".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "resize".into(),
+            severity: Severity::Info,
+            category: Category::Resize,
             summary: format!(
                 "session is {w}x{h}; the shrink→grow probe needs ≥20x8 to halve meaningfully — skipped."
             ),
@@ -174,6 +178,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     }
@@ -194,13 +199,14 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "RFLW-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "resize".into(),
+                severity: Severity::Error,
+                category: Category::Resize,
                 summary: format!("baseline observe failed: {e}"),
                 evidence: vec![ev_other_empty("reflow_baseline_failed", "observe failed")],
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -221,8 +227,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "RFLW-ERR".into(),
             rule_id: None,
-            severity: "error".into(),
-            category: "resize".into(),
+            severity: Severity::Error,
+            category: Category::Resize,
             summary: format!("shrink to {sw}x{sh} failed: {e}"),
             evidence: vec![ev_other_empty(
                 "reflow_shrink_failed",
@@ -231,6 +237,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         let _ = session.resize(w, h);
         return findings;
@@ -244,8 +251,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "RFLW-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "resize".into(),
+                severity: Severity::Error,
+                category: Category::Resize,
                 summary: "observe after shrink failed".into(),
                 evidence: vec![ev_other_empty(
                     "reflow_shrink_observe_failed",
@@ -254,6 +261,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             let _ = session.resize(w, h);
             return findings;
@@ -269,8 +277,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "RFLW-SHRINK-CLIP".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "resize".into(),
+            severity: Severity::Warn,
+            category: Category::Resize,
             summary: format!(
                 "at {sw}x{sh} (half the original {w}x{h}), {} region(s) clip: {} — a small-window user loses content.",
                 clipped_at_shrink.len(),
@@ -284,6 +292,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -297,8 +306,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "RFLW-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "resize".into(),
+                severity: Severity::Error,
+                category: Category::Resize,
                 summary: format!("observe after grow-back failed: {e}"),
                 evidence: vec![ev_other_empty(
                     "reflow_grow_observe_failed",
@@ -307,6 +316,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -334,8 +344,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "RFLW-CONTENT-LOST".into(),
             rule_id: None,
-            severity: "error".into(),
-            category: "resize".into(),
+            severity: Severity::Error,
+            category: Category::Resize,
             summary: format!(
                 "{} baseline row(s) never reappeared after shrink→grow ({}x{} → {}x{} → {}x{}): {} — the app's reflow loses content permanently.",
                 lost_rows.len(), w, h, sw, sh, w, h,
@@ -353,13 +363,14 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else {
         findings.push(Finding {
             id: "RFLW-CONTENT-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "resize".into(),
+            severity: Severity::Info,
+            category: Category::Resize,
             summary: format!(
                 "content survives the round trip: all {} content row(s) present after {w}x{h} → {sw}x{sh} → {w}x{h}.",
                 base_nonblank_rows.len()
@@ -372,6 +383,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -383,8 +395,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "RFLW-FOCUS-MOVED".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "resize".into(),
+                severity: Severity::Warn,
+                category: Category::Resize,
                 summary: format!(
                     "focus changed across the round trip: {before:?} → {after:?} (the app did not restore the focused control)."
                 ),
@@ -396,14 +408,15 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 0.8,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     } else if base_focus.is_some() && grw_sem.focus.control_id.is_none() {
         findings.push(Finding {
             id: "RFLW-FOCUS-LOST".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "resize".into(),
+            severity: Severity::Warn,
+            category: Category::Resize,
             summary: "the app had a focused control at baseline and none after shrink→grow — keyboard users start from nothing.".into(),
             evidence: vec![ev_other(
                 "reflow_focus_lost",
@@ -413,13 +426,14 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else {
         findings.push(Finding {
             id: "RFLW-FOCUS-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "resize".into(),
+            severity: Severity::Info,
+            category: Category::Resize,
             summary: "focus state survives the round trip (both ends agree, or neither had a focus).".into(),
             evidence: vec![ev_other(
                 "reflow_focus_ok",
@@ -429,6 +443,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.8,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -467,8 +482,8 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "RFLW-GHOST-CELLS".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "resize".into(),
+            severity: Severity::Info,
+            category: Category::Resize,
             summary: format!(
                 "{} row(s) show fragmented remnants after grow-back (baseline had {base_ghostish}) — possible ghost cells from an incomplete repaint.",
                 ghost_rows.len()
@@ -485,6 +500,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.5,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 

@@ -21,7 +21,7 @@
 //! `needs_live_session()` (needs a live session) — passive diagnostics stay
 //! available under a human lease.
 
-use crate::audit::{EvidenceKind, EvidenceRef, Finding};
+use crate::audit::{Category, EvidenceKind, EvidenceRef, Finding, Severity};
 use crate::session::state::Session;
 use serde_json::json;
 
@@ -630,8 +630,8 @@ pub fn run_profile_checked(
             findings.push(Finding {
                 id: "ORCH-GATED".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "orchestration".into(),
+                severity: Severity::Info,
+                category: Category::Orchestration,
                 summary: format!(
                     "'full' ran its observational members only ({} finding(s) above): {} member(s) withheld — {}. Pass allow_mutation=true (or attach a restartable launch) to permit them.",
                     findings.len(),
@@ -657,6 +657,7 @@ pub fn run_profile_checked(
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return Ok(ProfileReport {
                 profile,
@@ -672,8 +673,8 @@ pub fn run_profile_checked(
             findings: vec![Finding {
                 id: "ORCH-GATED".into(),
                 rule_id: None,
-                severity: "info".into(),
-                category: "orchestration".into(),
+                severity: Severity::Info,
+                category: Category::Orchestration,
                 summary: format!(
                     "profile '{}' was not run: it is {} ({}), and this session runs under the safe-only default. Pass allow_mutation=true (or attach a restartable launch) to permit it.",
                     profile.name(),
@@ -694,6 +695,7 @@ pub fn run_profile_checked(
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             }],
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             metrics: Vec::new(),
@@ -803,8 +805,8 @@ fn run_profile_with_contract_impl(
                     vec![Finding {
                         id: "AUDIT-TX-ERR".into(),
                         rule_id: None,
-                        severity: "error".into(),
-                        category: "audit".into(),
+                        severity: Severity::Error,
+                        category: Category::Audit,
                         summary: format!("audit transaction failed: {}", e),
                         evidence: vec![EvidenceRef::point(
                             EvidenceKind::Other,
@@ -815,6 +817,7 @@ fn run_profile_with_contract_impl(
                         confidence: 1.0,
                         reproduction: None,
                         source_refs: Vec::new(),
+                        occurrence_id: None,
                     }],
                     crate::audit::transaction::AuditMetrics {
                         profile: profile.name().to_string(),
@@ -853,8 +856,8 @@ fn run_profile_with_contract_impl(
                 findings: vec![Finding {
                     id: "ORCH-DEEP-REFUSED".into(),
                     rule_id: None,
-                    severity: "warn".into(),
-                    category: "orchestration".into(),
+                    severity: Severity::Warn,
+                    category: Category::Orchestration,
                     summary: "deep isolation requested but unattainable (no launch spec — attached brownfield): the requested profile is invasive, so it was REFUSED, not run in place. Re-run with a launched session, allow_mutation (explicit in-place consent), or an observational profile.".to_string(),
                     evidence: vec![EvidenceRef::point(
                         EvidenceKind::Other,
@@ -865,6 +868,7 @@ fn run_profile_with_contract_impl(
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 }],
                 focus_graph: graph,
                 metrics: Vec::new(),
@@ -873,8 +877,8 @@ fn run_profile_with_contract_impl(
         orchestration_notes.push(Finding {
             id: "ORCH-NO-RESTART".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "orchestration".into(),
+            severity: Severity::Info,
+            category: Category::Orchestration,
             summary: "deep isolation requested but this session has no launch spec (attached brownfield) — the requested profile is observational (no mutation), so it runs unaffected.".to_string(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Other,
@@ -885,6 +889,7 @@ fn run_profile_with_contract_impl(
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     let restart_between = deep;
@@ -902,8 +907,8 @@ fn run_profile_with_contract_impl(
                 Some(Finding {
                     id: "ORCH-RESTART".into(),
                     rule_id: None,
-                    severity: "info".into(),
-                    category: "orchestration".into(),
+                    severity: Severity::Info,
+                    category: Category::Orchestration,
                     summary: format!(
                         "session restarted between {before} and {after} (deep isolation): each driver sees a fresh app"
                     ),
@@ -920,13 +925,14 @@ fn run_profile_with_contract_impl(
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 })
             }
             Err(e) => Some(Finding {
                 id: "ORCH-RESTART-FAILED".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "orchestration".into(),
+                severity: Severity::Warn,
+                category: Category::Orchestration,
                 summary: format!(
                     "restart between {before} and {after} failed: {e} — remaining active drivers ABORTED (deep isolation broken; the app is in unknown state)"
                 ),
@@ -939,6 +945,7 @@ fn run_profile_with_contract_impl(
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             }),
         }
     };
@@ -988,8 +995,8 @@ fn run_profile_with_contract_impl(
                 fs.push(Finding {
                     id: "ORCH-DEEP-ABORTED".into(),
                     rule_id: None,
-                    severity: "warn".into(),
-                    category: "orchestration".into(),
+                    severity: Severity::Warn,
+                    category: Category::Orchestration,
                     summary: format!(
                         "deep isolation: run ABORTED after {restarts} restart gap(s) — a restart failed and the remaining active drivers were not run against the un-isolated app"
                     ),
@@ -1002,13 +1009,14 @@ fn run_profile_with_contract_impl(
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
             } else {
                 fs.push(Finding {
                     id: "ORCH-DEEP-SUMMARY".into(),
                     rule_id: None,
-                    severity: "info".into(),
-                    category: "orchestration".into(),
+                    severity: Severity::Info,
+                    category: Category::Orchestration,
                     summary: format!(
                         "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
                     ),
@@ -1021,6 +1029,7 @@ fn run_profile_with_contract_impl(
                     confidence: 1.0,
                     reproduction: None,
                     source_refs: Vec::new(),
+                    occurrence_id: None,
                 });
             }
         }
@@ -1063,8 +1072,8 @@ fn orchestration_error(profile: &str, summary: String) -> Finding {
     Finding {
         id: format!("AUDIT-ERR-{}", profile.to_uppercase()),
         rule_id: None,
-        severity: "error".into(),
-        category: "audit".into(),
+        severity: Severity::Error,
+        category: Category::Audit,
         summary,
         evidence: vec![EvidenceRef::point(
             EvidenceKind::Other,
@@ -1075,6 +1084,7 @@ fn orchestration_error(profile: &str, summary: String) -> Finding {
         confidence: 1.0,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     }
 }
 

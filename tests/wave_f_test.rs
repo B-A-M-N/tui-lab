@@ -889,8 +889,8 @@ fn audit_transaction_reports_timing_metrics() {
         vec![tui_lab::audit::Finding {
             id: "PROBE-1".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "probe".into(),
+            severity: tui_lab::audit::Severity::Info,
+            category: tui_lab::audit::Category::Other("probe".into()),
             summary: "probe hit".into(),
             evidence: vec![tui_lab::audit::EvidenceRef::point(
                 tui_lab::audit::EvidenceKind::Other,
@@ -900,6 +900,7 @@ fn audit_transaction_reports_timing_metrics() {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         }]
     })
     .expect("run");
@@ -970,7 +971,7 @@ fn clean_audit_run_has_no_fake_metrics_finding() {
         report
             .findings
             .iter()
-            .all(|f| f.severity != "info" || !f.id.starts_with("AUDIT-")),
+            .all(|f| f.severity != tui_lab::audit::Severity::Info || !f.id.starts_with("AUDIT-")),
         "timing must not masquerade as an audit finding"
     );
     assert!(

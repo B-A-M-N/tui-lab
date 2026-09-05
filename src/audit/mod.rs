@@ -122,6 +122,175 @@ impl EvidenceRef {
     }
 }
 
+/// Finding severity (finding 21): a closed, ordered vocabulary — not a
+/// free string. Ordering is the response ladder: `info < warn < error`, so
+/// callers can ask "any error-level findings?" without string matching.
+/// Serialized as the lowercase slug the wire has always used (`"error"`,
+/// `"warn"`, `"info"`), so persisted ledgers and existing clients keep
+/// working; unknown strings deserialize as an error, not a silent
+/// downgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl Severity {
+    /// The wire slug (`"error" | "warn" | "info"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+            Severity::Error => "error",
+        }
+    }
+
+    /// Parse a severity slug. Unknown values are errors — the old
+    /// `severity: String` field accepted anything ("critcal") and every
+    /// downstream `== "error"` filter silently missed it.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "info" => Ok(Severity::Info),
+            "warn" => Ok(Severity::Warn),
+            "error" => Ok(Severity::Error),
+            other => Err(format!(
+                "unknown severity '{other}' (expected info | warn | error)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for Severity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Severity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Severity::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The audit domain a finding belongs to (finding 21). Known families are a
+/// closed set with honest parse errors; contract-conformance findings carry
+/// `contract/<group>` (groups are project-defined), so unknown-but-shaped
+/// values parse as `Other` and round-trip losslessly instead of being
+/// rejected — a category names a domain, it does not gate behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Category {
+    Audit,
+    Clipping,
+    Color,
+    Controls,
+    Discoverability,
+    Errors,
+    Focus,
+    InputProtocol,
+    Keyboard,
+    Lifecycle,
+    Mouse,
+    Navigation,
+    Orchestration,
+    Performance,
+    QueryResponse,
+    Rendering,
+    Resize,
+    ShellCli,
+    States,
+    TerminalModes,
+    Unicode,
+    /// Contract conformance: `contract/<group>` with a project-defined
+    /// group slug, or any other unrecognized domain (round-trips as-is).
+    Other(String),
+}
+
+impl Category {
+    /// The wire slug (`"focus"`, `"terminal_modes"`, `"contract/ui"`, …).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Category::Audit => "audit",
+            Category::Clipping => "clipping",
+            Category::Color => "color",
+            Category::Controls => "controls",
+            Category::Discoverability => "discoverability",
+            Category::Errors => "errors",
+            Category::Focus => "focus",
+            Category::InputProtocol => "input_protocol",
+            Category::Keyboard => "keyboard",
+            Category::Lifecycle => "lifecycle",
+            Category::Mouse => "mouse",
+            Category::Navigation => "navigation",
+            Category::Orchestration => "orchestration",
+            Category::Performance => "performance",
+            Category::QueryResponse => "query_response",
+            Category::Rendering => "rendering",
+            Category::Resize => "resize",
+            Category::ShellCli => "shell_cli",
+            Category::States => "states",
+            Category::TerminalModes => "terminal_modes",
+            Category::Unicode => "unicode",
+            Category::Other(s) => s,
+        }
+    }
+
+    /// Parse a category slug. Known families map to their variant; anything
+    /// else parses as [`Category::Other`] (open domain, lossless
+    /// round-trip) — parse never fails.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "audit" => Category::Audit,
+            "clipping" => Category::Clipping,
+            "color" => Category::Color,
+            "controls" => Category::Controls,
+            "discoverability" => Category::Discoverability,
+            "errors" => Category::Errors,
+            "focus" => Category::Focus,
+            "input_protocol" => Category::InputProtocol,
+            "keyboard" => Category::Keyboard,
+            "lifecycle" => Category::Lifecycle,
+            "mouse" => Category::Mouse,
+            "navigation" => Category::Navigation,
+            "orchestration" => Category::Orchestration,
+            "performance" => Category::Performance,
+            "query_response" => Category::QueryResponse,
+            "rendering" => Category::Rendering,
+            "resize" => Category::Resize,
+            "shell_cli" => Category::ShellCli,
+            "states" => Category::States,
+            "terminal_modes" => Category::TerminalModes,
+            "unicode" => Category::Unicode,
+            other => Category::Other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for Category {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for Category {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Category {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Category::parse(&String::deserialize(deserializer)?))
+    }
+}
+
 /// One audit finding. `evidence` is a list of [`EvidenceRef`]s (re-review
 /// Part XV) — a Finding can carry many citations, not just one inline blob.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -136,8 +305,8 @@ pub struct Finding {
     /// `FOCUS-001`, …) — stable across runs, the comparison key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
-    pub severity: String, // error | warn | info
-    pub category: String,
+    pub severity: Severity,
+    pub category: Category,
     pub summary: String,
     /// One or more typed evidence references. Always non-empty for a
     /// well-formed finding; empty evidence is treated as a bug.
@@ -157,6 +326,12 @@ pub struct Finding {
     /// below-fence guess is carried, not hidden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<crate::semantic::source_ref::SourceRef>,
+    /// Canonical occurrence identity (finding 21): versioned hash over
+    /// sorted key material (rule, category, evidence targets). Assigned by
+    /// [`Finding::instance`]; a hand-built finding reports it on demand via
+    /// [`Finding::occurrence_id`]. Baselines compare on this, not on `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<String>,
 }
 
 impl Finding {
@@ -164,6 +339,10 @@ impl Finding {
     /// instance id is unique per (rule, semantic target) pair, stable for
     /// the same target on the same rule — comparisons fingerprint rule +
     /// target, and two distinct clipped regions can never collide.
+    ///
+    /// Finding 21: this is also where the typed `occurrence_id` is
+    /// assigned — the canonical, versioned occurrence identity (sorted
+    /// key material, see [`occurrence_id`]) that baselines compare on.
     pub fn instance(mut self) -> Self {
         let rule = self.rule_id.clone().unwrap_or_else(|| self.id.clone());
         // Discriminator: the first evidence target (region/control id,
@@ -181,7 +360,38 @@ impl Finding {
         } else {
             self.id = format!("{rule}@{}", short_hash(&rule, &target.unwrap_or_default()));
         }
+        self.occurrence_id = Some(Finding::occurrence_id(&self));
         self
+    }
+
+    /// The canonical occurrence identity (finding 21): a versioned hash
+    /// over SORTED key parts — rule id, category, every evidence target —
+    /// so the same defect observed through differently-ordered evidence
+    /// still fingerprints identically, and any drift in what constitutes
+    /// "the same occurrence" changes the schema prefix instead of
+    /// silently re-colliding. This is what baselines compare on.
+    pub fn occurrence_id(&self) -> String {
+        let rule = self.rule_id.clone().unwrap_or_else(|| self.id.clone());
+        let mut parts: Vec<String> = vec![rule, self.category.as_str().to_string()];
+        parts.extend(
+            self.evidence
+                .iter()
+                .filter_map(|e| e.target.clone())
+                .filter(|t| !t.is_empty()),
+        );
+        parts.sort();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FINDING_SCHEMA.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(b"occurrence");
+        hasher.update(&[0u8]);
+        hasher.update(&(parts.len() as u64).to_le_bytes());
+        for p in &parts {
+            hasher.update(&(p.len() as u64).to_le_bytes());
+            hasher.update(p.as_bytes());
+        }
+        let digest = hasher.finalize();
+        hex_16(digest.as_bytes())
     }
 }
 
@@ -212,12 +422,18 @@ fn short_hash(rule: &str, target: &str) -> String {
     format!("{:08x}", word)
 }
 
+/// First 16 hex chars of a digest — the occurrence-id shape (64-bit
+/// collision space, printed; not a truncated u32).
+fn hex_16(bytes: &[u8]) -> String {
+    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 impl Finding {
     /// Build a finding with a single screen-snapshot evidence ref.
     pub fn with_screen(
         id: impl Into<String>,
-        severity: impl Into<String>,
-        category: impl Into<String>,
+        severity: Severity,
+        category: Category,
         summary: impl Into<String>,
         screen_hash: impl Into<String>,
         confidence: f32,
@@ -227,13 +443,14 @@ impl Finding {
         Finding {
             id: id.into(),
             rule_id: None,
-            severity: severity.into(),
-            category: category.into(),
+            severity,
+            category,
             summary: s.clone(),
             evidence: vec![EvidenceRef::screen(hash, s)],
             confidence,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         }
     }
 
@@ -313,8 +530,8 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
         out.push(Finding {
             id: "FOCUS-001".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "focus".into(),
+            severity: Severity::Warn,
+            category: Category::Focus,
             summary: summary.clone(),
             evidence: vec![EvidenceRef::screen(screen.structure_hash.clone(), summary)
                 .with_detail(json!({
@@ -324,6 +541,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     } else if sem.focus.control.is_some() {
         let ctrl = sem.focus.control.clone().unwrap_or_default();
@@ -334,8 +552,8 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
         out.push(Finding {
             id: "FOCUS-OK".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "focus".into(),
+            severity: Severity::Info,
+            category: Category::Focus,
             summary: summary.clone(),
             evidence: vec![
                 EvidenceRef::control(ctrl.clone(), summary).with_detail(json!({
@@ -345,6 +563,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
             confidence: sem.focus.confidence,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     out
@@ -359,8 +578,8 @@ fn static_clipping_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
             out.push(Finding {
                 id: "CLIP-001".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "clipping".into(),
+                severity: Severity::Error,
+                category: Category::Clipping,
                 summary: summary.clone(),
                 evidence: vec![
                     EvidenceRef::region(rg.id.clone(), summary).with_detail(json!({
@@ -371,6 +590,7 @@ fn static_clipping_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                 confidence: 0.96,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -399,8 +619,8 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
         out.push(Finding {
             id: "DISC-001".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "discoverability".into(),
+            severity: Severity::Warn,
+            category: Category::Discoverability,
             summary: summary.clone(),
             evidence: vec![EvidenceRef::screen(screen.structure_hash.clone(), summary)
                 .with_detail(json!({
@@ -409,6 +629,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
             confidence: 0.5,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return out;
     }
@@ -421,8 +642,8 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
     out.push(Finding {
         id: "DISC-OK".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "discoverability".into(),
+        severity: Severity::Info,
+        category: Category::Discoverability,
         summary: summary.clone(),
         evidence: vec![EvidenceRef::screen(screen.structure_hash.clone(), &summary).with_detail(
             json!({
@@ -442,6 +663,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
         confidence: 0.85,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     // Hidden-keybinding heuristic: prose words that commonly announce
@@ -462,8 +684,8 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
             out.push(Finding {
                 id: format!("DISC-HIDDEN-{}", verb.to_uppercase()),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "discoverability".into(),
+                severity: Severity::Warn,
+                category: Category::Discoverability,
                 summary: s.clone(),
                 evidence: vec![
                     EvidenceRef::screen(screen.structure_hash.clone(), &s).with_detail(
@@ -473,6 +695,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                 confidence: 0.6,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -526,8 +749,8 @@ fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
         out.push(Finding {
             id: "UNI-WIDE".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "unicode".into(),
+            severity: Severity::Warn,
+            category: Category::Unicode,
             summary: summary.clone(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Other,
@@ -542,6 +765,7 @@ fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -560,8 +784,8 @@ fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
         out.push(Finding {
             id: "UNI-CTRL".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "unicode".into(),
+            severity: Severity::Warn,
+            category: Category::Unicode,
             summary: summary.clone(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Other,
@@ -575,6 +799,7 @@ fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -621,8 +846,8 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
         out.push(Finding {
             id: "CTRL-ORPHAN".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "controls".into(),
+            severity: Severity::Info,
+            category: Category::Controls,
             summary: summary.clone(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Other,
@@ -636,6 +861,7 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -656,8 +882,8 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
             out.push(Finding {
                 id: "CTRL-AMBIG".into(),
                 rule_id: None,
-                severity: "warn".into(),
-                category: "controls".into(),
+                severity: Severity::Warn,
+                category: Category::Controls,
                 summary: summary.clone(),
                 evidence: vec![EvidenceRef::point(
                     EvidenceKind::Other,
@@ -671,6 +897,7 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
                 confidence: 0.8,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
         }
     }
@@ -694,8 +921,8 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
         out.push(Finding {
             id: "KB-INFO".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "keyboard".into(),
+            severity: Severity::Info,
+            category: Category::Keyboard,
             summary: summary.clone(),
             evidence: vec![
                 EvidenceRef::point(EvidenceKind::Other, "keyboard_buttons", summary).with_detail(
@@ -707,6 +934,7 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
             confidence: 0.85,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
     out
@@ -715,6 +943,80 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 21: severity is a closed, ordered vocabulary — parses the
+    /// wire slugs, rejects typos, orders as the response ladder, and
+    /// round-trips through serde as the same slug the wire always used.
+    #[test]
+    fn severity_is_typed_ordered_and_wire_compatible() {
+        assert_eq!(Severity::parse("error"), Ok(Severity::Error));
+        assert!(Severity::parse("critical").is_err(), "typos are errors");
+        assert!(Severity::Error > Severity::Warn);
+        assert!(Severity::Warn > Severity::Info);
+        assert_eq!(serde_json::to_value(Severity::Warn).unwrap(), "warn");
+        assert_eq!(
+            serde_json::from_str::<Severity>("\"error\"").unwrap(),
+            Severity::Error
+        );
+        assert!(serde_json::from_str::<Severity>("\"critcal\"").is_err());
+    }
+
+    /// Finding 21: category is typed — known families parse to variants,
+    /// unknown-but-shaped slugs parse as Other and round-trip losslessly
+    /// (contract groups are project-defined, so the set stays open).
+    #[test]
+    fn category_is_typed_with_lossless_open_set() {
+        assert_eq!(Category::parse("terminal_modes"), Category::TerminalModes);
+        assert_eq!(
+            Category::parse("contract/ui"),
+            Category::Other("contract/ui".into())
+        );
+        // Round-trip: every known slug comes back identical, and an Other
+        // survives too — a category names a domain, it gates nothing.
+        for slug in [
+            "audit",
+            "focus",
+            "keyboard",
+            "resize",
+            "orchestration",
+            "contract/ui",
+        ] {
+            assert_eq!(Category::parse(slug).as_str(), slug);
+        }
+    }
+
+    /// Finding 21: occurrence identity is a sorted-key fingerprint —
+    /// evidence order cannot change it, but any key-part change can.
+    #[test]
+    fn occurrence_id_is_order_insensitive_and_discriminating() {
+        let mk = |targets: Vec<&str>| Finding {
+            id: "CLIP-001".into(),
+            rule_id: Some("CLIP-001".into()),
+            severity: Severity::Warn,
+            category: Category::Clipping,
+            summary: "clipped".into(),
+            evidence: targets
+                .into_iter()
+                .map(|t| EvidenceRef::point(EvidenceKind::Region, t, "region"))
+                .collect(),
+            confidence: 0.9,
+            reproduction: None,
+            source_refs: Vec::new(),
+            occurrence_id: None,
+        };
+        let a = mk(vec!["region-a", "region-b"]);
+        let b = mk(vec!["region-b", "region-a"]);
+        assert_eq!(a.occurrence_id(), b.occurrence_id(), "order is irrelevant");
+        let c = mk(vec!["region-a", "region-c"]);
+        assert_ne!(a.occurrence_id(), c.occurrence_id(), "target change bites");
+        let mut d = mk(vec!["region-a", "region-b"]);
+        d.severity = Severity::Error;
+        assert_eq!(
+            a.occurrence_id(),
+            d.occurrence_id(),
+            "severity is not identity — the same defect at a worse level is the same occurrence"
+        );
+    }
 
     fn screen(rows: Vec<&str>) -> ScreenState {
         ScreenState {
@@ -802,7 +1104,9 @@ mod tests {
         let sem = crate::semantic::analyze(&s);
         let findings = run("full", &s, &sem).expect("full is static-available");
         assert!(
-            findings.iter().any(|f| f.category == "discoverability"),
+            findings
+                .iter()
+                .any(|f| f.category.as_str() == "discoverability"),
             "discoverability runs in the full profile"
         );
         // Item 44: a profile without static checks is a caller error, not

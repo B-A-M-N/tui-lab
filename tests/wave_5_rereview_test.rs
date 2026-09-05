@@ -235,7 +235,7 @@ async fn rendering_imbalance_downgrades_on_dropped_head() {
             "unbalanced hide/show on a complete window must be reported; got {:?}",
             findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>()
         );
-        assert_eq!(leak.unwrap().severity, "warn");
+        assert_eq!(leak.unwrap().severity, tui_lab::audit::Severity::Warn);
     })
     .await
     .expect("rendering audit job");
@@ -375,7 +375,7 @@ async fn lifecycle_exit_audit_reports_missing_restoration() {
 }
 
 fn ok_severity_is_error(f: &tui_lab::audit::Finding) -> bool {
-    f.severity == "error"
+    f.severity == tui_lab::audit::Severity::Error
 }
 
 /// The safe-only default must REFUSE the exit audit: it kills the app.

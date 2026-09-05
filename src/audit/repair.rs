@@ -287,8 +287,8 @@ mod tests {
         crate::audit::Finding {
             id: "CLIP-001".into(),
             rule_id: None,
-            severity: "error".into(),
-            category: "layout".into(),
+            severity: crate::audit::Severity::Error,
+            category: crate::audit::Category::Clipping,
             summary: "Save button clipped at right edge".into(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Control,
@@ -298,6 +298,7 @@ mod tests {
             confidence: 0.9,
             reproduction: repro.map(String::from),
             source_refs: refs,
+            occurrence_id: None,
         }
     }
 

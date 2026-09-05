@@ -153,7 +153,11 @@ async fn errors_audit_catches_on_screen_error_text() {
             .iter()
             .find(|f| f.id == "ERR-TEXT-HINT")
             .expect("weak marker must surface as a hint, not silence");
-        assert_eq!(f.severity, "info", "weak markers stay informational");
+        assert_eq!(
+            f.severity,
+            tui_lab::audit::Severity::Info,
+            "weak markers stay informational"
+        );
         assert!(
             f.summary.contains("error"),
             "marker named in summary: {:?}",
@@ -199,7 +203,7 @@ async fn errors_audit_strong_markers_stay_errors() {
             .iter()
             .find(|f| f.id == "ERR-ON-SCREEN")
             .expect("strong marker must stay an error-severity finding");
-        assert_eq!(f.severity, "error");
+        assert_eq!(f.severity, tui_lab::audit::Severity::Error);
         let strong = f.evidence[0].detail["strong_markers"]
             .as_array()
             .expect("strong");
@@ -276,7 +280,7 @@ async fn states_audit_reports_frame_state_findings() {
         assert!(
             findings
                 .iter()
-                .all(|f| f.category == "states" || f.id == "AUDIT-RESIDUE"),
+                .all(|f| f.category.as_str() == "states" || f.id == "AUDIT-RESIDUE"),
             "states findings carry the states category: {:?}",
             findings
                 .iter()

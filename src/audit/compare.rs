@@ -5,25 +5,22 @@
 //! so a first-seen defect is not mistaken for a regression caused by a
 //! change).
 //!
-//! The fingerprint is `category + id + stable evidence target`: finding IDs
-//! like `KB-TRAP` repeat across steps, so the step-specific detail lives in
-//! evidence, and the fingerprint folds in the primary evidence target (a
-//! control id, region id, or evidence label) to distinguish "same defect,
-//! same place" from "same class, different place".
+//! The fingerprint is the finding's [`Finding::occurrence_id`] (finding
+//! 21): a versioned hash over SORTED key material — rule id, category,
+//! every evidence target — so evidence order cannot change identity, and
+//! the schema prefix bumps if what counts as "the same occurrence" ever
+//! changes.
 
 use serde_json::json;
 
 use crate::audit::Finding;
 
-/// A stable identity for one finding occurrence: same category + id +
-/// primary evidence target = same defect in the same place.
+/// A stable identity for one finding occurrence: same rule + category +
+/// evidence targets (order-insensitive) = same defect in the same place.
+/// Prefers the stored `occurrence_id` (assigned at `instance()`), so a
+/// persisted baseline is never re-derived; computes on demand otherwise.
 pub fn fingerprint(f: &Finding) -> String {
-    let target = f
-        .evidence
-        .first()
-        .and_then(|e| e.target.clone())
-        .unwrap_or_default();
-    format!("{}|{}|{}", f.category, f.id, target)
+    f.occurrence_id.clone().unwrap_or_else(|| f.occurrence_id())
 }
 
 /// One compared finding: what it is, its verdict against the baseline, and
@@ -128,19 +125,20 @@ pub fn summary(compared: &[ComparedFinding]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{EvidenceKind, EvidenceRef};
+    use crate::audit::{EvidenceKind, EvidenceRef, Severity};
 
     fn finding(id: &str, category: &str, target: &str) -> Finding {
         Finding {
             id: id.into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: category.into(),
+            severity: Severity::Warn,
+            category: crate::audit::Category::parse(category),
             summary: format!("{} in {}", id, category),
             evidence: vec![EvidenceRef::point(EvidenceKind::Other, target, "evidence")],
             confidence: 0.9,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         }
     }
 
@@ -155,15 +153,17 @@ mod tests {
             finding("FOCUS-001", "focus", "focus_missing"),
         ];
         let compared = compare(&baseline, &current);
-        let get = |fp_contains: &str| {
+        // Lookup by the compared finding's id (fingerprints are opaque
+        // hashes now — finding 21).
+        let get = |fid: &str| {
             compared
                 .iter()
-                .find(|c| c.fingerprint.contains(fp_contains))
+                .find(|c| c.finding.id == fid)
                 .expect("verdict present")
         };
-        assert_eq!(get("keyboard").verdict, "fixed");
-        assert_eq!(get("focus").verdict, "new");
-        assert_eq!(get("clipping").verdict, "persisting");
+        assert_eq!(get("KB-TRAP").verdict, "fixed");
+        assert_eq!(get("FOCUS-001").verdict, "new");
+        assert_eq!(get("CLIP-001").verdict, "persisting");
     }
 
     /// Same id but different evidence target = different defect, so one

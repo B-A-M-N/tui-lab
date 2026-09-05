@@ -8,7 +8,7 @@
 use crate::session::state::Session;
 use serde_json::json;
 
-use crate::audit::Finding;
+use crate::audit::{Category, Finding, Severity};
 use crate::protocol::TerminalOp;
 
 use super::shared::{decode_raw, ev_other, ev_other_empty};
@@ -26,8 +26,8 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
             findings.push(Finding {
                 id: "COLOR-ERR".into(),
                 rule_id: None,
-                severity: "error".into(),
-                category: "color".into(),
+                severity: Severity::Error,
+                category: Category::Color,
                 summary: format!("Cannot observe: {}", e),
                 evidence: vec![ev_other_empty(
                     "color_observe_failed",
@@ -36,6 +36,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
                 confidence: 1.0,
                 reproduction: None,
                 source_refs: Vec::new(),
+                occurrence_id: None,
             });
             return findings;
         }
@@ -54,8 +55,8 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
     findings.push(Finding {
         id: "COLOR-INVENTORY".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "color".into(),
+        severity: Severity::Info,
+        category: Category::Color,
         summary: format!(
             "color capability: {}, styled cells: {}/{}",
             if caps.colors { "present" } else { "absent" },
@@ -75,6 +76,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         confidence: 0.9,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
     findings
 }
@@ -89,8 +91,8 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "REND-NOSRC".into(),
             rule_id: None,
-            severity: "info".into(),
-            category: "rendering".into(),
+            severity: Severity::Info,
+            category: Category::Rendering,
             summary: "engine retains no raw output; rendering style unavailable".into(),
             evidence: vec![ev_other(
                 "raw_ring_absent",
@@ -100,6 +102,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 1.0,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
         return findings;
     };
@@ -180,8 +183,8 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
     findings.push(Finding {
         id: "REND-STYLE".into(),
         rule_id: None,
-        severity: "info".into(),
-        category: "rendering".into(),
+        severity: Severity::Info,
+        category: Category::Rendering,
         summary: format!("rendering style: {style}"),
         evidence: vec![ev_other(
             "render_op_census",
@@ -200,6 +203,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
         confidence: 0.9,
         reproduction: None,
         source_refs: Vec::new(),
+        occurrence_id: None,
     });
 
     // Flicker risk: repeated erase-all cycles with no synchronized-update
@@ -208,8 +212,8 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "REND-FLICKER".into(),
             rule_id: None,
-            severity: "warn".into(),
-            category: "rendering".into(),
+            severity: Severity::Warn,
+            category: Category::Rendering,
             summary: "repeated full-screen erases with no synchronized-update (CSI ?2026) — flicker/tearing risk on slow terminals.".into(),
             evidence: vec![ev_other(
                 "flicker_pattern",
@@ -219,6 +223,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             confidence: 0.7,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -230,7 +235,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
     if sync_on > 0 && sync_on != sync_off {
         let (severity, summary, confidence) = if dropped > 0 {
             (
-                "info",
+                Severity::Info,
                 format!(
                     "synchronized-update begin/end mismatch in the retained window ({sync_on} begins vs {sync_off} ends) — window is incomplete, so this is UNVERIFIED, not proof of an unbalanced pair."
                 ),
@@ -238,7 +243,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             )
         } else {
             (
-                "error",
+                Severity::Error,
                 format!(
                     "synchronized-update begin/end mismatch: {sync_on} begins vs {sync_off} ends in the retained window — an unbalanced pair freezes the terminal."
                 ),
@@ -248,8 +253,8 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "REND-SYNC-UNBALANCED".into(),
             rule_id: None,
-            severity: severity.into(),
-            category: "rendering".into(),
+            severity,
+            category: Category::Rendering,
             summary,
             evidence: vec![ev_other(
                 "sync_imbalance",
@@ -263,6 +268,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             confidence,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
@@ -273,7 +279,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
     if hide_cursor > show_cursor {
         let (severity, summary, confidence) = if dropped > 0 {
             (
-                "info",
+                Severity::Info,
                 format!(
                     "cursor hidden {hide_cursor}× but shown {show_cursor}× in the window — window is incomplete, so this is UNVERIFIED."
                 ),
@@ -281,7 +287,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             )
         } else {
             (
-                "warn",
+                Severity::Warn,
                 format!(
                     "cursor hidden {hide_cursor}× but shown {show_cursor}× in the window — the app may exit leaving the cursor invisible."
                 ),
@@ -291,8 +297,8 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
         findings.push(Finding {
             id: "REND-CURSOR-LEAK".into(),
             rule_id: None,
-            severity: severity.into(),
-            category: "rendering".into(),
+            severity,
+            category: Category::Rendering,
             summary,
             evidence: vec![ev_other(
                 "cursor_visibility_imbalance",
@@ -306,6 +312,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             confidence,
             reproduction: None,
             source_refs: Vec::new(),
+            occurrence_id: None,
         });
     }
 
