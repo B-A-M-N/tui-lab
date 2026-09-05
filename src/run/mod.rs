@@ -29,6 +29,7 @@ pub mod recording_scope;
 // signature, field visibility, and caller unchanged.)
 mod artifacts_impl;
 mod contract_impl;
+mod contract_state;
 mod coverage_impl;
 mod evidence_impl;
 mod findings_impl;
@@ -44,6 +45,7 @@ pub use manifest::RunManifest;
 
 use crate::checkpoint::store::CheckpointStore;
 use crate::exploration::state_graph::{ExplorationBudget, StateGraph};
+use contract_state::ContractState;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -335,14 +337,10 @@ pub struct RunContext {
     /// Events already written durably per session (item 38) — evidence for
     /// status: "events persisted incrementally" vs "held in memory".
     event_flushed_counts: HashMap<String, u64>,
-    /// The loaded project contract (Wave E item 39): feeds conformance
-    /// checks, exploration candidates, and audits.
-    contract: Option<crate::design::ProjectContract>,
-    /// Where that contract was loaded from (display/evidence).
-    contract_path: Option<String>,
-    /// Conformance baselines for `compare` (Wave E item 47): label → the
-    /// report captured under that label.
-    contract_baselines: HashMap<String, crate::design::ContractReport>,
+    /// The loaded project contract + conformance baselines (Wave E).
+    /// Round-2 (G1): moved into [`ContractState`] so the contract domain has
+    /// its own cohesive holder; RunContext delegates.
+    contract: ContractState,
     /// Wave G item 67: labeled audit-finding baselines for FIXED/REGRESSED/
     /// NEW comparison. `tui_audit label=X` stores this pass's findings under
     /// X; `tui_audit compare_to=X` diffs the fresh pass against the stored

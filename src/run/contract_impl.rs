@@ -1,30 +1,31 @@
 //! Design contracts and finding/contract baselines (label/compare support).
 //!
-//! Impl-family extraction (Phase 1): the `RunContext` struct and its
-//! fields stay in `super`; this child module only hosts the method
-//! bodies for this subsystem. Signatures, visibility, and callers are
-//! unchanged.
+//! Impl-family extraction (Phase 1): this child module hosts the method
+//! bodies for this subsystem. Round-2 (G1): the contract-domain methods
+//! now delegate to the cohesive [`super::contract_state::ContractState`];
+//! the finding-baseline methods still read `RunContext::finding_baselines`
+//! directly until the FindingStore extraction lands.
 
 use super::*;
 
 impl RunContext {
     /// The loaded project contract, if any. Feeds exploration candidates
-    /// (item 49) and `tui_contract status/compare`.
+    /// (item 49) and `tui_contract status/compare`. Round-2 (G1): delegates
+    /// to the cohesive [`super::contract_state::ContractState`].
     pub fn contract(&self) -> Option<&crate::design::ProjectContract> {
-        self.contract.as_ref()
+        self.contract.contract()
     }
 
     /// Record the loaded contract (replaces any previous one — the newest
     /// contract wins, matching the tool's load semantics).
     pub fn set_contract(&mut self, contract: crate::design::ProjectContract, path: String) {
-        self.contract = Some(contract);
-        self.contract_path = Some(path);
+        self.contract.set(contract, path);
         self.write_manifest().ok();
     }
 
     /// Where the current contract was loaded from.
     pub fn contract_path(&self) -> Option<&str> {
-        self.contract_path.as_deref()
+        self.contract.path()
     }
 
     /// Named conformance baselines for `tui_contract compare`: label →
@@ -32,7 +33,7 @@ impl RunContext {
     /// `compare` writes the label it was given so later comparisons have
     /// history.
     pub fn contract_baselines(&self) -> &HashMap<String, crate::design::ContractReport> {
-        &self.contract_baselines
+        self.contract.baselines()
     }
 
     /// Store (or overwrite) a labeled audit-finding baseline (item 67).
@@ -79,7 +80,6 @@ impl RunContext {
         label: &str,
         report: &crate::design::ContractReport,
     ) {
-        self.contract_baselines
-            .insert(label.to_string(), report.clone());
+        self.contract.record_baseline(label, report);
     }
 }
