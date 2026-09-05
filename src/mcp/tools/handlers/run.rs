@@ -172,24 +172,52 @@ pub(crate) async fn tui_run(
             }
             // OWNED sessions survive close unless explicitly requested;
             // foreign sessions are NEVER touched by another run's close.
-            let stopped: Vec<String> = if kill {
+            // Finding 4/13: a LEASED session is never killed by close
+            // either — killing the process under a human driving it is the
+            // exact hazard the lease exists to prevent. Leased sessions are
+            // skipped and reported (`leased_not_killed`) with holder and
+            // remaining TTL; they can still be stopped explicitly via
+            // tui_session stop after the lease is released or expired.
+            let (mut stopped, leased_not_killed) = if kill {
                 let mut out = Vec::new();
+                let mut leased = Vec::new();
                 for sid in &owned {
+                    // Lease check via the POOL, not with_sess: this runs
+                    // after run.close(), and with_sess refuses a closed run
+                    // — which would silently flatten to "no lease" and kill
+                    // the leased session. Reading the lease is bookkeeping,
+                    // not driving.
+                    let live_lease = s
+                        .sessions
+                        .with_session(Some(sid), |sess| sess.driving_blocked())
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(lease) = live_lease {
+                        leased.push(serde_json::json!({
+                            "session": sid,
+                            "holder": lease.holder,
+                            "remaining_ms": lease.remaining_ms(),
+                        }));
+                        continue;
+                    }
                     if s.sessions.stop(sid).await.is_ok() {
                         s.session_owners.lock().unwrap().remove(sid);
                         out.push(sid.clone());
                     }
                 }
-                out
+                (out, leased)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
+            let _ = &mut stopped;
             ok(json!({
                 "closed": true,
                 "already_closed": already,
                 "owned_sessions": owned,
                 "foreign_live_sessions": foreign,
                 "sessions_stopped": stopped,
+                "leased_not_killed": leased_not_killed,
                 "final": summary,
             }))
         }

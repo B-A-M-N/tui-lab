@@ -1326,13 +1326,24 @@ fn resources_list_and_read_live_state() {
     );
 
     // read the screen view: viewport text carries the child's output.
-    let screen = mcp.request(
-        "resources/read",
-        serde_json::json!({ "uri": format!("tui://sessions/{sid}/screen") }),
-    );
-    let stext = screen["result"]["contents"][0]["text"]
-        .as_str()
-        .unwrap_or("");
+    // The child boots (and prints) asynchronously — under parallel test
+    // load the first read can precede its output, so poll until the marker
+    // shows or the budget burns.
+    let mut stext = String::new();
+    for _ in 0..40 {
+        let screen = mcp.request(
+            "resources/read",
+            serde_json::json!({ "uri": format!("tui://sessions/{sid}/screen") }),
+        );
+        stext = screen["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if stext.contains("res-ready") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(stext.contains("res-ready"), "screen payload: {stext}");
 
     // read the run manifest: id matches the session-start echo.
@@ -1942,6 +1953,11 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
         serde_json::json!({ "action": "lease", "id": session, "by": "probe-e2e" }),
     );
     assert_eq!(lease["category"], "success", "lease: {lease}");
+    // Finding 4: the release token rides the grant.
+    let lease_id = lease["data"]["lease_id"]
+        .as_str()
+        .expect("lease_id")
+        .to_string();
 
     let drift = mcp.tool(
         "tui_probe",
@@ -1963,7 +1979,7 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
 
     let _ = mcp.tool(
         "tui_session",
-        serde_json::json!({ "action": "release", "id": session }),
+        serde_json::json!({ "action": "release", "id": session, "lease_id": lease_id }),
     );
 
     // 2) SENSITIVE stimulus: the typed secret must never surface in the

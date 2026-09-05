@@ -972,6 +972,11 @@ mod tests {
             // backend attaches panes and observes titles/bells); everything
             // else not listed restores to the no-claim `honest()` default.
             attach: true,
+            // Finding 6: this mirrors capabilities()' real claim — the pane
+            // is observed, not owned, and the native channel was never in
+            // its environment.
+            process_ownership: crate::backend::ProcessOwnership::Attached,
+            native_semantic: false,
             event_types: vec![
                 crate::backend::EventCapability::Output,
                 crate::backend::EventCapability::Bell,

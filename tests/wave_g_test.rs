@@ -499,6 +499,8 @@ async fn lease_blocks_driving_and_allows_observing() {
     );
     assert_eq!(take["leased"], true, "{take}");
     assert_eq!(take["holder"], "ana");
+    // Finding 4: the grant carries a release token.
+    let lease_id = take["lease_id"].as_str().expect("lease_id").to_string();
 
     // Every driving path refuses with control_leased, naming the holder.
     for (tool, args) in [
@@ -679,12 +681,13 @@ async fn lease_blocks_driving_and_allows_observing() {
     );
     assert_eq!(cap["format"], "svg", "{cap}");
 
-    // Release: driving works again (proves the block was the lease, not breakage).
+    // Release: driving works again (proves the block was the lease, not
+    // breakage). Finding 4: early release requires the lease_id token.
     let rel = unwrap_ok(
         &server
-            .tui_session(params_typed(
-                serde_json::json!({ "action": "release", "id": id }),
-            ))
+            .tui_session(params_typed(serde_json::json!({
+                "action": "release", "id": id, "lease_id": lease_id
+            })))
             .await,
         "lease release",
     );
@@ -720,6 +723,8 @@ async fn lease_is_exclusive_and_status_reports_it() {
         "first lease",
     );
     assert_eq!(first["leased"], true);
+    // Finding 4: the release token comes back with the grant.
+    let lease_id = first["lease_id"].as_str().expect("lease_id").to_string();
 
     // A second holder is refused (never silently stolen), naming who holds it.
     let second = unwrap_ok(
@@ -748,19 +753,63 @@ async fn lease_is_exclusive_and_status_reports_it() {
         "{st}"
     );
 
-    // Release with no lease afterwards is an honest false.
-    unwrap_ok(
+    // Finding 4: a tokenless release is refused while a live lease stands,
+    // and a WRONG token cannot drop someone else's grant either.
+    let tokenless = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "release", "id": id }),
+        ))
+        .await;
+    assert_eq!(
+        tokenless
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.get("category"))
+            .and_then(|c| c.as_str()),
+        Some("invalid_request"),
+        "release without lease_id is refused: {tokenless:?}"
+    );
+    let wrong = server
+        .tui_session(params_typed(serde_json::json!({
+            "action": "release", "id": id, "lease_id": "lease-not-the-holder"
+        })))
+        .await;
+    assert_eq!(
+        wrong
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.get("category"))
+            .and_then(|c| c.as_str()),
+        Some("control_leased"),
+        "a wrong token refuses with control_leased: {wrong:?}"
+    );
+    // status still shows the lease standing after both refusals.
+    let st2 = unwrap_ok(
         &server
             .tui_session(params_typed(
-                serde_json::json!({ "action": "release", "id": id }),
+                serde_json::json!({ "action": "status", "id": id }),
             ))
             .await,
-        "release",
+        "status after refused releases",
     );
+    assert_eq!(st2["lease"]["holder"], "human-1", "{st2}");
+
+    // The correct token releases.
+    let rel = unwrap_ok(
+        &server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "release", "id": id, "lease_id": lease_id }),
+            ))
+            .await,
+        "token release",
+    );
+    assert_eq!(rel["released"], true, "{rel}");
+
+    // Release with no lease afterwards is an honest false.
     let again = unwrap_ok(
         &server
             .tui_session(params_typed(
-                serde_json::json!({ "action": "release", "id": id }),
+                serde_json::json!({ "action": "release", "id": id, "lease_id": lease_id }),
             ))
             .await,
         "double release",
@@ -775,6 +824,128 @@ async fn lease_is_exclusive_and_status_reports_it() {
 }
 
 // ─────────────────────────── items 74 + 75: run restore / browser ───────────────────────────
+
+/// Finding 4/13: the lease gates the LIFECYCLE, not just driving. A live
+/// human lease refuses `tui_session stop` and `restart` (both kill the
+/// process the human is driving) and `tui_run close kill_sessions=true`
+/// skips leased sessions (reported as `leased_not_killed`). After release
+/// with the token, the same calls go through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lease_gates_lifecycle_mutations() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let id = start_session(
+        &server,
+        "print('lifecycle-lease'); import sys; sys.stdin.read(1)",
+    )
+    .await;
+
+    let lease = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "lease", "id": id, "holder": "operator", "ttl_ms": 60000,
+            })))
+            .await,
+        "lease",
+    );
+    let _lease_id = lease["lease_id"].as_str().expect("lease_id").to_string();
+
+    // stop refuses under the lease.
+    let stop = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+    let stop_v = stop.structured_content.clone().expect("stop envelope");
+    assert_eq!(stop_v["category"], "control_leased", "{stop_v:?}");
+    assert_eq!(stop_v["details"]["holder"], "operator", "{stop_v:?}");
+    assert!(
+        stop_v["details"]["retry_after_ms"].as_u64().unwrap_or(0) > 0,
+        "retry window rides the refusal: {stop_v:?}"
+    );
+
+    // restart refuses under the lease.
+    let restart = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "restart", "id": id }),
+        ))
+        .await;
+    let restart_v = restart
+        .structured_content
+        .clone()
+        .expect("restart envelope");
+    assert_eq!(restart_v["category"], "control_leased", "{restart_v:?}");
+
+    // kill_sessions=true SKIPS the leased session (never kills a human's
+    // process) but still stops an UNLEASED sibling — the skip is the lease
+    // gate, not a close-path regression. A second, unleased session makes
+    // that contrast observable through `tui_run status` (which does not
+    // drive sessions and stays legal on a closed run).
+    let free_id = start_session(&server, "print('unleased'); import sys; sys.stdin.read(1)").await;
+    // Fresh run so the new sibling is owned by the CURRENT (open) run.
+    let free_leases = server
+        .tui_run(params_typed(serde_json::json!({ "action": "status" })))
+        .await;
+    assert!(
+        free_leases.structured_content.is_some(),
+        "run status: {free_leases:?}"
+    );
+    let close_res = unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "close", "kill_sessions": true }),
+            ))
+            .await,
+        "close",
+    );
+    assert_eq!(
+        close_res["sessions_stopped"]
+            .as_array()
+            .expect("stopped list")
+            .clone(),
+        serde_json::json!([free_id]).as_array().unwrap().clone(),
+        "the unleased sibling was stopped: {close_res}"
+    );
+    assert_eq!(
+        close_res["leased_not_killed"][0]["session"],
+        id.as_str(),
+        "close NAMES the leased session it refused to kill: {close_res}"
+    );
+    assert_eq!(
+        close_res["leased_not_killed"][0]["holder"], "operator",
+        "{close_res}"
+    );
+    let after = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "status" })))
+            .await,
+        "run status after close",
+    );
+    let sessions_now = after["sessions"].as_array().expect("sessions list");
+    assert!(
+        sessions_now.iter().any(|v| v.as_str() == Some(id.as_str())),
+        "the LEASED session survived kill_sessions=true: {after:?}"
+    );
+    assert!(
+        !sessions_now
+            .iter()
+            .any(|v| v.as_str() == Some(free_id.as_str())),
+        "the unleased sibling was stopped as requested: {after:?}"
+    );
+
+    // The close never touched the survivor's lease state: the lease fields
+    // close reported prove it was still live at close time (tui_session
+    // status is run-gated on the closed run, so this is the honest window).
+    let remaining = close_res["leased_not_killed"][0]["remaining_ms"]
+        .as_u64()
+        .expect("remaining_ms present");
+    assert!(
+        remaining > 0 && remaining <= lease["ttl_ms"].as_u64().unwrap_or(0),
+        "the lease was live (within its TTL) at close time: {remaining}ms"
+    );
+    // (Leftover processes: the server's drop tears the pool down and kills
+    // the survivor — the lease never blocked the internal stop authority,
+    // only the machine-facing surface, by design.)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_list_resume_restores_identity_and_artifacts() {
