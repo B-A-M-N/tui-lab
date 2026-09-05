@@ -79,21 +79,22 @@ impl ActionVerb {
     /// raise this (a button labelled "Delete" mutates), never lower it.
     pub fn base_risk(&self) -> ActionRisk {
         match self {
-            // Audit P0-4: `focus` plans as a MOUSE CLICK in this engine —
-            // and a click on a button is an activation, not mere focus
-            // traversal. Claiming Safe while sending a click let a
-            // `max_risk=safe` explorer mutate the app while believing it
-            // was only moving focus. Until a genuinely non-activating
-            // focus primitive exists (a native focus event or verified
-            // Tab traversal), the honest class is Mutating.
-            ActionVerb::Focus => ActionRisk::Mutating,
+            // Finding 3A: focus is now a genuine non-activating primitive —
+            // Tab/Shift+Tab traversal verified by an AssertFocus guard, never
+            // a click (a click on a button is an activation). The doc's risk
+            // ladder names focus movement as the Safe case; now that the
+            // mechanism matches the name, the class does too.
+            ActionVerb::Focus => ActionRisk::Safe,
             // Activation/click runs the control's action — mutating unless
             // proven otherwise.
             ActionVerb::Activate | ActionVerb::Click | ActionVerb::Toggle | ActionVerb::Select => {
                 ActionRisk::Mutating
             }
             ActionVerb::Type { .. } => ActionRisk::Mutating,
-            ActionVerb::Open => ActionRisk::Safe,
+            // Finding 3C: `open` sends Enter on a genuinely openable control
+            // (a menu item). Opening a menu navigates/changes app state — it
+            // was never honestly `Safe`.
+            ActionVerb::Open => ActionRisk::Mutating,
         }
     }
 }
@@ -172,6 +173,17 @@ pub enum IntentError {
     /// The verb does not apply to the matched control's kind (typing into a
     /// button, toggling a label).
     VerbMismatch { target: String, verb: String },
+    /// Finding 3A/3C: the verb has no honest execution plan for this target
+    /// on this session — no proven focus route to the control (`focus` with
+    /// an empty/undemonstrated Tab graph), or the control is not a
+    /// known-openable role (`open` on a button). Distinct from
+    /// `VerbMismatch` (which names a kind the verb never applies to); this
+    /// is "the engine refuses to guess".
+    Unsupported {
+        target: String,
+        verb: String,
+        why: String,
+    },
 }
 
 impl IntentError {
@@ -199,6 +211,9 @@ impl IntentError {
             ),
             IntentError::VerbMismatch { target, verb } => {
                 format!("verb '{verb}' does not apply to {target}")
+            }
+            IntentError::Unsupported { target, verb, why } => {
+                format!("verb '{verb}' cannot be planned for {target}: {why}")
             }
         }
     }
@@ -243,10 +258,13 @@ pub struct ResolvedIntent {
 pub fn classify_risk(verb: &ActionVerb, control: Option<&Control>) -> ActionRisk {
     let base = verb.base_risk();
     let Some(c) = control else { return base };
-    // Focus/open never execute the control's action; label signals do not
-    // apply to them. (Audit P0-4: focus is already Mutating at the base —
-    // its click CAN activate — so there is no Safe shortcut to restore.)
-    if matches!(verb, ActionVerb::Focus | ActionVerb::Open) {
+    // Finding 3C: `open` on a menu item still executes the item's action,
+    // but the label signals below concern the payload — opening "Export"
+    // is exactly as external as activating it, so open participates in
+    // label evidence like every other verb. `focus` (finding 3A) is a
+    // guarded Tab traversal that never sends the payload — label evidence
+    // genuinely does not apply, and its base is now honestly Safe.
+    if matches!(verb, ActionVerb::Focus) {
         return base;
     }
     let label = c.label.to_lowercase();
@@ -341,29 +359,29 @@ pub fn resolve_target(sem: &SemanticScreen, target: &ActionTarget) -> Result<Con
 /// Keyboard-first: activation goes through focus + Enter so it works for any
 /// focusable control, with a mouse click only when the control is not
 /// focusable and the backend has mouse.
+///
+/// Finding 3A: `Focus` has NO action here — a bare key cannot name a target
+/// control, and the old click substitution activated the target it claimed
+/// to merely focus. Focus planning happens in [`super::plan::plan_intent`],
+/// which builds a verified Tab/Shift+Tab traversal from the session's
+/// FocusGraph; without a proven route the verb is `Unsupported`, never a
+/// click.
 pub fn plan_action(verb: &ActionVerb, control: &Control) -> Result<CanonicalAction, IntentError> {
     use CanonicalAction as CA;
     let center_x = control.bounds.x.saturating_add(control.bounds.width / 2);
     let center_y = control.bounds.y;
     let verb_name = verb.name();
     match (verb, &control.kind) {
-        (ActionVerb::Focus, _) => {
-            if !control.focusable {
-                return Err(IntentError::VerbMismatch {
-                    target: control.id.clone(),
-                    verb: verb_name.into(),
-                });
-            }
-            // Focus is reached by clicking with the keyboard-safe path:
-            // there is no "focus this" key, so activation-style traversal is
-            // the honest plan — a click on focusable controls is the only
-            // direct route and is left to the caller when mouse is absent.
-            Ok(CA::MouseClick {
-                button: MouseButton::Left,
-                x: center_x,
-                y: center_y,
-            })
-        }
+        // Finding 3A: focus is planned as traversal, not here. Reaching this
+        // arm means a caller asked for a one-step focus action — refused.
+        (ActionVerb::Focus, _) => Err(IntentError::Unsupported {
+            target: control.id.clone(),
+            verb: verb_name.into(),
+            why: "focus needs a verified traversal plan (FocusGraph Tab route); \
+                  a single unconditional action cannot move focus without activating — \
+                  use plan_intent, which plans the Tab route and guards it"
+                .into(),
+        }),
         (ActionVerb::Click, _) => Ok(CA::MouseClick {
             button: MouseButton::Left,
             x: center_x,
@@ -391,11 +409,17 @@ pub fn plan_action(verb: &ActionVerb, control: &Control) -> Result<CanonicalActi
             target: control.id.clone(),
             verb: verb_name.into(),
         }),
+        // Finding 3C: `open` is only legal on known-openable roles. The old
+        // fallthrough sent Enter to EVERY control under a Safe
+        // classification — an Enter on an arbitrary focused button is an
+        // activation, not an opening. Anything not provably openable is a
+        // VerbMismatch, so the agent picks `activate` deliberately.
         (ActionVerb::Open, ControlKind::MenuItem) => Ok(CA::Key {
             key: KeyEvent::new(KeyCode::Enter),
         }),
-        (ActionVerb::Open, _) => Ok(CA::Key {
-            key: KeyEvent::new(KeyCode::Enter),
+        (ActionVerb::Open, _) => Err(IntentError::VerbMismatch {
+            target: control.id.clone(),
+            verb: verb_name.into(),
         }),
         (ActionVerb::Type { text }, ControlKind::Field) => Ok(CA::Type { text: text.clone() }),
         (ActionVerb::Type { .. }, _) => Err(IntentError::VerbMismatch {

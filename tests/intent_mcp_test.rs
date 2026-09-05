@@ -32,15 +32,21 @@ fn unwrap_ok(raw: &CallToolResult, ctx: &str) -> serde_json::Value {
 }
 
 async fn start_dialog(server: &TuiLabServer) -> String {
+    start_dialog_with_env(server, serde_json::json!({})).await
+}
+
+async fn start_dialog_with_env(server: &TuiLabServer, env: serde_json::Value) -> String {
     let raw = server
         .tui_session(params_typed(serde_json::json!({
             "action": "start",
             "command": "python3",
             // The intent fixture enables mouse reporting, so the
-            // EnsureFocus click is protocol-legal (the plain dialog
-            // fixture's app has mouse mode None and the backend rightly
-            // refuses to fake a protocol the app did not request).
+            // focus-secured plan's primitives are protocol-legal (the
+            // plain dialog fixture's app has mouse mode None and the
+            // backend rightly refuses to fake a protocol the app did not
+            // request).
             "args": ["fixtures/intent_tui.py"],
+            "env": env,
             "cols": 80, "rows": 24,
         })))
         .await;
@@ -66,6 +72,18 @@ async fn plan_names_steps_and_risk_without_sending_input() {
     let id = start_dialog(&server).await;
     observe(&server, &id).await;
 
+    // Finding 3: planning a focus-secured activation needs a PROVEN Tab
+    // route. Prove it first with two real Tab traversals (there and back).
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
+
     let raw = server
         .tui_intent(params_typed(serde_json::json!({
             "target": { "by": "text", "text": "Save" },
@@ -78,12 +96,23 @@ async fn plan_names_steps_and_risk_without_sending_input() {
     assert_eq!(v["verb"], "activate");
     // Activation is mutating at base risk.
     assert_eq!(v["risk"], "mutating", "{v}");
-    // The focus-secured sequence: ensure_focus → assert_focus → act.
+    // The focus-secured sequence: move_focus → assert_focus → act.
     let steps = v["steps"].as_array().expect("steps array");
     assert_eq!(steps.len(), 3, "activate plans 3 steps: {v}");
-    assert_eq!(steps[0]["step"], "ensure_focus");
+    assert_eq!(steps[0]["step"], "move_focus");
     assert_eq!(steps[1]["step"], "assert_focus");
     assert_eq!(steps[2]["step"], "act");
+    // Finding 3A: the hop is a non-activating traversal key.
+    assert_eq!(steps[0]["how"], "tab", "{v}");
+    assert_eq!(steps[0]["non_activating"], true, "{v}");
+    // The plan response carries a plan_id (finding 3D).
+    assert!(
+        v["plan_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("plan-"),
+        "plan response carries a plan_id: {v}"
+    );
     let control = &v["control"];
     assert!(
         control["id"].as_str().unwrap_or("").contains("save"),
@@ -116,6 +145,21 @@ async fn execute_runs_the_focus_secured_sequence() {
     let id = start_dialog(&server).await;
     observe(&server, &id).await;
 
+    // Finding 3: focus routes are planned from the PROVEN FocusGraph.
+    // Prove the Tab route Cancel→Save with one real observed traversal:
+    // send Tab via tui_act (the fixture redraws focus onto Save and the
+    // executor records the edge), then Tab BACK so the plan has a hop to
+    // make. (Sending Tab twice lands focus where it started.)
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
+
     let raw = server
         .tui_intent(params_typed(serde_json::json!({
             "target": { "by": "text", "text": "Save" },
@@ -128,8 +172,15 @@ async fn execute_runs_the_focus_secured_sequence() {
     assert_eq!(v["mode"], "executed", "{v}");
     let steps = v["steps"].as_array().expect("executed steps");
     assert!(
-        steps.iter().any(|s| s["step"] == "ensure_focus"),
-        "focus click executed: {v}"
+        steps.iter().any(|s| s["step"] == "move_focus"),
+        "focus hop executed: {v}"
+    );
+    // Finding 3B: NO click may appear anywhere in the executed steps.
+    assert!(
+        !serde_json::to_string(&steps)
+            .unwrap()
+            .contains("mouse_click"),
+        "a focus-secured plan must not click: {v}"
     );
     assert!(
         steps
@@ -137,6 +188,168 @@ async fn execute_runs_the_focus_secured_sequence() {
             .any(|s| s["step"] == "act" && s["settled"] == true),
         "payload action executed and settled: {v}"
     );
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+}
+
+/// Finding 3B, the headline E2E invariant: activating an initially
+/// UNFOCUSED Save must activate it EXACTLY ONCE. The fixture appends a
+/// line to an activations ledger on every Save activation, so a
+/// click-then-Enter double-activation (the old defect) shows up as two
+/// lines. Also proves plan/execute is a genuine two-step contract: a plan
+/// without a max_risk executes fine (mutating ≤ mutating is legal), and
+/// the plan_id binding refuses execution when the previewed control has
+/// vanished.
+#[tokio::test]
+async fn activation_fires_exactly_once_and_two_step_contract_holds() {
+    let server = TuiLabServer::new();
+    let dir = std::env::temp_dir().join(format!("intent-act-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let act_log = dir.join("activations");
+    let id = start_dialog_with_env(
+        &server,
+        serde_json::json!({
+            "INTENT_TUI_ACTIVATIONS": act_log.to_string_lossy(),
+        }),
+    )
+    .await;
+    observe(&server, &id).await;
+
+    // Prove the Tab route (there and back, landing on Cancel as started).
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
+
+    // Plan first (finding 3D): the response carries a plan_id.
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "id": id,
+        })))
+        .await;
+    let plan = unwrap_ok(&raw, "intent plan");
+    assert_eq!(plan["mode"], "planned", "{plan}");
+    let plan_id = plan["plan_id"].as_str().expect("plan_id").to_string();
+    assert!(
+        !plan_id.is_empty(),
+        "plan response carries a plan_id: {plan}"
+    );
+
+    // Execute the previewed plan.
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "execute": true,
+            "plan_id": plan_id,
+            "id": id,
+        })))
+        .await;
+    let v = unwrap_ok(&raw, "intent execute");
+    assert_eq!(v["mode"], "executed", "{v}");
+
+    // EXACTLY ONE activation: give the app a moment to flush its ledger,
+    // then count.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let ledger = std::fs::read_to_string(&act_log).unwrap_or_default();
+    let count = ledger
+        .lines()
+        .filter(|l| l.contains("save-activated"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "Save must activate EXACTLY ONCE (a focus click + Enter would make two): ledger={ledger:?} steps={:?}",
+        v["steps"]
+    );
+
+    // Two-step contract, negative: a replayed plan_id is consumed —
+    // executing it again must fail (plans execute at most once).
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "execute": true,
+            "plan_id": plan_id,
+            "id": id,
+        })))
+        .await;
+    let env = envelope(&raw, "replayed plan");
+    assert!(
+        raw.is_error.unwrap_or(false) || env["error"].is_object() || !env["ok"].is_null(),
+        "replayed plan_id must be refused: {env}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+}
+
+/// Finding 3D: destructive/unknown plans REQUIRE an explicit max_risk;
+/// an explicit fence below the plan's risk refuses with nothing sent.
+#[tokio::test]
+async fn risk_fence_requires_explicit_authorization() {
+    let server = TuiLabServer::new();
+    let id = start_dialog(&server).await;
+    observe(&server, &id).await;
+    // Prove the Tab route so the execution attempts reach the fence.
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
+
+    // A mutating plan (activate Save) with an explicit fence BELOW its
+    // risk must refuse.
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "execute": true,
+            "max_risk": "safe",
+            "id": id,
+        })))
+        .await;
+    let env = envelope(&raw, "fence too low");
+    assert!(
+        raw.is_error.unwrap_or(false),
+        "a mutating plan under a safe fence must refuse: {env}"
+    );
+    let detail = serde_json::to_string(&env).unwrap_or_default();
+    assert!(
+        detail.contains("risk_fence"),
+        "the refusal names the fence: {env}"
+    );
+
+    // An explicit fence at/above the plan's risk authorizes execution.
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "execute": true,
+            "max_risk": "mutating",
+            "id": id,
+        })))
+        .await;
+    let v = unwrap_ok(&raw, "fence adequate");
+    assert_eq!(v["mode"], "executed", "{v}");
+
     server
         .tui_session(params_typed(
             serde_json::json!({ "action": "stop", "id": id }),
@@ -215,6 +428,16 @@ async fn execute_enters_run_evidence_and_scenario_recording() {
     let server = TuiLabServer::new();
     let id = start_dialog(&server).await;
     observe(&server, &id).await;
+    // Prove the Tab route so the intent plan can move focus.
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
 
     // Start an active recording BEFORE the intent.
     let rec = unwrap_ok(
@@ -306,6 +529,17 @@ async fn lease_blocks_intent_execution_but_not_planning() {
     let server = TuiLabServer::new();
     let id = start_dialog(&server).await;
     observe(&server, &id).await;
+    // Prove the Tab route so the execute attempt reaches the LEASE gate
+    // (planning resolves the route before the lease check).
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
 
     let lease = unwrap_ok(
         &server

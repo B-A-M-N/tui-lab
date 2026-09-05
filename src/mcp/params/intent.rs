@@ -40,6 +40,22 @@ pub struct TuiIntentParams {
     /// instead of the hard-coded stable-screen default.
     #[serde(default)]
     pub completion: Option<TuiCompletionParam>,
+    /// Finding 3D (two-step contract): when `execute=true`, either
+    /// `plan_id` (from a prior plan-only response) or `max_risk` is
+    /// honored; BOTH may be given. `plan_id` re-validates the plan's
+    /// control against a fresh observation — the executed plan must land
+    /// on the same control the caller previewed. `max_risk` is the
+    /// explicit risk fence: a plan whose risk exceeds it is refused
+    /// (`risk_fence` error) before anything is sent. Destructive,
+    /// external, and unknown risks always require an explicit
+    /// `max_risk` covering them — planning alone never authorizes them.
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// Finding 3D: explicit risk ceiling for execution. Accepted values:
+    /// `safe` < `mutating` < `destructive` < `external_side_effect` <
+    /// `unknown`. Execution is refused when the plan's risk exceeds this.
+    #[serde(default)]
+    pub max_risk: Option<String>,
 }
 
 /// Wire shape for the verb: a bare string for the payload-free verbs, or

@@ -149,6 +149,17 @@ impl FocusGraph {
         self.edges.iter().filter(|e| e.via == via).collect()
     }
 
+    /// Every proven edge out of `from` whose via-key is a NON-ACTIVATING
+    /// traversal (tab / shift+tab) — the only hops a focus route may take
+    /// (intent finding 3B: activating keys like Enter are never route
+    /// hops, and there is no proven mouse edge to trust).
+    pub fn traversal_successors(&self, from: &str) -> Vec<&FocusEdge> {
+        self.edges
+            .iter()
+            .filter(|e| e.from == from && matches!(e.via.as_str(), "tab" | "shift+tab"))
+            .collect()
+    }
+
     /// Detect a Tab cycle (item 37): walk forward Tab edges from any node
     /// until a repeat; a repeat proves A→B→…→A. Returns the cycle in order.
     pub fn tab_cycle(&self) -> Option<Vec<String>> {

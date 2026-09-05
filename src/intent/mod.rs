@@ -21,7 +21,7 @@ mod keys;
 mod plan;
 mod vocab;
 
-pub use plan::{plan_intent, IntentPlan, PlannedStep};
+pub use plan::{plan_intent, plan_intent_with_graph, IntentPlan, PlannedStep};
 pub use vocab::{
     classify_risk, plan_action, resolve_intent, resolve_target, ActionRisk, ActionTarget,
     ActionVerb, ControlSummary, IntentError, ResolvedIntent,
@@ -104,9 +104,10 @@ mod tests {
     }
 
     /// Review §8, the motivating defect: activation must activate the
-    /// RESOLVED target, not wherever focus currently is. The plan is
-    /// EnsureFocus (click on the target) → AssertFocus (guard) → Enter —
-    /// never a bare Enter over the current focus.
+    /// RESOLVED target, not wherever focus currently is. Finding 3B: the
+    /// focus move is a NON-activating Tab traversal from the proven
+    /// FocusGraph — never a click (which would fire the payload twice) —
+    /// then the AssertFocus guard, then the single Enter payload.
     #[test]
     fn activation_plan_secures_focus_before_the_key() {
         let s = sem(
@@ -114,31 +115,32 @@ mod tests {
                 control("button/save", ControlKind::Button, "Save", 0, 5),
                 control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
             ],
-            None, // NO current focus — the old test accepted a bare Enter here
+            Some("button/cancel"), // focus established on Cancel
         );
-        let plan = plan_intent(
+        // Proven route: Cancel --tab--> Save (recorded by a real traversal).
+        let mut graph = crate::semantic::focus_graph::FocusGraph::new();
+        graph.record_edge("button/cancel", "button/save", "tab", Some("Save"));
+        let plan = plan_intent_with_graph(
             &s,
             &ActionTarget::Id {
                 id: "button/save".into(),
             },
             ActionVerb::Activate,
+            &graph,
         )
         .expect("plan");
-        assert_eq!(
-            plan.steps.len(),
-            3,
-            "secure → guard → act: {:?}",
-            plan.steps
-        );
+        assert_eq!(plan.steps.len(), 3, "move → guard → act: {:?}", plan.steps);
         match &plan.steps[0] {
-            PlannedStep::EnsureFocus { target_id, click } => {
+            PlannedStep::MoveFocus { target_id, key } => {
                 assert_eq!(target_id, "button/save");
+                // Finding 3B: the hop is Tab, NOT a click — clicking would
+                // activate the target and the payload would fire twice.
                 assert!(
-                    matches!(click, CanonicalAction::MouseClick { .. }),
-                    "focus is secured by a click on the target: {click:?}"
+                    matches!(key, CanonicalAction::Key { .. }),
+                    "focus hop is a traversal key, never a click: {key:?}"
                 );
             }
-            other => panic!("step 0 must EnsureFocus, got {other:?}"),
+            other => panic!("step 0 must MoveFocus, got {other:?}"),
         }
         assert_eq!(
             plan.steps[1],
@@ -154,6 +156,211 @@ mod tests {
             "payload is the Enter: {:?}",
             plan.steps[2]
         );
+    }
+
+    /// Finding 3B, the headline invariant: a focus-secured activation plan
+    /// contains EXACTLY ONE activating action — the payload. Every focus
+    /// hop is Tab/Shift+Tab. This is the test that would have caught the
+    /// click-then-Enter double-activation.
+    #[test]
+    fn activation_plan_never_contains_two_activating_actions() {
+        let s = sem(
+            vec![
+                control("button/save", ControlKind::Button, "Save", 0, 5),
+                control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
+            ],
+            Some("button/cancel"),
+        );
+        let mut graph = crate::semantic::focus_graph::FocusGraph::new();
+        graph.record_edge("button/cancel", "button/save", "tab", Some("Save"));
+        // Each verb on a legal kind for it, each with its own proven
+        // route: Activate→button, Toggle→checkbox, Select→list, Open→menu
+        // item. (Open on a button refuses at plan time — finding 3C.)
+        let check = sem(
+            vec![
+                control("check/flag", ControlKind::Checkbox, "Flag", 0, 7),
+                control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
+            ],
+            Some("button/cancel"),
+        );
+        let list = sem(
+            vec![
+                control("list/lang", ControlKind::List, "Language", 0, 7),
+                control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
+            ],
+            Some("button/cancel"),
+        );
+        let menu = sem(
+            vec![
+                control("menu/file", ControlKind::MenuItem, "File", 0, 1),
+                control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
+            ],
+            Some("button/cancel"),
+        );
+        let mut check_graph = crate::semantic::focus_graph::FocusGraph::new();
+        check_graph.record_edge("button/cancel", "check/flag", "tab", Some("Flag"));
+        let mut list_graph = crate::semantic::focus_graph::FocusGraph::new();
+        list_graph.record_edge("button/cancel", "list/lang", "tab", Some("Language"));
+        let mut menu_graph = crate::semantic::focus_graph::FocusGraph::new();
+        menu_graph.record_edge("button/cancel", "menu/file", "tab", Some("File"));
+        for (screen, verb, target, graph) in [
+            (
+                &s,
+                ActionVerb::Activate,
+                ActionTarget::Id {
+                    id: "button/save".into(),
+                },
+                &graph,
+            ),
+            (
+                &check,
+                ActionVerb::Toggle,
+                ActionTarget::Id {
+                    id: "check/flag".into(),
+                },
+                &check_graph,
+            ),
+            (
+                &list,
+                ActionVerb::Select,
+                ActionTarget::Id {
+                    id: "list/lang".into(),
+                },
+                &list_graph,
+            ),
+            (
+                &menu,
+                ActionVerb::Open,
+                ActionTarget::Id {
+                    id: "menu/file".into(),
+                },
+                &menu_graph,
+            ),
+        ] {
+            let plan = plan_intent_with_graph(screen, &target, verb.clone(), graph)
+                .unwrap_or_else(|e| panic!("{verb:?}: {e:?}"));
+            let activating = plan
+                .steps
+                .iter()
+                .filter(|st| {
+                    matches!(
+                        st,
+                        PlannedStep::Act(CanonicalAction::Key { .. })
+                            | PlannedStep::Act(CanonicalAction::MouseClick { .. })
+                    )
+                })
+                .count();
+            assert_eq!(
+                activating, 1,
+                "{verb:?}: exactly one activating action (the payload), got {activating} in {:?}",
+                plan.steps
+            );
+            // And no click anywhere in a focus-secured plan.
+            assert!(
+                plan.steps.iter().all(|st| !matches!(
+                    st,
+                    PlannedStep::MoveFocus {
+                        key: CanonicalAction::MouseClick { .. },
+                        ..
+                    }
+                )),
+                "{verb:?}: a focus hop must never be a click"
+            );
+        }
+    }
+
+    /// Finding 3A: `focus` plans a NON-activating traversal with NO payload
+    /// (MoveFocus… → AssertFocus), or refuses when no proven route exists.
+    /// It NEVER plans a click.
+    #[test]
+    fn focus_verb_plans_tab_traversal_not_click() {
+        let s = sem(
+            vec![
+                control("button/save", ControlKind::Button, "Save", 0, 5),
+                control("button/cancel", ControlKind::Button, "Cancel", 10, 5),
+            ],
+            Some("button/cancel"),
+        );
+        let mut graph = crate::semantic::focus_graph::FocusGraph::new();
+        graph.record_edge("button/cancel", "button/save", "tab", Some("Save"));
+        let plan = plan_intent_with_graph(
+            &s,
+            &ActionTarget::Id {
+                id: "button/save".into(),
+            },
+            ActionVerb::Focus,
+            &graph,
+        )
+        .expect("focus plans from a proven route");
+        // Traversal + guard, and NO Act payload.
+        assert!(
+            matches!(plan.steps.last(), Some(PlannedStep::AssertFocus { .. })),
+            "focus ends in the guard: {:?}",
+            plan.steps
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .all(|st| !matches!(st, PlannedStep::Act(_))),
+            "focus has no payload: {:?}",
+            plan.steps
+        );
+        // Risk is honestly Safe now: the mechanism is pure traversal.
+        assert_eq!(plan.risk, ActionRisk::Safe);
+
+        // No proven route → Unsupported (with the remedy), never a click.
+        let empty = crate::semantic::focus_graph::FocusGraph::new();
+        let err = plan_intent_with_graph(
+            &s,
+            &ActionTarget::Id {
+                id: "button/save".into(),
+            },
+            ActionVerb::Focus,
+            &empty,
+        )
+        .expect_err("no proven route must refuse");
+        assert!(matches!(err, IntentError::Unsupported { .. }), "{err:?}");
+        // The refusal names the remedy (prove the traversal), not a click.
+        assert!(
+            err.message().contains("NOT substituted"),
+            "the refusal must state that clicking was not substituted: {}",
+            err.message()
+        );
+
+        // Already focused: guard only, nothing sent.
+        let s_focused = sem(
+            vec![control("button/save", ControlKind::Button, "Save", 0, 5)],
+            Some("button/save"),
+        );
+        let plan = plan_intent_with_graph(
+            &s_focused,
+            &ActionTarget::Id {
+                id: "button/save".into(),
+            },
+            ActionVerb::Focus,
+            &empty,
+        )
+        .expect("already-focused is guard-only");
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.steps);
+    }
+
+    /// Finding 3C: `open` is only legal on known-openable roles; a button
+    /// is VerbMismatch (the agent should say `activate`), and open is no
+    /// longer classified Safe.
+    #[test]
+    fn open_is_restricted_to_openable_roles_and_never_safe() {
+        let btn = control("button/save", ControlKind::Button, "Save", 0, 1);
+        let item = control("menu/file", ControlKind::MenuItem, "File", 0, 1);
+        assert!(
+            matches!(
+                plan_action(&ActionVerb::Open, &btn),
+                Err(IntentError::VerbMismatch { .. })
+            ),
+            "open on a button must refuse — an Enter there is an activation"
+        );
+        assert!(plan_action(&ActionVerb::Open, &item).is_ok());
+        // Risk honesty: opening a menu changes app state.
+        assert_eq!(ActionVerb::Open.base_risk(), ActionRisk::Mutating);
     }
 
     /// Direct verbs (Click) need no focus securing: their action names the
@@ -321,18 +528,22 @@ mod tests {
             classify_risk(&ActionVerb::Activate, Some(&next)),
             ActionRisk::Mutating
         );
-        // Audit P0-4: focus plans as a mouse click — which ACTIVATES. It is
-        // Mutating even on a destructive-labelled control (label evidence
-        // does not apply: the click risk comes from the mechanism, not the
-        // label), and never claims Safe again.
+        // Finding 3A: focus is now a guarded Tab traversal that never
+        // touches the control's action — honestly Safe (the doc's risk
+        // ladder names focus movement as the Safe case).
         assert_eq!(
             classify_risk(&ActionVerb::Focus, Some(&del)),
-            ActionRisk::Mutating
+            ActionRisk::Safe
         );
-        // Focus is mutating on a neutral control too.
         assert_eq!(
             classify_risk(&ActionVerb::Focus, Some(&next)),
-            ActionRisk::Mutating
+            ActionRisk::Safe
+        );
+        // Finding 3C: open executes the control's action on an openable
+        // role — mutating at base, raised by label evidence like activate.
+        assert_eq!(
+            classify_risk(&ActionVerb::Open, Some(&del)),
+            ActionRisk::Destructive
         );
         // Risk ordering supports gating.
         assert!(ActionRisk::Safe < ActionRisk::Mutating);
