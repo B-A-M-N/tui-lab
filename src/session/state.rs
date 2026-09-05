@@ -569,7 +569,13 @@ impl Session {
 
     /// Wait, returning the full [`WaitOutcome`] — MCP and audit callers get
     /// reason/elapsed/sequence/state, not just a bool (audit item 5).
+    ///
+    /// audit finding 37 (preflight): a condition the backend intrinsically
+    /// cannot satisfy fails immediately as `Unsupported` rather than burning
+    /// its budget in a timeout.
     pub fn wait(&mut self, cond: WaitCond, budget_ms: u64) -> anyhow::Result<WaitOutcome> {
+        let caps = self.backend.capabilities();
+        caps.require_wait(&cond)?;
         let out = self
             .backend
             .wait(cond, std::time::Duration::from_millis(budget_ms))?;
@@ -578,12 +584,17 @@ impl Session {
 
     /// Action-anchored wait: capture this session's event state *before*
     /// sending the action, then call this. See [`TerminalBackend::wait_after`].
+    ///
+    /// audit finding 37 (preflight): symmetric fast-fail on intrinsically
+    /// unsupported conditions.
     pub fn wait_after(
         &mut self,
         baseline: TerminalEventState,
         cond: WaitCond,
         budget_ms: u64,
     ) -> anyhow::Result<WaitOutcome> {
+        let caps = self.backend.capabilities();
+        caps.require_wait(&cond)?;
         let out =
             self.backend
                 .wait_after(baseline, cond, std::time::Duration::from_millis(budget_ms))?;

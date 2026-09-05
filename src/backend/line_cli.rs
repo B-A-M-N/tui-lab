@@ -747,6 +747,7 @@ impl TerminalBackend for PtyLineBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        use super::{EventCapability, InputFamily, WaitCapability};
         Capabilities {
             mouse: false,
             kitty_keyboard: false,
@@ -760,6 +761,41 @@ impl TerminalBackend for PtyLineBackend {
             signals: cfg!(unix),
             // The CLI engine retains the raw output ring.
             protocol_capture: true,
+            // --- audit finding 37: operation-oriented matrix, advertising only
+            //     what the line engine's code genuinely does ---
+            raw_input: true,        // Input::Raw writes bytes to the child
+            bell_observable: true,  // bell_seq tracked in wait()
+            exit_code: true,        // process() reports the real child exit code
+            shell_integration: false, // command_state() returns None (no OSC 133)
+            stdout_stderr_separation: false, // single PTY master
+            recording: true,        // recording hook delivered on output/input
+            native_semantic: true,  // session-provided side channel
+            attach: false,          // we spawn the child
+            query_response: false,  // no device-query responder
+            event_types: vec![
+                EventCapability::Output,
+                EventCapability::Bell,
+                EventCapability::FocusChanged,
+                EventCapability::SemanticChanged,
+                EventCapability::Raw,
+            ],
+            supported_waits: vec![
+                WaitCapability::Text,
+                WaitCapability::TextAbsent,
+                WaitCapability::ScreenChange,
+                WaitCapability::ScreenStable,
+                WaitCapability::ProcessExit,
+                WaitCapability::Bell,
+                WaitCapability::AnyActivity,
+                WaitCapability::Idle,
+            ],
+            input_families: vec![
+                InputFamily::Key,
+                InputFamily::Paste,
+                InputFamily::RawByte,
+                InputFamily::Resize,
+                InputFamily::Signal,
+            ],
         }
     }
 

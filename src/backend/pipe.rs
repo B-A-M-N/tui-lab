@@ -720,6 +720,7 @@ impl TerminalBackend for PipeBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        use super::{EventCapability, InputFamily, WaitCapability};
         Capabilities {
             mouse: false,
             kitty_keyboard: false,
@@ -733,6 +734,41 @@ impl TerminalBackend for PipeBackend {
             // (`recent_raw_output` stays on the trait default): nothing to
             // capture, so say false rather than overclaim.
             protocol_capture: false,
+            // --- audit finding 37: operation-oriented matrix ---
+            raw_input: true,        // Input::Raw writes bytes to the stdin pipe
+            bell_observable: true,  // bell_seq tracked in wait()
+            exit_code: true,        // process() reports the real child exit code
+            shell_integration: false, // command_state() returns None (no OSC 133)
+            // review P1 #28: the pipe backend IS the stdout/stderr split — the
+            // child is launched with separate stdout/stderr pipes.
+            stdout_stderr_separation: true,
+            recording: true,        // recording hook delivered on output/input
+            native_semantic: true,  // session-provided side channel
+            attach: false,          // we spawn the child
+            query_response: false,  // no device-query responder
+            event_types: vec![
+                EventCapability::Output,
+                EventCapability::Bell,
+                EventCapability::FocusChanged,
+                EventCapability::SemanticChanged,
+            ],
+            supported_waits: vec![
+                WaitCapability::Text,
+                WaitCapability::TextAbsent,
+                WaitCapability::ScreenChange,
+                WaitCapability::ScreenStable,
+                WaitCapability::ProcessExit,
+                WaitCapability::Bell,
+                WaitCapability::AnyActivity,
+                WaitCapability::Idle,
+            ],
+            input_families: vec![
+                InputFamily::Key,
+                InputFamily::Paste,
+                InputFamily::RawByte,
+                InputFamily::Resize,
+                InputFamily::Signal,
+            ],
         }
     }
 
