@@ -1,7 +1,7 @@
 //! tui_session: lifecycle, lease, backend/engine selection.
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{err, ok};
+use crate::mcp::helpers::{err, err_with_details, ok};
 use crate::mcp::params::*;
 use rmcp::serde_json::json;
 
@@ -210,6 +210,33 @@ pub(crate) async fn tui_session(
                     ),
                 );
             }
+            // Finding 4/13: a live human lease blocks restart too —
+            // restart kills the process the human is driving. Wait out the
+            // TTL or ask for the lease back.
+            let lease_gate_id = id.clone();
+            if let Ok(Some(refused)) = s
+                .with_sess(Some(&id), move |sess| {
+                    sess.driving_blocked().map(|lease| {
+                        err_with_details(
+                            ErrorCategory::ControlLeased,
+                            format!(
+                                "session '{}' is leased to '{}' ({}ms remaining); restart would kill the process they are driving",
+                                lease_gate_id,
+                                lease.holder,
+                                lease.remaining_ms()
+                            ),
+                            json!({
+                                "session": lease_gate_id,
+                                "holder": lease.holder,
+                                "retry_after_ms": lease.remaining_ms(),
+                            }),
+                        )
+                    })
+                })
+                .await
+            {
+                return refused;
+            }
             {
                 let cur_run = s.run.lock().unwrap().id.clone();
                 let bound = s
@@ -252,6 +279,33 @@ pub(crate) async fn tui_session(
                 Some(i) => i,
                 None => return err(ErrorCategory::NoSession, "no session"),
             };
+            // Finding 4/13: stop kills the process the lease holder may be
+            // driving — the lease gates it the same way it gates driving.
+            // (Restart above has the same gate; this is the sibling.)
+            let lease_gate_id = id.clone();
+            if let Ok(Some(refused)) = s
+                .with_sess(Some(&id), move |sess| {
+                    sess.driving_blocked().map(|lease| {
+                        err_with_details(
+                            ErrorCategory::ControlLeased,
+                            format!(
+                                "session '{}' is leased to '{}' ({}ms remaining); stop would kill the process they are driving",
+                                lease_gate_id,
+                                lease.holder,
+                                lease.remaining_ms()
+                            ),
+                            json!({
+                                "session": lease_gate_id,
+                                "holder": lease.holder,
+                                "retry_after_ms": lease.remaining_ms(),
+                            }),
+                        )
+                    })
+                })
+                .await
+            {
+                return refused;
+            }
             match s.sessions.stop(&id).await {
                 Ok(()) => {
                     // Session gone: drop its run ownership too.
@@ -281,14 +335,17 @@ pub(crate) async fn tui_session(
                             "leased": true,
                             "holder": lease.holder,
                             "ttl_ms": lease.ttl_ms,
-                            "note": "machine-driving tools (act/explore/audit/replay) refuse this session while the lease is valid; observe stays allowed",
+                            // Finding 4: early release requires this token;
+                            // expiry needs none.
+                            "lease_id": lease.lease_id,
+                            "note": "machine-driving tools (act/explore/audit/replay) refuse this session while the lease is valid; observe stays allowed; early release requires lease_id",
                         })),
                         Err(existing) => ok(json!({
                             "session": id,
                             "leased": false,
                             "holder": existing.holder,
                             "remaining_ms": existing.remaining_ms(),
-                            "note": "a live lease is already held; release it or wait for expiry",
+                            "note": "a live lease is already held; release it (with its lease_id) or wait for expiry",
                         })),
                     }
                 })
@@ -300,10 +357,35 @@ pub(crate) async fn tui_session(
                 Some(i) => i,
                 None => return err(ErrorCategory::NoSession, "no session"),
             };
+            // Finding 4: releasing a live lease requires the lease_id the
+            // acquire returned. Holder labels are shared ("human"); a
+            // tokenless release must not drop a stranger's grant.
+            let lease_id = match &p.lease_id {
+                Some(t) => t.clone(),
+                None => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "release requires 'lease_id' — the token the lease action returned (expiry needs no token)",
+                    )
+                }
+            };
             let selector = id.clone();
             s.with_sess(Some(&selector), move |s| {
-                let released = s.release_lease();
-                ok(json!({ "session": id.clone(), "released": released }))
+                match s.release_lease_with_token(&lease_id) {
+                    Ok(released) => ok(json!({ "session": id.clone(), "released": released })),
+                    Err(mismatch) => {
+                        let live = s.active_lease();
+                        err_with_details(
+                            ErrorCategory::ControlLeased,
+                            mismatch.to_string(),
+                            json!({
+                                "session": id,
+                                "holder": live.as_ref().map(|l| l.holder.clone()),
+                                "remaining_ms": live.as_ref().map(|l| l.remaining_ms()),
+                            }),
+                        )
+                    }
+                }
             })
             .await
             .unwrap_or_else(|e| e)

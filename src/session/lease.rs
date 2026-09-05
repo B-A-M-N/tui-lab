@@ -22,6 +22,13 @@ pub struct ControlLease {
     pub taken_at_ms: u64,
     /// Time-to-live in milliseconds from `taken_at_ms`.
     pub ttl_ms: u64,
+    /// The release token (audit finding 4): issued at acquire time and
+    /// required by `release_token`. Holder labels are free-form and
+    /// frequently shared ("human"), so a stranger releasing by label alone
+    /// could drop another's lease; only the party that acquired the grant
+    /// (or an operator naming the token) can release it early. Expiry needs
+    /// no token — the TTL does the releasing.
+    pub lease_id: String,
 }
 
 impl ControlLease {
@@ -44,6 +51,15 @@ impl ControlLease {
     }
 }
 
+/// The live lease could not be released with the presented token (audit
+/// finding 4): the caller is not the holder, and the lease stands. Names
+/// the holder so the caller can ask them (or wait out the TTL).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("lease token mismatch: the live lease is held by '{holder}'")]
+pub struct LeaseTokenMismatch {
+    pub holder: String,
+}
+
 /// The lease state of one session: `Some(lease)` while held.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LeaseState {
@@ -54,6 +70,8 @@ impl LeaseState {
     /// Take the lease. A fresh grant always wins over an expired one;
     /// a *live* lease must be released (or expired) before a new holder
     /// takes it — silently stealing a human's session defeats the point.
+    /// The grant carries a `lease_id` the acquirer must present to release
+    /// early (finding 4).
     pub fn acquire(&mut self, holder: &str, ttl_ms: u64) -> Result<ControlLease, ControlLease> {
         if let Some(existing) = &self.lease {
             if existing.active() {
@@ -66,12 +84,38 @@ impl LeaseState {
             ttl_ms: ttl_ms
                 .max(1000)
                 .min(Duration::from_secs(3600).as_millis() as u64),
+            lease_id: Self::generate_lease_id(),
         };
         self.lease = Some(lease.clone());
         Ok(lease)
     }
 
-    /// Release the lease. Returns whether a live lease was actually held.
+    /// Release the lease with its token (audit finding 4). `Ok(true)` when
+    /// the live lease was released; `Err(LeaseTokenMismatch)` when a LIVE
+    /// lease is held but the token does not match (the caller is not the
+    /// holder — the lease stays); `Ok(false)` when nothing was live.
+    pub fn release_token(&mut self, token: &str) -> Result<bool, LeaseTokenMismatch> {
+        match &self.lease {
+            Some(l) if l.active() => {
+                if l.lease_id == token {
+                    self.lease = None;
+                    Ok(true)
+                } else {
+                    Err(LeaseTokenMismatch {
+                        holder: l.holder.clone(),
+                    })
+                }
+            }
+            _ => {
+                self.lease = None;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Release unconditionally (in-process lifecycle: stop/restart/close
+    /// paths that tear the session down BY the lease owner's authority).
+    /// NOT the machine-facing release — that is [`Self::release_token`].
     pub fn release(&mut self) -> bool {
         match &self.lease {
             Some(l) if l.active() => {
@@ -83,6 +127,12 @@ impl LeaseState {
                 false
             }
         }
+    }
+
+    /// A fresh release token: enough entropy to be unguessable in practice,
+    /// short enough to read back over the wire.
+    fn generate_lease_id() -> String {
+        format!("lease-{}", uuid::Uuid::new_v4().simple())
     }
 
     /// The active lease, if any (expired leases report `None`; the stale
@@ -130,6 +180,7 @@ mod tests {
                 holder: "ghost".into(),
                 taken_at_ms: ControlLease::now_ms() - 60_000,
                 ttl_ms: 1_000,
+                lease_id: "lease-expired".into(),
             }),
         };
         assert!(!st.blocks_driving(), "expired lease does not block");
@@ -137,6 +188,26 @@ mod tests {
         // And a new holder can take it without release.
         st.acquire("new", 5_000).expect("take after expiry");
         assert!(st.blocks_driving());
+    }
+
+    /// Finding 4: the token contract. The holder's token releases; a wrong
+    /// token leaves the live lease standing and names the holder.
+    #[test]
+    fn release_requires_the_holder_token() {
+        let mut st = LeaseState::default();
+        let lease = st.acquire("ana", 60_000).expect("acquire");
+        // Wrong token: refused, lease stands, holder named.
+        let err = st
+            .release_token("lease-not-ana")
+            .expect_err("wrong token refused");
+        assert_eq!(err.holder, "ana");
+        assert!(st.blocks_driving(), "the live lease survives the refusal");
+        // The real token releases.
+        assert!(
+            st.release_token(&lease.lease_id).expect("holder release"),
+            "the holder's token releases the live lease"
+        );
+        assert!(!st.blocks_driving());
     }
 
     #[test]

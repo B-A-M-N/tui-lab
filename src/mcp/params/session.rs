@@ -52,6 +52,12 @@ pub struct TuiSessionParams {
     /// lease: time-to-live in milliseconds (default 300000 = 5 min).
     #[serde(default)]
     pub ttl_ms: Option<u64>,
+    /// release (finding 4): the lease_id token the lease action returned.
+    /// Required to release a LIVE lease — holder labels are shared, so a
+    /// tokenless release must not drop a stranger's grant. Expiry needs no
+    /// token.
+    #[serde(default)]
+    pub lease_id: Option<String>,
     /// action=attach (re-review item 18): the tmux target
     /// `session:window.pane` to adopt.
     #[serde(default)]

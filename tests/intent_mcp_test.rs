@@ -553,6 +553,8 @@ async fn lease_blocks_intent_execution_but_not_planning() {
         lease.get("lease").is_some() || lease.get("expires_at").is_some() || !lease.is_null(),
         "lease granted: {lease}"
     );
+    // Finding 4: the grant carries the release token.
+    let lease_id = lease["lease_id"].as_str().expect("lease_id").to_string();
 
     // execute=true must be refused with control_leased.
     let raw = server
@@ -594,7 +596,7 @@ async fn lease_blocks_intent_execution_but_not_planning() {
 
     let _ = server
         .tui_session(params_typed(
-            serde_json::json!({ "action": "release", "id": id }),
+            serde_json::json!({ "action": "release", "id": id, "lease_id": lease_id }),
         ))
         .await;
     server

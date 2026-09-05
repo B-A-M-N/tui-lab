@@ -19,7 +19,20 @@ impl Session {
         self.lease.acquire(holder, ttl_ms)
     }
 
-    /// Release the control lease. Returns whether one was live.
+    /// Release the control lease with its token (audit finding 4).
+    /// `Ok(released)` — token matched (or nothing was live);
+    /// `Err(LeaseTokenMismatch)` — a LIVE lease is held by someone else
+    /// (the lease stands; the error names the holder).
+    pub fn release_lease_with_token(
+        &mut self,
+        token: &str,
+    ) -> Result<bool, crate::session::lease::LeaseTokenMismatch> {
+        self.lease.release_token(token)
+    }
+
+    /// Internal, unconditional release for lifecycle teardown paths
+    /// (stop/restart/close) that act with operator authority — NOT the
+    /// machine-facing release, which must present the token.
     pub fn release_lease(&mut self) -> bool {
         self.lease.release()
     }
