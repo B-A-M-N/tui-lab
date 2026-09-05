@@ -1386,3 +1386,178 @@ fn replay_cli_renders_persisted_run() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Finding 33: `tui_run new` must not silently discard an ephemeral run's
+/// in-memory evidence. It refuses, naming the counts, until the caller
+/// either persists the run (evidence moves to disk where `new` flushes it)
+/// or passes `discard=true` to abandon it deliberately.
+#[tokio::test]
+async fn run_new_refuses_to_discard_ephemeral_evidence() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-discard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // 0. A fresh server run holds NOTHING: `new` swaps directly.
+    unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "new" })))
+            .await,
+        "new over an empty run",
+    );
+
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('discard-a'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "enter", "id": sid }),
+            ))
+            .await,
+        "act (records a transaction)",
+    );
+
+    // 1. (step 0 already proved the empty-run path.)
+
+    // 2. Record evidence again (new run, new session correlation needed).
+    let start2 = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('discard-b'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start 2",
+    );
+    let sid2 = start2["session"].as_str().unwrap().to_string();
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "enter", "id": sid2 }),
+            ))
+            .await,
+        "act 2",
+    );
+
+    // 3. `new` now REFUSES, naming what would be lost.
+    let refused = unwrap_err(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "new" })))
+            .await,
+        "new over evidence",
+    );
+    let msg = refused["error"].as_str().unwrap_or("").to_string();
+    assert!(
+        msg.contains("exist only in memory"),
+        "refusal names the hazard: {refused}"
+    );
+    let details = &refused["details"];
+    assert!(
+        details["evidence"]["transactions"].as_u64().unwrap_or(0) >= 1,
+        "transaction count in the details: {details}"
+    );
+    assert!(
+        details["hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("discard=true"),
+        "hint names the escape hatch: {details}"
+    );
+
+    // 4. The refusing `new` changed nothing: the evidence is still there.
+    let st = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "status" })))
+            .await,
+        "status after refusal",
+    );
+    assert_eq!(
+        st["counts"]["transactions"].as_u64().unwrap_or(0),
+        details["evidence"]["transactions"].as_u64().unwrap_or(0),
+        "refused new left the run intact"
+    );
+
+    // 5. discard=true proceeds — and the response names the accepted loss.
+    let discarded = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!(
+                { "action": "new", "discard": true }
+            )))
+            .await,
+        "new with discard",
+    );
+    assert_eq!(
+        discarded["discarded_evidence"]["evidence"]["transactions"].as_u64(),
+        details["evidence"]["transactions"].as_u64(),
+        "response names the discarded counts: {discarded}"
+    );
+    let after = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "status" })))
+            .await,
+        "status after discard",
+    );
+    assert_eq!(
+        after["counts"]["transactions"].as_u64().unwrap_or(0),
+        0,
+        "the new run starts empty"
+    );
+
+    // 6. The persist-first alternative: evidence on disk makes `new` a
+    // flush-then-swap, not a loss.
+    let start3 = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('discard-c'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start 3",
+    );
+    let sid3 = start3["session"].as_str().unwrap().to_string();
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "enter", "id": sid3 }),
+            ))
+            .await,
+        "act 3",
+    );
+    unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "persist" })))
+            .await,
+        "persist first",
+    );
+    let swapped = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "new" })))
+            .await,
+        "new after persist",
+    );
+    assert_eq!(
+        swapped["previous_flushed"], true,
+        "persistent run flushed before the swap: {swapped}"
+    );
+
+    // Cleanup: stop any live sessions the test leaked.
+    for s in [sid, sid2, sid3] {
+        let _ = server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "stop", "id": s }),
+            ))
+            .await;
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

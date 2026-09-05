@@ -2,7 +2,7 @@
 
 use super::super::running_id;
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{err, ok};
+use crate::mcp::helpers::{err, err_with_details, ok};
 use crate::mcp::params::*;
 use rmcp::serde_json::json;
 
@@ -34,10 +34,38 @@ pub(crate) async fn tui_run(
         // Review P0.1/2 + audit P0-6: begin a fresh ephemeral run. A
         // PERSISTENT current run is flushed BEFORE replacement and a
         // flush failure aborts the swap — `new` must never silently
-        // destroy unflushed evidence. An ephemeral run has nothing on
-        // disk to lose (held artifacts move nowhere; the response says
-        // so), so it swaps directly.
+        // destroy unflushed evidence. An EPHEMERAL run with evidence,
+        // though, has everything to lose: finding 33 — `new` REFUSES
+        // over in-memory-only evidence unless `discard=true` names the
+        // loss the caller accepted (or the caller persists first, which
+        // moves the bundle to disk where `new` can flush it).
         RA::New => {
+            let (loss, loss_persistent) = {
+                let guard = s.run.lock().unwrap();
+                let l = guard.unsaved_evidence();
+                (l, guard.run_dir().is_some())
+            };
+            if !loss_persistent
+                && loss["lost_if_dropped"].as_u64().unwrap_or(0) > 0
+                && !p.discard.unwrap_or(false)
+            {
+                let (run_id, lost) = {
+                    let g = s.run.lock().unwrap();
+                    (g.id.clone(), loss["lost_if_dropped"].clone())
+                };
+                return err_with_details(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "tui_run new refused: current ephemeral run '{run_id}' holds {lost} evidence record(s) that exist only in memory",
+                    ),
+                    json!({
+                        "current_run": run_id,
+                        "lost_if_dropped": lost,
+                        "evidence": loss["evidence"],
+                        "hint": "run tui_run action=persist first (keeps the bundle on disk), or re-send with discard=true to abandon it deliberately",
+                    }),
+                );
+            }
             let mut old = {
                 let mut guard = s.run.lock().unwrap();
                 std::mem::replace(&mut *guard, crate::run::RunContext::ephemeral())
@@ -54,6 +82,17 @@ pub(crate) async fn tui_run(
                         "previous_run": old.id,
                         "previous_flushed": old.run_dir().is_some(),
                         "mode": "ephemeral",
+                        // Finding 33: name what a discard threw away, so a
+                        // `discard=true` caller sees the accepted loss.
+                        "discarded_evidence": if loss["lost_if_dropped"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            > 0
+                        {
+                            loss
+                        } else {
+                            serde_json::Value::Null
+                        },
                         "note": "fresh ephemeral run begun; sessions from the previous run were not touched and now belong to a foreign run",
                     }))
                 }

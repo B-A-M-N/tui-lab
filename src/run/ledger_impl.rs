@@ -161,6 +161,51 @@ impl RunContext {
         })
     }
 
+    /// Finding 33: what would be LOST if this run were dropped right
+    /// now — the evidence that exists only in memory. For a persistent
+    /// run everything durable already sits under the artifact root, so
+    /// the loss is the un-flushed held tail (events held for flush,
+    /// unsaved recordings, torn checkpoint state); for an ephemeral run
+    /// it is the WHOLE in-memory bundle. `tui_run new` refuses over a
+    /// non-zero loss unless the caller passes `discard=true`.
+    ///
+    /// Deliberately conservative: only counts that mean real evidence
+    /// (transactions, events, checkpoints, scenarios, findings,
+    /// recordings, focus/state-graph edges) — bookkeeping like artifact
+    /// refs or contract baselines never blocks a `new`.
+    pub fn unsaved_evidence(&self) -> serde_json::Value {
+        let incremental_persisted: u64 = self.event_flushed_counts.values().sum();
+        // Events that were counted but never written anywhere yet (an
+        // ephemeral run's whole event history, or a persistent run's
+        // held tail): counted events minus those already flushed.
+        let events_unwritten = self.event_count.saturating_sub(incremental_persisted);
+        let counts = [
+            ("transactions", self.transaction_count),
+            ("events_unwritten", events_unwritten),
+            ("checkpoints", self.checkpoints.count() as u64),
+            ("scenarios", self.saved_scenarios.len() as u64),
+            ("findings", self.findings.len() as u64),
+            ("held_recordings", self.held_recordings.len() as u64),
+            ("focus_transitions", self.focus_transitions.len() as u64),
+            (
+                "state_graph_records",
+                (self.state_graph.state_count() + self.state_graph.transition_count()) as u64,
+            ),
+        ];
+        let evidence: serde_json::Value = counts
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect::<serde_json::Value>();
+        let lost: u64 = counts.iter().map(|(_, v)| *v).sum();
+        json!({
+            "lost_if_dropped": lost,
+            "persistent": self.run_dir.is_some(),
+            // Which buckets actually hold something — a caller refusing
+            // (or a caller discarding) sees WHY without diffing counts.
+            "evidence": evidence,
+        })
+    }
+
     /// Counts for `tui_run status`.
     pub fn counts(&self) -> serde_json::Value {
         let held: u64 = self.held_events.iter().map(|(_, e)| e.len() as u64).sum();

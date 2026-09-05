@@ -71,4 +71,12 @@ pub struct TuiRunParams {
     /// still live, to preserve run provenance; pass true to detach them).
     #[serde(default)]
     pub detach_existing_sessions: Option<bool>,
+    /// new: deliberately abandon the current EPHEMERAL run's in-memory
+    /// evidence? (finding 33 — default false: `new` REFUSES when an
+    /// ephemeral run holds evidence, naming what would be lost; pass
+    /// `discard=true` (or `persist` first) to proceed. A persistent run is
+    /// never affected — its evidence is already on disk and `new` flushes
+    /// it before the swap.)
+    #[serde(default)]
+    pub discard: Option<bool>,
 }
