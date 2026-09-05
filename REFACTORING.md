@@ -128,7 +128,7 @@ test --all-features) verified green on the formatted tree.
 | 28 | ~~Target resolution: `format!("{kind:?}")` wire slug (`vocab.rs:440`); comment-priority mismatch in nearest_candidates~~ FIXED (`037e2e4`) | — |
 | 29 | Risk classification: label heuristics remain the authority; no native/contract risk attestation | `src/intent/vocab.rs` |
 | 31 | ~~Only the run manifest carries a schema tag; ledger/frame/event/finding/scenario/contract formats unversioned~~ FIXED (`0b5b28e`) | — |
-| 32 | `reopen()` flips `closed=false`; no resume epochs | `src/run/persistence_impl.rs:458` |
+| 32 | ~~`reopen()` flips `closed=false`; no resume epochs~~ FIXED (`7e3deca`) | — |
 | 33 | `tui_run new` silently replaces an ephemeral run holding evidence (no `discard=true` / count refusal) | `handlers/run.rs` New |
 | 36-42 | Construction features: tui_inspect, multi-state scaffold, workflow object, regression-asset generation, semantic render diffs, framework diagnostic knowledge, adapter versioning | not started |
 | 43 | Partially done (registry-generated SKILL sections); full single-descriptor doc generation open | registry |
@@ -159,8 +159,9 @@ test --all-features) verified green on the formatted tree.
 - **23** NextObservation structured: every observation names its MCP tool (`tui_probe` / `tui_act` / `tui_run`) + ready-to-send arguments in the canonical grammar; prose stays for display (`1dc4bbc`)
 - **28** Vocab slugs: role matching uses the serde wire name (`menu_item`, not Debug's `menuitem`); ControlSummary echoes the same slug; nearest_candidates actually sorts focused-first (`037e2e4`)
 - **31** Format versioning: `src/run/formats.rs` — Envelope (`{"schema": tag, "payload": old}`) for findings/coverage/focus graphs/state graph/scenarios; StreamHeader first line for ledger/frames/events streams; readers accept bare pre-versioning files, mismatched versions are NAMED restore warnings (`0b5b28e`)
+- **32** Resume epochs: `resume_epoch` on RunContext + RunManifest (`#[serde(default)]`, v1 manifests = epoch 0); `reopen()` bumps it and writes the manifest BEFORE returning, so a crash after resume still names the epoch; surfaced in `tui_run status` / `list` / `resume` responses; a reopened run is no longer indistinguishable from the original process's history (`7e3deca`)
 
 ### Priority order (implementation sequence)
 
-Remaining P0: none. Next: P1/P2 — 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
+Remaining P0: none. Next: P1/P2 — 33 (ephemeral evidence discard), then construction set 36-42.
 
