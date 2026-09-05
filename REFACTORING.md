@@ -114,8 +114,6 @@ test --all-features) verified green on the formatted tree.
 | # | Finding | Evidence |
 | - | ------- | -------- |
 | 2 | One driving authority: `drive_pipeline` exists + scenario replay uses it, but no `DriveOrigin` provenance and ~25 direct `execute_act` call sites remain (exploration, conformance, audit drivers) | `src/execution/drive.rs`, callers |
-| 4 | Lease completeness: release needs no token; restart checks run-ownership but not the human lease; `stop` checks neither; `tui_run close kill_sessions=true` kills leased sessions ungated. (Stale sub-claim: `probe_query_response` no longer writes to the PTY — it drains the parser engine-side, `portable_pty.rs:639`; the orchestrator comment saying otherwise is wrong.) | `src/session/lease.rs`, `handlers/session.rs:193,250`, `handlers/run.rs:164` |
-| 7 | Native channel: `read_line` has no max-frame bound; channel file grows unbounded (offset advances, never truncated). (Landed half: bounded event ring + seq cursors + truncation detection.) | `src/semantic/native.rs:247` |
 | 8 | Native adapters: `NativeNode.actions` parsed but consumed nowhere (dead data); Textual fallback id is `id(widget)` memory address; snippets emit snapshots only | `src/semantic/node.rs`, `src/framework/adapters.rs:114` |
 | 9 | Evidence health: no `EvidenceHealth` model on DriveOutcome; frame-commit failures can still yield citable defaults | `src/execution/drive.rs` |
 
@@ -123,7 +121,7 @@ test --all-features) verified green on the formatted tree.
 
 | # | Finding | Evidence |
 | - | ------- | -------- |
-| 13 | Lifecycle mutation vs lease (subsumed by #4) | — |
+| 13 | ~~Lifecycle mutation vs lease~~ FIXED with #4 (`b5cbe20`) | — |
 | 16 | Native suffix match takes first hit, no uniqueness/ambiguity report | `src/semantic/native.rs:822` |
 | 17 | Native focus rewrites headline + matched node but never clears stale `focused=true` on other controls | `src/semantic/native.rs:364-430` |
 | 20 | Fake `AUDIT-METRICS` finding on clean runs; findings still carry passes/metrics | `src/audit/transaction.rs:170` |
@@ -141,6 +139,8 @@ test --all-features) verified green on the formatted tree.
 
 ### FIXED (verified in code)
 
+- **4** Lease completeness: release requires the `lease_id` token issued at acquire (wrong token → `control_leased` naming the holder; expiry needs none); restart, stop, and `tui_run close kill_sessions=true` all refuse live-leased sessions with holder + retry_after_ms (close checks via the pool — `with_sess` is run-closed-gated after close); fixed as `b5cbe20`, subsumes 13
+- **7** Native channel bounds: `read_until` capped at 1 MiB per window (oversize skipped window-per-poll, resync at next newline, counted `frames_invalid`); non-UTF-8 refused not sticky; compaction rewrites the file to the unconsumed tail (atomic rename) past 8 MiB consumed history, offset restarts at 0 (`350b13c`)
 - **1** SessionActor shared ownership: `Arc<SessionActorInner>` (shared `closing` + join slot); stop removes from directory first, acks, joins (`049c144`)
 - **3** Intent semantics: focus moves are PROVEN FocusGraph Tab traversals (never clicks); AssertFocus guard between hops and payload; `Focus` Safe + payload-free; `Open` Mutating and MenuItem-only; plan/execute two-step contract (plan_id execute-once tickets + `max_risk` fence); E2E activation-ledger proves exactly-once (`33de5cf`)
 - **5** Scenario fail-fast: `on_failure` (stop|continue, stop default) on the model + wire override; `skipped_due_to_prior_failure` marking, `steps_skipped` count, `status: stopped_on_failure`; a skipped step fails `passed` (`a30290c`)
@@ -157,5 +157,5 @@ test --all-features) verified green on the formatted tree.
 
 ### Priority order (implementation sequence)
 
-Remaining P0: 4 (lease completeness, subsumes 13) → 7 (native channel bounds) → 8 (adapter dead data) → 9 (evidence health) → 2 (DriveOrigin provenance), then P1/P2: 16/17/20/21/23/28/31/32/33, then construction set 36-42.
+Remaining P0: 8 (adapter dead data) → 9 (evidence health) → 2 (DriveOrigin provenance), then P1/P2: 16/17/20/21/23/28/31/32/33, then construction set 36-42.
 
