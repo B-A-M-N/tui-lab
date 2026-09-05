@@ -436,21 +436,43 @@ impl NativeChannel {
         let mut report = NativeOverlayReport::default();
         for (_path, node) in &flat {
             report.native_ids.push(node.id.clone());
-            let mut resolved = resolve_node(&mut tree.root, node);
-            // Focus: the app's word outranks inference.
+            // Scoped so the mutable borrow ends before the focus clear.
+            let resolved_id = {
+                let resolved = resolve_node(&mut tree.root, node);
+                let resolved_id: Option<String> = resolved.as_ref().map(|n| n.id.clone());
+                // Focus: the app's word outranks inference — and it is
+                // exclusive (finding 17): the declared node gains focus,
+                // the rest of the tree loses whatever stale flag it
+                // carried.
+                if node.focused == Some(true) {
+                    if let Some(n) = resolved {
+                        n.state.focused = true;
+                        report.focus_applied = Some(node.id.clone());
+                    }
+                }
+                resolved_id
+            };
             if node.focused == Some(true) {
-                if let Some(n) = resolved.as_deref_mut() {
-                    n.state.focused = true;
-                    report.focus_applied = Some(node.id.clone());
+                clear_tree_focus_except(&mut tree.root, resolved_id.as_deref());
+            }
+            if resolved_id.is_none() {
+                // Finding 16: unmatched may mean AMBIGUOUS — report the
+                // competing nodes instead of a bare miss.
+                let competing = collect_ambiguous_ids(&tree.root, node);
+                if !competing.is_empty() {
+                    report.ambiguous.push((node.id.clone(), competing));
                 }
             }
-            if let Some(n) = resolved {
-                // Tree-only path: affordances live on the node; the flat
-                // mirror below does not exist in this entry point.
-                let _ = apply_native_facts(n, node);
-                report.matched.push(node.id.clone());
-            } else {
-                report.native_only.push(node.id.clone());
+            match resolve_node(&mut tree.root, node) {
+                Some(n) => {
+                    // Tree-only path: affordances live on the node; the flat
+                    // mirror below does not exist in this entry point.
+                    let _ = apply_native_facts(n, node);
+                    report.matched.push(node.id.clone());
+                }
+                None => {
+                    report.native_only.push(node.id.clone());
+                }
             }
         }
         report
@@ -475,29 +497,56 @@ impl NativeChannel {
         };
         let flat = root.flatten();
         let mut report = NativeOverlayReport::default();
+        // Finding 17: collect the app's focus verdict FIRST, so the clear
+        // below can run against every non-focused control — a stale
+        // `focused: true` from inference (or an earlier frame) must not
+        // survive a frame where the app says focus lives elsewhere.
+        let native_focus_target: Option<String> = flat
+            .iter()
+            .find(|(_, n)| n.focused == Some(true))
+            .map(|(_, n)| n.id.clone());
         for (_path, node) in &flat {
             report.native_ids.push(node.id.clone());
-            let mut resolved = resolve_node(&mut tree.root, node);
-            // Capture the join facts before the mutable move below — the
-            // tree node's id is the key back into `sem.controls`.
-            let resolved_id: Option<String> = resolved.as_ref().map(|n| n.id.clone());
-            let resolved_label: Option<String> = resolved.as_ref().and_then(|n| n.label.clone());
-            if node.focused == Some(true) {
-                if let Some(n) = resolved.as_deref_mut() {
-                    n.state.focused = true;
-                    report.focus_applied = Some(node.id.clone());
+            // Scoped so the mutable borrow ends before the focus clear.
+            // The join facts are captured inside — the tree node's id is
+            // the key back into `sem.controls`.
+            let resolved_id = {
+                let resolved = resolve_node(&mut tree.root, node);
+                let resolved_id: Option<String> = resolved.as_ref().map(|n| n.id.clone());
+                let resolved_label: Option<String> =
+                    resolved.as_ref().and_then(|n| n.label.clone());
+                if node.focused == Some(true) {
+                    if let Some(n) = resolved {
+                        n.state.focused = true;
+                        report.focus_applied = Some(node.id.clone());
+                    }
+                    // Fused: focus is mode-independent. Resolve the label
+                    // from the tree node when the native node carries none
+                    // apps often declare ids only.
+                    sem.focus = crate::semantic::FocusInfo {
+                        control: node.label.clone().or(resolved_label),
+                        control_id: Some(resolved_id.clone().unwrap_or_else(|| node.id.clone())),
+                        confidence: 1.0,
+                        evidence: vec![format!("native-focus:{}", node.id)],
+                    };
                 }
-                // Fused: focus is mode-independent. Resolve the label from
-                // the tree node when the native node carries none (apps
-                // often declare ids only).
-                sem.focus = crate::semantic::FocusInfo {
-                    control: node.label.clone().or(resolved_label),
-                    control_id: Some(resolved_id.clone().unwrap_or_else(|| node.id.clone())),
-                    confidence: 1.0,
-                    evidence: vec![format!("native-focus:{}", node.id)],
-                };
+                resolved_id
+            };
+            if node.focused == Some(true) {
+                // Finding 17, tree side: focus is exclusive — every OTHER
+                // node loses its focused flag, whatever inference or a
+                // previous frame claimed.
+                clear_tree_focus_except(&mut tree.root, resolved_id.as_deref());
             }
-            if let Some(n) = resolved {
+            if resolved_id.is_none() {
+                // Finding 16: unmatched may mean AMBIGUOUS — report the
+                // competing nodes instead of a bare miss.
+                let competing = collect_ambiguous_ids(&tree.root, node);
+                if !competing.is_empty() {
+                    report.ambiguous.push((node.id.clone(), competing));
+                }
+            }
+            if let Some(n) = resolve_node(&mut tree.root, node) {
                 let affordances = apply_native_facts(n, node);
                 // Mirror the same facts into the flat control with the same
                 // id (control-derived tree nodes keep the control's id, so
@@ -589,6 +638,25 @@ impl NativeChannel {
                 }
             }
         }
+        // Finding 17, flat side: the app's focus verdict is exclusive —
+        // when it names a target, every OTHER control loses its focused
+        // flag. Done after the loop so it covers controls whose native
+        // counterpart did not resolve: inference's style-guessed focus and
+        // an earlier frame's focus must not both be live.
+        if let Some(target) = &native_focus_target {
+            // The control id the focus landed on (the resolved join id, or
+            // the native id itself for native-only insertions).
+            let focused_control = sem
+                .focus
+                .control_id
+                .clone()
+                .unwrap_or_else(|| target.clone());
+            for c in sem.controls.iter_mut() {
+                if c.id != focused_control {
+                    c.focused = false;
+                }
+            }
+        }
         report
     }
 
@@ -634,6 +702,12 @@ pub struct NativeOverlayReport {
     pub matched: Vec<String>,
     pub native_only: Vec<String>,
     pub focus_applied: Option<String>,
+    /// Finding 16: native ids that matched MORE than one inferred node
+    /// (by suffix or label) and were therefore left unmatched — ambiguity
+    /// is reported, never silently resolved to the first hit. The inner
+    /// vec lists the competing inferred-node ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambiguous: Vec<(String, Vec<String>)>,
 }
 
 impl NativeOverlayReport {
@@ -655,6 +729,19 @@ fn find_by_id<'a>(
         }
     }
     None
+}
+
+/// Finding 17: focus is exclusive. Clear `focused` on every tree node
+/// EXCEPT `keep` (the node the app declared focused). A native snapshot
+/// is a whole-frame verdict, not a delta — a stale `focused: true` from
+/// style inference or an earlier frame must not survive beside it.
+fn clear_tree_focus_except(node: &mut crate::semantic::node::SemanticNode, keep: Option<&str>) {
+    if Some(node.id.as_str()) != keep {
+        node.state.focused = false;
+    }
+    for c in node.children.iter_mut() {
+        clear_tree_focus_except(c, keep);
+    }
 }
 
 /// Finding 8: the app-declared action verbs become affordances. The
@@ -993,33 +1080,61 @@ fn resolve_node<'a>(
 ) -> Option<&'a mut crate::semantic::node::SemanticNode> {
     // Decide which *key* matches first (id / suffix / label), then borrow
     // once — returning early from inside `if let Some(n)` holds the first
-    // mutable borrow across the later lookups.
-    enum Key {
-        Id(String),
-        Suffix(String),
+    // mutable borrow across the later lookups. Finding 16: EVERY relaxed
+    // key is uniqueness-checked — a suffix hit used to resolve to the
+    // first matching node while a second one sat unnoticed, so the app's
+    // declaration could silently land on the wrong widget.
+    if find_by_key(root, &native.id, 0).is_some() {
+        return find_by_id(root, &native.id);
     }
-    let key = if find_by_key(root, &native.id, 0).is_some() {
-        Key::Id(native.id.clone())
-    } else {
-        let want = native.id.trim_start_matches(['#', '@']).to_lowercase();
-        if !want.is_empty() && find_by_suffix_key(root, &want).is_some() {
-            Key::Suffix(want)
-        } else if let Some(label) = &native.label {
-            let mut hits: Vec<&crate::semantic::node::SemanticNode> = Vec::new();
-            collect_by_label(root, label, &mut hits);
-            if hits.len() == 1 {
-                Key::Id(hits[0].id.clone())
-            } else {
-                return None;
-            }
-        } else {
-            return None;
+    let want = native.id.trim_start_matches(['#', '@']).to_lowercase();
+    let mut suffix_hits: Vec<&crate::semantic::node::SemanticNode> = Vec::new();
+    if !want.is_empty() {
+        collect_by_suffix_key(root, &want, &mut suffix_hits);
+    }
+    if suffix_hits.len() == 1 {
+        let id = suffix_hits[0].id.clone();
+        return find_by_id(root, &id);
+    }
+    if let Some(label) = &native.label {
+        let mut hits: Vec<&crate::semantic::node::SemanticNode> = Vec::new();
+        collect_by_label(root, label, &mut hits);
+        if hits.len() == 1 {
+            let id = hits[0].id.clone();
+            return find_by_id(root, &id);
         }
-    };
-    match key {
-        Key::Id(id) => find_by_id(root, &id),
-        Key::Suffix(want) => find_by_suffix(root, &want),
     }
+    None
+}
+
+/// Ambiguous suffix/label resolution (finding 16): the tree nodes that
+/// COMPETED for a native id, for the overlay report — an ambiguity is
+/// reported, never silently resolved to the first hit.
+pub(crate) fn collect_ambiguous_ids(
+    root: &crate::semantic::node::SemanticNode,
+    native: &NativeNode,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if find_by_key(root, &native.id, 0).is_some() {
+        return out; // exact id: unique by definition
+    }
+    let want = native.id.trim_start_matches(['#', '@']).to_lowercase();
+    if !want.is_empty() {
+        let mut hits = Vec::new();
+        collect_by_suffix_key(root, &want, &mut hits);
+        if hits.len() > 1 {
+            out.extend(hits.iter().map(|n| n.id.clone()));
+            return out;
+        }
+    }
+    if let Some(label) = &native.label {
+        let mut hits = Vec::new();
+        collect_by_label(root, label, &mut hits);
+        if hits.len() > 1 {
+            out.extend(hits.iter().map(|n| n.id.clone()));
+        }
+    }
+    out
 }
 
 fn find_by_key<'a>(
@@ -1033,33 +1148,20 @@ fn find_by_key<'a>(
     node.children.iter().find_map(|c| find_by_key(c, id, 0))
 }
 
-fn find_by_suffix_key<'a>(
+/// ALL nodes whose last path segment equals `want` (finding 16: the count,
+/// not just the first hit, is what decides trust).
+fn collect_by_suffix_key<'a>(
     node: &'a crate::semantic::node::SemanticNode,
     want: &str,
-) -> Option<&'a crate::semantic::node::SemanticNode> {
+    out: &mut Vec<&'a crate::semantic::node::SemanticNode>,
+) {
     let last = node.id.rsplit('/').next().unwrap_or("").to_lowercase();
     if last == want {
-        return Some(node);
+        out.push(node);
     }
-    node.children
-        .iter()
-        .find_map(|c| find_by_suffix_key(c, want))
-}
-
-fn find_by_suffix<'a>(
-    node: &'a mut crate::semantic::node::SemanticNode,
-    want: &str,
-) -> Option<&'a mut crate::semantic::node::SemanticNode> {
-    let last = node.id.rsplit('/').next().unwrap_or("").to_lowercase();
-    if last == want {
-        return Some(node);
+    for c in &node.children {
+        collect_by_suffix_key(c, want, out);
     }
-    for c in node.children.iter_mut() {
-        if let Some(found) = find_by_suffix(c, want) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 fn collect_by_label<'a>(
@@ -1743,6 +1845,214 @@ mod tests {
         ch.poll();
         assert_eq!(ch.frames_accepted, 2, "pending frame survived compaction");
         assert_eq!(ch.latest.as_ref().expect("latest").id, "#pending");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ── Findings 16/17: honest resolution — ambiguity reported, focus exclusive ──
+
+    /// Finding 16: a native id whose suffix matches TWO inferred nodes is
+    /// ambiguous — it must NOT resolve to the first hit. The report names
+    /// both competitors, and neither gains native facts. (Built directly:
+    /// inference does not naturally produce colliding suffixes.)
+    #[test]
+    fn ambiguous_suffix_is_reported_not_first_hit() {
+        use crate::semantic::node::{NodeState, SemanticNode, SemanticTree};
+        let mk = |id: &str| SemanticNode {
+            id: id.into(),
+            parent: None,
+            role: crate::semantic::node::Role::Unknown,
+            bounds: crate::semantic::regions::Bounds {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            label: None,
+            value: None,
+            state: NodeState::default(),
+            children: Vec::new(),
+            affordances: Vec::new(),
+            identity: None,
+            confidence: crate::semantic::Confidence::inferred(0.5, &["fixture"]),
+        };
+        let mut tree = SemanticTree {
+            root: mk("screen"),
+            layers: std::collections::HashMap::new(),
+        };
+        tree.root.children = vec![mk("panel/a/save"), mk("panel/b/save")];
+
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        let body = r##"{"v":1,"type":"snapshot","root":{"id":"#root","role":"screen","children":[{"id":"#save","role":"button","label":"Save"}]}}"##;
+        std::fs::write(&path, format!("{body}\n")).expect("write");
+        ch.poll();
+        let mut sem = crate::semantic::SemanticScreen {
+            cols: 40,
+            rows: 2,
+            regions: Vec::new(),
+            controls: Vec::new(),
+            focus: crate::semantic::FocusInfo::default(),
+            relationships: Vec::new(),
+            affordances: Vec::new(),
+            components: Vec::new(),
+        };
+        let report = ch.overlay_fused(&mut tree, &mut sem);
+        // Two nodes compete for suffix `save`: the declaration is reported
+        // ambiguous, not resolved to whichever came first.
+        assert!(
+            !report.ambiguous.is_empty(),
+            "the competing match is reported: {report:?}"
+        );
+        let (_, competitors) = &report.ambiguous[0];
+        assert_eq!(
+            competitors.len(),
+            2,
+            "both competing ids named: {competitors:?}"
+        );
+        // And neither competitor gained native facts.
+        fn count_native(n: &crate::semantic::node::SemanticNode, native_id: &str) -> usize {
+            let own = (n.identity.as_ref().and_then(|i| i.native_id.as_deref()) == Some(native_id))
+                as usize;
+            own + n
+                .children
+                .iter()
+                .map(|c| count_native(c, native_id))
+                .sum::<usize>()
+        }
+        assert_eq!(
+            count_native(&tree.root, "#save"),
+            0,
+            "ambiguity matched nothing"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Finding 16b: a UNIQUE suffix still resolves — the uniqueness gate
+    /// must not over-refuse honest matches.
+    #[test]
+    fn unique_suffix_still_resolves() {
+        use crate::semantic::node::{NodeState, SemanticNode, SemanticTree};
+        let mk = |id: &str| SemanticNode {
+            id: id.into(),
+            parent: None,
+            role: crate::semantic::node::Role::Unknown,
+            bounds: crate::semantic::regions::Bounds {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            label: None,
+            value: None,
+            state: NodeState::default(),
+            children: Vec::new(),
+            affordances: Vec::new(),
+            identity: None,
+            confidence: crate::semantic::Confidence::inferred(0.5, &["fixture"]),
+        };
+        let mut tree = SemanticTree {
+            root: mk("screen"),
+            layers: std::collections::HashMap::new(),
+        };
+        tree.root.children = vec![mk("toolbar/save"), mk("toolbar/cancel")];
+
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        let body = r##"{"v":1,"type":"snapshot","root":{"id":"#root","role":"screen","children":[{"id":"#save","role":"button"}]}}"##;
+        std::fs::write(&path, format!("{body}\n")).expect("write");
+        ch.poll();
+        let mut sem = crate::semantic::SemanticScreen {
+            cols: 40,
+            rows: 2,
+            regions: Vec::new(),
+            controls: Vec::new(),
+            focus: crate::semantic::FocusInfo::default(),
+            relationships: Vec::new(),
+            affordances: Vec::new(),
+            components: Vec::new(),
+        };
+        let report = ch.overlay_fused(&mut tree, &mut sem);
+        assert!(
+            report.matched.iter().any(|id| id == "#save"),
+            "the unique suffix resolved: {report:?}"
+        );
+        assert!(report.ambiguous.is_empty());
+        fn native_id_of(n: &crate::semantic::node::SemanticNode, want: &str) -> Option<String> {
+            if n.identity.as_ref().and_then(|i| i.native_id.as_deref()) == Some(want) {
+                return Some(n.id.clone());
+            }
+            n.children.iter().find_map(|c| native_id_of(c, want))
+        }
+        assert_eq!(
+            native_id_of(&tree.root, "#save").as_deref(),
+            Some("toolbar/save"),
+            "the join landed on the ONE suffix hit"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Finding 17: focus is exclusive. When the app declares focus on ONE
+    /// control, every other control's stale `focused` flag is cleared in
+    /// BOTH shapes — inference's guess and an earlier frame's verdict do
+    /// not survive beside the app's word.
+    #[test]
+    fn native_focus_clears_stale_focus_everywhere() {
+        let screen = two_button_screen();
+        let (mut sem, mut tree) = crate::semantic::detect_frame(&screen);
+        // Force stale focus onto Cancel (as style inference or a previous
+        // frame might have left it).
+        for c in sem.controls.iter_mut() {
+            if c.label == "Cancel" {
+                c.focused = true;
+            }
+        }
+        // (Mark a tree node stale-focused too, so the tree-side clear is
+        // proven, not just the flat side.)
+        fn mark_stale_focus(n: &mut crate::semantic::node::SemanticNode, label: &str) {
+            if n.label.as_deref() == Some(label) {
+                n.state.focused = true;
+            }
+            for c in n.children.iter_mut() {
+                mark_stale_focus(c, label);
+            }
+        }
+        mark_stale_focus(&mut tree.root, "Cancel");
+
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        // The app declares: SAVE is focused. Cancel's stale flag must go.
+        let body = r##"{"v":1,"type":"snapshot","root":{"id":"#root","role":"screen","children":[{"id":"#save","role":"button","label":"Save","focused":true},{"id":"#cancel","role":"button","label":"Cancel"}]}}"##;
+        std::fs::write(&path, format!("{body}\n")).expect("write");
+        ch.poll();
+        let report = ch.overlay_fused(&mut tree, &mut sem);
+        assert_eq!(report.focus_applied.as_deref(), Some("#save"));
+
+        // Flat shape: exactly one focused control, and it is Save.
+        let focused: Vec<_> = sem.controls.iter().filter(|c| c.focused).collect();
+        assert_eq!(focused.len(), 1, "focus is exclusive: {focused:?}");
+        assert_eq!(focused[0].label, "Save");
+        assert_eq!(sem.focus.control.as_deref(), Some("Save"));
+
+        // Tree shape: no OTHER node claims focus either — and the node
+        // that does is the Save one, not the stale-marked Cancel.
+        fn focused_labels(n: &crate::semantic::node::SemanticNode, out: &mut Vec<String>) {
+            if n.state.focused {
+                out.push(n.label.clone().unwrap_or_else(|| n.id.clone()));
+            }
+            for c in &n.children {
+                focused_labels(c, out);
+            }
+        }
+        let mut tree_focused = Vec::new();
+        focused_labels(&tree.root, &mut tree_focused);
+        assert!(
+            tree_focused.len() <= 1,
+            "tree focus is exclusive too: {tree_focused:?}"
+        );
+        assert!(
+            tree_focused.first().map(String::as_str) == Some("Save"),
+            "the app's verdict is the survivor: {tree_focused:?}"
+        );
         std::fs::remove_file(&path).ok();
     }
 
