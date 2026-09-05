@@ -52,6 +52,7 @@
 //! touch `record_transaction` and all its call sites. Recording drops
 //! visibly in health is the minimal, observable compromise.
 
+use super::formats::StreamHeader;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -223,10 +224,21 @@ impl JournalHandle {
 
     /// Spawn a writer with an explicit capacity.
     pub fn spawn_with_capacity(path: std::path::PathBuf, capacity: usize) -> std::io::Result<Self> {
+        // Finding 31: a NEW stream file opens with a self-describing header
+        // line naming the format; an existing file (crash restart) keeps its
+        // header and records append after it. Only the creator writes it.
+        let is_new = std::fs::metadata(&path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
+        if is_new {
+            let mut file = &file;
+            let _ = file.write_all(StreamHeader::line(super::formats::tags::LEDGER).as_bytes());
+            let _ = file.write_all(b"\n");
+        }
         let (tx, rx) = mpsc::sync_channel::<JournalLine>(capacity);
         let flushed_upto = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -384,7 +396,7 @@ mod tests {
         drop(j); // disconnect -> writer flushes + exits
 
         let body = std::fs::read_to_string(&path).expect("read");
-        let lines: Vec<&str> = body.lines().collect();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.contains("\"schema\"")).collect();
         assert_eq!(lines.len(), 2, "{body}");
         assert!(lines[0].contains("\"seq\":0"));
         assert!(lines[1].contains("\"seq\":1"));
@@ -441,7 +453,7 @@ mod tests {
         // Verify file contents.
         drop(j);
         let body = std::fs::read_to_string(&path).expect("read");
-        let file_lines: Vec<&str> = body.lines().collect();
+        let file_lines: Vec<&str> = body.lines().filter(|l| !l.contains("\"schema\"")).collect();
         assert_eq!(
             file_lines.len(),
             line_count as usize,
@@ -523,7 +535,7 @@ mod tests {
 
         // Verify file line count matches.
         let body = std::fs::read_to_string(&path).expect("read");
-        let file_lines: Vec<&str> = body.lines().collect();
+        let file_lines: Vec<&str> = body.lines().filter(|l| !l.contains("\"schema\"")).collect();
         assert_eq!(file_lines.len(), PUSH_COUNT);
     }
 

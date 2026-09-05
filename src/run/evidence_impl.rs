@@ -154,7 +154,18 @@ impl RunContext {
                 "semantic_identity": frame.semantic_identity.clone().unwrap_or_else(|| crate::semantic::semantic_identity(&frame.state)),
             });
             let path = dir.join("frames.jsonl");
-            let body = format!("{line}\n");
+            // Finding 31: a NEW stream file starts with its format header.
+            let is_new = std::fs::metadata(&path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
+            let body = if is_new {
+                format!(
+                    "{}\n{line}\n",
+                    StreamHeader::line(crate::run::formats::tags::FRAMES)
+                )
+            } else {
+                format!("{line}\n")
+            };
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -194,7 +205,15 @@ impl RunContext {
             }
             let safe = sanitize(session);
             let path = ev_dir.join(format!("{}.jsonl", safe));
+            // Finding 31: a NEW session log starts with its format header.
+            let is_new = std::fs::metadata(&path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
             let mut body = String::new();
+            if is_new {
+                body.push_str(&StreamHeader::line(crate::run::formats::tags::EVENTS));
+                body.push('\n');
+            }
             for ev in &events {
                 if let Ok(line) = serde_json::to_string(ev) {
                     body.push_str(&line);
