@@ -101,3 +101,61 @@ All nine P1 items from the re-review are implemented:
    observe cycle after pool.start, same treatment as the earlier
    query_response fix.
 
+## Beta-stable audit map (2026-09-04)
+
+Status of the 44-finding beta-stable release audit, verified against code
+at `84ef926`. The earlier architecture-audit commits (`9a9c484`..`b1559d5`)
+covered much of the same ground under a different numbering; this table is
+the reconciliation. All release gates (fmt / clippy -D warnings /
+test --all-features) verified green on the formatted tree.
+
+### OPEN — P0 blockers
+
+| # | Finding | Evidence |
+| - | ------- | -------- |
+| 1 | SessionActor ownership/shutdown: `closing` copied by value in `Clone`; no shared inner; no cancellation for long jobs | `src/session/actor.rs:77` |
+| 2 | One driving authority: `drive_pipeline` exists + scenario replay uses it, but no `DriveOrigin` provenance and ~25 direct `execute_act` call sites remain (exploration, conformance, audit drivers) | `src/execution/drive.rs`, callers |
+| 3 | Intent: `Focus` plans a left click (`vocab.rs:350`); `EnsureFocus` uses a click as focus primitive so Activate/Toggle can double-fire (`plan.rs:82`); `Open` is `Safe` + Enter for every control (`vocab.rs:394`); `execute=true` still fuses plan+authorization (no `plan_id`/`max_risk` two-step) | `src/intent/{plan,vocab}.rs`, `src/mcp/params/intent.rs` |
+| 4 | Lease completeness: release needs no token; restart checks run-ownership but not the human lease; `stop` checks neither; `tui_run close kill_sessions=true` kills leased sessions ungated. (Stale sub-claim: `probe_query_response` no longer writes to the PTY — it drains the parser engine-side, `portable_pty.rs:639`; the orchestrator comment saying otherwise is wrong.) | `src/session/lease.rs`, `handlers/session.rs:193,250`, `handlers/run.rs:164` |
+| 5 | Scenario fail-fast: failed step increments and the loop continues; no `on_failure=stop`, no `skipped_due_to_prior_failure` | `src/scenario/runner.rs:88-360` |
+| 6 | tmux honesty: every wait returns `WaitReason::ScreenChange` (`tmux.rs:586`); `input_families` lists `RawByte` while `raw_input:false`; `native_semantic:true` claimed for attach; no `ProcessOwnership` model; synthetic ProcessExited on detach | `src/backend/tmux.rs` |
+| 7 | Native channel: `read_line` has no max-frame bound; channel file grows unbounded (offset advances, never truncated). (Landed half: bounded event ring + seq cursors + truncation detection.) | `src/semantic/native.rs:247` |
+| 8 | Native adapters: `NativeNode.actions` parsed but consumed nowhere (dead data); Textual fallback id is `id(widget)` memory address; snippets emit snapshots only | `src/semantic/node.rs`, `src/framework/adapters.rs:114` |
+| 9 | Evidence health: no `EvidenceHealth` model on DriveOutcome; frame-commit failures can still yield citable defaults | `src/execution/drive.rs` |
+
+### OPEN — P1/P2
+
+| # | Finding | Evidence |
+| - | ------- | -------- |
+| 12 | `ActorBusy` maps to `NoSession`; no `session_busy`/retryable category | `src/session/actor.rs:305` |
+| 13 | Lifecycle mutation vs lease (subsumed by #4) | — |
+| 16 | Native suffix match takes first hit, no uniqueness/ambiguity report | `src/semantic/native.rs:822` |
+| 17 | Native focus rewrites headline + matched node but never clears stale `focused=true` on other controls | `src/semantic/native.rs:364-430` |
+| 20 | Fake `AUDIT-METRICS` finding on clean runs; findings still carry passes/metrics | `src/audit/transaction.rs:170` |
+| 21 | `rule_id` landed, but severity/category remain `String`; no occurrence_id/sorted-key fingerprints | `src/audit/mod.rs:139` |
+| 22 | Audit uncertainty: no Unverified/LowConfidence/Ambiguous verdicts | drivers |
+| 23 | `NextObservation` is prose (`suggestion`/`rationale`), no structured tool+arguments | `src/audit/repair.rs:128` |
+| 25 | `action + dozens of Option<T>` request shapes (tagged unions) | `src/mcp/params/*` |
+| 28 | Target resolution: `format!("{kind:?}")` wire slug (`vocab.rs:440`); comment-priority mismatch in nearest_candidates | `src/intent/vocab.rs` |
+| 29 | Risk classification: label heuristics remain the authority; no native/contract risk attestation | `src/intent/vocab.rs` |
+| 31 | Only the run manifest carries a schema tag; ledger/frame/event/finding/scenario/contract formats unversioned | `src/run/manifest.rs:61` |
+| 32 | `reopen()` flips `closed=false`; no resume epochs | `src/run/persistence_impl.rs:458` |
+| 33 | `tui_run new` silently replaces an ephemeral run holding evidence (no `discard=true` / count refusal) | `handlers/run.rs` New |
+| 36-42 | Construction features: tui_inspect, multi-state scaffold, workflow object, regression-asset generation, semantic render diffs, framework diagnostic knowledge, adapter versioning | not started |
+| 43 | Partially done (registry-generated SKILL sections); full single-descriptor doc generation open | registry |
+
+### FIXED (verified in code)
+
+- **26** BackendParam VARIANTS ↔ enum consistent; tmux parses (serde-typed enum; no FromStr drift surface)
+- **30** Coverage delta stateless via caller-owned `since_seq` (`handlers/coverage.rs:86`)
+- **34** Completion honesty: `MayBeSilent`/`OutputClosed`/`BudgetExpired` vocabulary; budget plumbed through every strategy
+- **35** `require_wait` consults declared `supported_waits` for conditional families (`backend/mod.rs:210`)
+- **44** `repair` marked as alias of `diagnose` in registry summary
+- **10** (largely) probe timeline armed AT the stimulus (`diagnostic/mod.rs:179`); frame-history capture via transition capture
+- **11** (partially) typed stale-state guards (executor validates atomically with send); remaining: internal stringly error surfaces
+- **15** detection names OpenTUI/Ink/Bubble Tea but integration is tier-1 only — detection-side honesty landed, adapters open (see 36-42)
+
+### Priority order (implementation sequence)
+
+1→3→4→5→6→7→8→9→2 as P0, then 12/16/17/20/21/23, then construction set.
+
