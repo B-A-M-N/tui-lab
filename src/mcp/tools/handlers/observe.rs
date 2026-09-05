@@ -240,7 +240,7 @@ pub(crate) async fn tui_observe(
         } else {
             None
         };
-        super::observe_modes::observe_mode_arm(sess, mode, &p, screen)
+        super::observe_modes::observe_mode_arm(sess, mode, &p, screen, &run)
     })
     .await
     .unwrap_or_else(|e| e)
@@ -253,7 +253,14 @@ fn mode_needs_sweep(mode: crate::mcp::params::ObserveMode) -> bool {
     use crate::mcp::params::ObserveMode as OM;
     matches!(
         mode,
-        OM::Summary | OM::Screen | OM::Cells | OM::Semantic | OM::Tree | OM::Nodes | OM::Diff
+        OM::Summary
+            | OM::Screen
+            | OM::Cells
+            | OM::Semantic
+            | OM::Tree
+            | OM::Nodes
+            | OM::Diff
+            | OM::Inspect
     )
 }
 
