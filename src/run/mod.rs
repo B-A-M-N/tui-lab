@@ -20,6 +20,7 @@
 //! turns "implemented modules" into "product paths".
 
 pub mod artifacts;
+pub mod formats;
 pub mod journal;
 pub mod manifest;
 pub mod recording_scope;
@@ -37,6 +38,7 @@ mod persistence_impl;
 mod scenario_impl;
 
 pub use artifacts::{ArtifactKind, ArtifactRef};
+pub use formats::StreamHeader;
 pub use journal::JournalHandle;
 pub use manifest::RunManifest;
 
@@ -579,6 +581,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Serialize a JSON artifact under its format envelope (finding 31):
+/// every persisted document names its format + version so a reader that
+/// predates a shape change refuses honestly instead of reporting bare
+/// "corrupt".
+fn format_envelope(tag: &str, payload: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    crate::run::formats::Envelope::wrap(tag, payload.clone()).to_vec_pretty()
+}
+
 /// Whether a coverage target is a real file locus (`src/lib.rs`, `src/
 /// lib.rs:42`, `src/lib.rs:42:7`). A path separator plus an extension is
 /// the discriminator — `#save.activate` and `main` are not files.
@@ -785,7 +795,7 @@ mod tests {
         let body =
             std::fs::read_to_string(run.run_dir().expect("run dir").join("transactions.jsonl"))
                 .expect("ledger file");
-        let lines: Vec<&str> = body.lines().collect();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.contains("\"schema\"")).collect();
         assert_eq!(lines.len(), 2, "one NDJSON record per line: {body}");
         let first: TransactionRecord = serde_json::from_str(lines[0]).expect("parse");
         assert_eq!(first.action, "key");
@@ -894,17 +904,21 @@ mod tests {
         let path = run.run_dir().expect("dir").join("transactions.jsonl");
         run.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(&path).expect("ledger exists pre-flush");
-        assert_eq!(body.lines().count(), 1, "appended: {body}");
+        assert_eq!(body.lines().count(), 2, "appended (+header): {body}");
 
         let _ = run.record_event("s1", "wait");
         run.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(&path).expect("reread");
-        assert_eq!(body.lines().count(), 2, "second append: {body}");
+        assert_eq!(body.lines().count(), 3, "second append (+header): {body}");
 
         // And flush is idempotent on the file (no duplicate lines).
         run.flush().expect("flush");
         let body = std::fs::read_to_string(&path).expect("reread");
-        assert_eq!(body.lines().count(), 2, "flush must not duplicate");
+        assert_eq!(
+            body.lines().count(),
+            3,
+            "flush must not duplicate (+header)"
+        );
     }
 
     /// Wave B item 11: frames get citable per-run ids and provenance.
@@ -1044,7 +1058,8 @@ mod tests {
             .join("events")
             .join("incr-sess.jsonl");
         let log = std::fs::read_to_string(&path).expect("incremental log");
-        assert_eq!(log.lines().count(), 2, "both events appended");
+        // +1: the finding-31 stream header line.
+        assert_eq!(log.lines().count(), 3, "both events appended (+header)");
         // And the counter says so.
         assert_eq!(run.event_flushed_counts.get("incr-sess"), Some(&2));
         assert_eq!(run.counts()["events_persisted_incrementally"], 2);
@@ -1053,7 +1068,7 @@ mod tests {
         // Flush must not duplicate.
         run.flush().expect("flush");
         let log = std::fs::read_to_string(&path).expect("log after flush");
-        assert_eq!(log.lines().count(), 2, "flush must not re-append");
+        assert_eq!(log.lines().count(), 3, "flush must not re-append (+header)");
 
         // An ephemeral run keeps the old hold-for-flush contract.
         let mut eph = RunContext::ephemeral();
@@ -1112,7 +1127,7 @@ mod tests {
             "events must reach disk during observation, not only at close"
         );
         // The cursor advanced: a second sweep round saw no duplicates.
-        let count_before = log.lines().count();
+        let count_before = log.lines().filter(|l| !l.contains("\"schema\"")).count();
         assert_eq!(
             run.event_cursor("persistence:sweep-ev"),
             Some(run.event_cursor("persistence:sweep-ev").unwrap_or(0)),
@@ -1139,8 +1154,11 @@ mod tests {
 
         let path = run.run_dir().expect("dir").join("frames.jsonl");
         let log = std::fs::read_to_string(&path).expect("frames.jsonl");
-        let line: serde_json::Value =
-            serde_json::from_str(log.lines().next().expect("one line")).expect("json");
+        let first_record = log
+            .lines()
+            .find(|l| !l.contains("\"schema\""))
+            .expect("one record line");
+        let line: serde_json::Value = serde_json::from_str(first_record).expect("json");
         assert_eq!(line["frame_id"], 1);
         assert!(line["semantic_identity"]
             .as_str()
@@ -1185,6 +1203,69 @@ mod tests {
         // …and by unambiguous name.
         let loaded_by_name = run.load_scenario("roundtrip").expect("load by name");
         assert_eq!(loaded_by_name.id, scenario_id);
+    }
+
+    /// Finding 31: every persisted artifact names its format + version.
+    /// A saved scenario is an envelope whose payload round-trips the
+    /// historical shape; a bare pre-envelope file still restores; a
+    /// mismatched version is a named restore warning, never silent
+    /// best-effort.
+    #[test]
+    fn persisted_artifacts_carry_format_versions_and_refuse_mismatches() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+        let sc = crate::scenario::model::Scenario::new("versioned")
+            .act(serde_json::json!({"action": "key", "key": "enter"}));
+        let sc_id = sc.id.clone();
+        let path = run.save_scenario(sc).expect("save");
+        let _ = run.record_event("v-sess", "wait");
+        run.wait_for_journal(std::time::Duration::from_secs(2));
+
+        // The scenario file is an envelope naming the format.
+        let bytes = std::fs::read(&path).expect("scenario bytes");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            v["schema"],
+            serde_json::json!(crate::run::formats::tags::SCENARIO),
+            "scenario names its format: {v}"
+        );
+        assert!(v["payload"].is_object(), "payload holds the old shape");
+        // The restore path reads the envelope back into a Scenario.
+        let restored = RunContext::restore(run.run_dir().unwrap()).expect("restore");
+        assert!(restored.saved_scenarios.contains_key(&sc_id));
+
+        // The ledger stream opens with its header line.
+        let ledger = std::fs::read_to_string(run.run_dir().unwrap().join("transactions.jsonl"))
+            .expect("ledger");
+        let first = ledger.lines().next().expect("header line");
+        assert!(
+            first.contains(crate::run::formats::tags::LEDGER),
+            "ledger stream self-describes: {first}"
+        );
+        // And restore still sees the record past the header.
+        assert_eq!(restored.transaction_count, 1, "header is not a record");
+
+        // A mismatched-version artifact is a NAMED restore warning.
+        let wrong = crate::run::formats::Envelope::wrap(
+            "tui-lab.scenario.v999",
+            serde_json::json!({"id": "x", "name": "future"}),
+        );
+        let wrong_path = run
+            .run_dir()
+            .unwrap()
+            .join("scenarios")
+            .join("future-abc.json");
+        std::fs::write(&wrong_path, wrong.to_vec_pretty().expect("bytes")).expect("write");
+        let warned = RunContext::restore(run.run_dir().unwrap()).expect("restore");
+        assert!(
+            warned
+                .restore_warnings()
+                .iter()
+                .any(|w| w.error.contains("tui-lab.scenario.v999")),
+            "version mismatch names itself: {:?}",
+            warned.restore_warnings()
+        );
+        run.close().ok();
     }
 
     #[test]
@@ -1507,7 +1588,11 @@ mod tests {
         // before reading (the writer is asynchronous by design).
         restored.wait_for_journal(std::time::Duration::from_secs(2));
         let body = std::fs::read_to_string(root.join("transactions.jsonl")).expect("ledger");
-        assert_eq!(body.lines().count(), 2, "ledger appended in place: {body}");
+        assert_eq!(
+            body.lines().count(),
+            3,
+            "ledger appended in place (+header): {body}"
+        );
         // And the manifest still declares the same run id.
         let m = crate::run::manifest::load(&root).expect("manifest");
         assert_eq!(m.run_id, run_id);

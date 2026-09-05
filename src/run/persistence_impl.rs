@@ -172,8 +172,15 @@ impl RunContext {
             // Transaction ledger size on disk (the durable history — memory
             // is only a bounded window).
             let ledger = run_dir.join("transactions.jsonl");
+            // A versioned stream's header line is not a transaction.
             let ledger_lines = std::fs::read_to_string(&ledger)
-                .map(|s| s.lines().count() as u64)
+                .map(|s| {
+                    StreamHeader::strip(&s, crate::run::formats::tags::LEDGER)
+                        .ok()
+                        .flatten()
+                        .map(|rest| rest.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+                        .unwrap_or_else(|| s.lines().count() as u64)
+                })
                 .unwrap_or(0);
             out.push((
                 manifest.started_at,
@@ -244,7 +251,22 @@ impl RunContext {
         let ledger_path = run_dir.join("transactions.jsonl");
         if let Ok(body) = std::fs::read_to_string(&ledger_path) {
             let mut torn = 0u64;
-            for line in body.lines() {
+            // Finding 31: a versioned stream carries a header naming its
+            // format; a mismatch is a named restore warning, not silent
+            // best-effort parsing. Header-less (pre-versioning) files
+            // restore as before.
+            let data = match StreamHeader::strip(&body, crate::run::formats::tags::LEDGER) {
+                Ok(Some(rest)) => rest,
+                Ok(None) => &body[..],
+                Err(e) => {
+                    run.restore_warnings.push(RestoreWarning {
+                        artifact: "transactions.jsonl".to_string(),
+                        error: e.to_string(),
+                    });
+                    String::as_str(&body)
+                }
+            };
+            for line in data.lines() {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -270,34 +292,49 @@ impl RunContext {
         // either failure (present-but-unreadable / corrupt). Absent files
         // are normal (a run may never have produced one) and warn nothing.
         macro_rules! load_json {
-            ($file:expr, $ty:ty, $slot:expr) => {
+            ($file:expr, $tag:expr, $ty:ty, $slot:expr) => {
                 match std::fs::read(run_dir.join($file)) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => run.restore_warnings.push(RestoreWarning {
                         artifact: $file.to_string(),
                         error: format!("unreadable: {e}"),
                     }),
-                    Ok(bytes) => match serde_json::from_slice::<$ty>(&bytes) {
-                        Ok(v) => {
-                            $slot = v;
+                    Ok(bytes) => {
+                        // Finding 31: the artifact is versioned. An
+                        // envelope is checked against the reader's tag (a
+                        // mismatch is a named warning, not "corrupt"); a
+                        // bare pre-envelope document parses as before.
+                        match crate::run::formats::Envelope::unwrap(&bytes, $tag).and_then(|v| {
+                            serde_json::from_value::<$ty>(v).map_err(anyhow::Error::from)
+                        }) {
+                            Ok(v) => {
+                                $slot = v;
+                            }
+                            Err(e) => run.restore_warnings.push(RestoreWarning {
+                                artifact: $file.to_string(),
+                                error: format!("corrupt: {e}"),
+                            }),
                         }
-                        Err(e) => run.restore_warnings.push(RestoreWarning {
-                            artifact: $file.to_string(),
-                            error: format!("corrupt: {e}"),
-                        }),
-                    },
+                    }
                 }
             };
         }
-        load_json!("findings.json", Vec<crate::audit::Finding>, run.findings);
+        load_json!(
+            "findings.json",
+            crate::run::formats::tags::FINDINGS,
+            Vec<crate::audit::Finding>,
+            run.findings
+        );
         // Focus graphs (both ledgers).
         load_json!(
             "focus_graph.json",
+            crate::run::formats::tags::FOCUS_LEGACY,
             Vec<(u64, String, Option<String>, Option<String>)>,
             run.focus_transitions
         );
         load_json!(
             "focus_graph_ids.json",
+            crate::run::formats::tags::FOCUS_IDS,
             crate::semantic::focus_graph::FocusGraph,
             run.focus_graph
         );
@@ -313,13 +350,19 @@ impl RunContext {
                     artifact: "state_graph.json".to_string(),
                     error: format!("unreadable: {e}"),
                 }),
-                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    Ok(v) => slot = Some(v),
-                    Err(e) => run.restore_warnings.push(RestoreWarning {
-                        artifact: "state_graph.json".to_string(),
-                        error: format!("corrupt: {e}"),
-                    }),
-                },
+                Ok(bytes) => {
+                    // Finding 31: versioned like every other artifact.
+                    match crate::run::formats::Envelope::unwrap(
+                        &bytes,
+                        crate::run::formats::tags::STATE_GRAPH,
+                    ) {
+                        Ok(v) => slot = Some(v),
+                        Err(e) => run.restore_warnings.push(RestoreWarning {
+                            artifact: "state_graph.json".to_string(),
+                            error: format!("corrupt: {e}"),
+                        }),
+                    }
+                }
             }
             slot
         };
@@ -329,6 +372,7 @@ impl RunContext {
         // Coverage ledger.
         load_json!(
             "coverage.json",
+            crate::run::formats::tags::COVERAGE,
             std::collections::BTreeMap<String, CoverageEntry>,
             run.coverage_ledger
         );
@@ -342,7 +386,14 @@ impl RunContext {
                 }
                 match std::fs::read(&path) {
                     Ok(bytes) => {
-                        match serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes) {
+                        match crate::run::formats::Envelope::unwrap(
+                            &bytes,
+                            crate::run::formats::tags::SCENARIO,
+                        )
+                        .and_then(|v| {
+                            serde_json::from_value::<crate::scenario::model::Scenario>(v)
+                                .map_err(anyhow::Error::from)
+                        }) {
                             Ok(sc) => {
                                 run.saved_scenarios.insert(sc.id.clone(), sc);
                             }
@@ -491,21 +542,42 @@ impl RunContext {
                     continue;
                 }
                 let tmp = scen_dir.join(format!("{}.json.tmp", stem));
-                std::fs::write(&tmp, serde_json::to_vec_pretty(sc)?)?;
+                std::fs::write(
+                    &tmp,
+                    format_envelope(
+                        crate::run::formats::tags::SCENARIO,
+                        &serde_json::to_value(sc)?,
+                    )?,
+                )?;
                 std::fs::rename(&tmp, &path)?;
             }
         }
         // State graph.
         let graph = self.state_graph.export();
         let tmp = dir.join("state_graph.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&graph)?)?;
+        std::fs::write(
+            &tmp,
+            format_envelope(crate::run::formats::tags::STATE_GRAPH, &graph)?,
+        )?;
         std::fs::rename(&tmp, dir.join("state_graph.json"))?;
         // Focus graph (legacy label ledger + the ID-keyed FocusGraph).
         let ftmp = dir.join("focus_graph.json.tmp");
-        std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.focus_transitions)?)?;
+        std::fs::write(
+            &ftmp,
+            format_envelope(
+                crate::run::formats::tags::FOCUS_LEGACY,
+                &serde_json::to_value(&self.focus_transitions)?,
+            )?,
+        )?;
         std::fs::rename(&ftmp, dir.join("focus_graph.json"))?;
         let gtmp = dir.join("focus_graph_ids.json.tmp");
-        std::fs::write(&gtmp, serde_json::to_vec_pretty(&self.focus_graph)?)?;
+        std::fs::write(
+            &gtmp,
+            format_envelope(
+                crate::run::formats::tags::FOCUS_IDS,
+                &serde_json::to_value(&self.focus_graph)?,
+            )?,
+        )?;
         std::fs::rename(&gtmp, dir.join("focus_graph_ids.json"))?;
         // Transaction ledger (Wave-2 item 15 + Wave B item 14 + the
         // run-journal-writer audit item): records stream to the background
@@ -531,7 +603,11 @@ impl RunContext {
         std::fs::create_dir_all(&ev_dir)?;
         for (session, events) in std::mem::take(&mut self.held_events) {
             let safe = sanitize(&session);
+            // Finding 31: this whole-file write is the stream CREATOR for
+            // ephemeral runs flushed at close — it carries the header.
             let mut body = String::new();
+            body.push_str(&StreamHeader::line(crate::run::formats::tags::EVENTS));
+            body.push('\n');
             for ev in &events {
                 body.push_str(&serde_json::to_string(ev)?);
                 body.push('\n');
@@ -585,12 +661,24 @@ impl RunContext {
         let fdir = dir.join("findings");
         std::fs::create_dir_all(&fdir)?;
         let ftmp = dir.join("findings.json.tmp");
-        std::fs::write(&ftmp, serde_json::to_vec_pretty(&self.findings)?)?;
+        std::fs::write(
+            &ftmp,
+            format_envelope(
+                crate::run::formats::tags::FINDINGS,
+                &serde_json::to_value(&self.findings)?,
+            )?,
+        )?;
         std::fs::rename(&ftmp, dir.join("findings.json"))?;
         // Wave F item 64: the native coverage ledger.
         if !self.coverage_ledger.is_empty() {
             let ctmp = dir.join("coverage.json.tmp");
-            std::fs::write(&ctmp, serde_json::to_vec_pretty(&self.coverage_ledger)?)?;
+            std::fs::write(
+                &ctmp,
+                format_envelope(
+                    crate::run::formats::tags::COVERAGE,
+                    &serde_json::to_value(&self.coverage_ledger)?,
+                )?,
+            )?;
             std::fs::rename(&ctmp, dir.join("coverage.json"))?;
         }
         Ok(())
@@ -622,12 +710,17 @@ impl RunContext {
         // arm the writer for everything after this point.
         if self.transaction_count > 0 {
             let ledger_path = root.join("transactions.jsonl");
+            // Finding 31: promotion CREATES the stream file — it carries
+            // the format header before the records.
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&ledger_path)
             {
                 use std::io::Write as _;
+                let _ = file
+                    .write_all(StreamHeader::line(crate::run::formats::tags::LEDGER).as_bytes());
+                let _ = file.write_all(b"\n");
                 for tx in &self.transactions {
                     if let Ok(line) = serde_json::to_string(tx) {
                         let _ = file.write_all(line.as_bytes());

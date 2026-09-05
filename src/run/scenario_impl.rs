@@ -178,7 +178,14 @@ impl RunContext {
         let path = dir.join(format!("{}.json", file_stem));
         // Atomic write: temp file then rename (audit item 16).
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&scenario).ok()?).ok()?;
+        let payload = serde_json::to_value(&scenario).ok()?;
+        std::fs::write(
+            &tmp,
+            crate::run::formats::Envelope::wrap(crate::run::formats::tags::SCENARIO, payload)
+                .to_vec_pretty()
+                .ok()?,
+        )
+        .ok()?;
         std::fs::rename(&tmp, &path).ok()?;
         Some(path)
     }
