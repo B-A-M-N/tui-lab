@@ -161,22 +161,31 @@ pub(crate) async fn tui_explore(
                         )
                     }
                 };
-                match crate::exploration::random::run(sess, seed, budget, recording_path) {
+                // Audit finding 22: the explorer's transactions enter the
+                // canonical run ledger — the graph summary below stays the
+                // exploration view, the ledger the evidence view.
+                let mut run_guard = run.lock().unwrap();
+                match crate::exploration::random::run_evidenced(
+                    sess,
+                    seed,
+                    budget,
+                    recording_path,
+                    Some(&mut run_guard),
+                ) {
                     Ok(report) => {
                         // The state graph records WHAT ACTUALLY HAPPENED
                         // (re-review item 12): transitions come from the
                         // ordered ExplorationStep records (before → after via
                         // the real action), not from post-hoc hash lists.
                         let graph_summary = {
-                            let mut run = run.lock().unwrap();
                             crate::exploration::random::record_steps(
-                                &mut run.state_graph,
+                                &mut run_guard.state_graph,
                                 &report.steps,
                             );
                             json!({
-                                "states": run.state_graph.state_count(),
-                                "transitions": run.state_graph.transition_count(),
-                                "dead_ends": run.state_graph.find_dead_ends().len(),
+                                "states": run_guard.state_graph.state_count(),
+                                "transitions": run_guard.state_graph.transition_count(),
+                                "dead_ends": run_guard.state_graph.find_dead_ends().len(),
                             })
                         };
                         // Persist the graph when the run is persistent.
@@ -240,7 +249,11 @@ pub(crate) async fn tui_explore(
                 let mut local_graph =
                     crate::exploration::state_graph::StateGraph::new(graph_budget.clone());
                 let mut focus_graph = crate::semantic::focus_graph::FocusGraph::new();
-                let report = match crate::exploration::semantic::run_with_contract(
+                // Audit finding 22: the run ledger rides INTO the explorer
+                // so each executed action's transaction lands in the
+                // canonical evidence store as it happens, not as a summary.
+                let mut run_guard = run.lock().unwrap();
+                let report = match crate::exploration::semantic::run_evidenced(
                     sess,
                     &mut local_graph,
                     &mut focus_graph,
@@ -248,15 +261,15 @@ pub(crate) async fn tui_explore(
                     max_actions,
                     max_risk,
                     contract.as_ref(),
+                    Some(&mut run_guard),
                 ) {
                     Ok(r) => r,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
                 // Merge what actually happened into the run's graphs.
                 {
-                    let mut run = run.lock().unwrap();
-                    run.state_graph.merge(&local_graph);
-                    run.focus_graph.merge(&focus_graph);
+                    run_guard.state_graph.merge(&local_graph);
+                    run_guard.focus_graph.merge(&focus_graph);
                 }
                 ok(json!({
                     "mode": "semantic",

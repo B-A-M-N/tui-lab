@@ -107,7 +107,11 @@ pub(crate) async fn tui_coverage(
             ok(json!({
                 "new_targets": new_targets,
                 "new_target_count": new_targets.len(),
-                "hits_since_last_delta": hits_since,
+                // Audit finding 30 (honest naming): this is the hit count ON
+                // THE NEW TARGETS, not a delta of all hits — hits on
+                // already-known targets after the cursor are not counted
+                // (no per-hit journal exists to know them).
+                "hits_on_new_targets": hits_since,
                 "cursor_was": cur,
                 "cursor_now": new_cursor,
                 // Repeat this call with since_seq=cursor_now to see only

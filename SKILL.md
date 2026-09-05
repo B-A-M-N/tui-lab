@@ -27,7 +27,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.
   - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes, rendering, input_protocol, shell_cli, lifecycle, lifecycle_exit, query_response
 - `tui_coverage` — Coverage: native NSP coverage-event ledger plus the optional tuicov executable (honest Unsupported when absent).
-  - action: detect, summary, collect, delta, uncovered, ledger
+  - action: detect, summary, collect, delta, uncovered, ledger, snapshot
 - `tui_framework` — Framework detection, capability probes, and NativeSemanticProtocol adapter snippets (Ratatui/Textual/Python).
   - action: detect, capabilities, adapter_snippet
 - `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, diagnose (or its alias repair): diagnostic evidence contexts per finding — provenance-tiered source loci, verification plan (targeted checks, replay only with a reproduction), observation-shaped next steps — never edit prescriptions, bundle for ONE finding (context + before/after regression diff), and context (this registry as JSON).

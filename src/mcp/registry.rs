@@ -496,4 +496,33 @@ mod tests {
             assert!(doc.contains(r.uri), "SKILL.md misses resource {}", r.uri);
         }
     }
+
+    /// Audit finding 32: permanently unsupported operations must be named
+    /// as such IN THE SURFACE an agent reads before calling — not
+    /// discoverable only by invoking the tool and eating an error. Each
+    /// (tool, selector, keyword) triple here asserts the tool description
+    /// (the machine-readable contract on the wire) marks the member
+    /// explicitly unsupported with the reason.
+    #[test]
+    fn permanently_unsupported_selectors_are_named_in_descriptions() {
+        let router = crate::mcp::TuiLabServer::tool_router();
+        let desc = |tool: &str| {
+            router
+                .get(tool)
+                .map(|t| t.description.clone().unwrap_or_default().to_string())
+                .unwrap_or_else(|| panic!("tool {tool} missing from router"))
+        };
+        let coverage = desc("tui_coverage");
+        assert!(
+            coverage.contains("uncovered")
+                && (coverage.contains("explicitly unsupported")
+                    || coverage.contains("unsupported")),
+            "tui_coverage description must mark 'uncovered' unsupported up front: {coverage}"
+        );
+        let snapshot = desc("tui_coverage");
+        assert!(
+            snapshot.contains("snapshot") && snapshot.contains("tuicov"),
+            "tui_coverage description must state snapshot's tuicov requirement: {snapshot}"
+        );
+    }
 }

@@ -187,6 +187,41 @@ impl FrameAnalysis {
 
 /// Rows whose cell text differs between two frames (Wave B item 12:
 /// `ScreenChanged.dirty_rows` derived at the only place with both frames).
+/// The semantic half of the frame diff (audit finding 28): compare the two
+/// frames' analyzed semantics and push FocusChanged / SemanticChanged when
+/// the advertised vocabulary's premises actually hold. A free function so
+/// the decision is testable without a PTY session.
+fn emit_semantic_frame_events(
+    events: &mut crate::events::TerminalEventQueue,
+    session: &str,
+    generation: u32,
+    prev: &ScreenState,
+    next: &ScreenState,
+    cache: &mut crate::semantic::SemanticCache,
+) {
+    let prev_sem = cache.analyze(prev).sem;
+    let next_sem = cache.analyze(next).sem;
+    if prev_sem.focus.control_id != next_sem.focus.control_id
+        || prev_sem.focus.control != next_sem.focus.control
+    {
+        events.push(
+            session,
+            generation,
+            crate::events::TerminalEventKind::FocusChanged {
+                from: prev_sem.focus.control_id.or(prev_sem.focus.control),
+                to: next_sem.focus.control_id.or(next_sem.focus.control),
+            },
+        );
+    }
+    if prev.semantic_identity() != next.semantic_identity() {
+        events.push(
+            session,
+            generation,
+            crate::events::TerminalEventKind::SemanticChanged,
+        );
+    }
+}
+
 /// Compares viewport text per row — cheap, and matches what an incremental
 /// reader would fetch.
 fn dirty_rows(prev: &ScreenState, next: &ScreenState) -> Vec<u16> {
@@ -476,6 +511,21 @@ impl Session {
                 });
             }
         }
+        // Audit finding 28: the event contract advertises FocusChanged and
+        // SemanticChanged; emit them from the same semantic comparison the
+        // rest of the engine trusts, instead of leaving advertised
+        // vocabulary nothing ordinary observation produces.
+        {
+            let mut cache = self.semantic_cache.borrow_mut();
+            emit_semantic_frame_events(
+                &mut self.events,
+                &self.id,
+                self.generation,
+                prev,
+                next,
+                &mut cache,
+            );
+        }
         if prev.process.running && !next.process.running {
             self.push_event(crate::events::TerminalEventKind::ProcessExited {
                 exit_code: next.process.exit_code,
@@ -538,5 +588,89 @@ impl Session {
             self.backend
                 .wait_after(baseline, cond, std::time::Duration::from_millis(budget_ms))?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod emission_tests {
+    use super::*;
+
+    /// Audit finding 28: FocusChanged and SemanticChanged are advertised
+    /// event vocabulary — the frame diff must actually emit them, and a
+    /// pure pixel change must NOT emit a false SemanticChanged.
+    #[test]
+    fn frame_diff_emits_focus_and_semantic_events() {
+        // Two frames that differ only in which line carries the focused
+        // marker: the analyzer's focus must move between distinct labels.
+        // A "[ Save ]" button plus a reverse-video focus indicator line.
+        let base = |focused: u16| {
+            let mut s = ScreenState::new(40, 6);
+            s.viewport_text = vec![
+                "Menu".into(),
+                "[ Save ]".into(),
+                "[ Quit ]".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ];
+            // The analyzer's focus heuristic #2: the cursor sitting on a
+            // control IS the focus.
+            s.cursor.y = focused;
+            s.cursor.x = 3;
+            s
+        };
+        let a = base(1);
+        let b = base(2);
+        let sem_a = crate::semantic::analyze(&a);
+        let sem_b = crate::semantic::analyze(&b);
+        // Premise: the analyzer distinguishes the focus targets.
+        assert_ne!(
+            sem_a.focus.control_id, sem_b.focus.control_id,
+            "premise: the analyzer must see the focus move: {:?} vs {:?}",
+            sem_a.focus.control_id, sem_b.focus.control_id
+        );
+
+        let mut q = crate::events::TerminalEventQueue::new();
+        let mut cache = crate::semantic::SemanticCache::new();
+        emit_semantic_frame_events(&mut q, "s", 1, &a, &b, &mut cache);
+        let batch = q.since(0);
+        assert!(
+            batch.events.iter().any(|e| matches!(
+                &e.kind,
+                crate::events::TerminalEventKind::FocusChanged { .. }
+            )),
+            "a focus move must emit FocusChanged: {:?}",
+            batch.events.iter().map(|e| e.kind.name()).collect::<Vec<_>>()
+        );
+
+        // Semantic change: a control appears.
+        let mut c = base(1);
+        c.viewport_text[3] = "[ New Button ]".into();
+        let mut q2 = crate::events::TerminalEventQueue::new();
+        emit_semantic_frame_events(&mut q2, "s", 1, &a, &c, &mut cache);
+        let batch2 = q2.since(0);
+        assert!(
+            batch2.events.iter().any(|e| {
+                matches!(
+                    &e.kind,
+                    crate::events::TerminalEventKind::SemanticChanged
+                )
+            }),
+            "an added control must emit SemanticChanged: {:?}",
+            batch2
+                .events
+                .iter()
+                .map(|e| e.kind.name())
+                .collect::<Vec<_>>()
+        );
+
+        // Honest negative: identical semantics (same screen twice) emits
+        // NEITHER event.
+        let mut q3 = crate::events::TerminalEventQueue::new();
+        emit_semantic_frame_events(&mut q3, "s", 1, &a, &a.clone(), &mut cache);
+        assert!(
+            q3.since(0).events.is_empty(),
+            "identical frames must emit no semantic events"
+        );
     }
 }

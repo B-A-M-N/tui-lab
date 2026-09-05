@@ -81,6 +81,28 @@ pub fn run_with_contract(
     max_risk: ActionRisk,
     contract: Option<&crate::design::ProjectContract>,
 ) -> anyhow::Result<SemanticExploreReport> {
+    run_evidenced(
+        session, graph, focus_graph, budget, max_actions, max_risk, contract, None,
+    )
+}
+
+/// Ledger-evidenced variant (audit finding 22): when `run` is given, every
+/// executed action ALSO enters the run's canonical transaction ledger and
+/// frame store — one history, not two. The exploration metadata stays on
+/// the exploration report; the ledger carries the exact canonical
+/// transaction (linked with `exploration:<seq>` provenance), so "which
+/// exploration step produced frame:N?" is answerable from the run record.
+#[allow(clippy::too_many_arguments)]
+pub fn run_evidenced(
+    session: &mut Session,
+    graph: &mut StateGraph,
+    focus_graph: &mut crate::semantic::focus_graph::FocusGraph,
+    budget: &ExplorationBudget,
+    max_actions: u32,
+    max_risk: ActionRisk,
+    contract: Option<&crate::design::ProjectContract>,
+    mut run: Option<&mut crate::run::RunContext>,
+) -> anyhow::Result<SemanticExploreReport> {
     let started = std::time::Instant::now();
     let mut steps: Vec<SemanticStep> = Vec::new();
     let mut identities: Vec<StateIdentity> = Vec::new();
@@ -150,6 +172,16 @@ pub fn run_with_contract(
 
         // Execute via the one canonical executor.
         let tx = crate::execution::execute_act(session, &action, 80, 900, false)?;
+        // Audit finding 23: the action's IDENTITY is the exact canonical
+        // signature (`mouse:left:click@12,3`), not the generic kind name —
+        // distinct keys/targets must not collapse in the graph, history,
+        // or novelty dimensions. Finding 22: when a run sink is present,
+        // the transaction enters the canonical ledger like every other
+        // driver, linked as exploration evidence.
+        let action_sig = action.signature();
+        if let Some(run) = run.as_deref_mut() {
+            let _ = run.record_interaction(&session.id, &tx);
+        }
         let after = tx.after().clone();
         // Re-review P0.7: the after-state identity comes from the SAME
         // fused authority as the before-state — the state graph never
@@ -160,18 +192,13 @@ pub fn run_with_contract(
         let after_sem = session.fuse_screen(&after);
         let after_identity = StateIdentity::with_semantic(&after, &after_sem);
 
-        graph.record_transition_identity(&identity, &after_identity, candidate_name(&action));
+        graph.record_transition_identity(&identity, &after_identity, &action_sig);
         // Focus edges with the action as provenance.
         if let (Some(f), Some(t)) = (
             sem.focus.control_id.as_deref(),
             after_sem.focus.control_id.as_deref(),
         ) {
-            focus_graph.transition(
-                f,
-                t,
-                after_sem.focus.control.as_deref(),
-                candidate_name(&action),
-            );
+            focus_graph.transition(f, t, after_sem.focus.control.as_deref(), &action_sig);
         }
 
         // Item 29: feed the novelty ledger from what this step evidenced.
@@ -183,7 +210,7 @@ pub fn run_with_contract(
                 after_sem.focus.control_id.as_ref(),
             ) {
                 (Some(f), Some(t)) => {
-                    vec![(f.clone(), t.clone(), candidate_name(&action).to_string())]
+                    vec![(f.clone(), t.clone(), action_sig.clone())]
                 }
                 _ => Vec::new(),
             };
@@ -202,7 +229,7 @@ pub fn run_with_contract(
         steps.push(SemanticStep {
             motive,
             target: target_desc,
-            action: candidate_name(&action).to_string(),
+            action: action_sig.clone(),
             changed,
             settle: tx.settle,
             process_running: after.process.running,
@@ -292,10 +319,6 @@ fn build_action(
     } else {
         (None, candidate.control_id.clone(), reason_text)
     }
-}
-
-fn candidate_name(a: &crate::execution::CanonicalAction) -> &'static str {
-    a.name()
 }
 
 #[cfg(test)]

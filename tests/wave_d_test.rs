@@ -6,6 +6,7 @@
 
 use tui_lab::exploration::random;
 use tui_lab::exploration::state_graph::ExplorationBudget;
+use tui_lab::session::SessionPool;
 
 /// A program that dies on the first key it reads — the reproduction
 /// pipeline's target. Raw mode is required: the PTY line discipline
@@ -19,8 +20,9 @@ fn crasher_args() -> Vec<String> {
     ]
 }
 
-fn start(mgr: &mut tui_lab::session::SessionManager, args: &[String]) -> String {
-    mgr.start("python3", args, None, &[], 80, 24, "auto", "local")
+async fn start(pool: &SessionPool, args: &[String]) -> String {
+    pool.start("python3", args, None, &[], 80, 24, "auto", "local")
+        .await
         .expect("start session")
 }
 
@@ -28,42 +30,46 @@ fn start(mgr: &mut tui_lab::session::SessionManager, args: &[String]) -> String 
 /// (a) a failure exit, (b) a minimized reproduction saved as a Scenario,
 /// and (c) a Finding whose `reproduction` names the scenario. The scenario
 /// replays through the same canonical executor path as `tui_scenario run`.
-#[test]
-fn crash_minimization_produces_replayable_reproduction() {
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = start(&mut mgr, &crasher_args());
+#[tokio::test]
+async fn crash_minimization_produces_replayable_reproduction() {
+    let pool = SessionPool::new();
+    let id = start(&pool, &crasher_args()).await;
 
-    let sess = mgr.resolve_mut(Some(&id)).expect("session");
-    let budget = random::Budget {
-        max_actions: 4,
-        max_runtime_ms: 20_000,
-        // 0 would stop the loop before any action (the top-of-loop check
-        // `relaunches >= max_relaunches` fires immediately); 1 lets the
-        // first action run, the crash gets recorded, and the budget then
-        // halts further actions.
-        max_relaunches: 1,
-        max_depth: 100,
-        max_unique_states: 50,
-        // Items 27/28: the pool is risk-gated; the default (mutating) keeps
-        // Escape (unknown) out of the draw set.
-        allowed_risk: tui_lab::intent::ActionRisk::Mutating,
-    };
-    let report = random::run(sess, 9, budget, None).expect("explore");
-
-    // The crasher dies on the first key: an exit must have been recorded.
-    assert!(
-        !report.exits.is_empty(),
-        "crasher app must produce an exit: {:?}",
-        report.completion_reason
-    );
-
-    // Pipeline: minimize the trace that killed it.
-    let pipeline = tui_lab::exploration::repro::minimize_crash(
-        sess,
-        &report.steps,
-        tui_lab::exploration::repro::FailureKind::Crash,
-        "e2e-crasher",
-    );
+    let (report, pipeline) = pool
+        .with_session(Some(&id), move |sess| {
+            let budget = random::Budget {
+                max_actions: 4,
+                max_runtime_ms: 20_000,
+                // 0 would stop the loop before any action (the top-of-loop
+                // check `relaunches >= max_relaunches` fires immediately);
+                // 1 lets the first action run, the crash gets recorded, and
+                // the budget then halts further actions.
+                max_relaunches: 1,
+                max_depth: 100,
+                max_unique_states: 50,
+                // Items 27/28: the pool is risk-gated; the default
+                // (mutating) keeps Escape (unknown) out of the draw set.
+                allowed_risk: tui_lab::intent::ActionRisk::Mutating,
+            };
+            let report = random::run(sess, 9, budget, None).expect("explore");
+            // The crasher dies on the first key: an exit must have been
+            // recorded.
+            assert!(
+                !report.exits.is_empty(),
+                "crasher app must produce an exit: {:?}",
+                report.completion_reason
+            );
+            // Pipeline: minimize the trace that killed it.
+            let pipeline = tui_lab::exploration::repro::minimize_crash(
+                sess,
+                &report.steps,
+                tui_lab::exploration::repro::FailureKind::Crash,
+                "e2e-crasher",
+            );
+            (report, pipeline)
+        })
+        .await
+        .expect("explore job");
 
     // The first key kills this app, so the minimized reproduction is one
     // action — and the pipeline must have confirmed it reproduces.
@@ -74,7 +80,7 @@ fn crash_minimization_produces_replayable_reproduction() {
         "one key kills the crasher: {}",
         pipeline.steps.join(",")
     );
-    let scenario = pipeline.scenario.as_ref().expect("scenario built");
+    let scenario = pipeline.scenario.clone().expect("scenario built");
     assert!(
         scenario.name.starts_with("repro-"),
         "repro scenario named for its origin: {}",
@@ -86,30 +92,39 @@ fn crash_minimization_produces_replayable_reproduction() {
 
     // Replay it through the ScenarioRunner (the tui_scenario run path):
     // the reproduction must kill a fresh instance again.
-    let mut mgr2 = tui_lab::session::SessionManager::new();
-    let id2 = start(&mut mgr2, &crasher_args());
-    let sess2 = mgr2.resolve_mut(Some(&id2)).expect("session 2");
-    let replay = tui_lab::scenario::runner::ScenarioRunner::run(scenario, sess2);
+    let pool2 = SessionPool::new();
+    let id2 = start(&pool2, &crasher_args()).await;
+    let replay_failed = pool2
+        .with_session(Some(&id2), move |sess| {
+            let replay = tui_lab::scenario::runner::ScenarioRunner::run(&scenario, sess);
+            replay.steps_failed
+        })
+        .await
+        .expect("replay job");
     assert!(
-        replay.steps_failed > 0,
-        "the reproduction must fail again on a clean instance: {:?}",
-        replay.step_results
+        replay_failed > 0,
+        "the reproduction must fail again on a clean instance"
     );
 }
 
 /// Items 36/37: the keyboard audit records ID-keyed edges into the graph,
 /// and the navigation audit reads them back — with the Shift+Tab reversal
 /// checked edge-for-edge.
-#[test]
-fn navigation_audit_proves_traversal() {
-    let mut mgr = tui_lab::session::SessionManager::new();
+#[tokio::test]
+async fn navigation_audit_proves_traversal() {
+    let pool = SessionPool::new();
     let id = start(
-        &mut mgr,
+        &pool,
         &["-c".into(), "print('nav audit'); input()".to_string()],
-    );
-    let sess = mgr.resolve_mut(Some(&id)).expect("session");
-    let mut graph = tui_lab::semantic::focus_graph::FocusGraph::new();
-    let findings = tui_lab::audit::driver::navigation_audit(sess, 4, &mut graph);
+    )
+    .await;
+    let findings = pool
+        .with_session(Some(&id), move |sess| {
+            let mut graph = tui_lab::semantic::focus_graph::FocusGraph::new();
+            tui_lab::audit::driver::navigation_audit(sess, 4, &mut graph)
+        })
+        .await
+        .expect("audit job");
 
     assert!(
         !findings.is_empty(),
@@ -134,7 +149,7 @@ fn navigation_audit_proves_traversal() {
     );
 }
 
-/// Item 33 + 34, live: guided_candidates from a session context returns
+/// Items 33/34, live: guided_candidates from a session context returns
 /// only candidates at or below the allowed risk, each with ≥1 evidence
 /// citation naming a real source.
 #[test]
@@ -176,4 +191,59 @@ fn guided_candidates_cite_evidence_and_respect_risk() {
         .find(|c| c.action["key"] == "tab")
         .expect("tab is safe and never taken");
     assert!(tab.reasons.iter().any(|r| r.source == "graph"));
+}
+
+/// Audit findings 22/23: exploration actions enter the canonical run
+/// ledger (one history, not two), and the recorded action identity is the
+/// EXACT canonical signature, not the generic kind (`key`).
+#[tokio::test]
+async fn random_exploration_enters_run_ledger_with_exact_signatures() {
+    let pool = SessionPool::new();
+    // Raw-mode app that survives keys: reads three bytes before exiting,
+    // so several pooled actions run.
+    let id = start(
+        &pool,
+        &[
+            "-c".into(),
+            "import sys,tty; tty.setraw(0); print('READY'); sys.stdin.buffer.read(1); sys.stdin.buffer.read(1); sys.stdin.buffer.read(1)"
+                .into(),
+        ],
+    )
+    .await;
+    let (ledger_len, step_actions) = pool
+        .with_session(Some(&id), move |sess| {
+            let budget = random::Budget {
+                max_actions: 3,
+                max_runtime_ms: 20_000,
+                // 0 would stop the loop before any action (the top-of-loop
+                // `relaunches >= max_relaunches` check fires immediately).
+                max_relaunches: 1,
+                max_depth: 100,
+                max_unique_states: 50,
+                allowed_risk: tui_lab::intent::ActionRisk::Mutating,
+            };
+            let mut run = tui_lab::run::RunContext::ephemeral();
+            let report = random::run_evidenced(sess, 7, budget, None, Some(&mut run))
+                .expect("explore");
+            let ledger = run.transactions().len();
+            let actions: Vec<String> = report.steps.iter().map(|s| s.action.clone()).collect();
+            (ledger, actions)
+        })
+        .await
+        .expect("explore job");
+
+    assert!(!step_actions.is_empty(), "steps must have run");
+    // Finding 22: every executed action is in the canonical ledger.
+    assert!(
+        ledger_len >= step_actions.len(),
+        "each exploration action must be a ledger transaction: {ledger_len} ledger vs {} steps",
+        step_actions.len()
+    );
+    // Finding 23: identity is the exact signature, never the bare kind.
+    for action in &step_actions {
+        assert!(
+            action != "key" && action != "mouse_click" && !action.is_empty(),
+            "step identity must be the canonical signature, not the kind: {action}"
+        );
+    }
 }

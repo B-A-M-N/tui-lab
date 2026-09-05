@@ -231,31 +231,67 @@ impl ScenarioRunner {
                     },
                     StepKind::Wait => {
                         match serde_json::from_value::<TuiWaitParams>(params.clone()) {
-                        Ok(wp) => match crate::mcp::helpers::build_wait(&wp) {
-                            Some(cond) => {
-                                match crate::execution::execute_wait(
-                                    session,
-                                    cond,
-                                    wp.budget_ms.unwrap_or(5000),
-                                ) {
-                                    Ok(out) => (
-                                        out.met,
-                                        format!("wait met={} reason={:?}", out.met, out.reason),
+                        Ok(wp) => {
+                            // Audit finding 20: a wait step may be an EVENT
+                            // wait (condition=event). Route it through the
+                            // SAME shared primitive the live `tui_wait` uses
+                            // — event history is a session-queue concern, not
+                            // a backend read condition, and a recorded event
+                            // wait must replay with identical semantics.
+                            if matches!(
+                                wp.condition.known(),
+                                Some(crate::mcp::params::WaitCondition::Event)
+                            ) {
+                                match wp.event.clone() {
+                                    Some(pred) => {
+                                        let budget = wp.budget_ms.unwrap_or(5000);
+                                        match crate::execution::execute_wait_event(
+                                            session, &pred, budget,
+                                        ) {
+                                            Ok(out) => (
+                                                out.met,
+                                                format!(
+                                                    "event wait met={} matched_seq={}",
+                                                    out.met, out.matched_seq
+                                                ),
+                                            ),
+                                            Err(e) => (false, format!("event wait failed: {e}")),
+                                        }
+                                    }
+                                    None => (
+                                        false,
+                                        "event wait requires the 'event' predicate object"
+                                            .to_string(),
                                     ),
-                                    Err(e) => (false, format!("wait failed: {e}")),
+                                }
+                            } else {
+                                match crate::mcp::helpers::build_wait(&wp) {
+                                    Some(cond) => {
+                                        match crate::execution::execute_wait(
+                                            session,
+                                            cond,
+                                            wp.budget_ms.unwrap_or(5000),
+                                        ) {
+                                            Ok(out) => (
+                                                out.met,
+                                                format!("wait met={} reason={:?}", out.met, out.reason),
+                                            ),
+                                            Err(e) => (false, format!("wait failed: {e}")),
+                                        }
+                                    }
+                                    None => (
+                                        false,
+                                        format!(
+                                            "unknown wait condition '{}' (expected one of: {})",
+                                            match &wp.condition {
+                                                crate::mcp::params::Known::Other(o) => o.clone(),
+                                                _ => String::new(),
+                                            },
+                                            <crate::mcp::params::WaitCondition as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                                        ),
+                                    ),
                                 }
                             }
-                            None => (
-                                false,
-                                format!(
-                                    "unknown wait condition '{}' (expected one of: {})",
-                                    match &wp.condition {
-                                        crate::mcp::params::Known::Other(o) => o.clone(),
-                                        _ => String::new(),
-                                    },
-                                    <crate::mcp::params::WaitCondition as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
-                                ),
-                            ),
                         },
                         Err(e) => (false, format!("unparseable wait step: {e}")),
                     }

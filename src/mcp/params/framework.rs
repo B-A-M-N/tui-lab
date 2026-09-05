@@ -21,4 +21,10 @@ pub struct TuiFrameworkParams {
     pub cwd: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    /// Optional session id. When given, `detect`/`capabilities` ALSO report
+    /// the native-channel facts that only a live session can attest:
+    /// whether the adapter file exists, whether this app actually
+    /// cooperated (wrote ≥1 valid frame), and the frame health split.
+    #[serde(default)]
+    pub id: Option<String>,
 }
