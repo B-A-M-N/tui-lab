@@ -38,8 +38,8 @@ use vt100::Parser;
 use crate::backend::line_types::{now_ms, CommandState, SearchHit};
 use crate::backend::{
     new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
-    Input, InputModes, ObserveResult, RecordingHookSlot, TerminalEventState, WaitCond, WaitOutcome,
-    WaitReason,
+    Input, InputModes, ObserveResult, ProcessOwnership, RecordingHookSlot, TerminalEventState,
+    WaitCond, WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -410,6 +410,10 @@ impl TerminalBackend for TmuxBackend {
 
     /// Detach. The pane is NOT killed unless `kill_on_stop` was set — the
     /// attached TUI predates this session and must outlive it.
+    fn kill_on_stop(&self) -> bool {
+        self.kill_on_stop
+    }
+
     fn stop(&mut self) -> BackendResult<()> {
         if self.kill_on_stop {
             self.tmux(&["kill-pane", "-t", &self.target.to_tmux()])?;
@@ -539,8 +543,13 @@ impl TerminalBackend for TmuxBackend {
             std::thread::sleep(Duration::from_millis(50));
             let now_state = self.state()?;
             let now = self.event_state();
-            let met = match &cond {
-                WaitCond::ScreenChange => now.screen_seq > baseline.screen_seq,
+            // Finding 6: each condition resolves with its OWN reason — the
+            // reason field names WHY the wait returned, not a blanket
+            // ScreenChange for every condition.
+            let (met, reason) = match &cond {
+                WaitCond::ScreenChange => {
+                    (now.screen_seq > baseline.screen_seq, WaitReason::ScreenChange)
+                }
                 WaitCond::ScreenStable {
                     quiet_for,
                     after_screen_seq,
@@ -548,32 +557,47 @@ impl TerminalBackend for TmuxBackend {
                     let quiet_ms = quiet_for.as_millis() as u64;
                     let quiet_elapsed =
                         now_ms().saturating_sub(now.last_screen_change_at) >= quiet_ms;
-                    quiet_elapsed
-                        && after_screen_seq.map(|s| now.screen_seq > s).unwrap_or(true)
+                    (
+                        quiet_elapsed
+                            && after_screen_seq.map(|s| now.screen_seq > s).unwrap_or(true),
+                        WaitReason::ScreenStable,
+                    )
                 }
-                WaitCond::Text(text) => {
-                    now_state.viewport_text.join("\n").contains(text.as_str())
-                }
-                WaitCond::TextAbsent(text) => {
-                    !now_state.viewport_text.join("\n").contains(text.as_str())
-                }
-                WaitCond::Title(title) => now_state.title.as_deref() == Some(title),
-                WaitCond::Bell { after_bell_seq } => {
-                    now.bell_seq > after_bell_seq.unwrap_or(baseline.bell_seq)
-                }
+                WaitCond::Text(text) => (
+                    now_state.viewport_text.join("\n").contains(text.as_str()),
+                    WaitReason::Text,
+                ),
+                WaitCond::TextAbsent(text) => (
+                    !now_state.viewport_text.join("\n").contains(text.as_str()),
+                    WaitReason::TextAbsent,
+                ),
+                WaitCond::Title(title) => (
+                    now_state.title.as_deref() == Some(title),
+                    WaitReason::Title,
+                ),
+                WaitCond::Bell { after_bell_seq } => (
+                    now.bell_seq > after_bell_seq.unwrap_or(baseline.bell_seq),
+                    WaitReason::Bell,
+                ),
                 WaitCond::Idle {
                     quiet_for,
                     after_output_seq,
                 } => {
                     let quiet_ms = quiet_for.as_millis() as u64;
-                    now_ms().saturating_sub(now.last_output_at) >= quiet_ms
-                        && after_output_seq.map(|s| now.output_seq > s).unwrap_or(true)
+                    (
+                        now_ms().saturating_sub(now.last_output_at) >= quiet_ms
+                            && after_output_seq.map(|s| now.output_seq > s).unwrap_or(true),
+                        WaitReason::Idle,
+                    )
                 }
-                WaitCond::ProcessExit => self.pane_dead,
+                WaitCond::ProcessExit => (self.pane_dead, WaitReason::ProcessExit),
                 WaitCond::AnyActivity {
                     after_interaction_seq,
-                } => now.interaction_seq
-                    > after_interaction_seq.unwrap_or(baseline.interaction_seq),
+                } => (
+                    now.interaction_seq
+                        > after_interaction_seq.unwrap_or(baseline.interaction_seq),
+                    WaitReason::ScreenChange,
+                ),
                 WaitCond::CommandDone { .. } | WaitCond::CommandOutput { .. } => {
                     return Err(BackendError::Unsupported(
                         "OSC 133 shell-integration waits need the portable engine; the tmux pane's shell integration is not visible to capture".into(),
@@ -583,7 +607,7 @@ impl TerminalBackend for TmuxBackend {
             if met {
                 return Ok(WaitOutcome {
                     met: true,
-                    reason: WaitReason::ScreenChange,
+                    reason,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     state: now_state,
                     screen_seq: now.screen_seq,
@@ -705,11 +729,20 @@ impl TerminalBackend for TmuxBackend {
             exit_code: false,
             shell_integration: false, // command_state() returns None
             stdout_stderr_separation: false,
-            recording: true,       // recording hook delivered from pane capture
-            native_semantic: true, // session-provided side channel
+            recording: true, // recording hook delivered from pane capture
+            // Finding 6: FALSE for attach. The native semantic channel is
+            // provisioned at SESSION launch by injecting TUI_LAB_SEMANTIC
+            // into the child's environment — impossible for a pane this
+            // backend attached and did not spawn. Claiming it here promised
+            // native events that can never arrive on an attach.
+            native_semantic: false,
             // Attach semantics: this backend attaches an EXISTING TUI it did
             // not spawn.
             attach: true,
+            // Finding 6: the ownership model the rest of the system keys off
+            // — not our child, so no signals, exit_code: false, and a plain
+            // detach leaves the pane running.
+            process_ownership: ProcessOwnership::Attached,
             query_response: false, // no device-query responder behind tmux
             event_types: vec![
                 EventCapability::Output,
@@ -729,12 +762,12 @@ impl TerminalBackend for TmuxBackend {
                 WaitCapability::AnyActivity,
                 WaitCapability::Idle,
             ],
-            input_families: vec![
-                InputFamily::Key,
-                InputFamily::Paste,
-                InputFamily::RawByte,
-                InputFamily::Resize,
-            ],
+            // Finding 6: RawByte is NOT listed. send-keys accepts UTF-8
+            // TEXT only (`Input::Raw` with non-UTF-8 bytes is refused), so
+            // advertising the RawByte family here contradicted
+            // `raw_input: false` and the send-path refusal. Text-shaped
+            // payload delivery is the Key/Paste families.
+            input_families: vec![InputFamily::Key, InputFamily::Paste, InputFamily::Resize],
         }
     }
 
@@ -962,6 +995,24 @@ mod tests {
         assert!(!caps.mouse, "tmux pane mouse injection is unsupported");
         // audit finding 37: operation-oriented honesty for the attach engine.
         assert!(caps.attach, "tmux attaches an existing TUI");
+        // Finding 6: ownership + native-channel honesty. An attached pane is
+        // not our child, and the native semantic channel could never have
+        // been injected into its environment.
+        assert_eq!(
+            caps.process_ownership,
+            crate::backend::ProcessOwnership::Attached,
+            "the pane is observed, not owned"
+        );
+        assert!(
+            !caps.native_semantic,
+            "attach cannot inject TUI_LAB_SEMANTIC into the child env"
+        );
+        assert!(
+            !caps
+                .input_families
+                .contains(&crate::backend::InputFamily::RawByte),
+            "UTF-8-only send-keys is not raw-byte input"
+        );
         assert!(!caps.raw_input, "tmux send-keys cannot deliver raw bytes");
         assert!(!caps.exit_code, "tmux cannot report the child's exit code");
         assert!(

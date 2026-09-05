@@ -169,6 +169,14 @@ pub trait TerminalBackend: Send {
         false
     }
 
+    /// Whether `stop()` will KILL the observed process, or merely detach
+    /// from it (audit finding 6). Only the tmux attach backend detaches
+    /// without killing (its pane predates the session); every spawning
+    /// backend owns the child and stops it, so the default is true.
+    fn kill_on_stop(&self) -> bool {
+        true
+    }
+
     /// Capability flags for this backend/session. Must describe working
     /// behavior, not intended behavior (spec section 9).
     fn capabilities(&self) -> Capabilities;
