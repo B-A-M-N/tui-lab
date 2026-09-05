@@ -187,6 +187,20 @@ pub(crate) async fn tui_act(
                     },
                 })
             });
+            // Finding 9: the act landing and the evidence committing are
+            // separate facts. Citable frames carry ids; failed legs are
+            // null + error, and `evidence_health.healthy: false` names the
+            // caveat explicitly instead of letting "frame:0" impersonate
+            // evidence.
+            let health = &outcome.health;
+            let mut warnings = if tx.settled() {
+                Vec::<String>::new()
+            } else if tx.settle == crate::execution::SettleStatus::Skipped {
+                vec!["settlement was not tested (no_wait=true); reported honestly as skipped".to_string()]
+            } else {
+                vec!["screen did not reach the requested stability within the settle budget".to_string()]
+            };
+            warnings.extend(health.failures());
             ok(json!({
                 "action": tx.name(),
                 "settled": tx.settled(),
@@ -194,11 +208,12 @@ pub(crate) async fn tui_act(
                 "settle_reason": tx.settle_reason(),
                 "elapsed_ms": tx.elapsed_ms,
                 "frames": outcome.frames,
-                "warnings": if tx.settled() { Vec::<String>::new() } else if tx.settle == crate::execution::SettleStatus::Skipped {
-                    vec!["settlement was not tested (no_wait=true); reported honestly as skipped".to_string()]
-                } else {
-                    vec!["screen did not reach the requested stability within the settle budget".to_string()]
+                "evidence_health": {
+                    "healthy": health.healthy(),
+                    "ledger_recorded": health.ledger_recorded,
+                    "failures": health.failures(),
                 },
+                "warnings": warnings,
                 "render": render,
                 "transition": tx.transition,
             }))
@@ -474,6 +489,10 @@ pub(crate) async fn tui_intent(
                         "step": "move_focus", "how": key.signature(),
                         "target": target_id, "ok": true,
                         "frames": focus_outcome.frames,
+                        "evidence_health": {
+                            "healthy": focus_outcome.health.healthy(),
+                            "failures": focus_outcome.health.failures(),
+                        },
                     }));
                     // The executor's settle observes through the
                     // backend's wait path and does NOT refresh the
@@ -525,6 +544,10 @@ pub(crate) async fn tui_intent(
                         "settled": outcome.tx.settled(),
                         "settle": format!("{:?}", outcome.tx.settle).to_lowercase(),
                         "frames": outcome.frames,
+                        "evidence_health": {
+                            "healthy": outcome.health.healthy(),
+                            "failures": outcome.health.failures(),
+                        },
                     }));
                 }
             }
