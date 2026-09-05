@@ -33,7 +33,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_observe",
-        summary: "Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state, protocol trace + mode timeline (portable-pty/line engines), pipe stdout/stderr streams.",
+        summary: "Observe terminal state: summary, screen text, cells, semantic surfaces, node tree, diffs, scrollback, search, shell-command state, protocol trace + mode timeline (portable-pty/line engines), pipe stdout/stderr streams, and inspect — the one-call construction view (frame + semantic identity, per-control stable ids/bounds/state/affordances/source loci, native overlay health, loaded-contract violations; target= narrows to one control).",
         selector: Some(("mode", <crate::mcp::params::ObserveMode as EnumVariants>::VARIANTS)),
     },
     ToolCapability {

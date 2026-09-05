@@ -5,7 +5,7 @@
 //! cycle — and arms opt in through the [`cap`] helper the caller passes.
 
 use crate::error::ErrorCategory;
-use crate::mcp::helpers::{err, ok};
+use crate::mcp::helpers::{err, err_with_details, ok};
 use crate::mcp::params::ObserveMode as OM;
 use crate::mcp::params::TuiObserveParams;
 use rmcp::model::CallToolResult;
@@ -14,12 +14,15 @@ use rmcp::serde_json::json;
 /// Body of one observe mode. Split from `super::tui_observe`'s match so the
 /// mode vocabulary has a file of its own; `screen` is `None` for modes that
 /// skip the sweep (retained-state readers) — a screen-rendering arm never
-/// sees `None` because the caller only sweeps for those exact modes.
+/// sees `None` because the caller only sweeps for those exact modes. `run`
+/// is the run handle, for arms that cite run-held evidence (finding 36's
+/// frame id + contract verdict).
 pub(crate) fn observe_mode_arm(
     sess: &mut crate::session::Session,
     mode: OM,
     p: &TuiObserveParams,
     screen: Option<crate::screen::ScreenState>,
+    run: &std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
 ) -> CallToolResult {
     use crate::semantic;
     // Fused truth helper (re-review Wave-4): every semantic-bearing mode
@@ -329,5 +332,297 @@ pub(crate) fn observe_mode_arm(
                 },
             }))
         }
+        OM::Inspect => {
+            // Finding 36: the first-class inspection view. One call
+            // answers "what is this component, what can it do, where is
+            // it in source, what state is it in, and what currently
+            // violates the design?" — frame + semantic identity, per-
+            // control facts (stable ids, bounds, state, affordances,
+            // source loci), the fused native overlay health, and the
+            // loaded contract's verdict on THIS frame.
+            let screen = screen();
+            let (sem, tree, native_report) = fused(sess, &screen);
+            // ── target narrowing ──────────────────────────────────────
+            // `target` picks ONE control by stable id, unique label
+            // (exact first, then substring), or native id. Ambiguity is
+            // reported with the candidates — never a first-pick.
+            let target = p.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
+            let selected: Vec<&crate::semantic::Control> = match target {
+                None => sem.controls.iter().collect(),
+                Some(t) => {
+                    let by_id: Vec<&crate::semantic::Control> =
+                        sem.controls.iter().filter(|c| c.id == t).collect();
+                    if by_id.len() == 1 {
+                        by_id
+                    } else {
+                        let tl = t.to_lowercase();
+                        let by_native: Vec<&crate::semantic::Control> = sem
+                            .controls
+                            .iter()
+                            .filter(|c| {
+                                c.source == "native" && {
+                                    // Native ids ride the app's own node ids; the
+                                    // overlay stores them on the tree nodes.
+                                    tree.root
+                                        .find(&c.id)
+                                        .and_then(|n| n.identity.as_ref())
+                                        .and_then(|i| i.native_id.as_deref())
+                                        .map(|nid| {
+                                            nid == t
+                                                || nid.strip_prefix('#').unwrap_or(nid)
+                                                    == t.strip_prefix('#').unwrap_or(t)
+                                        })
+                                        .unwrap_or(false)
+                                }
+                            })
+                            .collect();
+                        let exact: Vec<&crate::semantic::Control> = sem
+                            .controls
+                            .iter()
+                            .filter(|c| c.label.to_lowercase() == tl)
+                            .collect();
+                        let chosen = if !by_native.is_empty() {
+                            by_native
+                        } else {
+                            exact
+                        };
+                        if chosen.len() == 1 {
+                            chosen
+                        } else {
+                            let sub: Vec<&crate::semantic::Control> = sem
+                                .controls
+                                .iter()
+                                .filter(|c| c.label.to_lowercase().contains(&tl))
+                                .collect();
+                            match sub.len() {
+                                1 => sub,
+                                _ => {
+                                    // 0 or ambiguous: name the candidates.
+                                    let candidates: Vec<serde_json::Value> = if sub.len() > 1 {
+                                        sub.iter()
+                                            .map(|c| json!({ "id": c.id, "label": c.label }))
+                                            .collect()
+                                    } else {
+                                        crate::intent::nearest_candidates(
+                                            &sem.controls,
+                                            &crate::intent::ActionTarget::Text {
+                                                text: t.to_string(),
+                                            },
+                                        )
+                                        .into_iter()
+                                        .take(5)
+                                        .map(|cs| json!({ "id": cs.id, "label": cs.label }))
+                                        .collect()
+                                    };
+                                    return err_with_details(
+                                        ErrorCategory::InvalidRequest,
+                                        if sub.len() > 1 {
+                                            format!(
+                                                "target '{t}' is ambiguous: {} controls match",
+                                                sub.len()
+                                            )
+                                        } else {
+                                            format!("target '{t}' not found")
+                                        },
+                                        json!({ "candidates": candidates }),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            // ── per-control facts ─────────────────────────────────────
+            let controls_json: Vec<serde_json::Value> = selected
+                .iter()
+                .map(|c| {
+                    // The joined identity for this control, when the fused
+                    // tree carries one (native/contract/source joins).
+                    let identity = tree
+                        .root
+                        .find(&c.id)
+                        .and_then(|n| n.identity.clone());
+                    let source: Vec<serde_json::Value> = identity
+                        .as_ref()
+                        .map(|i| {
+                            i.source_refs
+                                .iter()
+                                .map(|sr| {
+                                    json!({
+                                        "location": sr.location(),
+                                        "symbol": sr.symbol,
+                                        "confidence": sr.confidence,
+                                        "source": sr.source,
+                                        "provenance": sr.provenance.name(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // The invocations this control actually supports —
+                    // declared native verbs first, conventional inference
+                    // otherwise (finding 8 semantics).
+                    let affordances: Vec<serde_json::Value> = tree
+                        .root
+                        .find(&c.id)
+                        .map(|n| {
+                            n.affordances
+                                .iter()
+                                .map(|a| serde_json::to_value(a).unwrap_or_default())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "id": c.id,
+                        "kind": c.kind,
+                        "label": c.label,
+                        "value": c.value,
+                        "bounds": { "x": c.bounds.x, "y": c.bounds.y, "w": c.bounds.width, "h": c.bounds.height },
+                        "region_id": c.region_id,
+                        "state": {
+                            "focusable": c.focusable,
+                            "focused": c.focused,
+                            "enabled": c.enabled,
+                            "selected": c.selected,
+                            "checked": c.checked,
+                        },
+                        "shortcut": c.shortcut,
+                        "confidence": c.confidence,
+                        "source": c.source,
+                        "identity": identity,
+                        "source_refs": source,
+                        "affordances": affordances,
+                    })
+                })
+                .collect();
+            // ── frame + semantic identity ─────────────────────────────
+            let frame_record = run_frame_of(sess, run);
+            let clipped: Vec<&crate::semantic::Region> = sem
+                .regions
+                .iter()
+                .filter(|r| r.clipping_state != crate::semantic::ClippingState::None)
+                .collect();
+            // ── contract verdict on this frame ────────────────────────
+            // Component presence checks are static (no driving), so the
+            // inspect view can answer "what currently violates the
+            // design?" without touching the app. Driving checks
+            // (interactions/layout/behavior) are NOT run here.
+            let loaded_contract = run.lock().unwrap().contract().cloned();
+            let contract_violations: Vec<serde_json::Value> = match loaded_contract {
+                Some(ref contract) if !contract.components.is_empty() => contract
+                    .components
+                    .iter()
+                    .filter_map(|comp| {
+                        let want = comp.role.trim().to_lowercase();
+                        let component_hit = crate::semantic::detect_components(&screen)
+                            .iter()
+                            .any(|c| match c {
+                                crate::semantic::Component::Table(_) => want == "table",
+                                crate::semantic::Component::Tree(_) => want == "tree",
+                                crate::semantic::Component::Scrollbar(_) => want == "scrollbar",
+                            });
+                        let region_hit = sem
+                            .regions
+                            .iter()
+                            .any(|r| format!("{:?}", r.kind).to_lowercase() == want);
+                        let node_hit =
+                            role_matches_contract(want.as_str(), &tree.root);
+                        let found = component_hit || region_hit || node_hit;
+                        if found {
+                            None
+                        } else {
+                            Some(json!({
+                                "component": comp.name,
+                                "role": comp.role,
+                                "required": comp.required,
+                                "severity": if comp.required { "error" } else { "warn" },
+                                "detail": format!(
+                                    "component role '{}' declared in contract but not found on this frame",
+                                    comp.role
+                                ),
+                            }))
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            ok(json!({
+                "frame": frame_record,
+                "semantic_identity": crate::semantic::semantic_identity_fused(&sem, &tree),
+                "viewport": { "cols": screen.cols, "rows": screen.rows },
+                "title": screen.title,
+                "focus": {
+                    "label": sem.focus.control,
+                    "id": sem.focus.control_id,
+                    "confidence": sem.focus.confidence,
+                },
+                "controls": controls_json,
+                "control_count": sem.controls.len(),
+                "targeted": target.is_some(),
+                "regions": sem.regions.iter().map(|r| json!({
+                    "id": r.id,
+                    "kind": r.kind,
+                    "bounds": r.bounds,
+                    "clipping": r.clipping_state,
+                })).collect::<Vec<_>>(),
+                "clipped_regions": clipped.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+                "components": sem.components,
+                "affordances": sem.affordances,
+                "native": {
+                    "active": native_report.active(),
+                    "adapter_status": sess.adapter_status(),
+                    "framework": sess.native_channel().framework,
+                    "matched": native_report.matched,
+                    "native_only": native_report.native_only,
+                    "ambiguous": native_report.ambiguous,
+                },
+                "contract": {
+                    "loaded": loaded_contract.is_some(),
+                    "violations": contract_violations,
+                    "note": if loaded_contract.is_some() {
+                        "static component-presence checks only; driving checks (interactions/layout/behavior) are tui_contract action=status"
+                    } else {
+                        "no contract loaded (tui_contract action=load)"
+                    },
+                },
+            }))
+        }
     }
+}
+
+/// The committed frame record for the session's current screen, when this
+/// run has one (finding 36: the inspect view cites the frame id, not just
+/// hashes). `None` = no committed frame (the run evicted it or the frame
+/// was never committed) — the view still carries both hashes.
+fn run_frame_of(
+    sess: &crate::session::Session,
+    run: &std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
+) -> Option<serde_json::Value> {
+    let screen = sess.last()?;
+    let structure = &screen.structure_hash;
+    let run = run.lock().unwrap();
+    let hit = run
+        .frame_hot_records()
+        .find(|r| &r.structure_hash == structure)
+        .map(|r| {
+            json!({
+                "ref": format!("frame:{}", r.frame_id),
+                "semantic_identity": r.semantic_identity,
+                "screen_seq": r.screen_seq,
+                "committed_at": r.committed_at,
+            })
+        });
+    drop(run);
+    hit
+}
+
+/// The contract component-presence role match (conformance's own
+/// `role_matches`, re-exported here so the inspect view judges the frame
+/// with the SAME rule the contract checker uses — never a diverging
+/// reimplementation).
+fn role_matches_contract(want: &str, node: &crate::semantic::SemanticNode) -> bool {
+    if node.role.slug() == want && node.confidence.score >= 0.6 {
+        return true;
+    }
+    node.children.iter().any(|c| role_matches_contract(want, c))
 }

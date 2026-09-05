@@ -23,8 +23,8 @@ mod vocab;
 
 pub use plan::{plan_intent, plan_intent_with_graph, IntentPlan, PlannedStep};
 pub use vocab::{
-    classify_risk, plan_action, resolve_intent, resolve_target, ActionRisk, ActionTarget,
-    ActionVerb, ControlSummary, IntentError, ResolvedIntent,
+    classify_risk, nearest_candidates, plan_action, resolve_intent, resolve_target, ActionRisk,
+    ActionTarget, ActionVerb, ControlSummary, IntentError, ResolvedIntent,
 };
 
 #[cfg(test)]

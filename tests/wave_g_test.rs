@@ -1561,3 +1561,214 @@ async fn run_new_refuses_to_discard_ephemeral_evidence() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Finding 36: `tui_observe mode=inspect` — the one-call construction
+/// view. A real python child throughout: frame id, semantic identity,
+/// per-control stable ids + bounds + state + affordances, target
+/// narrowing (id / unique label / ambiguity refused with candidates),
+/// and the loaded contract's violations on THIS frame.
+#[tokio::test]
+async fn inspect_mode_one_call_construction_view() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-inspect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // A child with a visible button-like affordance and a form-ish line.
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", r#"print("== MAIN =="); print("[ Save ]  [ Quit ]"); print("Host: localhost"); input()"#],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+
+    // Seed a committed frame (act once) so the inspect view can cite it.
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+            ))
+            .await,
+        "seed act",
+    );
+
+    // ── full inspect: identity + controls + frame ──
+    let insp = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "inspect", "id": sid }),
+            ))
+            .await,
+        "inspect",
+    );
+    // Semantic identity present and hash-like; frame citation present
+    // because the seed act committed a frame.
+    let semantic_identity = insp["semantic_identity"]
+        .as_str()
+        .expect("semantic identity")
+        .to_string();
+    assert!(
+        !semantic_identity.is_empty(),
+        "semantic identity non-empty: {insp}"
+    );
+    let frame = &insp["frame"];
+    assert!(
+        frame["ref"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("frame:"),
+        "inspect cites the committed frame: {frame}"
+    );
+    // Controls carry the construction-grade facts.
+    let controls = insp["controls"].as_array().expect("controls array");
+    assert!(
+        !controls.is_empty(),
+        "at least one control detected: {insp}"
+    );
+    let first = &controls[0];
+    assert!(
+        first["id"].as_str().is_some()
+            && first["kind"].is_string()
+            && first["bounds"].is_object()
+            && first["state"].is_object()
+            && first["confidence"].is_object(),
+        "control carries id/kind/bounds/state/confidence: {first}"
+    );
+    // Focus reported.
+    assert!(
+        insp["focus"].is_object() && insp["viewport"].is_object(),
+        "focus + viewport present: {insp}"
+    );
+    // No contract loaded → honest note, no fabricated violations.
+    assert_eq!(insp["contract"]["loaded"], false, "{insp}");
+    assert!(
+        insp["contract"]["violations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no contract → no violations: {insp}"
+    );
+
+    // ── target narrowing by unique label substring ──
+    let targeted = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "inspect", "id": sid, "target": "save" }),
+            ))
+            .await,
+        "inspect target=save",
+    );
+    let tcontrols = targeted["controls"].as_array().expect("targeted controls");
+    assert_eq!(
+        tcontrols.len(),
+        1,
+        "unique substring narrows to one: {targeted}"
+    );
+    assert_eq!(targeted["targeted"], true);
+
+    // ── unknown target refused with candidates (not a first-pick) ──
+    let missing = unwrap_err(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "inspect", "id": sid, "target": "svae" }),
+            ))
+            .await,
+        "inspect target typo",
+    );
+    assert!(
+        missing["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not found"),
+        "{missing}"
+    );
+    assert!(
+        missing["details"]["candidates"]
+            .as_array()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false),
+        "candidates named: {missing}"
+    );
+
+    // ── contract verdict: load a contract naming a role the screen
+    //    does NOT have (a dialog) → one required violation ──
+    let contract_path = base.join("inspect_contract.yaml");
+    std::fs::write(
+        &contract_path,
+        "schema:\n  name: inspect-fixture\n  version: \"1\"\ncomponents:\n  - name: save-button\n    role: button\n    required: false\n  - name: missing-dialog\n    role: dialog\n    required: true\n",
+    )
+    .expect("write contract");
+    unwrap_ok(
+        &server
+            .tui_contract(params_typed(
+                serde_json::json!({ "action": "load", "path": contract_path.to_string_lossy() }),
+            ))
+            .await,
+        "load contract",
+    );
+    let with_contract = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "inspect", "id": sid }),
+            ))
+            .await,
+        "inspect with contract",
+    );
+    assert_eq!(with_contract["contract"]["loaded"], true, "{with_contract}");
+    let violations = with_contract["contract"]["violations"]
+        .as_array()
+        .expect("violations array");
+    assert_eq!(
+        violations.len(),
+        1,
+        "only the missing dialog: {violations:?}"
+    );
+    assert_eq!(violations[0]["component"], "missing-dialog");
+    assert_eq!(violations[0]["severity"], "error");
+    assert_eq!(violations[0]["required"], true);
+
+    // ── ambiguous target: a second matching control makes the narrow a
+    //    refusal with the matches named ──
+    let start2 = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", r#"print("[ OK ]"); print("[ ok ]"); input()"#],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start 2",
+    );
+    let sid2 = start2["session"].as_str().unwrap().to_string();
+    let amb = unwrap_err(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "inspect", "id": sid2, "target": "ok" }),
+            ))
+            .await,
+        "inspect ambiguous",
+    );
+    assert!(
+        amb["error"].as_str().unwrap_or("").contains("ambiguous"),
+        "{amb}"
+    );
+    assert_eq!(
+        amb["details"]["candidates"].as_array().map(|c| c.len()),
+        Some(2),
+        "both matches named: {amb}"
+    );
+
+    for s in [sid, sid2] {
+        let _ = server
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "stop", "id": s }),
+            ))
+            .await;
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

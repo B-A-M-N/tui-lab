@@ -477,7 +477,7 @@ fn kind_role_slug(kind: &ControlKind) -> String {
 /// there. (Finding 28: the doc promised focus-first but the sort key never
 /// saw the flag — now the focused control sorts ahead regardless of
 /// distance score.)
-fn nearest_candidates(controls: &[Control], target: &ActionTarget) -> Vec<ControlSummary> {
+pub fn nearest_candidates(controls: &[Control], target: &ActionTarget) -> Vec<ControlSummary> {
     let mut scored: Vec<(bool, u32, &Control)> = controls
         .iter()
         .filter(|c| c.focusable || matches!(c.kind, ControlKind::Button | ControlKind::MenuItem))

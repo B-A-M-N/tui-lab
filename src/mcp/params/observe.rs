@@ -17,6 +17,11 @@ selector_enum!(
         Diff => "diff", Changes => "changes", Scrollback => "scrollback",
         Search => "search", CommandState => "command_state", History => "history",
         Protocol => "protocol", Streams => "streams", TerminalModes => "terminal_modes",
+        // Finding 36: the one-call construction/inspection view — frame
+        // identity, semantic identity, per-control facts with stable ids +
+        // source refs + affordances, and the loaded contract's verdict on
+        // this frame.
+        Inspect => "inspect",
     ]
 );
 
@@ -161,6 +166,11 @@ pub struct TuiObserveParams {
     /// "bell", "screen_changed", "native_event", "process_exited", …).
     #[serde(default)]
     pub event_types: Option<Vec<String>>,
+    /// mode=inspect (finding 36): narrow the per-control list to one
+    /// control — stable id (`button/save`), a unique label substring, or
+    /// a native id (`#save-button`). Absent = every control.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
