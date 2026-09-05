@@ -181,15 +181,16 @@ fn replay(run_id: &str, root: Option<&str>, full: bool) -> anyhow::Result<()> {
     let _ = writeln!(
         out,
         "\nstate graph: {} states, {} transitions",
-        run.state_graph.state_count(),
-        run.state_graph.transition_count()
+        run.graphs().state_graph.state_count(),
+        run.graphs().state_graph.transition_count()
     );
     let _ = writeln!(
         out,
         "focus graph: {} controls, {} edges (tab cycle: {})",
-        run.focus_graph.nodes.len(),
-        run.focus_graph.edges.len(),
-        run.focus_graph
+        run.graphs().focus_graph.nodes.len(),
+        run.graphs().focus_graph.edges.len(),
+        run.graphs()
+            .focus_graph
             .tab_cycle()
             .map(|c| c.join("→"))
             .unwrap_or_else(|| "none".into())

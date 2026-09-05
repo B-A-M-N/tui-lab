@@ -184,7 +184,7 @@ pub(crate) async fn tui_audit(
             let mut compare_block = serde_json::Value::Null;
             let focus_summary = {
                 let mut run = run.lock().unwrap();
-                run.focus_graph.merge(&report.focus_graph);
+                run.graphs_mut().focus_graph.merge(&report.focus_graph);
                 // W2.10: attach app-declared source loci where coverage
                 // evidence can name the finding's control.
                 let _ = run.extend_findings_with_source_refs(report.findings.clone());
@@ -225,10 +225,10 @@ pub(crate) async fn tui_audit(
                     run.record_finding_baseline(lbl, report.findings.clone());
                 }
                 json!({
-                    "nodes": run.focus_graph.nodes.len(),
-                    "edges": run.focus_graph.edges.len(),
-                    "tab_cycle": run.focus_graph.tab_cycle(),
-                    "reverse_tab_gaps": run.focus_graph.reverse_tab_gaps(),
+                    "nodes": run.graphs().focus_graph.nodes.len(),
+                    "edges": run.graphs().focus_graph.edges.len(),
+                    "tab_cycle": run.graphs().focus_graph.tab_cycle(),
+                    "reverse_tab_gaps": run.graphs().focus_graph.reverse_tab_gaps(),
                 })
             };
             ok(json!({
