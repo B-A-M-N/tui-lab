@@ -36,6 +36,13 @@ pub enum ErrorCategory {
     /// run or start a fresh one — retrying against the closed run would
     /// corrupt it as an evidence bundle (review P0.1).
     RunClosed,
+    /// The session is healthy but mid-job: its actor mailbox was full when
+    /// a non-blocking call tried to enqueue (audit finding 12). This is
+    /// TEMPORARY by definition — the session exists and will drain — so it
+    /// is not `no_session`. The payload carries `retry_after_ms`; the agent
+    /// retries the identical call after the backoff instead of concluding
+    /// the session is gone.
+    SessionBusy,
 }
 
 impl ErrorCategory {
@@ -52,6 +59,7 @@ impl ErrorCategory {
             ErrorCategory::ControlLeased => "control_leased",
             ErrorCategory::StaleState => "stale_state",
             ErrorCategory::RunClosed => "run_closed",
+            ErrorCategory::SessionBusy => "session_busy",
         }
     }
 }

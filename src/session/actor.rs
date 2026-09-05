@@ -318,11 +318,40 @@ pub enum ActorError {
 }
 
 impl ActorError {
-    /// Map to the MCP error category for a missing/unresponsive session.
+    /// Map to the MCP error category (audit finding 12): a busy mailbox is
+    /// `session_busy` — the session EXISTS and is healthy, it is mid-job and
+    /// will drain, so the agent should retry rather than re-launch. Only a
+    /// genuinely gone actor (stopped/crashed) is `no_session`. A dropped
+    /// reply is a transport-level fault (`backend_error`), not a missing
+    /// session.
     pub fn category(&self) -> crate::error::ErrorCategory {
-        crate::error::ErrorCategory::NoSession
+        match self {
+            ActorError::ActorBusy(_) => crate::error::ErrorCategory::SessionBusy,
+            ActorError::ActorGone(_) => crate::error::ErrorCategory::NoSession,
+            ActorError::ActorDropped(_) => crate::error::ErrorCategory::BackendError,
+        }
+    }
+
+    /// Structured remediation for the busy mapping: how long the caller
+    /// should wait before retrying. The mailbox is bounded; a full one
+    /// drains in roughly one job time, so the retry window is short and
+    /// constant.
+    pub fn details(&self) -> Option<serde_json::Value> {
+        match self {
+            ActorError::ActorBusy(id) => Some(serde_json::json!({
+                "session": id,
+                "retry_after_ms": RETRY_AFTER_MS,
+                "why": "session actor mailbox is full; the session is mid-job and will drain",
+            })),
+            _ => None,
+        }
     }
 }
+
+/// Suggested retry window for a `session_busy` refusal (audit finding 12).
+/// The mailbox holds 64 jobs; one job is at most a wait with a ~1s budget
+/// beyond its quiet window, so a short constant backoff is honest.
+pub(crate) const RETRY_AFTER_MS: u64 = 50;
 
 /// The session pool: the actor-backed replacement for the global
 /// `Mutex<SessionManager>` on the MCP surface.
@@ -940,5 +969,36 @@ mod tests {
         // join, so is_some() is false — the handle was joined to completion.
         let joined = clone.inner.join.lock().expect("join lock").is_none();
         assert!(joined, "join handle must be consumed by the stop's join");
+    }
+
+    /// Finding 12: the error taxonomy distinguishes "session gone" from
+    /// "session mid-job". A busy mailbox maps to `session_busy` WITH a
+    /// structured retry window; a gone actor maps to `no_session` with no
+    /// remediation (there is nothing to retry against).
+    #[test]
+    fn busy_maps_to_retryable_session_busy_not_no_session() {
+        let busy = ActorError::ActorBusy("s-1".into());
+        assert_eq!(
+            busy.category(),
+            crate::error::ErrorCategory::SessionBusy,
+            "a full mailbox is not a missing session"
+        );
+        let details = busy.details().expect("busy carries remediation");
+        assert_eq!(details["session"], "s-1");
+        assert!(
+            details["retry_after_ms"].as_u64().is_some_and(|ms| ms > 0),
+            "retry window is a positive backoff: {details}"
+        );
+
+        let gone = ActorError::ActorGone("s-1".into());
+        assert_eq!(gone.category(), crate::error::ErrorCategory::NoSession);
+        assert!(gone.details().is_none(), "a gone session has no retry");
+
+        let dropped = ActorError::ActorDropped("s-1".into());
+        assert_eq!(
+            dropped.category(),
+            crate::error::ErrorCategory::BackendError,
+            "a dropped reply is a transport fault, not a missing session"
+        );
     }
 }

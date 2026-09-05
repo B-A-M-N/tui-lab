@@ -398,7 +398,15 @@ impl TuiLabServer {
         self.sessions
             .with_session(id, job)
             .await
-            .map_err(|e| err(e.category(), e.to_string()))
+            .map_err(|e| match e.details() {
+                // Finding 12: a busy refusal carries the retry window
+                // structurally — the agent reads `retry_after_ms` instead of
+                // regex-matching the prose.
+                Some(details) => {
+                    crate::mcp::helpers::err_with_details(e.category(), e.to_string(), details)
+                }
+                None => err(e.category(), e.to_string()),
+            })
     }
 
     /// Bind a freshly launched session to the current run, and its owner on
