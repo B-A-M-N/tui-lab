@@ -27,7 +27,7 @@ impl RunContext {
             focus_transitions: Vec::new(),
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
-            findings: Vec::new(),
+            findings: FindingStore::new(),
             transactions: Vec::new(),
             transaction_count: 0,
             event_count: 0,
@@ -41,7 +41,6 @@ impl RunContext {
             held_events: Vec::new(),
             event_flushed_counts: HashMap::new(),
             contract: contract_state::ContractState::new(),
-            finding_baselines: HashMap::new(),
             coverage_ledger: std::collections::BTreeMap::new(),
             event_cursors: std::collections::HashMap::new(),
             coverage_seq: 0,
@@ -320,12 +319,18 @@ impl RunContext {
                 }
             };
         }
+        // Round-2 (G1): findings live in the FindingStore holder now; the
+        // artifact is still a plain findings array, so read into a local
+        // (a corrupt array is still a restore warning, per the macro) and
+        // hand it to the store.
+        let mut loaded_findings: Vec<crate::audit::Finding> = Vec::new();
         load_json!(
             "findings.json",
             crate::run::formats::tags::FINDINGS,
             Vec<crate::audit::Finding>,
-            run.findings
+            loaded_findings
         );
+        run.findings = FindingStore::from_findings(loaded_findings);
         // Focus graphs (both ledgers).
         load_json!(
             "focus_graph.json",
@@ -680,7 +685,7 @@ impl RunContext {
             &ftmp,
             format_envelope(
                 crate::run::formats::tags::FINDINGS,
-                &serde_json::to_value(&self.findings)?,
+                &serde_json::to_value(self.findings.all())?,
             )?,
         )?;
         std::fs::rename(&ftmp, dir.join("findings.json"))?;

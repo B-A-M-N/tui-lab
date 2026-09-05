@@ -15,7 +15,7 @@ impl RunContext {
         // `rule_id`, the instance id gains a stable (rule, target)
         // discriminator, so two findings from one rule can never collide.
         self.findings
-            .extend(findings.into_iter().map(|f| f.instance()));
+            .push_all(findings.into_iter().map(|f| f.instance()));
         Ok(())
     }
 
@@ -47,7 +47,7 @@ impl RunContext {
             .filter(|t| !target_is_file_locus(t))
             .collect();
         if file_targets.is_empty() && widget_targets.is_empty() {
-            self.findings.extend(findings);
+            self.findings.push_all(findings);
             return Ok(());
         }
         let mut enriched = findings;
@@ -91,13 +91,14 @@ impl RunContext {
                 f.source_refs = refs;
             }
         }
-        self.findings.extend(enriched);
+        self.findings.push_all(enriched);
         Ok(())
     }
 
-    /// Findings accumulated in this run.
+    /// Findings accumulated in this run. Round-2 (G1): delegates to
+    /// [`super::finding_store::FindingStore`].
     pub fn findings(&self) -> &[crate::audit::Finding] {
-        &self.findings
+        self.findings.all()
     }
 
     /// Wave 5 item 45: the explain-time source join, as a pure lookup.
@@ -188,7 +189,7 @@ impl RunContext {
         let sessions: Vec<String> = self.session_specs.keys().cloned().collect();
         let mut out = Vec::new();
         let mut skipped = 0usize;
-        for f in &self.findings {
+        for f in self.findings.all() {
             // Late-join source loci (review P1 item 14): coverage events often
             // arrive AFTER the audit pass that produced this finding, so a
             // finding stored without loci gains them here if the coverage
