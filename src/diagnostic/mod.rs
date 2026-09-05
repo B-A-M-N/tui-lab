@@ -232,14 +232,7 @@ pub fn run_probe_with_guard(
     let (tx, events) = match stimulus {
         Some(act) => {
             let tx = crate::execution::execute_act_with_guard(
-                session,
-                &act,
-                quiet_ms,
-                budget_ms,
-                false,
-                visibility,
-                completion,
-                guard,
+                session, &act, quiet_ms, budget_ms, false, visibility, completion, guard,
             )?;
             let batch = session.events_since(pre_seq);
             (Some(tx), batch.events)

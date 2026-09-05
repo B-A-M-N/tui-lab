@@ -651,7 +651,11 @@ mod emission_tests {
                 crate::events::TerminalEventKind::FocusChanged { .. }
             )),
             "a focus move must emit FocusChanged: {:?}",
-            batch.events.iter().map(|e| e.kind.name()).collect::<Vec<_>>()
+            batch
+                .events
+                .iter()
+                .map(|e| e.kind.name())
+                .collect::<Vec<_>>()
         );
 
         // Semantic change: a control appears.
@@ -661,12 +665,10 @@ mod emission_tests {
         emit_semantic_frame_events(&mut q2, "s", 1, &a, &c, &mut cache);
         let batch2 = q2.since(0);
         assert!(
-            batch2.events.iter().any(|e| {
-                matches!(
-                    &e.kind,
-                    crate::events::TerminalEventKind::SemanticChanged
-                )
-            }),
+            batch2
+                .events
+                .iter()
+                .any(|e| { matches!(&e.kind, crate::events::TerminalEventKind::SemanticChanged) }),
             "an added control must emit SemanticChanged: {:?}",
             batch2
                 .events

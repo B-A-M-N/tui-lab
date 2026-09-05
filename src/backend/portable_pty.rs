@@ -1318,13 +1318,13 @@ impl TerminalBackend for PortablePtyBackend {
         // --- audit finding 37: the portable engine is the reference backend —
         //     every operation-oriented capability it advertises is backed by a
         //     real implementation the conformance suite exercises (finding 61).
-        caps.raw_input = true;      // Input::Raw writes arbitrary bytes to the PTY
+        caps.raw_input = true; // Input::Raw writes arbitrary bytes to the PTY
         caps.bell_observable = true; // bell_seq tracked in wait()
-        caps.exit_code = true;      // process() reports the real exit code
+        caps.exit_code = true; // process() reports the real exit code
         caps.shell_integration = true; // command_state() parses OSC 133
         caps.stdout_stderr_separation = false; // single PTY master, no split pipes
-        caps.recording = true;      // recording hook delivered on output/input
-        caps.attach = false;        // we spawn the child; we do not attach one
+        caps.recording = true; // recording hook delivered on output/input
+        caps.attach = false; // we spawn the child; we do not attach one
         caps.query_response = true; // the device-query responder answers CSI queries
         caps.event_types = vec![
             EventCapability::Output,

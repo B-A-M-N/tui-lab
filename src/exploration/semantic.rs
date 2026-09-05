@@ -82,7 +82,14 @@ pub fn run_with_contract(
     contract: Option<&crate::design::ProjectContract>,
 ) -> anyhow::Result<SemanticExploreReport> {
     run_evidenced(
-        session, graph, focus_graph, budget, max_actions, max_risk, contract, None,
+        session,
+        graph,
+        focus_graph,
+        budget,
+        max_actions,
+        max_risk,
+        contract,
+        None,
     )
 }
 

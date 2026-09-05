@@ -818,7 +818,8 @@ mod tests {
     /// transactions.jsonl immediately — the file grows with the run, so a
     /// crash cannot lose the unflushed tail.
     #[test]
-    fn persistent_ledger_appends_incrementally() {        let tmp = tempfile::tempdir().expect("tmpdir");
+    fn persistent_ledger_appends_incrementally() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
         let mut run = RunContext::persistent(tmp.path()).expect("run");
 
         // Records stream to the background journal writer; drain-wait for

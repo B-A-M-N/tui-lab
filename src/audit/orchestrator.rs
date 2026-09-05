@@ -597,15 +597,20 @@ pub fn run_profile_checked(
                 let (screen, sem, _, _) = session
                     .observe_fused(40)
                     .map_err(|e| format!("observe failed: {e}"))?;
-                findings.extend(crate::audit::run("full", &screen, &sem).map_err(|e| e.to_string())?);
+                findings
+                    .extend(crate::audit::run("full", &screen, &sem).map_err(|e| e.to_string())?);
             }
             // 2. Every observational member of full that has a driver —
             //    these read live state without touching the app.
-            for d in PROFILES.iter().filter(|d| {
-                d.included_in_full && d.risk == MutationRisk::Observational
-            }) {
+            for d in PROFILES
+                .iter()
+                .filter(|d| d.included_in_full && d.risk == MutationRisk::Observational)
+            {
                 let f = d.driver;
-                findings.extend(f(session, &mut crate::semantic::focus_graph::FocusGraph::new()));
+                findings.extend(f(
+                    session,
+                    &mut crate::semantic::focus_graph::FocusGraph::new(),
+                ));
             }
             // 3. The withheld list: every invasive member, named.
             let withheld: Vec<serde_json::Value> = PROFILES

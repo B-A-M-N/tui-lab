@@ -705,7 +705,7 @@ impl TerminalBackend for TmuxBackend {
             exit_code: false,
             shell_integration: false, // command_state() returns None
             stdout_stderr_separation: false,
-            recording: true, // recording hook delivered from pane capture
+            recording: true,       // recording hook delivered from pane capture
             native_semantic: true, // session-provided side channel
             // Attach semantics: this backend attaches an EXISTING TUI it did
             // not spawn.
@@ -969,15 +969,20 @@ mod tests {
             "tmux has no OSC 133 command-state observability"
         );
         assert!(
-            !caps.supported_waits.contains(&crate::backend::WaitCapability::CommandDone),
+            !caps
+                .supported_waits
+                .contains(&crate::backend::WaitCapability::CommandDone),
             "tmux command waits return Unsupported"
         );
         assert!(
-            !caps.input_families.contains(&crate::backend::InputFamily::Signal),
+            !caps
+                .input_families
+                .contains(&crate::backend::InputFamily::Signal),
             "tmux cannot deliver signals to the attached process"
         );
         assert!(
-            caps.event_types.contains(&crate::backend::EventCapability::Title),
+            caps.event_types
+                .contains(&crate::backend::EventCapability::Title),
             "tmux observes pane titles"
         );
     }

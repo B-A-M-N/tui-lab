@@ -60,10 +60,7 @@ pub(crate) async fn tui_framework(
     let fw_name = det.framework().map(str::to_string);
     let adapter_status = match p.id.as_deref() {
         None => None,
-        Some(sel) => match s
-            .with_sess(Some(sel), |sess| sess.adapter_status())
-            .await
-        {
+        Some(sel) => match s.with_sess(Some(sel), |sess| sess.adapter_status()).await {
             Ok(st) => Some(st),
             Err(_e) => None,
         },
@@ -93,9 +90,9 @@ pub(crate) async fn tui_framework(
     });
     match fw_action {
         FA::Detect => ok(json!({ "framework": det, "project_context": ctx })),
-        FA::Capabilities => ok(
-            json!({ "framework": det, "project_context": ctx, "capabilities": capability_json }),
-        ),
+        FA::Capabilities => {
+            ok(json!({ "framework": det, "project_context": ctx, "capabilities": capability_json }))
+        }
         FA::AdapterSnippet => {
             // Audit finding 35: adapter selection uses the FRAMEWORK
             // candidate (det.framework()), not the highest-ranked generic

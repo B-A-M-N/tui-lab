@@ -194,10 +194,7 @@ async fn session_history_serves_real_action_events() {
         batch.cursor,
         batch.events.last().map(|e| e.seq).unwrap_or(0)
     );
-    assert!(
-        after_empty,
-        "since the served cursor there is nothing new"
-    );
+    assert!(after_empty, "since the served cursor there is nothing new");
     pool.stop(&sid).await.ok();
 }
 
@@ -357,8 +354,7 @@ async fn wait_event_fires_on_new_output_and_respects_since_seq() {
             contains: None,
             since_seq: Some(sess.event_queue_last_seq()),
         };
-        let out =
-            tui_lab::execution::execute_wait_event(sess, &pred, 5000).expect("wait");
+        let out = tui_lab::execution::execute_wait_event(sess, &pred, 5000).expect("wait");
         assert!(
             out.met,
             "the delayed second print must produce a screen_changed event"

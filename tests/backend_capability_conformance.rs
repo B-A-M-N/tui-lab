@@ -184,8 +184,14 @@ fn portable_capabilities_are_backed_by_real_operations() {
     spawn(&mut b, LINES_CHILD);
     let caps = b.capabilities();
     // The reference backend advertises every operation it can genuinely do.
-    assert!(caps.raw_input && caps.protocol_capture, "portable does raw I/O");
-    assert!(caps.bell_observable && caps.exit_code, "portable observes bell + exit");
+    assert!(
+        caps.raw_input && caps.protocol_capture,
+        "portable does raw I/O"
+    );
+    assert!(
+        caps.bell_observable && caps.exit_code,
+        "portable observes bell + exit"
+    );
     assert!(caps.shell_integration, "portable parses OSC 133");
     assert!(caps.recording, "portable records casts");
     assert!(caps.query_response, "portable answers device queries");
@@ -219,7 +225,11 @@ fn portable_capabilities_are_backed_by_real_operations() {
         .expect("exit wait");
     assert!(out.met, "exit_code=true backend must report child exit");
     let st = exit_b.state().expect("state");
-    assert_eq!(st.process.exit_code, Some(3), "real exit code must be reported");
+    assert_eq!(
+        st.process.exit_code,
+        Some(3),
+        "real exit code must be reported"
+    );
     exit_b.stop().expect("stop");
 }
 
@@ -230,13 +240,20 @@ fn line_cli_capabilities_are_backed_by_real_operations() {
     let mut b = PtyLineBackend::new(80, 24);
     spawn(&mut b, LINES_CHILD);
     let caps = b.capabilities();
-    assert!(caps.protocol_capture && caps.scrollback, "line keeps history + raw ring");
+    assert!(
+        caps.protocol_capture && caps.scrollback,
+        "line keeps history + raw ring"
+    );
     exercise_positive(&mut b, &caps);
     check_matrix_consistency(&caps);
 
     // Known-unsupported ops fail fast (finding 61): mouse + modified keys.
     check_fast_unsupported(&mut b, "line CLI mouse", |b| {
-        b.send_input(Input::MouseClick { button: MouseButton::Left, x: 1, y: 1 })
+        b.send_input(Input::MouseClick {
+            button: MouseButton::Left,
+            x: 1,
+            y: 1,
+        })
     });
     check_fast_unsupported(&mut b, "line CLI modified key", |b| {
         b.send_input(Input::Key(KeyEvent::with_modifiers(
@@ -268,11 +285,20 @@ fn pipe_capabilities_are_backed_by_real_operations() {
     let mut pb = PipeBackend::new(80, 24);
     spawn(&mut pb, SPLIT_CHILD);
     std::thread::sleep(Duration::from_millis(300));
-    let pipe = pb.as_any_mut().downcast_mut::<PipeBackend>().expect("pipe downcast");
+    let pipe = pb
+        .as_any_mut()
+        .downcast_mut::<PipeBackend>()
+        .expect("pipe downcast");
     let out = pipe.stdout_lines().concat();
     let err = pipe.stderr_lines().concat();
-    assert!(out.contains("ONOUT"), "stdout must carry stdout: {out:?} {err:?}");
-    assert!(err.contains("ONERR"), "stderr must carry stderr: {out:?} {err:?}");
+    assert!(
+        out.contains("ONOUT"),
+        "stdout must carry stdout: {out:?} {err:?}"
+    );
+    assert!(
+        err.contains("ONERR"),
+        "stderr must carry stderr: {out:?} {err:?}"
+    );
     pb.stop().expect("stop");
 
     // exit_code=true → the pipe child's real exit code is reported.
@@ -281,12 +307,23 @@ fn pipe_capabilities_are_backed_by_real_operations() {
     let out = exit_b
         .wait(WaitCond::ProcessExit, Duration::from_secs(5))
         .expect("pipe exit wait");
-    assert!(out.met, "pipe exit_code=true backend must report child exit");
-    assert_eq!(out.state.process.exit_code, Some(3), "pipe must report the real exit code");
+    assert!(
+        out.met,
+        "pipe exit_code=true backend must report child exit"
+    );
+    assert_eq!(
+        out.state.process.exit_code,
+        Some(3),
+        "pipe must report the real exit code"
+    );
 
     // Negative: mouse + modified keys fail fast on the pipe engine too.
     check_fast_unsupported(&mut exit_b, "pipe mouse", |b| {
-        b.send_input(Input::MouseClick { button: MouseButton::Left, x: 1, y: 1 })
+        b.send_input(Input::MouseClick {
+            button: MouseButton::Left,
+            x: 1,
+            y: 1,
+        })
     });
     check_fast_unsupported(&mut exit_b, "pipe modified key", |b| {
         b.send_input(Input::Key(KeyEvent::with_modifiers(
@@ -335,12 +372,24 @@ fn tmux_capabilities_are_honest_and_backed() {
     // The historical inconsistencies this suite must catch (audit findings
     // 38/39/40): title is genuinely observable, but raw bytes, signals, mouse,
     // exit codes and protocol capture are genuinely absent.
-    assert!(caps.title && caps.attach, "tmux observes pane titles and attaches");
-    assert!(!caps.raw_input, "tmux send-keys cannot deliver arbitrary raw bytes");
-    assert!(!caps.exit_code, "tmux cannot report the (non-child) exit code");
+    assert!(
+        caps.title && caps.attach,
+        "tmux observes pane titles and attaches"
+    );
+    assert!(
+        !caps.raw_input,
+        "tmux send-keys cannot deliver arbitrary raw bytes"
+    );
+    assert!(
+        !caps.exit_code,
+        "tmux cannot report the (non-child) exit code"
+    );
     assert!(!caps.signals, "tmux cannot signal the attached process");
     assert!(!caps.mouse, "tmux pane mouse injection is unsupported");
-    assert!(!caps.protocol_capture, "tmux mediates the byte stream (no raw capture)");
+    assert!(
+        !caps.protocol_capture,
+        "tmux mediates the byte stream (no raw capture)"
+    );
     assert!(!caps.shell_integration, "tmux has no OSC 133 command state");
     assert!(
         !caps.supported_waits.contains(&WaitCapability::CommandDone),
@@ -350,7 +399,10 @@ fn tmux_capabilities_are_honest_and_backed() {
     check_matrix_consistency(&caps);
 
     // Positive: a real pane is attached and capturable (scrollback present).
-    assert!(caps.scrollback, "tmux exposes its own history buffer as scrollback");
+    assert!(
+        caps.scrollback,
+        "tmux exposes its own history buffer as scrollback"
+    );
     b.state().expect("tmux state reads the pane");
     b.scrollback_lines().expect("tmux scrollback_lines");
 
@@ -360,7 +412,11 @@ fn tmux_capabilities_are_honest_and_backed() {
     });
     check_fast_unsupported(&mut b, "tmux signal", |b| b.send_input(Input::Signal(15)));
     check_fast_unsupported(&mut b, "tmux mouse", |b| {
-        b.send_input(Input::MouseClick { button: MouseButton::Left, x: 1, y: 1 })
+        b.send_input(Input::MouseClick {
+            button: MouseButton::Left,
+            x: 1,
+            y: 1,
+        })
     });
     check_fast_unsupported(&mut b, "tmux command wait", |b| {
         b.wait(

@@ -763,15 +763,15 @@ impl TerminalBackend for PtyLineBackend {
             protocol_capture: true,
             // --- audit finding 37: operation-oriented matrix, advertising only
             //     what the line engine's code genuinely does ---
-            raw_input: true,        // Input::Raw writes bytes to the child
-            bell_observable: true,  // bell_seq tracked in wait()
-            exit_code: true,        // process() reports the real child exit code
-            shell_integration: false, // command_state() returns None (no OSC 133)
+            raw_input: true,                 // Input::Raw writes bytes to the child
+            bell_observable: true,           // bell_seq tracked in wait()
+            exit_code: true,                 // process() reports the real child exit code
+            shell_integration: false,        // command_state() returns None (no OSC 133)
             stdout_stderr_separation: false, // single PTY master
-            recording: true,        // recording hook delivered on output/input
-            native_semantic: true,  // session-provided side channel
-            attach: false,          // we spawn the child
-            query_response: false,  // no device-query responder
+            recording: true,                 // recording hook delivered on output/input
+            native_semantic: true,           // session-provided side channel
+            attach: false,                   // we spawn the child
+            query_response: false,           // no device-query responder
             event_types: vec![
                 EventCapability::Output,
                 EventCapability::Bell,

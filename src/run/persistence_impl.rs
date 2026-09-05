@@ -289,11 +289,7 @@ impl RunContext {
                 }
             };
         }
-        load_json!(
-            "findings.json",
-            Vec<crate::audit::Finding>,
-            run.findings
-        );
+        load_json!("findings.json", Vec<crate::audit::Finding>, run.findings);
         // Focus graphs (both ledgers).
         load_json!(
             "focus_graph.json",
@@ -345,19 +341,21 @@ impl RunContext {
                     continue;
                 }
                 match std::fs::read(&path) {
-                    Ok(bytes) => match serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes) {
-                        Ok(sc) => {
-                            run.saved_scenarios.insert(sc.id.clone(), sc);
+                    Ok(bytes) => {
+                        match serde_json::from_slice::<crate::scenario::model::Scenario>(&bytes) {
+                            Ok(sc) => {
+                                run.saved_scenarios.insert(sc.id.clone(), sc);
+                            }
+                            Err(e) => run.restore_warnings.push(RestoreWarning {
+                                artifact: path
+                                    .strip_prefix(run_dir)
+                                    .unwrap_or(&path)
+                                    .to_string_lossy()
+                                    .to_string(),
+                                error: format!("corrupt scenario: {e}"),
+                            }),
                         }
-                        Err(e) => run.restore_warnings.push(RestoreWarning {
-                            artifact: path
-                                .strip_prefix(run_dir)
-                                .unwrap_or(&path)
-                                .to_string_lossy()
-                                .to_string(),
-                            error: format!("corrupt scenario: {e}"),
-                        }),
-                    },
+                    }
                     Err(e) => run.restore_warnings.push(RestoreWarning {
                         artifact: path
                             .strip_prefix(run_dir)

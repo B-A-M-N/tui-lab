@@ -155,9 +155,7 @@ impl Watchdog {
                     } else {
                         "no line for the liveness window"
                     };
-                    eprintln!(
-                        "[e2e watchdog] {why} elapsed; killing server {child_pid:?}"
-                    );
+                    eprintln!("[e2e watchdog] {why} elapsed; killing server {child_pid:?}");
                     if let Some(pid) = child_pid {
                         // SIGKILL the process group: the child PTY apps die
                         // too, so no stray python3 survives the failed test.
@@ -1822,13 +1820,14 @@ fn stdio_e2e_exploration_safety_safe_never_clicks() {
     // Cross-check the honesty of the record: any focus_target step the
     // explorer DID propose is risk-classed mutating in the report (or was
     // filtered out entirely) — the old Safe label must not reappear.
-    let steps = ex["data"]["report"]["steps"].as_array().cloned().unwrap_or_default();
+    let steps = ex["data"]["report"]["steps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     for s in steps.iter() {
         let motive = s["motive"].as_str().unwrap_or("");
         if motive.contains("click-focus") {
-            panic!(
-                "a click-focus candidate executed under max_risk=safe: {s}"
-            );
+            panic!("a click-focus candidate executed under max_risk=safe: {s}");
         }
     }
 
@@ -1854,7 +1853,10 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
             "clientInfo": { "name": "tui-lab-e2e-probe", "version": "0" },
         }),
     );
-    assert!(init["result"]["serverInfo"]["name"].is_string(), "init: {init}");
+    assert!(
+        init["result"]["serverInfo"]["name"].is_string(),
+        "init: {init}"
+    );
     mcp.notify("notifications/initialized");
 
     let start = mcp.tool(
@@ -1867,7 +1869,10 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
     );
     assert_eq!(start["category"], "success", "start: {start}");
     let session = start["data"]["session"].as_str().unwrap().to_string();
-    let _ = mcp.tool("tui_observe", serde_json::json!({ "mode": "screen", "id": session }));
+    let _ = mcp.tool(
+        "tui_observe",
+        serde_json::json!({ "mode": "screen", "id": session }),
+    );
 
     // 1) LEASE: a stimulated probe drives — under a human lease it must be
     // refused with control_leased, exactly like tui_act; a drift probe
@@ -1896,7 +1901,10 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
         "stimulated probe must be refused under the lease: {stimulated}"
     );
 
-    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "release", "id": session }));
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "release", "id": session }),
+    );
 
     // 2) SENSITIVE stimulus: the typed secret must never surface in the
     // probe's own response evidence (the payload is redacted the same way
@@ -1912,7 +1920,10 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
         }),
     );
     let resp_text = serde_json::to_string(&sensitive).unwrap_or_default();
-    assert_eq!(sensitive["category"], "success", "sensitive probe: {sensitive}");
+    assert_eq!(
+        sensitive["category"], "success",
+        "sensitive probe: {sensitive}"
+    );
     assert!(
         !resp_text.contains(SECRET),
         "the secret must not surface in the probe response: {resp_text}"
@@ -1974,7 +1985,9 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
     // 6) Stimulus provenance: a stimulated probe enters the run's
     // transaction ledger (finding 56/57 parity with tui_act evidence).
     let status_before = mcp.tool("tui_run", serde_json::json!({ "action": "status" }));
-    let tx_before = status_before["data"]["counts"]["transactions"].as_u64().unwrap_or(0);
+    let tx_before = status_before["data"]["counts"]["transactions"]
+        .as_u64()
+        .unwrap_or(0);
     let _ = mcp.tool(
         "tui_probe",
         serde_json::json!({
@@ -1985,13 +1998,18 @@ fn stdio_e2e_probe_lease_sensitivity_and_capture() {
         }),
     );
     let status_after = mcp.tool("tui_run", serde_json::json!({ "action": "status" }));
-    let tx_after = status_after["data"]["counts"]["transactions"].as_u64().unwrap_or(0);
+    let tx_after = status_after["data"]["counts"]["transactions"]
+        .as_u64()
+        .unwrap_or(0);
     assert!(
         tx_after > tx_before,
         "stimulated probe must enter the run ledger: {tx_before} -> {tx_after}"
     );
 
-    let _ = mcp.tool("tui_session", serde_json::json!({ "action": "stop", "id": session }));
+    let _ = mcp.tool(
+        "tui_session",
+        serde_json::json!({ "action": "stop", "id": session }),
+    );
 }
 
 /// Audit finding 59 — run-lifecycle provenance over the wire. The four
@@ -2026,12 +2044,15 @@ fn stdio_e2e_run_lifecycle_provenance() {
             "clientInfo": { "name": "tui-lab-e2e-provenance", "version": "0" },
         }),
     );
-    assert!(init["result"]["serverInfo"]["name"].is_string(), "init: {init}");
+    assert!(
+        init["result"]["serverInfo"]["name"].is_string(),
+        "init: {init}"
+    );
     mcp.notify("notifications/initialized");
 
     // ── Scenario (a): persistent run A, dirty state → new → A flushed ──
-    let persist_root = std::env::temp_dir()
-        .join(format!("tui-lab-e2e-provrun-{}", std::process::id()));
+    let persist_root =
+        std::env::temp_dir().join(format!("tui-lab-e2e-provrun-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&persist_root);
     std::fs::create_dir_all(&persist_root).expect("persist root");
 
@@ -2062,14 +2083,18 @@ fn stdio_e2e_run_lifecycle_provenance() {
     );
     assert_eq!(persist["category"], "success", "persist A: {persist}");
     let run_a = persist["data"]["run_id"].as_str().unwrap().to_string();
-    let artifact_a = persist["data"]["artifact_root"].as_str().unwrap().to_string();
+    let artifact_a = persist["data"]["artifact_root"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Now begin a fresh run. The old persistent run A must be flushed, and
     // the response must NAME that flush — never silently abandon it.
     let new_run = mcp.tool("tui_run", serde_json::json!({ "action": "new" }));
     assert_eq!(new_run["category"], "success", "new: {new_run}");
     assert_eq!(
-        new_run["data"]["previous_run"], run_a.as_str(),
+        new_run["data"]["previous_run"],
+        run_a.as_str(),
         "new names the run it left: {new_run}"
     );
     assert_eq!(
@@ -2087,7 +2112,8 @@ fn stdio_e2e_run_lifecycle_provenance() {
     )
     .expect("run A manifest parses as JSON");
     assert_eq!(
-        manifest_a["run_id"], run_a.as_str(),
+        manifest_a["run_id"],
+        run_a.as_str(),
         "flush after new must leave run A's durable manifest: {manifest_a}"
     );
 
@@ -2147,7 +2173,10 @@ fn stdio_e2e_run_lifecycle_provenance() {
     // sessions must survive a corrupt-resume refusal. sess_a becomes foreign
     // again and is simply cleaned up at server teardown.
     let open_b = mcp.tool("tui_run", serde_json::json!({ "action": "new" }));
-    assert_eq!(open_b["category"], "success", "re-open after resume A: {open_b}");
+    assert_eq!(
+        open_b["category"], "success",
+        "re-open after resume A: {open_b}"
+    );
 
     // ── Scenario (c): resume a CORRUPT run with detach=true → refuse at
     // restore (step 1), current sessions survive. ──
@@ -2171,11 +2200,8 @@ fn stdio_e2e_run_lifecycle_provenance() {
     // step-1 refusal — before the flush and long before any detach.
     let corrupt_dir = persist_root.join("run-corrupt");
     std::fs::create_dir_all(&corrupt_dir).expect("corrupt dir");
-    std::fs::write(
-        corrupt_dir.join("run.json"),
-        "{ this is: not json !!!",
-    )
-    .expect("write corrupt manifest");
+    std::fs::write(corrupt_dir.join("run.json"), "{ this is: not json !!!")
+        .expect("write corrupt manifest");
 
     let resume_c = mcp.tool(
         "tui_run",
