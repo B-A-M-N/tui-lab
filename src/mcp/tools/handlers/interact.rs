@@ -244,12 +244,16 @@ pub(crate) async fn tui_intent(
     let selector = p.id.clone();
     let target = p.target.clone();
     let run = s.run.clone();
+    // Finding 3D: the plan store lives on the server; clone the Arc handle
+    // into the closure instead of capturing `s` (whose borrow cannot cross
+    // the actor await).
+    let intent_plans = s.plans_handle();
     s.with_sess(selector.as_deref(), move |sess| {
         // Planning reads the session's LAST fused frame (observe-before-act):
         // the semantic truth the agent would have seen from tui_observe.
         // Execution below re-observes fresh instead.
         let plan_frame = if execute {
-            // Audit P0-13: fresh observation BEFORE any click. The plan the
+            // Audit P0-13: fresh observation BEFORE any focus move. The plan the
             // agent saw may be stale; this frame is what actually executes.
             match sess.observe_fused(40) {
                 Ok((_, sem, _, _)) => Some(sem),
@@ -266,7 +270,20 @@ pub(crate) async fn tui_intent(
                 "no observed frame yet — observe the session (tui_observe) before planning an intent, or the target has nothing to resolve against",
             );
         };
-        let plan = match crate::intent::plan_intent(&semantic, &target, verb.clone()) {
+        // Finding 3: focus routes are planned from the run's PROVEN
+        // FocusGraph (real observed Tab/Shift+Tab transitions), never from
+        // guesses. An empty graph makes focus-needing verbs honestly
+        // Unsupported with the remedy named.
+        let graph_snapshot = {
+            let run = run.lock().unwrap();
+            run.focus_graph.clone()
+        };
+        let plan = match crate::intent::plan_intent_with_graph(
+            &semantic,
+            &target,
+            verb.clone(),
+            &graph_snapshot,
+        ) {
             Ok(pl) => pl,
             // Target resolution failures are refinement-loop payloads, not
             // malformed requests: category=target_error with the
@@ -282,20 +299,136 @@ pub(crate) async fn tui_intent(
                     crate::intent::IntentError::VerbMismatch { target, verb } => {
                         json!({ "reason": "verb_mismatch", "target": target, "verb": verb })
                     }
+                    crate::intent::IntentError::Unsupported { target, verb, why } => {
+                        json!({ "reason": "unsupported_intent", "target": target, "verb": verb, "why": why })
+                    }
                 };
                 return err_with_details(ErrorCategory::TargetError, e.message(), details);
             }
         };
         let plan_json = plan_to_json(&plan);
         if !execute {
+            // Finding 3D: the plan response carries a plan_id so execution
+            // can reference THIS previewed plan; the preview is stored
+            // server-side and consumed (revalidated) at execute time.
+            let plan_id = {
+                let mut plans = intent_plans.lock().unwrap();
+                let id = format!("plan-{}", uuid::Uuid::new_v4().simple());
+                if plans.len() >= crate::mcp::tools::INTENT_PLAN_CAP {
+                    if let Some(oldest) = plans
+                        .iter()
+                        .min_by_key(|(_, t)| t.created)
+                        .map(|(k, _)| k.clone())
+                    {
+                        plans.remove(&oldest);
+                    }
+                }
+                plans.insert(
+                    id.clone(),
+                    crate::mcp::tools::IntentPlanTicket {
+                        control_id: plan.control.id.clone(),
+                        created: std::time::Instant::now(),
+                    },
+                );
+                id
+            };
             return ok(json!({
                 "mode": "planned",
+                "plan_id": plan_id,
                 "control": plan_json["control"],
                 "verb": plan.verb.name(),
                 "risk": plan.risk.name(),
                 "steps": plan_json["steps"],
-                "note": "plan only — nothing was sent; pass execute=true to run these steps in order",
+                "note": "plan only — nothing was sent; execute by passing execute=true with this plan_id (plus max_risk when the plan is destructive/external/unknown)",
             }));
+        }
+        // ── Finding 3D: authorization gates, BEFORE anything is sent ──
+        // 1. Risk fence: a plan whose risk exceeds max_risk is refused.
+        // Destructive/external/unknown ALWAYS need an explicit covering
+        // fence — planning alone never authorizes them.
+        if plan.risk.needs_confirmation() && p.max_risk.is_none() {
+            return err_with_details(
+                ErrorCategory::InvalidRequest,
+                format!(
+                    "plan risk '{}' requires an explicit max_risk fence before execution — planning alone does not authorize {} risk",
+                    plan.risk.name(),
+                    plan.risk.name()
+                ),
+                json!({
+                    "reason": "risk_fence_required",
+                    "plan_risk": plan.risk.name(),
+                    "expected": format!("max_risk at or above the plan's risk, e.g. \"max_risk\": \"{}\"", plan.risk.name()),
+                }),
+            );
+        }
+        if let Some(fence) = p.max_risk.as_deref() {
+            match crate::intent::ActionRisk::parse(fence) {
+                None => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "invalid max_risk '{fence}' (expected one of: safe, mutating, destructive, external_side_effect, unknown)"
+                        ),
+                    )
+                }
+                Some(ceiling) => {
+                    if plan.risk > ceiling {
+                        return err_with_details(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                                "plan risk '{}' exceeds the max_risk fence '{}'; nothing was sent",
+                                plan.risk.name(),
+                                ceiling.name()
+                            ),
+                            json!({
+                                "reason": "risk_fence",
+                                "plan_risk": plan.risk.name(),
+                                "max_risk": ceiling.name(),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        // 2. plan_id revalidation (finding 3D): the caller must be
+        // executing a plan it actually previewed. The store holds the
+        // previewed control identity per plan_id; execution re-resolves
+        // against the FRESH frame (the plan above) and the identities must
+        // still agree — a UI change that removed or renamed the previewed
+        // control refuses instead of acting on a lookalike. Unknown or
+        // expired plan_ids refuse too (plans are server-side state with a
+        // bounded lifetime).
+        if let Some(want) = p.plan_id.as_deref() {
+            match intent_plans.lock().unwrap().remove(want) {
+                Some(stored) => {
+                    let fresh_id = plan_json["control"]["id"].as_str().unwrap_or_default();
+                    if stored.control_id != fresh_id {
+                        return err_with_details(
+                            ErrorCategory::StaleState,
+                            format!(
+                                "the previewed plan's control '{old}' no longer resolves (fresh resolution: '{new}'); re-plan instead of executing a stale preview",
+                                old = stored.control_id,
+                                new = fresh_id
+                            ),
+                            json!({
+                                "reason": "stale_plan",
+                                "plan_id": want,
+                                "previewed_control": stored.control_id,
+                                "fresh_control": fresh_id,
+                            }),
+                        );
+                    }
+                }
+                None => {
+                    return err_with_details(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "unknown or expired plan_id '{want}'; plans live server-side for a bounded number of intents — re-plan (execute=false) and execute the fresh plan_id"
+                        ),
+                        json!({ "reason": "unknown_plan", "plan_id": want }),
+                    );
+                }
+            }
         }
         // A live human lease blocks execution (planning stays allowed — it
         // sends nothing). Checked here AND inside `drive` per action.
@@ -309,54 +442,51 @@ pub(crate) async fn tui_intent(
         let mut executed: Vec<serde_json::Value> = Vec::new();
         for step in &plan.steps {
             match step {
-                crate::intent::PlannedStep::EnsureFocus { click, target_id } => {
-                    // Skip the focus click when the target already holds
-                    // focus in the frame the plan resolved against.
-                    let already =
-                        semantic.focus.control_id.as_deref() == Some(target_id.as_str());
-                    if !already {
-                        // A generous quiet window: the redraw that proves
-                        // the focus move landed must be committed before
-                        // the AssertFocus guard reads it — a focus move
-                        // that half-arrived SHOULD fail the plan, but not
-                        // because we sampled before the app answered.
-                        let focus_outcome = match drive(
-                            sess,
-                            &run,
-                            DriveSpec {
-                                action: click,
-                                quiet_ms: 300,
-                                budget_ms: 1300,
-                                no_wait: false,
-                                visibility: crate::execution::InputVisibility::Normal,
-                                completion: crate::capture::CompletionPolicy::StableScreen,
-                                guard: None,
-                                // Internal plan step: evidenced in the ledger,
-                                // but not a caller-authored scenario act.
-                                scenario: None,
-                            },
-                        ) {
-                            Ok(o) => o,
-                            Err(refused) => return refused,
-                        };
-                        executed.push(json!({
-                            "step": "ensure_focus", "how": "mouse_click",
-                            "target": target_id, "ok": true,
-                            "frames": focus_outcome.frames,
-                        }));
-                        // The executor's settle observes through the
-                        // backend's wait path and does NOT refresh the
-                        // session's last frame — the guard below reads
-                        // `analyze_last()`, so observe once to make the
-                        // post-click screen the one it validates against.
-                        // Without this the guard would re-check the
-                        // PRE-click screen and the plan could never pass
-                        // its own focus assertion.
-                        if let Err(e) = sess.observe(0) {
-                            return err(ErrorCategory::BackendError, format!(
-                                "post-focus observe failed: {e}"
-                            ));
-                        }
+                // Finding 3B: the focus move is a NON-activating traversal
+                // key (Tab / Shift+Tab) from the proven route — never a
+                // click, so the payload below is the ONLY activation.
+                crate::intent::PlannedStep::MoveFocus { key, target_id } => {
+                    // A generous quiet window: the redraw that proves
+                    // the focus move landed must be committed before
+                    // the AssertFocus guard reads it — a focus move
+                    // that half-arrived SHOULD fail the plan, but not
+                    // because we sampled before the app answered.
+                    let focus_outcome = match drive(
+                        sess,
+                        &run,
+                        DriveSpec {
+                            action: key,
+                            quiet_ms: 300,
+                            budget_ms: 1300,
+                            no_wait: false,
+                            visibility: crate::execution::InputVisibility::Normal,
+                            completion: crate::capture::CompletionPolicy::StableScreen,
+                            guard: None,
+                            // Internal plan step: evidenced in the ledger,
+                            // but not a caller-authored scenario act.
+                            scenario: None,
+                        },
+                    ) {
+                        Ok(o) => o,
+                        Err(refused) => return refused,
+                    };
+                    executed.push(json!({
+                        "step": "move_focus", "how": key.signature(),
+                        "target": target_id, "ok": true,
+                        "frames": focus_outcome.frames,
+                    }));
+                    // The executor's settle observes through the
+                    // backend's wait path and does NOT refresh the
+                    // session's last frame — the guard below reads
+                    // `analyze_last()`, so observe once to make the
+                    // post-move screen the one it validates against.
+                    // Without this the guard would re-check the
+                    // PRE-move screen and the plan could never pass
+                    // its own focus assertion.
+                    if let Err(e) = sess.observe(0) {
+                        return err(ErrorCategory::BackendError, format!(
+                            "post-focus observe failed: {e}"
+                        ));
                     }
                 }
                 crate::intent::PlannedStep::AssertFocus { target_id } => {
@@ -399,10 +529,11 @@ pub(crate) async fn tui_intent(
                 }
             }
         }
-        // Intent linkage record (audit P0-12): one ledger entry tying the
-        // plan's transactions together causally — id, target identity,
-        // risk, and the executed step list — so diagnosis reconstructs an
-        // intent as ONE unit, not orphaned sends.
+        // Finding 3 (plan enrichment): this execution's REAL focus
+        // transitions (observed before/after each hop) are recorded into
+        // the run's FocusGraph below by the drive boundary — here we only
+        // write the intent linkage record (audit P0-12): one ledger entry
+        // tying the plan's transactions together causally.
         {
             let (sid, gen) = (sess.id.clone(), sess.generation);
             let mut run = run.lock().unwrap();
@@ -445,11 +576,14 @@ fn plan_to_json(plan: &crate::intent::IntentPlan) -> serde_json::Value {
         .steps
         .iter()
         .map(|s| match s {
-            crate::intent::PlannedStep::EnsureFocus { target_id, click } => json!({
-                "step": "ensure_focus",
+            crate::intent::PlannedStep::MoveFocus { target_id, key } => json!({
+                "step": "move_focus",
                 "target": target_id,
-                "how": serde_json::to_value(click).unwrap_or(json!(click.name())),
-                "skipped_when": "target already focused",
+                // The action's EXACT identity (`tab`, `shift+tab`) — name()
+                // would only say "key".
+                "how": key.signature(),
+                "non_activating": true,
+                "skipped_when": "target already focused (no hops needed)",
             }),
             crate::intent::PlannedStep::AssertFocus { target_id } => json!({
                 "step": "assert_focus",

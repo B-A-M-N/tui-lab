@@ -40,6 +40,22 @@ pub struct TuiLabServer {
     /// provenance). Populated at launch/attach, dropped when the session
     /// stops.
     session_owners: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Finding 3D (two-step intent): previewed execution plans by plan_id.
+    /// `plan` stores; `execute` consumes (revalidates + removes) — a plan
+    /// executes at most once, so a replayed plan_id cannot re-fire a
+    /// destructive payload.
+    intent_plans: Arc<std::sync::Mutex<std::collections::HashMap<String, IntentPlanTicket>>>,
+}
+
+/// One previewed intent plan: the control identity it resolved against,
+/// kept between `tui_intent plan` and `tui_intent execute`. Risk is NOT
+/// stored here — the executor re-fences against the plan's LIVE risk at
+/// execute time, never a stale snapshot.
+#[derive(Clone)]
+pub(crate) struct IntentPlanTicket {
+    pub control_id: String,
+    /// Bounded store: creation order, oldest evicted first.
+    pub created: std::time::Instant,
 }
 
 /// Which named view of a session a `tui://sessions/<id>/<view>` resource
@@ -52,12 +68,17 @@ enum SessionView {
     Screen,
 }
 
+/// Bounded intent-plan store (finding 3D): at most this many previewed
+/// plans are held; the oldest is evicted first.
+pub(crate) const INTENT_PLAN_CAP: usize = 64;
+
 impl TuiLabServer {
     pub fn new() -> Self {
         TuiLabServer {
             sessions: Arc::new(SessionPool::new()),
             run: Arc::new(std::sync::Mutex::new(crate::run::RunContext::ephemeral())),
             session_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            intent_plans: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -70,7 +91,17 @@ impl TuiLabServer {
             sessions: Arc::new(SessionPool::new()),
             run: Arc::new(std::sync::Mutex::new(run)),
             session_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            intent_plans: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Finding 3D: the shared intent-plan store handle for the handler
+    /// family (child modules cannot capture `&self` across the actor
+    /// await, so they take the Arc).
+    pub(crate) fn plans_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<std::collections::HashMap<String, IntentPlanTicket>>> {
+        self.intent_plans.clone()
     }
 
     /// Resolve a `tui://` resource URI to its text content (Wave G item

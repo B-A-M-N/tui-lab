@@ -2,12 +2,14 @@
 """A tiny TUI for tui_intent end-to-end tests.
 
 Draws two buttons ([Cancel] [ Save ]) on the alternate screen with mouse
-reporting ENABLED (1000 press+release, SGR encoding) so the intent
-executor's EnsureFocus mouse click is protocol-legal. A click MOVES FOCUS
-to the clicked button (redrawn in reverse video) — this is what lets the
-plan's AssertFocus guard verify the focus move actually landed. Activating
-Save (click when focused, or any key while focused) prints "saved." and
-exits.
+reporting ENABLED (1000 press+release, SGR encoding). Tab MOVES FOCUS
+between the buttons (redrawn in reverse video) WITHOUT activating —
+this is what lets the intent executor's focus-secured plan (a Tab hop
+plus an AssertFocus guard) verify the focus move landed before the
+payload. A click also moves focus (never activates on its own), so both
+focus primitives are non-activating here. Activating Save (any key
+while focused) prints "saved." and exits; the app logs each activation
+to ACTIVATIONS so the double-activation test can count them exactly.
 """
 import sys
 import select
@@ -16,12 +18,22 @@ import os
 
 # Debug trace (path override via env; off by default).
 _dbg = os.environ.get("INTENT_TUI_LOG")
+# Activation ledger (path override via env; off by default): every
+# activation of Save appends a line, so tests can count activations
+# EXACTLY (finding 3B: the plan must activate once, never twice).
+_act = os.environ.get("INTENT_TUI_ACTIVATIONS")
 
 
 def log(msg):
     if _dbg:
         with open(_dbg, "a") as f:
             f.write(msg + "\n")
+
+
+def record_activation():
+    if _act:
+        with open(_act, "a") as f:
+            f.write("save-activated\n")
 
 
 # Raw mode is required under a real PTY: the line discipline otherwise
@@ -87,7 +99,7 @@ def read_event(timeout=10.0):
 def main():
     focus = "cancel"
     draw(focus)
-    for _ in range(4):
+    for _ in range(8):
         ev = read_event()
         if ev is None:
             break
@@ -96,19 +108,28 @@ def main():
             if not release:
                 continue  # act on release, like most toolkits
             # Save sits at columns 12..18, Cancel at 2..10 (1-based, row 1).
+            # A click MOVES FOCUS (never activates): the harness's
+            # focus-secured plans rely on focus primitives not firing the
+            # control (finding 3B).
             if y == 1 and 12 <= x <= 18:
-                if focus == "save":
-                    sys.stdout.write("saved.\n")
-                    sys.stdout.flush()
-                    break
                 focus = "save"
                 draw(focus)
             elif y == 1 and 2 <= x <= 10:
                 focus = "cancel"
                 draw(focus)
-        else:
-            # Any key activates the focused control.
+        elif ev[0] == "key":
+            key = ev[1]  # a 1-char str (latin1) or a bytes escape tail
+            # Tab is pure focus traversal: Cancel <-> Save, never
+            # activating (finding 3A: a focus verb must not fire the
+            # target). `read_event` returns the raw byte for a bare key
+            # (latin1-decoded str) or a bytes tail after ESC.
+            if key in ("\t", b"\t"):
+                focus = "save" if focus == "cancel" else "cancel"
+                draw(focus)
+                continue
+            # Any other key activates the focused control.
             if focus == "save":
+                record_activation()
                 sys.stdout.write("saved.\n")
                 sys.stdout.flush()
                 break
