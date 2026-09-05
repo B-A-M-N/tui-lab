@@ -118,8 +118,8 @@ test --all-features) verified green on the formatted tree.
 | # | Finding | Evidence |
 | - | ------- | -------- |
 | 13 | ~~Lifecycle mutation vs lease~~ FIXED with #4 (`b5cbe20`) | — |
-| 16 | Native suffix match takes first hit, no uniqueness/ambiguity report | `src/semantic/native.rs:822` |
-| 17 | Native focus rewrites headline + matched node but never clears stale `focused=true` on other controls | `src/semantic/native.rs:364-430` |
+| 16 | ~~Native suffix match takes first hit, no uniqueness/ambiguity report~~ FIXED with 17 (`ca9af5d`) | — |
+| 17 | ~~Native focus rewrites headline + matched node but never clears stale `focused=true` on other controls~~ FIXED with 16 (`ca9af5d`) | — |
 | 20 | Fake `AUDIT-METRICS` finding on clean runs; findings still carry passes/metrics | `src/audit/transaction.rs:170` |
 | 21 | `rule_id` landed, but severity/category remain `String`; no occurrence_id/sorted-key fingerprints | `src/audit/mod.rs:139` |
 | 22 | Audit uncertainty: no Unverified/LowConfidence/Ambiguous verdicts | drivers |
@@ -153,8 +153,9 @@ test --all-features) verified green on the formatted tree.
 - **10** (largely) probe timeline armed AT the stimulus (`diagnostic/mod.rs:179`); frame-history capture via transition capture
 - **11** (partially) typed stale-state guards (executor validates atomically with send); remaining: internal stringly error surfaces
 - **15** detection names OpenTUI/Ink/Bubble Tea but integration is tier-1 only — detection-side honesty landed, adapters open (see 36-42)
+- **16/17** Native resolution: relaxed matches (suffix/label) are uniqueness-gated — ambiguity is reported (`NativeOverlayReport.ambiguous`), never first-hit; focus is exclusive (`clear_tree_focus_except` on the tree, flat mirror follows `sem.focus.control_id`) (`ca9af5d`)
 
 ### Priority order (implementation sequence)
 
-Remaining P0: none. Next: P1/P2 — 16/17 (native resolution) → 20 (fake AUDIT-METRICS) → 21 (typed severity/category) → 23 (structured NextObservation) → 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
+Remaining P0: none. Next: P1/P2 — 20 (fake AUDIT-METRICS) → 21 (typed severity/category) → 23 (structured NextObservation) → 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
 
