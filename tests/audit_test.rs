@@ -24,7 +24,11 @@ async fn start(pool: &SessionPool, script: &str) -> String {
 #[tokio::test]
 async fn test_keyboard_audit_detects_states() {
     let pool = SessionPool::new();
-    let id = start(&pool, "import sys; print('tab test'); sys.stdout.flush(); input()").await;
+    let id = start(
+        &pool,
+        "import sys; print('tab test'); sys.stdout.flush(); input()",
+    )
+    .await;
 
     let findings = pool
         .with_session(Some(&id), move |sess| {
@@ -45,7 +49,11 @@ async fn test_keyboard_audit_detects_states() {
 #[tokio::test]
 async fn test_focus_audit_detects_focus() {
     let pool = SessionPool::new();
-    let id = start(&pool, "import sys; print('focus test'); sys.stdout.flush(); input()").await;
+    let id = start(
+        &pool,
+        "import sys; print('focus test'); sys.stdout.flush(); input()",
+    )
+    .await;
 
     let findings = pool
         .with_session(Some(&id), move |sess| tui_lab::audit::focus_audit(sess))
@@ -60,7 +68,11 @@ async fn test_focus_audit_detects_focus() {
 #[tokio::test]
 async fn test_clipping_audit_no_regions() {
     let pool = SessionPool::new();
-    let id = start(&pool, "import sys; print('hello'); sys.stdout.flush(); input()").await;
+    let id = start(
+        &pool,
+        "import sys; print('hello'); sys.stdout.flush(); input()",
+    )
+    .await;
 
     let findings = pool
         .with_session(Some(&id), move |sess| tui_lab::audit::clipping_audit(sess))
@@ -78,7 +90,11 @@ async fn test_clipping_audit_no_regions() {
 #[tokio::test]
 async fn test_resize_audit_restores_dimensions() {
     let pool = SessionPool::new();
-    let id = start(&pool, "import sys; print('resize test'); sys.stdout.flush(); input()").await;
+    let id = start(
+        &pool,
+        "import sys; print('resize test'); sys.stdout.flush(); input()",
+    )
+    .await;
 
     let (findings, cols, rows) = pool
         .with_session(Some(&id), move |sess| {

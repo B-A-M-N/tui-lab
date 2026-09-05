@@ -349,13 +349,12 @@ mod tests {
             // the walk below sees the real variants.
             let defs = schema.get("$defs").cloned().unwrap_or_default();
             let selector_schema = resolve_refs(&selector_schema, &defs);
-            let served_values = enum_consts(&selector_schema)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}: selector '{}' schema carries no enumerable constants: {selector_schema}",
-                        t.name, field
-                    )
-                });
+            let served_values = enum_consts(&selector_schema).unwrap_or_else(|| {
+                panic!(
+                    "{}: selector '{}' schema carries no enumerable constants: {selector_schema}",
+                    t.name, field
+                )
+            });
             let mut a: Vec<&str> = values.to_vec();
             let mut b: Vec<String> = served_values;
             a.sort_unstable();
@@ -436,10 +435,7 @@ mod tests {
                         // The Known<T> shape: one anyOf member carries the
                         // FULL variant enum; the other is the free-string
                         // arm (no enum). Collect every string it offers.
-                        out.extend(
-                            vals.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string)),
-                        );
+                        out.extend(vals.iter().filter_map(|v| v.as_str().map(str::to_string)));
                     } else if let Some(nested) = enum_consts(variant) {
                         // Option<Known<T>> nests a Known anyOf INSIDE the
                         // Option anyOf — recurse into the member.

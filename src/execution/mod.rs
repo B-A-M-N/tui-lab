@@ -35,4 +35,8 @@ pub use guard::MutationGuard;
 /// The central machine-driving pipeline (audit P0-1): one
 /// execute→evidence→fold path every driving facility shares.
 pub mod drive;
-pub use drive::{act_request_json, drive as drive_pipeline, fold_session_events, DriveOutcome as CoreDriveOutcome, DriveSpec as CoreDriveSpec, ScenarioCapture as CoreScenarioCapture};
+pub use drive::{
+    act_request_json, drive as drive_pipeline, fold_session_events,
+    DriveOutcome as CoreDriveOutcome, DriveSpec as CoreDriveSpec,
+    ScenarioCapture as CoreScenarioCapture,
+};

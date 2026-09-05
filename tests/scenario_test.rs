@@ -182,10 +182,7 @@ async fn scenario_runner_actually_sends_input() {
         })
         .await
         .expect("observe job");
-    assert!(
-        echoed,
-        "typed text must reach the PTY (terminal echo)"
-    );
+    assert!(echoed, "typed text must reach the PTY (terminal echo)");
 }
 
 // ── Wave-2: mutation guards (StepExpect) ─────────────────────────────────
@@ -264,10 +261,7 @@ async fn stale_guard_blocks_input_on_drift() {
         })
         .await
         .expect("post-check job");
-    assert!(
-        !leaked,
-        "guarded input must NOT reach the app"
-    );
+    assert!(!leaked, "guarded input must NOT reach the app");
     pool.stop(&id).await.ok();
 }
 
@@ -351,9 +345,7 @@ async fn run_in_run_enters_transaction_ledger() {
         .await
         .expect("start");
 
-    let run = Arc::new(std::sync::Mutex::new(
-        tui_lab::run::RunContext::ephemeral(),
-    ));
+    let run = Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
     let (report, ledger_len) = {
         let run = run.clone();
         pool.with_session(Some(&id), move |sess| {

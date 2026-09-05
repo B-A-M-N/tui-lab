@@ -172,7 +172,9 @@ async fn assert_profile_holds(
     // The resize driver restores the requested geometry (item 65 residue
     // contract): after the full audit, the session is back at cols x rows.
     let after = pool
-        .with_session(Some(sid), |sess| sess.observe(60).expect("post-audit observe"))
+        .with_session(Some(sid), |sess| {
+            sess.observe(60).expect("post-audit observe")
+        })
         .await
         .expect("post-audit observe job");
     assert_eq!(

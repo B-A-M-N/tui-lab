@@ -155,8 +155,12 @@ pub(crate) async fn tui_run(
             {
                 let mut run = s.run.lock().unwrap();
                 already = run.is_closed();
-                summary = run
-                    .status(owned.iter().map(|s| serde_json::Value::String(s.clone())).collect());
+                summary = run.status(
+                    owned
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                );
                 kill = p.kill_sessions.unwrap_or(false);
                 result = run.close();
             }
@@ -230,9 +234,8 @@ pub(crate) async fn tui_run(
                     // corrupt entries silently vanished. A directory with
                     // no run.json lands here with its `skipped` reason;
                     // keep it — corruption is evidence.
-                    let (runs, skipped): (Vec<_>, Vec<_>) = entries
-                        .into_iter()
-                        .partition(|e| e.get("run_id").is_some());
+                    let (runs, skipped): (Vec<_>, Vec<_>) =
+                        entries.into_iter().partition(|e| e.get("run_id").is_some());
                     ok(json!({
                         "base": base,
                         "runs": runs,
@@ -377,10 +380,7 @@ pub(crate) async fn tui_run(
                 // could not bring back — a damaged run is usable but the
                 // agent must see the evidence is incomplete.
                 let restore_health = restored.restore_health();
-                *guard = std::mem::replace(
-                    &mut restored,
-                    crate::run::RunContext::ephemeral(),
-                );
+                *guard = std::mem::replace(&mut restored, crate::run::RunContext::ephemeral());
                 json!({
                     "resumed": true,
                     "run_id": restored_id,

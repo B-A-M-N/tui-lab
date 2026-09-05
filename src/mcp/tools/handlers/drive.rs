@@ -87,6 +87,9 @@ pub(crate) fn drive(
         scenario: spec.scenario,
     };
     crate::execution::drive_pipeline(sess, run, core)
-        .map(|o| DriveOutcome { tx: o.tx, frames: o.frames })
+        .map(|o| DriveOutcome {
+            tx: o.tx,
+            frames: o.frames,
+        })
         .map_err(execution_error)
 }

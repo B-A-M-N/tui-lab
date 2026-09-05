@@ -299,58 +299,58 @@ pub fn detect(cwd: &str) -> FrameworkDetection {
         // dependency).
         let txt = read_file(cwd, "pyproject.toml");
         match txt.parse::<toml::Value>() {
-        Ok(py) => {
-            let mut py_deps: Vec<String> = Vec::new();
-            if let Some(deps) = py
-                .get("project")
-                .and_then(|p| p.get("dependencies"))
-                .and_then(|d| d.as_array())
-            {
-                for d in deps {
-                    // PEP 508 strings: take the package name before any
-                    // version/extra specifier.
-                    if let Some(name) = d.as_str() {
-                        let name: String = name
-                            .chars()
-                            .take_while(|c| {
-                                c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'
-                            })
-                            .collect();
-                        if !name.is_empty() {
-                            py_deps.push(name.to_lowercase());
+            Ok(py) => {
+                let mut py_deps: Vec<String> = Vec::new();
+                if let Some(deps) = py
+                    .get("project")
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|d| d.as_array())
+                {
+                    for d in deps {
+                        // PEP 508 strings: take the package name before any
+                        // version/extra specifier.
+                        if let Some(name) = d.as_str() {
+                            let name: String = name
+                                .chars()
+                                .take_while(|c| {
+                                    c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'
+                                })
+                                .collect();
+                            if !name.is_empty() {
+                                py_deps.push(name.to_lowercase());
+                            }
+                        }
+                    }
+                }
+                if let Some(tool_deps) = py
+                    .get("tool")
+                    .and_then(|t| t.get("poetry"))
+                    .and_then(|t| t.get("dependencies"))
+                    .and_then(|d| d.as_table())
+                {
+                    for name in tool_deps.keys() {
+                        py_deps.push(name.to_lowercase());
+                    }
+                }
+                for (fw, class, _cargo, _npm, _go, pip) in FRAMEWORKS {
+                    for pip_pkg in *pip {
+                        if py_deps.iter().any(|d| d == *pip_pkg) {
+                            note(
+                                &mut candidates,
+                                fw,
+                                class,
+                                0.9,
+                                format!("pyproject.toml dependency '{}'", pip_pkg),
+                            );
                         }
                     }
                 }
             }
-            if let Some(tool_deps) = py
-                .get("tool")
-                .and_then(|t| t.get("poetry"))
-                .and_then(|t| t.get("dependencies"))
-                .and_then(|d| d.as_table())
-            {
-                for name in tool_deps.keys() {
-                    py_deps.push(name.to_lowercase());
-                }
-            }
-            for (fw, class, _cargo, _npm, _go, pip) in FRAMEWORKS {
-                for pip_pkg in *pip {
-                    if py_deps.iter().any(|d| d == *pip_pkg) {
-                        note(
-                            &mut candidates,
-                            fw,
-                            class,
-                            0.9,
-                            format!("pyproject.toml dependency '{}'", pip_pkg),
-                        );
-                    }
-                }
-            }
+            Err(e) => parse_failures.push(FrameworkParseFailure {
+                file: format!("{}/pyproject.toml", cwd),
+                reason: format!("parse failed: {e}"),
+            }),
         }
-        Err(e) => parse_failures.push(FrameworkParseFailure {
-            file: format!("{}/pyproject.toml", cwd),
-            reason: format!("parse failed: {e}"),
-        }),
-    }
     }
     // requirements.txt stays line-based (it IS a line format). A name
     // pyproject already reported gets REINFORCED here (two loci agreeing
@@ -489,10 +489,7 @@ mod tests {
     /// detected". A broken package.json must appear in `parse_failures`.
     #[test]
     fn malformed_manifest_is_reported_not_ignored() {
-        let dir = std::env::temp_dir().join(format!(
-            "tui-fw-detect-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("tui-fw-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A package.json that is NOT valid JSON.
@@ -507,7 +504,9 @@ mod tests {
             det.parse_failures
         );
         assert!(
-            det.searched_paths.iter().any(|p| *p == dir.to_str().unwrap()),
+            det.searched_paths
+                .iter()
+                .any(|p| *p == dir.to_str().unwrap()),
             "searched_paths must name where detection looked: {:?}",
             det.searched_paths
         );
@@ -520,10 +519,7 @@ mod tests {
     /// a valid project still detects, and a clean tree has no failures.
     #[test]
     fn clean_manifest_has_no_parse_failures() {
-        let dir = std::env::temp_dir().join(format!(
-            "tui-fw-clean-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("tui-fw-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A Cargo.toml with a recognizable framework.

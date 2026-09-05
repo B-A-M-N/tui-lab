@@ -70,7 +70,10 @@ async fn contract_run_assertion_exit_code_compares_expected_code() {
     assert!(_passed_7, "expected_code == 7 passes");
     assert!(!passed_0);
     assert!(_invalid_0.is_none());
-    assert!(detail_0.contains("expected exit code 0"), "detail: {detail_0}");
+    assert!(
+        detail_0.contains("expected exit code 0"),
+        "detail: {detail_0}"
+    );
 }
 
 #[test]

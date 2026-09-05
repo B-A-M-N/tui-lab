@@ -223,8 +223,8 @@ async fn random_exploration_enters_run_ledger_with_exact_signatures() {
                 allowed_risk: tui_lab::intent::ActionRisk::Mutating,
             };
             let mut run = tui_lab::run::RunContext::ephemeral();
-            let report = random::run_evidenced(sess, 7, budget, None, Some(&mut run))
-                .expect("explore");
+            let report =
+                random::run_evidenced(sess, 7, budget, None, Some(&mut run)).expect("explore");
             let ledger = run.transactions().len();
             let actions: Vec<String> = report.steps.iter().map(|s| s.action.clone()).collect();
             (ledger, actions)
