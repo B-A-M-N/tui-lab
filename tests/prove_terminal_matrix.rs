@@ -7,7 +7,7 @@
 
 use std::fs;
 use tempfile::TempDir;
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
 /// A dialog fixture with fixed-width content so every profile point asks
 /// the same question of the screen (do the controls stay found, does the
@@ -87,14 +87,14 @@ fn screen_generation(screen: &tui_lab::screen::ScreenState) -> Option<u64> {
         .max()
 }
 
-fn start_at(
-    mgr: &mut SessionManager,
+async fn start_at(
+    pool: &SessionPool,
     app: &str,
     cols: u16,
     rows: u16,
     env: &[(String, String)],
 ) -> String {
-    mgr.start(
+    pool.start(
         "python3",
         &[app.to_string()],
         None,
@@ -104,6 +104,7 @@ fn start_at(
         "auto",
         "local",
     )
+    .await
     .expect("start fixture")
 }
 
@@ -111,8 +112,8 @@ fn start_at(
 /// requested geometry (anchored via the fixture's generation counter, so
 /// a stale pre-resize frame can never pass), the text is present, and
 /// the static audits run with resolvable evidence.
-fn assert_profile_holds(
-    mgr: &mut SessionManager,
+async fn assert_profile_holds(
+    pool: &SessionPool,
     sid: &str,
     cols: u16,
     rows: u16,
@@ -123,9 +124,11 @@ fn assert_profile_holds(
     // AT the requested geometry — proves the frame postdates the profile
     // change rather than trusting observe to have raced a redraw.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let sess = mgr.resolve_mut(Some(sid)).unwrap();
     let screen = loop {
-        let screen = sess.observe(300).expect("observe");
+        let screen = pool
+            .with_session(Some(sid), |sess| sess.observe(300).expect("observe"))
+            .await
+            .expect("observe job");
         if screen_generation(&screen).is_some_and(|g| g >= min_gen)
             && (screen.cols, screen.rows) == (cols, rows)
         {
@@ -144,13 +147,18 @@ fn assert_profile_holds(
     );
 
     // Static audit machinery holds at every size.
-    let report = tui_lab::audit::orchestrator::run_profile_checked(
-        sess,
-        "full",
-        None,
-        tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
-    )
-    .unwrap_or_else(|e| panic!("{label}: full audit must run at {cols}x{rows}: {e}"));
+    let report = pool
+        .with_session(Some(sid), |sess| {
+            tui_lab::audit::orchestrator::run_profile_checked(
+                sess,
+                "full",
+                None,
+                tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+            )
+        })
+        .await
+        .expect("audit job")
+        .unwrap_or_else(|e| panic!("{label}: full audit must run at {cols}x{rows}: {e}"));
     assert!(
         !report.findings.is_empty(),
         "{label}: an audit with findings machinery working yields findings"
@@ -163,7 +171,10 @@ fn assert_profile_holds(
     }
     // The resize driver restores the requested geometry (item 65 residue
     // contract): after the full audit, the session is back at cols x rows.
-    let after = sess.observe(60).expect("post-audit observe");
+    let after = pool
+        .with_session(Some(sid), |sess| sess.observe(60).expect("post-audit observe"))
+        .await
+        .expect("post-audit observe job");
     assert_eq!(
         (after.cols, after.rows),
         (cols, rows),
@@ -172,18 +183,18 @@ fn assert_profile_holds(
 }
 
 /// The size matrix: floor, classic, wide. Same fixture, same assertions.
-#[test]
-fn size_matrix_floor_classic_and_wide() {
+#[tokio::test]
+async fn size_matrix_floor_classic_and_wide() {
     let (_dir, app) = fixture_dir();
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     for (cols, rows, label) in [
         (20u16, 8u16, "floor 20x8"),
         (80, 24, "classic 80x24"),
         (120, 40, "wide 120x40"),
     ] {
-        let sid = start_at(&mut mgr, &app, cols, rows, &[]);
-        assert_profile_holds(&mut mgr, &sid, cols, rows, 1, label);
-        mgr.stop(&sid).ok();
+        let sid = start_at(&pool, &app, cols, rows, &[]).await;
+        assert_profile_holds(&pool, &sid, cols, rows, 1, label).await;
+        pool.stop(&sid).await.ok();
     }
 }
 
@@ -191,10 +202,10 @@ fn size_matrix_floor_classic_and_wide() {
 /// observations and audit machinery must hold under each; the frame's
 /// process stays alive (a TERM the app cannot use must not silently kill
 /// the session).
-#[test]
-fn env_matrix_term_variants_and_scrubbed_env() {
+#[tokio::test]
+async fn env_matrix_term_variants_and_scrubbed_env() {
     let (_dir, app) = fixture_dir();
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     type EnvCase = (String, &'static str, Vec<(String, String)>);
     let envs: Vec<EnvCase> = vec![
         (
@@ -214,15 +225,18 @@ fn env_matrix_term_variants_and_scrubbed_env() {
         ),
     ];
     for (term, label, env) in envs {
-        let sid = start_at(&mut mgr, &app, 80, 24, &env);
-        assert_profile_holds(&mut mgr, &sid, 80, 24, 1, label);
+        let sid = start_at(&pool, &app, 80, 24, &env).await;
+        assert_profile_holds(&pool, &sid, 80, 24, 1, label).await;
         // The child survived its TERM.
-        let sess = mgr.resolve(Some(&sid)).unwrap();
+        let available = pool
+            .with_session(Some(&sid), |sess| sess.adapter_status().adapter_available)
+            .await
+            .expect("adapter status job");
         assert!(
-            sess.adapter_status().adapter_available,
+            available,
             "{label}: session stays instrumented under {term}"
         );
-        mgr.stop(&sid).ok();
+        pool.stop(&sid).await.ok();
     }
 
     // Scrubbed environment (clean isolation): fresh scratch HOME/TMPDIR,
@@ -243,54 +257,61 @@ fn env_matrix_term_variants_and_scrubbed_env() {
         !python3.is_empty() && python3.starts_with('/'),
         "python3 must resolve to an absolute path for clean isolation: {python3:?}"
     );
-    let sid = mgr
+    let sid = pool
         .start(&python3, &[app], None, &[], 80, 24, "auto", "clean")
+        .await
         .expect("clean-isolated launch");
-    assert_profile_holds(&mut mgr, &sid, 80, 24, 1, "clean isolation");
-    mgr.stop(&sid).ok();
+    assert_profile_holds(&pool, &sid, 80, 24, 1, "clean isolation").await;
+    pool.stop(&sid).await.ok();
 }
 
 /// Size x env interaction: the floor size under the least capable TERM —
 /// the combination most likely to break naive layouts — still holds.
-#[test]
-fn floor_size_under_dumb_term_holds() {
+#[tokio::test]
+async fn floor_size_under_dumb_term_holds() {
     let (_dir, app) = fixture_dir();
-    let mut mgr = SessionManager::new();
-    let sid = start_at(&mut mgr, &app, 20, 8, &[("TERM".into(), "dumb".into())]);
-    assert_profile_holds(&mut mgr, &sid, 20, 8, 1, "20x8 + TERM=dumb");
-    mgr.stop(&sid).ok();
+    let pool = SessionPool::new();
+    let sid = start_at(&pool, &app, 20, 8, &[("TERM".into(), "dumb".into())]).await;
+    assert_profile_holds(&pool, &sid, 20, 8, 1, "20x8 + TERM=dumb").await;
+    pool.stop(&sid).await.ok();
 }
 
 /// Resize DURING a session moves the whole profile: the parsed geometry
 /// follows every leg of the matrix and the app re-renders into it. The
 /// anchored generation counter makes each leg wait for a frame drawn
 /// AFTER the previous leg's audit — a stale clipped frame cannot pass.
-#[test]
-fn live_resize_walks_the_matrix() {
+#[tokio::test]
+async fn live_resize_walks_the_matrix() {
     let (_dir, app) = fixture_dir();
-    let mut mgr = SessionManager::new();
-    let sid = start_at(&mut mgr, &app, 80, 24, &[]);
+    let pool = SessionPool::new();
+    let sid = start_at(&pool, &app, 80, 24, &[]).await;
     let mut min_gen = 1u64;
     for (cols, rows) in [(120u16, 40u16), (20u16, 8u16), (80u16, 24u16)] {
-        {
-            let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+        pool.with_session(Some(&sid), move |sess| {
             sess.resize(cols, rows).expect("resize");
-        }
+        })
+        .await
+        .expect("resize job");
         assert_profile_holds(
-            &mut mgr,
+            &pool,
             &sid,
             cols,
             rows,
             min_gen,
             &format!("resized to {cols}x{rows}"),
-        );
+        )
+        .await;
         // The audit's full run types keys and resizes internally; every
         // one of those consumed inputs redraws the fixture, so the next
         // leg anchors on a counter strictly beyond whatever is on screen
         // NOW.
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-        let now = sess.observe(300).expect("observe between legs");
+        let now = pool
+            .with_session(Some(&sid), |sess| {
+                sess.observe(300).expect("observe between legs")
+            })
+            .await
+            .expect("observe job");
         min_gen = screen_generation(&now).expect("generation visible between legs") + 1;
     }
-    mgr.stop(&sid).ok();
+    pool.stop(&sid).await.ok();
 }

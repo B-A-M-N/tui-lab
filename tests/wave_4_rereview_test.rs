@@ -2,11 +2,12 @@
 //! event-predicate waits (item 17), and tmux attach (item 18).
 
 use tui_lab::events::{project_history, BusSource, HistoryQuery};
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
-fn python_session(mgr: &mut SessionManager, code: &str) -> String {
+async fn python_session(pool: &SessionPool, code: &str) -> String {
     let args: Vec<String> = vec!["-c".to_string(), code.to_string()];
-    mgr.start("python3", &args, None, &[], 80, 24, "auto", "local")
+    pool.start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .await
         .expect("start python session")
 }
 
@@ -142,24 +143,38 @@ fn history_projection_windows_filters_and_counts() {
 /// End-to-end through a real session: act on a TUI, then read the history
 /// and find the output/screen-changed events that the action produced,
 /// with a cursor that advances cleanly.
-#[test]
-fn session_history_serves_real_action_events() {
-    let mut mgr = SessionManager::new();
+#[tokio::test]
+async fn session_history_serves_real_action_events() {
+    let pool = SessionPool::new();
     // Print in two phases: the FIRST observation only seeds `last` (the
     // screen it settles on is the baseline), so the ScreenChanged event
     // comes from the transition between phase 1 and phase 2.
     let sid = python_session(
-        &mut mgr,
+        &pool,
         "import time\nprint('hello'); time.sleep(1); print('world'); time.sleep(30)",
-    );
-    {
-        let sess = mgr.get_mut(&sid).expect("session");
-        let _ = sess.observe(300);
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        let _ = sess.observe(300);
-    }
-    let sess = mgr.get(&sid).expect("session");
-    let events = sess.all_events();
+    )
+    .await;
+    let (events, evicted, after_empty) = pool
+        .with_session(Some(&sid), move |sess| {
+            let _ = sess.observe(300);
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let _ = sess.observe(300);
+
+            let events = sess.all_events();
+            // Serve through the projection with a cursor and confirm it advances.
+            let batch = project_history(&events, &HistoryQuery::default(), sess.events_evicted());
+            let after = project_history(
+                &sess.all_events(),
+                &HistoryQuery {
+                    since_seq: batch.cursor,
+                    ..Default::default()
+                },
+                0,
+            );
+            (events, sess.events_evicted(), after.events.is_empty())
+        })
+        .await
+        .expect("history job");
     assert!(
         events
             .iter()
@@ -173,41 +188,31 @@ fn session_history_serves_real_action_events() {
         )),
         "the hello→world transition must be a screen_changed event"
     );
-    // Serve through the projection with a cursor and confirm it advances.
-    let batch = project_history(&events, &HistoryQuery::default(), sess.events_evicted());
+    let batch = project_history(&events, &HistoryQuery::default(), evicted);
     assert!(!batch.gap);
     assert_eq!(
         batch.cursor,
         batch.events.last().map(|e| e.seq).unwrap_or(0)
     );
-    let after = project_history(
-        &sess.all_events(),
-        &HistoryQuery {
-            since_seq: batch.cursor,
-            ..Default::default()
-        },
-        0,
-    );
     assert!(
-        after.events.is_empty(),
+        after_empty,
         "since the served cursor there is nothing new"
     );
-    mgr.stop(&sid).ok();
+    pool.stop(&sid).await.ok();
 }
 
 /// Native events converge into the same history with the native source.
 /// The app side is simulated exactly as a cooperative adapter does: write an
 /// NDJSON event frame to the semantic channel file, then let the session
 /// poll it in.
-#[test]
-fn history_wire_kinds_and_native_source() {
+#[tokio::test]
+async fn history_wire_kinds_and_native_source() {
     use std::io::Write;
     use tui_lab::events::TerminalEventKind;
-    let mut mgr = SessionManager::new();
-    let sid = python_session(&mut mgr, "print('x'); import time; time.sleep(30)");
-    {
-        // Observe once so the queue seeds, then simulate one app event.
-        let sess = mgr.get_mut(&sid).expect("session");
+    let pool = SessionPool::new();
+    let sid = python_session(&pool, "print('x'); import time; time.sleep(30)").await;
+    // Observe once so the queue seeds, then simulate one app event.
+    pool.with_session(Some(&sid), move |sess| {
         let _ = sess.observe(300);
         let (_, path) = sess
             .native_channel()
@@ -222,11 +227,17 @@ fn history_wire_kinds_and_native_source() {
             r#"{{"v":1,"type":"event","event":"focus","target":"menu.file"}}"#
         )
         .expect("write frame");
-    }
-    mgr.get_mut(&sid).expect("session").poll_native();
-    let sess = mgr.get(&sid).expect("session");
-    let names: Vec<&str> = sess
-        .all_events()
+    })
+    .await
+    .expect("seed job");
+    pool.with_session(Some(&sid), move |sess| sess.poll_native())
+        .await
+        .expect("poll job");
+    let events = pool
+        .with_session(Some(&sid), move |sess| sess.all_events())
+        .await
+        .expect("events job");
+    let names: Vec<&str> = events
         .iter()
         .map(|ev| match ev.kind {
             TerminalEventKind::NativeEvent { .. } => "native_event",
@@ -238,7 +249,7 @@ fn history_wire_kinds_and_native_source() {
         "the polled native event must be absorbed into history; got {names:?}"
     );
     // The converged vocabulary projects it under the native source.
-    let batch = project_history(&sess.all_events(), &HistoryQuery::default(), 0);
+    let batch = project_history(&events, &HistoryQuery::default(), 0);
     assert!(
         batch.events.iter().any(|e| e.source == BusSource::Native
             && matches!(
@@ -249,7 +260,7 @@ fn history_wire_kinds_and_native_source() {
     );
     // And the kind filter names it exactly as an agent would ask.
     let only_native = project_history(
-        &sess.all_events(),
+        &events,
         &HistoryQuery {
             event_types: vec!["native_event".into()],
             ..Default::default()
@@ -257,7 +268,7 @@ fn history_wire_kinds_and_native_source() {
         0,
     );
     assert_eq!(only_native.events.len(), 1);
-    mgr.stop(&sid).ok();
+    pool.stop(&sid).await.ok();
 }
 
 // ── Item 17: declarative event-predicate waits ───────────────────────────
@@ -329,16 +340,16 @@ fn event_predicate_matches_conjunctively() {
 /// End-to-end: a child that prints after a delay; the event wait fires only
 /// when the new output's events arrive, and a `since_seq`-anchored wait
 /// ignores the past.
-#[test]
-fn wait_event_fires_on_new_output_and_respects_since_seq() {
+#[tokio::test]
+async fn wait_event_fires_on_new_output_and_respects_since_seq() {
     use tui_lab::mcp::params::EventPredicate;
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let sid = python_session(
-        &mut mgr,
+        &pool,
         "import time\nprint('first'); time.sleep(1); print('second'); time.sleep(30)",
-    );
-    {
-        let sess = mgr.get_mut(&sid).expect("session");
+    )
+    .await;
+    pool.with_session(Some(&sid), move |sess| {
         let _ = sess.observe(300);
         // The predicate: any new screen_changed event AFTER now.
         let pred = EventPredicate {
@@ -346,8 +357,8 @@ fn wait_event_fires_on_new_output_and_respects_since_seq() {
             contains: None,
             since_seq: Some(sess.event_queue_last_seq()),
         };
-        let out = tui_lab::execution::execute_wait_event(mgr.get_mut(&sid).unwrap(), &pred, 5000)
-            .expect("wait");
+        let out =
+            tui_lab::execution::execute_wait_event(sess, &pred, 5000).expect("wait");
         assert!(
             out.met,
             "the delayed second print must produce a screen_changed event"
@@ -360,11 +371,12 @@ fn wait_event_fires_on_new_output_and_respects_since_seq() {
             contains: None,
             since_seq: Some(out.matched_seq),
         };
-        let out2 = tui_lab::execution::execute_wait_event(mgr.get_mut(&sid).unwrap(), &stale, 400)
-            .expect("wait");
+        let out2 = tui_lab::execution::execute_wait_event(sess, &stale, 400).expect("wait");
         assert!(!out2.met, "no further screen change is pending");
-    }
-    mgr.stop(&sid).ok();
+    })
+    .await
+    .expect("wait job");
+    pool.stop(&sid).await.ok();
 }
 
 // ── Item 18: tmux attach ─────────────────────────────────────────────────

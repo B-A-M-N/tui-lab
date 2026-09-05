@@ -48,10 +48,10 @@ async fn start_session(server: &tui_lab::mcp::tools::TuiLabServer, script: &str)
 
 // ─────────────────────────── item 66: real drivers ───────────────────────────
 
-#[test]
-fn performance_audit_reports_measured_percentiles() {
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn performance_audit_reports_measured_percentiles() {
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &["-c".to_string(), "print('perf'); input()".to_string()],
@@ -62,31 +62,35 @@ fn performance_audit_reports_measured_percentiles() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::driver::performance_audit(sess, 5);
-    let f = findings
-        .iter()
-        .find(|f| f.id == "PERF-OK" || f.id == "PERF-OBSERVE-SLOW")
-        .expect("percentile finding present");
-    let detail = &f.evidence[0].detail;
-    assert!(
-        detail["observe_ms"]["p50"].is_u64(),
-        "observe p50 must be a measured number: {detail}"
-    );
-    assert!(
-        detail["samples"].as_u64().unwrap() == 5,
-        "sample count honored: {detail}"
-    );
-    // A healthy python echo screen is nowhere near the observe budget.
-    assert_eq!(f.id, "PERF-OK", "fast child must not flag slow observe");
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let findings = tui_lab::audit::driver::performance_audit(sess, 5);
+        let f = findings
+            .iter()
+            .find(|f| f.id == "PERF-OK" || f.id == "PERF-OBSERVE-SLOW")
+            .expect("percentile finding present");
+        let detail = &f.evidence[0].detail;
+        assert!(
+            detail["observe_ms"]["p50"].is_u64(),
+            "observe p50 must be a measured number: {detail}"
+        );
+        assert!(
+            detail["samples"].as_u64().unwrap() == 5,
+            "sample count honored: {detail}"
+        );
+        // A healthy python echo screen is nowhere near the observe budget.
+        assert_eq!(f.id, "PERF-OK", "fast child must not flag slow observe");
+    })
+    .await
+    .expect("performance audit job");
+    pool.stop(&id).await.ok();
 }
 
-#[test]
-fn errors_audit_survives_burst_and_scans_screen() {
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn errors_audit_survives_burst_and_scans_screen() {
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &["-c".to_string(), "print('crash-me'); input()".to_string()],
@@ -97,33 +101,37 @@ fn errors_audit_survives_burst_and_scans_screen() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::driver::errors_audit(sess, 10);
-    // A python `input()` child survives arrows/tab/escape by construction;
-    // the honest outcome is ERR-OK with the burst recorded as evidence.
-    let ok = findings
-        .iter()
-        .find(|f| f.id == "ERR-OK" || f.id == "ERR-ON-SCREEN")
-        .expect("crash-resistance finding present");
-    if ok.id == "ERR-OK" {
-        let detail = &ok.evidence[0].detail;
-        assert!(
-            detail["keys_sent"].as_u64().unwrap() > 0,
-            "burst actually sent keys: {detail}"
-        );
-    }
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let findings = tui_lab::audit::driver::errors_audit(sess, 10);
+        // A python `input()` child survives arrows/tab/escape by construction;
+        // the honest outcome is ERR-OK with the burst recorded as evidence.
+        let ok = findings
+            .iter()
+            .find(|f| f.id == "ERR-OK" || f.id == "ERR-ON-SCREEN")
+            .expect("crash-resistance finding present");
+        if ok.id == "ERR-OK" {
+            let detail = &ok.evidence[0].detail;
+            assert!(
+                detail["keys_sent"].as_u64().unwrap() > 0,
+                "burst actually sent keys: {detail}"
+            );
+        }
+    })
+    .await
+    .expect("errors audit job");
+    pool.stop(&id).await.ok();
 }
 
-#[test]
-fn errors_audit_catches_on_screen_error_text() {
+#[tokio::test]
+async fn errors_audit_catches_on_screen_error_text() {
     // Wave 4 item 39: "Error:" alone is a WEAK marker (matches log viewers
     // and docs too) — the audit reports it as ERR-TEXT-HINT at info, not a
     // fabricated crash verdict. Strong markers (panic/traceback) stay
     // ERR-ON-SCREEN at error. Both tiers must name the offending line.
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &[
@@ -137,35 +145,39 @@ fn errors_audit_catches_on_screen_error_text() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::driver::errors_audit(sess, 5);
-    let f = findings
-        .iter()
-        .find(|f| f.id == "ERR-TEXT-HINT")
-        .expect("weak marker must surface as a hint, not silence");
-    assert_eq!(f.severity, "info", "weak markers stay informational");
-    assert!(
-        f.summary.contains("error"),
-        "marker named in summary: {:?}",
-        f.summary
-    );
-    let weak = f.evidence[0].detail["weak_markers"]
-        .as_array()
-        .expect("weak");
-    assert!(
-        weak.iter().any(|m| m.as_str() == Some("error:")),
-        "error: listed among weak markers: {weak:?}"
-    );
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let findings = tui_lab::audit::driver::errors_audit(sess, 5);
+        let f = findings
+            .iter()
+            .find(|f| f.id == "ERR-TEXT-HINT")
+            .expect("weak marker must surface as a hint, not silence");
+        assert_eq!(f.severity, "info", "weak markers stay informational");
+        assert!(
+            f.summary.contains("error"),
+            "marker named in summary: {:?}",
+            f.summary
+        );
+        let weak = f.evidence[0].detail["weak_markers"]
+            .as_array()
+            .expect("weak");
+        assert!(
+            weak.iter().any(|m| m.as_str() == Some("error:")),
+            "error: listed among weak markers: {weak:?}"
+        );
+    })
+    .await
+    .expect("weak marker job");
+    pool.stop(&id).await.ok();
 }
 
-#[test]
-fn errors_audit_strong_markers_stay_errors() {
+#[tokio::test]
+async fn errors_audit_strong_markers_stay_errors() {
     // A strong app-failure marker (panic text) keeps the ERR-ON-SCREEN
     // error verdict.
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &[
@@ -179,28 +191,32 @@ fn errors_audit_strong_markers_stay_errors() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::driver::errors_audit(sess, 5);
-    let f = findings
-        .iter()
-        .find(|f| f.id == "ERR-ON-SCREEN")
-        .expect("strong marker must stay an error-severity finding");
-    assert_eq!(f.severity, "error");
-    let strong = f.evidence[0].detail["strong_markers"]
-        .as_array()
-        .expect("strong");
-    assert!(
-        strong.iter().any(|m| m.as_str() == Some("panicked at")),
-        "panic marker recorded: {strong:?}"
-    );
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let findings = tui_lab::audit::driver::errors_audit(sess, 5);
+        let f = findings
+            .iter()
+            .find(|f| f.id == "ERR-ON-SCREEN")
+            .expect("strong marker must stay an error-severity finding");
+        assert_eq!(f.severity, "error");
+        let strong = f.evidence[0].detail["strong_markers"]
+            .as_array()
+            .expect("strong");
+        assert!(
+            strong.iter().any(|m| m.as_str() == Some("panicked at")),
+            "panic marker recorded: {strong:?}"
+        );
+    })
+    .await
+    .expect("strong marker job");
+    pool.stop(&id).await.ok();
 }
 
-#[test]
-fn mouse_audit_risk_filters_destructive_labels() {
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn mouse_audit_risk_filters_destructive_labels() {
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &[
@@ -214,27 +230,31 @@ fn mouse_audit_risk_filters_destructive_labels() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::driver::mouse_audit(sess, 12);
-    // Whatever the semantic layer detects, the audit must never have
-    // clicked a destructive-looking control; the no-targets finding (or a
-    // results finding listing what it did) must exist.
-    assert!(
-        findings.iter().any(|f| f.id == "MOUSE-NO-TARGETS"
-            || f.id == "MOUSE-OK"
-            || f.id == "MOUSE-UNRESPONSIVE"
-            || f.id == "MOUSE-NO-CAPS"),
-        "mouse audit produces an honest verdict: {:?}",
-        findings.iter().map(|f| &f.id).collect::<Vec<_>>()
-    );
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let findings = tui_lab::audit::driver::mouse_audit(sess, 12);
+        // Whatever the semantic layer detects, the audit must never have
+        // clicked a destructive-looking control; the no-targets finding (or a
+        // results finding listing what it did) must exist.
+        assert!(
+            findings.iter().any(|f| f.id == "MOUSE-NO-TARGETS"
+                || f.id == "MOUSE-OK"
+                || f.id == "MOUSE-UNRESPONSIVE"
+                || f.id == "MOUSE-NO-CAPS"),
+            "mouse audit produces an honest verdict: {:?}",
+            findings.iter().map(|f| &f.id).collect::<Vec<_>>()
+        );
+    })
+    .await
+    .expect("mouse audit job");
+    pool.stop(&id).await.ok();
 }
 
-#[test]
-fn states_audit_reports_frame_state_findings() {
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn states_audit_reports_frame_state_findings() {
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &["-c".to_string(), "print('states'); input()".to_string()],
@@ -245,24 +265,28 @@ fn states_audit_reports_frame_state_findings() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let findings = tui_lab::audit::driver::states_audit(sess, 4);
-    assert!(
-        !findings.is_empty(),
-        "states audit always reports something (inventory or ok)"
-    );
-    assert!(
-        findings
-            .iter()
-            .all(|f| f.category == "states" || f.id == "AUDIT-RESIDUE"),
-        "states findings carry the states category: {:?}",
-        findings
-            .iter()
-            .map(|f| (&f.id, &f.category))
-            .collect::<Vec<_>>()
-    );
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let findings = tui_lab::audit::driver::states_audit(sess, 4);
+        assert!(
+            !findings.is_empty(),
+            "states audit always reports something (inventory or ok)"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.category == "states" || f.id == "AUDIT-RESIDUE"),
+            "states findings carry the states category: {:?}",
+            findings
+                .iter()
+                .map(|f| (&f.id, &f.category))
+                .collect::<Vec<_>>()
+        );
+    })
+    .await
+    .expect("states audit job");
+    pool.stop(&id).await.ok();
 }
 
 // ─────────────────────────── item 67: finding compare ───────────────────────────
@@ -345,12 +369,12 @@ async fn audit_label_and_compare_flow() {
 
 // ─────────────────────────── item 65 + 73: residue + parallelism ───────────────────────────
 
-#[test]
-fn full_audit_leaves_no_state_residue() {
+#[tokio::test]
+async fn full_audit_leaves_no_state_residue() {
     // Item 65's contract, proven live: after `full` (which Tabs, resizes,
     // clicks, and bursts), focus and dimensions are back where they started.
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let id = mgr
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &["-c".to_string(), "print('residue'); input()".to_string()],
@@ -361,28 +385,32 @@ fn full_audit_leaves_no_state_residue() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let report = tui_lab::audit::orchestrator::run_profile(sess, "full").expect("full runs");
-    // The last driver restores what it changed; the transaction verify pass
-    // must find focus/size unchanged, so NO residue finding appears.
-    assert!(
-        !report.findings.iter().any(|f| f.id == "AUDIT-RESIDUE"),
-        "full audit must restore state (or honestly report it — here restoration works): {:?}",
-        report
-            .findings
-            .iter()
-            .filter(|f| f.id == "AUDIT-RESIDUE")
-            .map(|f| &f.summary)
-            .collect::<Vec<_>>()
-    );
-    let screen = sess.observe(40).expect("post-audit observe");
-    assert_eq!(
-        (screen.cols, screen.rows),
-        (100, 30),
-        "viewport restored after the resize matrix"
-    );
-    mgr.stop(&id).ok();
+    pool.with_session(Some(&id), |sess| {
+        let report = tui_lab::audit::orchestrator::run_profile(sess, "full").expect("full runs");
+        // The last driver restores what it changed; the transaction verify pass
+        // must find focus/size unchanged, so NO residue finding appears.
+        assert!(
+            !report.findings.iter().any(|f| f.id == "AUDIT-RESIDUE"),
+            "full audit must restore state (or honestly report it — here restoration works): {:?}",
+            report
+                .findings
+                .iter()
+                .filter(|f| f.id == "AUDIT-RESIDUE")
+                .map(|f| &f.summary)
+                .collect::<Vec<_>>()
+        );
+        let screen = sess.observe(40).expect("post-audit observe");
+        assert_eq!(
+            (screen.cols, screen.rows),
+            (100, 30),
+            "viewport restored after the resize matrix"
+        );
+    })
+    .await
+    .expect("residue job");
+    pool.stop(&id).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

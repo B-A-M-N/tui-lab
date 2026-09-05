@@ -6,7 +6,7 @@
 
 use tui_lab::exploration::state_graph::StateIdentity;
 use tui_lab::exploration::{ExplorationBudget, StateGraph, StateId};
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
 /// Identity for a bare content key — tests exercise graph bookkeeping, not
 /// frame semantics.
@@ -157,10 +157,10 @@ fn test_state_id_creation() {
     assert!(id3.as_str().starts_with("sem:"));
 }
 
-#[test]
-fn test_exploration_run_with_graph() {
-    let mut mgr = SessionManager::new();
-    let id = mgr
+#[tokio::test]
+async fn test_exploration_run_with_graph() {
+    let pool = SessionPool::new();
+    let id = pool
         .start(
             "python3",
             &[
@@ -174,6 +174,7 @@ fn test_exploration_run_with_graph() {
             "auto",
             "local",
         )
+        .await
         .expect("start");
 
     let budget = ExplorationBudget {
@@ -183,26 +184,33 @@ fn test_exploration_run_with_graph() {
     };
     let mut graph = StateGraph::new(budget);
 
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let before = sess.observe(30).unwrap();
-    let before_identity = StateIdentity::from_frame(&before);
-    assert!(graph.record_state_identity(&before_identity, 0));
+    pool.with_session(Some(&id), move |sess| {
+        let before = sess.observe(30).unwrap();
+        let before_identity = StateIdentity::from_frame(&before);
+        assert!(graph.record_state_identity(&before_identity, 0));
 
-    // Send a tab and record the transition through the identity path.
-    let _ = sess.send(tui_lab::backend::Input::Key(
-        tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Tab),
-    ));
-    let _ = sess.wait(
-        tui_lab::backend::WaitCond::ScreenStable {
-            quiet_for: std::time::Duration::from_millis(80),
-            after_screen_seq: None,
-        },
-        500,
-    );
-    let after = sess.observe(50).unwrap();
+        // Send a tab and record the transition through the identity path.
+        let _ = sess.send(tui_lab::backend::Input::Key(
+            tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Tab),
+        ));
+        let _ = sess.wait(
+            tui_lab::backend::WaitCond::ScreenStable {
+                quiet_for: std::time::Duration::from_millis(80),
+                after_screen_seq: None,
+            },
+            500,
+        );
+        let after = sess.observe(50).unwrap();
 
-    graph.record_transition_identity(&before_identity, &StateIdentity::from_frame(&after), "tab");
+        graph.record_transition_identity(
+            &before_identity,
+            &StateIdentity::from_frame(&after),
+            "tab",
+        );
 
-    assert!(graph.state_count() >= 1);
-    assert_eq!(graph.transition_count(), 1);
+        assert!(graph.state_count() >= 1);
+        assert_eq!(graph.transition_count(), 1);
+    })
+    .await
+    .expect("graph job");
 }
