@@ -36,15 +36,15 @@ impl RunContext {
     /// replay-complete — the manifest and status report the gap instead of
     /// pretending.
     pub fn history_complete(&self) -> bool {
-        self.dropped_records == 0
+        self.evidence.transactions.dropped_records() == 0
     }
 
     pub fn dropped_records(&self) -> u64 {
-        self.dropped_records
+        self.evidence.transactions.dropped_records()
     }
 
     pub fn first_available_seq(&self) -> Option<u64> {
-        self.first_available_seq
+        self.evidence.transactions.first_available_seq()
     }
 
     // ── Contracts (Wave E items 39–49) ──────────────────────────────────

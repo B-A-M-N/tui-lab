@@ -61,8 +61,7 @@ impl RunContext {
     /// Assign the next citable frame id (Wave B item 11) and stamp the
     /// frame with run provenance. Returns the id (`frame:N`).
     pub fn register_frame(&mut self, frame: &mut crate::backend::CanonicalFrame) -> u64 {
-        self.next_frame_id += 1;
-        let id = self.next_frame_id;
+        let id = self.evidence.frames.allocate_id();
         frame.assign_frame_id(id);
         frame.run_id = Some(self.id.clone());
         id
@@ -73,18 +72,18 @@ impl RunContext {
     /// run, or evicted (check [`Self::frame_hot_evicted`]); the cold log
     /// (`frames.jsonl`, persistent runs) still resolves it.
     pub fn frame_record(&self, frame_id: u64) -> Option<&FrameRecord> {
-        self.frame_hot.iter().find(|r| r.frame_id == frame_id)
+        self.evidence.frames.record(frame_id)
     }
 
     /// The hot frame ring, oldest first (item 51 storage split: hot ids +
     /// hashes here, full grids only in the cold log).
     pub fn frame_hot_records(&self) -> impl Iterator<Item = &FrameRecord> {
-        self.frame_hot.iter()
+        self.evidence.frames.hot()
     }
 
     /// How many hot records have been evicted past the ring bound.
     pub fn frame_hot_evicted(&self) -> u64 {
-        self.frame_hot_evicted
+        self.evidence.frames.evicted()
     }
 
     /// The frame commit pipeline (re-review item 40): the ONE path a
@@ -136,11 +135,7 @@ impl RunContext {
                 .unwrap_or(0),
             commit_us: started.elapsed().as_micros() as u64,
         };
-        self.frame_hot.push_back(record);
-        while self.frame_hot.len() > FRAME_HOT_RING {
-            self.frame_hot.pop_front();
-            self.frame_hot_evicted += 1;
-        }
+        self.evidence.frames.push_hot(record);
         if let Some(dir) = self.run_dir.as_ref() {
             let line = serde_json::json!({
                 "frame_id": id,
@@ -200,7 +195,7 @@ impl RunContext {
             let ev_dir = dir.join("events");
             if std::fs::create_dir_all(&ev_dir).is_err() {
                 self.persistence_unhealthy = true;
-                self.held_events.push((session.to_string(), events));
+                self.evidence.events.hold(session, events);
                 return Ok(());
             }
             let safe = sanitize(session);
@@ -227,11 +222,7 @@ impl RunContext {
                 .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
             {
                 Ok(()) => {
-                    let written = self
-                        .event_flushed_counts
-                        .entry(session.to_string())
-                        .or_insert(0);
-                    *written += events.len() as u64;
+                    self.evidence.events.note_flushed(session, events.len());
                     // Artifact registered once per session (the log is a
                     // growing file, not a per-batch artifact).
                     let artifact_path =
@@ -250,7 +241,7 @@ impl RunContext {
                         )
                         .ok();
                     }
-                    self.event_count += events.len() as u64;
+                    self.evidence.events.add_batch(events.len());
                     return Ok(());
                 }
                 Err(_) => {
@@ -259,7 +250,7 @@ impl RunContext {
                 }
             }
         }
-        self.held_events.push((session.to_string(), events));
+        self.evidence.events.hold(session, events);
         Ok(())
     }
 }

@@ -16,8 +16,6 @@ impl RunContext {
             run_dir: None,
             session_specs: HashMap::new(),
             primary_session: None,
-            dropped_records: 0,
-            first_available_seq: None,
             checkpoints: CheckpointStore::new(),
             recorders: HashMap::new(),
             saved_scenarios: HashMap::new(),
@@ -28,18 +26,11 @@ impl RunContext {
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             state_graph: StateGraph::new(ExplorationBudget::default()),
             findings: FindingStore::new(),
-            transactions: Vec::new(),
-            transaction_count: 0,
-            event_count: 0,
-            next_frame_id: 0,
-            frame_hot: std::collections::VecDeque::new(),
-            frame_hot_evicted: 0,
+            evidence: evidence_store::EvidenceStore::new(),
             artifacts: Vec::new(),
             ledger_flushed_upto: 0,
             journal: None,
             persistence_unhealthy: false,
-            held_events: Vec::new(),
-            event_flushed_counts: HashMap::new(),
             contract: contract_state::ContractState::new(),
             coverage_ledger: std::collections::BTreeMap::new(),
             event_cursors: std::collections::HashMap::new(),
@@ -223,8 +214,12 @@ impl RunContext {
         run.started_at = manifest.started_at;
         run.closed = manifest.closed;
         run.resume_epoch = manifest.resume_epoch;
-        run.dropped_records = manifest.dropped_records;
-        run.first_available_seq = manifest.first_available_seq;
+        run.evidence
+            .transactions
+            .set_dropped_records(manifest.dropped_records);
+        run.evidence
+            .transactions
+            .set_first_available_seq(manifest.first_available_seq);
         run.session_specs = manifest.sessions.clone();
         run.primary_session = manifest.primary_session.clone();
         run.run_dir = Some(run_dir.to_path_buf());
@@ -243,7 +238,7 @@ impl RunContext {
                 }
             }
         }
-        run.ledger_flushed_upto = run.transaction_count; // 0 — file is authoritative
+        run.ledger_flushed_upto = run.evidence.transactions.total(); // 0 — file is authoritative
 
         // Transaction ledger: every line that is still parseable comes back.
         // A torn final line (crash mid-append) is skipped and *counted*, not
@@ -271,18 +266,14 @@ impl RunContext {
                     continue;
                 }
                 match serde_json::from_str::<TransactionRecord>(line) {
-                    Ok(rec) => {
-                        run.transaction_count = run.transaction_count.max(rec.seq + 1);
-                        run.transactions.push(rec);
-                    }
+                    Ok(rec) => run.evidence.transactions.adopt_restored(rec),
                     Err(_) => torn += 1,
                 }
             }
             if torn > 0 {
-                run.dropped_records += torn;
-                run.first_available_seq = run.transactions.first().map(|t| t.seq);
+                run.evidence.transactions.note_dropped(torn);
             }
-            run.ledger_flushed_upto = run.transaction_count;
+            run.ledger_flushed_upto = run.evidence.transactions.total();
         }
 
         // Findings. Audit P1-46: a present-but-unparseable artifact is a
@@ -607,21 +598,21 @@ impl RunContext {
         // channel tail, and `flush` never reports success while lines are
         // still unwritten.
         if let Some(j) = &self.journal {
-            let target = self.transaction_count;
+            let target = self.evidence.transactions.total();
             let reached = j.wait_for(target, std::time::Duration::from_secs(5));
             if reached < target || j.is_unhealthy() {
                 self.persistence_unhealthy = true;
             }
             self.ledger_flushed_upto = reached;
-        } else if self.transaction_count > self.ledger_flushed_upto {
+        } else if self.evidence.transactions.total() > self.ledger_flushed_upto {
             // Restored run with no writer yet (no new records since
             // restore): the file is already authoritative; nothing to do.
-            self.ledger_flushed_upto = self.transaction_count;
+            self.ledger_flushed_upto = self.evidence.transactions.total();
         }
         // Terminal-event logs (Wave B item 12/14).
         let ev_dir = dir.join("events");
         std::fs::create_dir_all(&ev_dir)?;
-        for (session, events) in std::mem::take(&mut self.held_events) {
+        for (session, events) in self.evidence.events.take_held() {
             let safe = sanitize(&session);
             // Finding 31: this whole-file write is the stream CREATOR for
             // ephemeral runs flushed at close — it carries the header.
@@ -728,7 +719,7 @@ impl RunContext {
         // journal writer — write the whole window now (one synchronous
         // pass at promotion, not per-record on the driving path), then
         // arm the writer for everything after this point.
-        if self.transaction_count > 0 {
+        if self.evidence.transactions.total() > 0 {
             let ledger_path = root.join("transactions.jsonl");
             // Finding 31: promotion CREATES the stream file — it carries
             // the format header before the records.
@@ -741,14 +732,14 @@ impl RunContext {
                 let _ = file
                     .write_all(StreamHeader::line(crate::run::formats::tags::LEDGER).as_bytes());
                 let _ = file.write_all(b"\n");
-                for tx in &self.transactions {
+                for tx in self.evidence.transactions.records() {
                     if let Ok(line) = serde_json::to_string(tx) {
                         let _ = file.write_all(line.as_bytes());
                         let _ = file.write_all(b"\n");
                     }
                 }
             }
-            self.ledger_flushed_upto = self.transaction_count;
+            self.ledger_flushed_upto = self.evidence.transactions.total();
         }
         // Flush everything accumulated while ephemeral into the new root.
         self.flush()?;
@@ -760,8 +751,8 @@ impl RunContext {
     /// the watermark reached. A no-op for ephemeral runs.
     pub fn wait_for_journal(&self, deadline: std::time::Duration) -> u64 {
         match &self.journal {
-            Some(j) => j.wait_for(self.transaction_count, deadline),
-            None => self.transaction_count,
+            Some(j) => j.wait_for(self.evidence.transactions.total(), deadline),
+            None => self.evidence.transactions.total(),
         }
     }
 
