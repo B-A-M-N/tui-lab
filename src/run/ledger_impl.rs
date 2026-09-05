@@ -134,15 +134,15 @@ impl RunContext {
                 "hot_evicted": self.frame_hot_evicted,
                 "next_frame_id": self.next_frame_id,
             },
-            "contract": self.contract.as_ref().map(|c| json!({
+            "contract": self.contract.contract().map(|c| json!({
                 "name": c.schema.name,
                 "version": c.schema.version,
-                "path": self.contract_path,
+                "path": self.contract.path(),
                 "components": c.components.len(),
                 "interactions": c.interactions.len(),
                 "oracles": c.oracles.len(),
             })),
-            "contract_baselines": self.contract_baselines.keys().cloned().collect::<Vec<_>>(),
+            "contract_baselines": self.contract.baselines().keys().cloned().collect::<Vec<_>>(),
             "artifacts": self.artifacts.iter().map(|a| serde_json::json!({
                 "id": a.id,
                 "kind": a.kind,
