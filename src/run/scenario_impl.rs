@@ -17,10 +17,7 @@ impl RunContext {
         session_id: &str,
         generation: u32,
     ) -> recording_scope::ScenarioRecordingId {
-        let rec = recording_scope::ScenarioRecording::new(name, session_id, generation);
-        let id = rec.id.clone();
-        self.recorders.insert(id.as_str().to_string(), rec);
-        id
+        self.scenarios.begin_recording(name, session_id, generation)
     }
 
     /// Record an act step into every recording scoped to this exact session
@@ -33,10 +30,8 @@ impl RunContext {
         params: serde_json::Value,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        for r in self.recorders.values_mut() {
-            if r.matches(session_id, generation) {
-                r.record_act(params.clone());
-            }
+        for r in self.scenarios.recorders_for(session_id, generation) {
+            r.record_act(params.clone());
         }
         Ok(())
     }
@@ -55,10 +50,8 @@ impl RunContext {
         byte_len: usize,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        for r in self.recorders.values_mut() {
-            if r.matches(session_id, generation) {
-                r.record_act_sensitive(action_params.clone(), payload_field, kind, byte_len);
-            }
+        for r in self.scenarios.recorders_for(session_id, generation) {
+            r.record_act_sensitive(action_params.clone(), payload_field, kind, byte_len);
         }
         Ok(())
     }
@@ -71,10 +64,8 @@ impl RunContext {
         params: serde_json::Value,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        for r in self.recorders.values_mut() {
-            if r.matches(session_id, generation) {
-                r.record_wait(params.clone());
-            }
+        for r in self.scenarios.recorders_for(session_id, generation) {
+            r.record_wait(params.clone());
         }
         Ok(())
     }
@@ -87,10 +78,8 @@ impl RunContext {
         params: serde_json::Value,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        for r in self.recorders.values_mut() {
-            if r.matches(session_id, generation) {
-                r.record_assert(params.clone());
-            }
+        for r in self.scenarios.recorders_for(session_id, generation) {
+            r.record_assert(params.clone());
         }
         Ok(())
     }
@@ -101,8 +90,7 @@ impl RunContext {
         &mut self,
         recording_id: &str,
     ) -> Option<crate::scenario::model::Scenario> {
-        let mut rec = self.recorders.remove(recording_id)?;
-        Some(rec.finish())
+        self.scenarios.finish_recording(recording_id)
     }
 
     /// Look up a recording id by name (any session). Duplicate names are an
@@ -112,47 +100,21 @@ impl RunContext {
     /// disambiguate by id; callers that care about identity hold the id
     /// from `begin_scenario_recording` in the first place.
     pub fn find_recording_by_name(&self, name: &str) -> Result<String, Vec<String>> {
-        let matches: Vec<String> = self
-            .recorders
-            .values()
-            .filter(|r| r.name == name)
-            .map(|r| r.id.as_str().to_string())
-            .collect();
-        match matches.len() {
-            0 => Err(Vec::new()),
-            1 => Ok(matches.into_iter().next().expect("one match")),
-            _ => {
-                let mut ids = matches;
-                ids.sort();
-                Err(ids)
-            }
+        match self.scenarios.recording_ids_by_name(name).as_slice() {
+            [] => Err(Vec::new()),
+            [one] => Ok(one.clone()),
+            ids => Err(ids.to_vec()),
         }
     }
 
     /// Metadata for all active recordings.
     pub fn active_recordings(&self) -> Vec<serde_json::Value> {
-        let mut out: Vec<serde_json::Value> = self
-            .recorders
-            .values()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.id.as_str(),
-                    "name": r.name,
-                    "session": r.session_id,
-                    "generation": r.generation,
-                    "steps": r.recorder.step_count_hint(),
-                })
-            })
-            .collect();
-        out.sort_by_key(|v| v["id"].as_str().unwrap_or("").to_string());
-        out
+        self.scenarios.active_recording_meta()
     }
 
     /// True while any recording is active for this exact session generation.
     pub fn is_recording_scenario(&self, session_id: &str, generation: u32) -> bool {
-        self.recorders
-            .values()
-            .any(|r| r.matches(session_id, generation))
+        self.scenarios.is_recording(session_id, generation)
     }
 
     /// Save a scenario: memory first (canonical), then disk when the run is
@@ -169,10 +131,7 @@ impl RunContext {
         // load_scenario's fallbacks).
         let short_id = scenario.id.rsplit('-').next().unwrap_or("0").to_string();
         let file_stem = format!("{}-{}", sanitize(&scenario.name), short_id);
-        self.scenario_names.remove(&scenario.name);
-        self.saved_scenarios
-            .insert(scenario.id.clone(), scenario.clone());
-        self.rebuild_scenario_name_index();
+        self.scenarios.save(scenario.clone());
         let dir = self.run_dir.as_ref()?.join("scenarios");
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("{}.json", file_stem));
@@ -195,10 +154,11 @@ impl RunContext {
     /// this run's own `<name>-<id-suffix>.json` artifact for an in-memory
     /// scenario are not double-listed.
     pub fn list_saved_scenarios(&self) -> anyhow::Result<Vec<String>> {
-        let mut out: Vec<String> = self.saved_scenarios.keys().cloned().collect();
+        let mut out: Vec<String> = self.scenarios.ids();
         // Stems this run already accounts for in memory.
         let known_stems: Vec<String> = self
-            .saved_scenarios
+            .scenarios
+            .all()
             .values()
             .map(|sc| {
                 let short_id = sc.id.rsplit('-').next().unwrap_or("0");
@@ -231,25 +191,18 @@ impl RunContext {
     /// ambiguous and deliberately refuses (use the scenario id). Legacy files
     /// saved as plain `<name>.json` before ids existed are still found.
     pub fn load_scenario(&self, key: &str) -> anyhow::Result<crate::scenario::model::Scenario> {
-        // 1. Direct id hit.
-        if let Some(s) = self.saved_scenarios.get(key) {
-            return Ok(s.clone());
-        }
-        // 2. Unambiguous-name fallback over the in-memory set.
-        if let Some(id) = self.scenario_names.get(key) {
-            if let Some(s) = self.saved_scenarios.get(id) {
-                return Ok(s.clone());
+        // 1+2. Direct id hit, then the unambiguous-name fallback — both
+        // store policy now (the name index refuses ambiguity itself).
+        match self.scenarios.resolve(key) {
+            Ok(s) => return Ok(s.clone()),
+            Err(scenario_store::ResolveError::AmbiguousName) => {
+                return Err(anyhow::anyhow!(
+                    "scenario name '{}' is ambiguous in run '{}' — pass scenario_id instead",
+                    key,
+                    self.id()
+                ));
             }
-        }
-        let name_held = self.saved_scenarios.values().any(|sc| sc.name == key);
-        if name_held {
-            // Multiple scenarios carry this name and the name index already
-            // refused it: never guess between them.
-            return Err(anyhow::anyhow!(
-                "scenario name '{}' is ambiguous in run '{}' — pass scenario_id instead",
-                key,
-                self.id()
-            ));
+            Err(scenario_store::ResolveError::Absent) => {}
         }
         // 3. Not held in memory: run-dir fallbacks for scenarios persisted by
         // an earlier process — a file whose stem ends in this id suffix (when

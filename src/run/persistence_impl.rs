@@ -18,9 +18,7 @@ impl RunContext {
             sessions: identity::RunSessionRegistry::default(),
             run_dir: None,
             checkpoints: CheckpointStore::new(),
-            recorders: HashMap::new(),
-            saved_scenarios: HashMap::new(),
-            scenario_names: HashMap::new(),
+            scenarios: scenario_store::ScenarioStore::new(),
             held_recordings: Vec::new(),
             held_captures: Vec::new(),
             graphs: graph_state::RunGraphs::new(),
@@ -393,7 +391,7 @@ impl RunContext {
                                 .map_err(anyhow::Error::from)
                         }) {
                             Ok(sc) => {
-                                run.saved_scenarios.insert(sc.id.clone(), sc);
+                                run.scenarios.insert_loaded(sc);
                             }
                             Err(e) => run.restore_warnings.push(RestoreWarning {
                                 artifact: path
@@ -416,7 +414,7 @@ impl RunContext {
                 }
             }
         }
-        run.rebuild_scenario_name_index();
+        run.scenarios.rebuild_name_index();
         // Findings baselines: not persisted as a file (they are a live-run
         // working set); a restored run starts without them and `tui_audit
         // label=X` can rebuild one in one call. Same for contract baselines
@@ -544,10 +542,10 @@ impl RunContext {
         // `<name>-<id-suffix>.json` shape (Wave-1 item 9).
         let scen_dir = dir.join("scenarios");
         std::fs::create_dir_all(&scen_dir)?;
-        let mut pending: Vec<String> = self.saved_scenarios.keys().cloned().collect();
+        let mut pending: Vec<String> = self.scenarios.ids();
         pending.sort();
         for id in pending {
-            if let Some(sc) = self.saved_scenarios.get(&id) {
+            if let Some(sc) = self.scenarios.all().get(&id) {
                 let short_id = sc.id.rsplit('-').next().unwrap_or("0");
                 let stem = format!("{}-{}", sanitize(&sc.name), short_id);
                 let path = scen_dir.join(format!("{}.json", stem));

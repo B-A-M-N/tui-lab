@@ -200,12 +200,21 @@ impl RunContext {
             } else {
                 f.clone()
             };
-            let repro_ids: Vec<String> = self
-                .saved_scenarios
-                .keys()
-                .cloned()
-                .chain(self.scenario_names.values().cloned())
-                .collect();
+            let repro_ids: Vec<String> = {
+                let all = self.scenarios.all();
+                let mut counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for sc in all.values() {
+                    *counts.entry(sc.name.as_str()).or_insert(0) += 1;
+                }
+                let mut ids: Vec<String> = all.keys().cloned().collect();
+                for sc in all.values() {
+                    if counts.get(sc.name.as_str()).copied().unwrap_or(0) == 1 {
+                        ids.push(sc.name.clone());
+                    }
+                }
+                ids
+            };
             // The loader resolves by id first, then unambiguous name.
             let loader = |id: &str| {
                 let _ = &repro_ids;
