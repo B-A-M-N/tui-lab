@@ -117,7 +117,7 @@ impl TuiLabServer {
         if uri == "tui://findings" {
             let run = self.run.lock().unwrap();
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "run": run.id,
+                "run": run.id(),
                 "findings": run.findings(),
                 "count": run.findings().len(),
             }))
@@ -129,7 +129,7 @@ impl TuiLabServer {
             let finding = run.findings().iter().find(|f| f.id == fid).ok_or_else(|| {
                 not_found(format!(
                     "no finding '{fid}' in run '{}' (tui://findings lists the {} available)",
-                    run.id,
+                    run.id(),
                     run.findings().len()
                 ))
             })?;
@@ -159,7 +159,7 @@ impl TuiLabServer {
             // The live run first (it carries live session state)…
             {
                 let run = self.run.lock().unwrap();
-                if rest == run.id {
+                if rest == run.id() {
                     let sessions = self.sessions.list();
                     return Ok(run
                         .status(
@@ -194,7 +194,7 @@ impl TuiLabServer {
                     return Ok(summary.to_string());
                 }
             }
-            let live_id = self.run.lock().unwrap().id.clone();
+            let live_id = self.run.lock().unwrap().id().to_string();
             return Err(not_found(format!(
                 "no run '{rest}' in this server or under its runs roots (this server's live run is '{live_id}'; use tui_run action=list to see persisted runs)"
             )));
@@ -304,7 +304,7 @@ impl TuiLabServer {
         // Resolve the run: live first (borrowed, short lock — this fn is
         // sync and never awaits under it), then any persisted one restored
         // read-only from disk.
-        let live_is_target = self.run.lock().unwrap().id == run_id;
+        let live_is_target = self.run.lock().unwrap().id() == run_id;
         let rendered = if live_is_target {
             let run = self.run.lock().unwrap();
             run_scoped_payload(&run, run_id, kind, key)
@@ -359,7 +359,7 @@ impl TuiLabServer {
         F: FnOnce(&mut crate::session::Session) -> R + Send + 'static,
     {
         if self.run.lock().unwrap().is_closed() {
-            let run_id = self.run.lock().unwrap().id.clone();
+            let run_id = self.run.lock().unwrap().id().to_string();
             return Err(err(
                 ErrorCategory::RunClosed,
                 format!(
@@ -373,7 +373,7 @@ impl TuiLabServer {
         // spill foreign evidence into B. The owning run is bound at
         // launch/attach; resolution against a non-owner fails loudly instead
         // of silently re-targeting the process.
-        let cur_run = self.run.lock().unwrap().id.clone();
+        let cur_run = self.run.lock().unwrap().id().to_string();
         let target_id = match id {
             Some(i) => Some(i.to_string()),
             None => self.sessions.active_id(),
@@ -413,7 +413,7 @@ impl TuiLabServer {
     /// Bind a freshly launched session to the current run, and its owner on
     /// the same short lock. Called right after start/attach succeeds.
     fn bind_session_owner(&self, id: &str) {
-        let run_id = self.run.lock().unwrap().id.clone();
+        let run_id = self.run.lock().unwrap().id().to_string();
         self.session_owners
             .lock()
             .expect("session owner lock")
@@ -955,7 +955,7 @@ impl ServerHandler for TuiLabServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData> {
         use rmcp::model::{ListResourcesResult, Resource};
-        let run_id = self.run.lock().unwrap().id.clone();
+        let run_id = self.run.lock().unwrap().id().to_string();
         let items = vec![
             Resource::new("tui://findings", "findings").with_description(
                 "Findings accumulated this run (audits, contracts, exploration).",

@@ -113,16 +113,16 @@ impl RunContext {
     pub fn status(&self, sessions: Vec<serde_json::Value>) -> serde_json::Value {
         let journal = self.journal.as_ref().map(|j| j.health_snapshot());
         json!({
-            "run_id": self.id,
+            "run_id": self.id(),
             "mode": if self.run_dir.is_some() { "persistent" } else { "ephemeral" },
             "persistent": self.run_dir.is_some(),
             "artifact_root": self.run_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
             "sessions": sessions,
-            "started_at": self.started_at,
-            "closed": self.closed,
+            "started_at": self.identity.started_at(),
+            "closed": self.identity.closed(),
             // Finding 32: which resume epoch this run is in (0 = the
             // original process's run; >0 = reopened that many times).
-            "resume_epoch": self.resume_epoch,
+            "resume_epoch": self.identity.resume_epoch(),
             "primary_session_cwd": self.primary_session_cwd().map(str::to_string),
             "counts": self.counts(),
             // FrameAnalysis storage (re-review item 51): hot ring health —

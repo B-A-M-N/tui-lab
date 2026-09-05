@@ -39,7 +39,7 @@ pub(crate) async fn tui_explain(
                     "unknown finding id '{}' — not in the current run (run '{}'); \
                          re-run tui_audit or read tui://findings",
                     p.finding_id,
-                    run.lock().unwrap().id,
+                    run.lock().unwrap().id(),
                 ),
             );
         }

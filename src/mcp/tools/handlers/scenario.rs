@@ -629,7 +629,7 @@ pub(crate) async fn tui_scenario(
                             ErrorCategory::InvalidRequest,
                             format!(
                                 "unknown finding id '{finding_id}' in run '{}'. Record audits with label= to build baselines (stored: {})",
-                                run.id,
+                                run.id(),
                                 if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
                             ),
                         );

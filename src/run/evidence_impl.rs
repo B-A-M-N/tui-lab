@@ -63,7 +63,7 @@ impl RunContext {
     pub fn register_frame(&mut self, frame: &mut crate::backend::CanonicalFrame) -> u64 {
         let id = self.evidence.frames.allocate_id();
         frame.assign_frame_id(id);
-        frame.run_id = Some(self.id.clone());
+        frame.run_id = Some(self.id().to_string());
         id
     }
 

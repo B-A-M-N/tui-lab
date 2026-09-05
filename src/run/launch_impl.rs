@@ -12,23 +12,18 @@ impl RunContext {
     /// (per-session map, P0 fix 6). The first session recorded becomes the
     /// run's primary (cwd/root resolution).
     pub fn set_launch_spec(&mut self, session_id: &str, spec: crate::session::state::LaunchSpec) {
-        if self.primary_session.is_none() {
-            self.primary_session = Some(session_id.to_string());
-        }
-        self.session_specs.insert(session_id.to_string(), spec);
+        self.sessions.record_launch(session_id, spec);
         self.write_manifest().ok();
     }
 
     /// The launch spec recorded for one session.
     pub fn launch_spec(&self, session_id: &str) -> Option<&crate::session::state::LaunchSpec> {
-        self.session_specs.get(session_id)
+        self.sessions.spec(session_id)
     }
 
     /// The primary session's launch spec, if any session was recorded.
     pub fn primary_launch_spec(&self) -> Option<&crate::session::state::LaunchSpec> {
-        self.primary_session
-            .as_ref()
-            .and_then(|id| self.session_specs.get(id))
+        self.sessions.primary_spec()
     }
 
     /// Replay-history completeness (P0 fix 5): when the in-memory ledger
@@ -57,13 +52,7 @@ impl RunContext {
     /// Launch specs the run recorded, sorted by session id (replay CLI:
     /// the manifest's per-session launch table).
     pub fn launch_specs(&self) -> Vec<(String, crate::session::state::LaunchSpec)> {
-        let mut out: Vec<(String, _)> = self
-            .session_specs
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        self.sessions.pairs()
     }
 
     /// Where a `tui://runs/<other-id>` browser read should look for other

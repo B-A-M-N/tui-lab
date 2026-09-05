@@ -186,7 +186,7 @@ impl RunContext {
     /// that cannot form a context (no evidence) are skipped and counted,
     /// never silently dropped from the list.
     pub fn diagnostic_contexts(&self) -> (Vec<crate::audit::repair::DiagnosticContext>, usize) {
-        let sessions: Vec<String> = self.session_specs.keys().cloned().collect();
+        let sessions: Vec<String> = self.sessions.session_ids();
         let mut out = Vec::new();
         let mut skipped = 0usize;
         for f in self.findings.all() {
@@ -213,7 +213,7 @@ impl RunContext {
             };
             let ctx = crate::audit::repair::DiagnosticContext::assemble(
                 joined.clone(),
-                &self.id,
+                &self.id(),
                 sessions.clone(),
                 loader,
             );

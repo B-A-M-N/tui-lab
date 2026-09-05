@@ -121,7 +121,7 @@ pub(crate) async fn tui_session(
             if let Some(spec) = launch.clone() {
                 s.run.lock().unwrap().set_launch_spec(&id, spec);
             }
-            let run_id = s.run.lock().unwrap().id.clone();
+            let run_id = s.run.lock().unwrap().id().to_string();
             ok(json!({
                 "session": id,
                 "generation": generation,
@@ -175,7 +175,7 @@ pub(crate) async fn tui_session(
             {
                 s.run.lock().unwrap().set_launch_spec(&id, spec);
             }
-            let run_id = s.run.lock().unwrap().id.clone();
+            let run_id = s.run.lock().unwrap().id().to_string();
             ok(json!({
                 "session": id,
                 "generation": generation,
@@ -202,7 +202,7 @@ pub(crate) async fn tui_session(
             // same rules `with_sess` enforces for driving apply here, in
             // the same order, before the destructive call.
             if s.run.lock().unwrap().is_closed() {
-                let run_id = s.run.lock().unwrap().id.clone();
+                let run_id = s.run.lock().unwrap().id().to_string();
                 return err(
                     ErrorCategory::RunClosed,
                     format!(
@@ -238,7 +238,7 @@ pub(crate) async fn tui_session(
                 return refused;
             }
             {
-                let cur_run = s.run.lock().unwrap().id.clone();
+                let cur_run = s.run.lock().unwrap().id().to_string();
                 let bound = s
                     .session_owners
                     .lock()

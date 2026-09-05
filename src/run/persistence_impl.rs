@@ -11,11 +11,12 @@ impl RunContext {
     /// Create an in-memory run (no artifacts written).
     pub fn ephemeral() -> Self {
         RunContext {
-            id: format!("run-{}", uuid::Uuid::new_v4().simple()),
-            started_at: now_ms(),
+            identity: identity::RunIdentity::fresh(
+                format!("run-{}", uuid::Uuid::new_v4().simple()),
+                now_ms(),
+            ),
+            sessions: identity::RunSessionRegistry::default(),
             run_dir: None,
-            session_specs: HashMap::new(),
-            primary_session: None,
             checkpoints: CheckpointStore::new(),
             recorders: HashMap::new(),
             saved_scenarios: HashMap::new(),
@@ -33,8 +34,6 @@ impl RunContext {
             persistence_unhealthy: false,
             contract: contract_state::ContractState::new(),
             coverage: coverage_state::CoverageState::new(),
-            closed: false,
-            resume_epoch: 0,
             restore_warnings: Vec::new(),
         }
     }
@@ -47,7 +46,7 @@ impl RunContext {
     /// explicit request root.
     pub fn persistent(base: &std::path::Path) -> anyhow::Result<Self> {
         let mut run = RunContext::ephemeral();
-        let root = Self::runs_dir_for(base, &run.id);
+        let root = Self::runs_dir_for(base, run.id());
         std::fs::create_dir_all(root.join("checkpoints"))?;
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
@@ -207,18 +206,20 @@ impl RunContext {
         // Restore over the id the manifest declares — a mismatched directory
         // name is fine (identity lives in run.json), a missing id is not.
         let mut run = RunContext::ephemeral();
-        run.id = manifest.run_id.clone();
-        run.started_at = manifest.started_at;
-        run.closed = manifest.closed;
-        run.resume_epoch = manifest.resume_epoch;
+        run.identity.adopt(
+            manifest.run_id.clone(),
+            manifest.started_at,
+            manifest.closed,
+            manifest.resume_epoch,
+        );
         run.evidence
             .transactions
             .set_dropped_records(manifest.dropped_records);
         run.evidence
             .transactions
             .set_first_available_seq(manifest.first_available_seq);
-        run.session_specs = manifest.sessions.clone();
-        run.primary_session = manifest.primary_session.clone();
+        run.sessions
+            .adopt(manifest.sessions.clone(), manifest.primary_session.clone());
         run.run_dir = Some(run_dir.to_path_buf());
         run.checkpoints = CheckpointStore::with_run_dir(
             run_dir.join("checkpoints").to_string_lossy().to_string(),
@@ -510,23 +511,24 @@ impl RunContext {
     /// live after a process boundary it did not choose, and evidence taken
     /// across that boundary is distinguishable via the epoch.
     pub fn reopen(&mut self) {
-        self.resume_epoch += 1;
-        self.closed = false;
+        self.identity
+            .set_resume_epoch(self.identity.resume_epoch() + 1);
+        self.identity.set_closed(false);
         // Persist the epoch before returning: if the resumed process dies
         // mid-transaction, the manifest still names the epoch everything
         // after it belongs to.
         if let Err(e) = self.write_manifest() {
-            tracing::warn!(run = %self.id, error = %e, "reopen: manifest write failed");
+            tracing::warn!(run = %self.id(), error = %e, "reopen: manifest write failed");
         }
     }
 
     /// Mark the run closed and flush durable state. Does NOT touch sessions —
     /// killing them is the caller's explicit decision.
     pub fn close(&mut self) -> anyhow::Result<()> {
-        if self.closed {
+        if self.identity.closed() {
             return Ok(());
         }
-        self.closed = true;
+        self.identity.set_closed(true);
         // Flush everything flushable to the artifact root (no-op when
         // ephemeral — ephemeral means "not persisted", not "degraded").
         self.flush()?;
@@ -707,7 +709,7 @@ impl RunContext {
         if let Some(existing) = &self.run_dir {
             return Ok(existing.clone());
         }
-        let root = Self::runs_dir_for(base, &self.id);
+        let root = Self::runs_dir_for(base, &self.id());
         std::fs::create_dir_all(root.join("checkpoints"))?;
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
