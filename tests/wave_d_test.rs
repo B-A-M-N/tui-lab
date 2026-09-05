@@ -35,7 +35,7 @@ async fn crash_minimization_produces_replayable_reproduction() {
     let pool = SessionPool::new();
     let id = start(&pool, &crasher_args()).await;
 
-    let (report, pipeline) = pool
+    let (_report, pipeline) = pool
         .with_session(Some(&id), move |sess| {
             let budget = random::Budget {
                 max_actions: 4,

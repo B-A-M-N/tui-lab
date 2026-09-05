@@ -56,7 +56,7 @@ async fn test_focus_audit_detects_focus() {
     .await;
 
     let findings = pool
-        .with_session(Some(&id), move |sess| tui_lab::audit::focus_audit(sess))
+        .with_session(Some(&id), tui_lab::audit::focus_audit)
         .await
         .expect("job");
 
@@ -75,7 +75,7 @@ async fn test_clipping_audit_no_regions() {
     .await;
 
     let findings = pool
-        .with_session(Some(&id), move |sess| tui_lab::audit::clipping_audit(sess))
+        .with_session(Some(&id), tui_lab::audit::clipping_audit)
         .await
         .expect("job");
 
@@ -98,8 +98,8 @@ async fn test_resize_audit_restores_dimensions() {
 
     let (findings, cols, rows) = pool
         .with_session(Some(&id), move |sess| {
-            let original_cols = sess.cols();
-            let original_rows = sess.rows();
+            let _original_cols = sess.cols();
+            let _original_rows = sess.rows();
             let findings = tui_lab::audit::resize_audit(sess);
             (findings, sess.cols(), sess.rows())
         })
