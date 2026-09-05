@@ -70,7 +70,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_scenario",
-        summary: "Record, save, list, export, and replay interaction scenarios (session+generation scoped).",
+        summary: "Record, save, list, export, and replay interaction scenarios (session+generation scoped); regression_asset synthesizes review-gated regression assets (scenario/assertion/contract_rule/viewport_case) from a finding's own evidence (finding 39) — generated/inferred, never auto-run.",
         selector: Some(("action", <crate::mcp::params::ScenarioAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {

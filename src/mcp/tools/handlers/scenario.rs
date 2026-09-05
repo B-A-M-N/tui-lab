@@ -567,5 +567,125 @@ pub(crate) async fn tui_scenario(
             .await
             .unwrap_or_else(|e| e)
         }
+        // finding 39: synthesize regression assets from a finding's OWN
+        // evidence + reproduction. Pure read — never drives, never records
+        // new evidence. Every asset is stamped generated/inferred/
+        // requires_review; a kind is only produced when the finding's
+        // evidence can justify it; a finding with nothing to synthesize is
+        // reported as such, never as an empty shell.
+        SA::RegressionAsset => {
+            let finding_id =
+                match &p.finding_id {
+                    Some(id) => id.clone(),
+                    None => return err(
+                        ErrorCategory::InvalidRequest,
+                        "regression_asset requires 'finding_id' (from tui_audit or tui://findings)",
+                    ),
+                };
+            let only = match &p.asset_type {
+                None => None,
+                Some(known) => match known.known() {
+                    Some(t) => Some(match t {
+                        crate::mcp::params::RegressionAssetType::Scenario => {
+                            crate::scenario::regression_asset::RegressionAssetKind::Scenario
+                        }
+                        crate::mcp::params::RegressionAssetType::Assertion => {
+                            crate::scenario::regression_asset::RegressionAssetKind::Assertion
+                        }
+                        crate::mcp::params::RegressionAssetType::ContractRule => {
+                            crate::scenario::regression_asset::RegressionAssetKind::ContractRule
+                        }
+                        crate::mcp::params::RegressionAssetType::ViewportCase => {
+                            crate::scenario::regression_asset::RegressionAssetKind::ViewportCase
+                        }
+                    }),
+                    None => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                                "unknown asset_type '{}' (expected one of: {})",
+                                match known {
+                                    crate::mcp::params::Known::Other(o) => o.clone(),
+                                    _ => String::new(),
+                                },
+                                <crate::mcp::params::RegressionAssetType as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                            ),
+                        )
+                    }
+                },
+            };
+
+            // Pure reads: find the finding, gather the ledger + reproduction
+            // loader (immutable borrow of the run), and generate the assets.
+            // The immutable borrow is scoped so persistence can take the
+            // mutable guard afterward.
+            let (finding, assets) = {
+                let run = s.run.lock().unwrap();
+                let f = match run.findings().iter().find(|f| f.id == finding_id) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let labels = run.finding_baseline_labels();
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                                "unknown finding id '{finding_id}' in run '{}'. Record audits with label= to build baselines (stored: {})",
+                                run.id,
+                                if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
+                            ),
+                        );
+                    }
+                };
+                let transactions = run.transactions().to_vec();
+                let assets = {
+                    let load = |key: &str| run.load_scenario(key).ok();
+                    let ctx = crate::scenario::regression_asset::AssetContext {
+                        load_scenario: &load,
+                        transactions: &transactions,
+                    };
+                    crate::scenario::regression_asset::generate(&f, &ctx, only)
+                };
+                (f, assets)
+            };
+            // Persist the scenario-form assets (canonical, in-run) so the
+            // reviewer can `tui_scenario action=export` them; always mark
+            // the response with the review gate.
+            let mut run = s.run.lock().unwrap();
+            let mut persisted: Vec<serde_json::Value> = Vec::new();
+            for a in &assets {
+                let mut v = serde_json::to_value(a).unwrap_or_default();
+                if let Some(sc) = a.as_scenario() {
+                    let saved = run.save_scenario(sc.clone());
+                    v["saved_to"] = saved
+                        .map(|p| serde_json::Value::String(p.to_string_lossy().to_string()))
+                        .unwrap_or(serde_json::Value::Null);
+                    v["scenario_id"] = serde_json::Value::String(sc.id.clone());
+                }
+                persisted.push(v);
+            }
+            drop(run);
+            if persisted.is_empty() {
+                return ok(json!({
+                    "workflow": "regression_asset",
+                    "finding_id": finding_id,
+                    "assets": [],
+                    "generated": [],
+                    "skipped": [
+                        "scenario",
+                        "assertion",
+                        "contract_rule",
+                        "viewport_case",
+                    ],
+                    "note": "finding '{finding_id}' has no reproduction, no transaction-ledger acts toward a concrete target, and no cited viewport — nothing to synthesize from (generation never fabricates evidence)",
+                }));
+            }
+            ok(json!({
+                "workflow": "regression_asset",
+                "finding_id": finding_id,
+                "rule": finding.rule_id.clone().unwrap_or_else(|| finding.id.clone()),
+                "generated": persisted.iter().map(|a| a["kind"].clone()).collect::<Vec<_>>(),
+                "assets": persisted,
+                "review_gate": "all assets are generated/inferred and REQUIRE REVIEW before use — generation never auto-runs or promotes to required",
+            }))
+        }
     }
 }
