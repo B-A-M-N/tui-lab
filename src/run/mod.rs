@@ -36,6 +36,7 @@ mod evidence_impl;
 mod evidence_store;
 mod finding_store;
 mod findings_impl;
+mod identity;
 mod launch_impl;
 mod ledger_impl;
 mod persistence_impl;
@@ -237,18 +238,16 @@ impl TransactionRecord {
 
 /// Identity + artifact directory for one run.
 pub struct RunContext {
-    /// Opaque run id (`run-<uuid simple>`).
-    pub id: String,
-    /// Wall-clock start (unix millis).
-    pub started_at: u64,
+    /// Who this run is (id, started_at, closed, resume_epoch). Round-2
+    /// (G1): moved into [`identity::RunIdentity`]; RunContext keeps the
+    /// public `id()`/`started_at()` accessors external callers use.
+    identity: identity::RunIdentity,
+    /// Which sessions the run has seen and how they were launched —
+    /// provenance records, not live process ownership. Round-2 (G1):
+    /// moved into [`identity::RunSessionRegistry`].
+    sessions: identity::RunSessionRegistry,
     /// Artifact root: `.tui-lab/runs/<id>` when persistence is enabled.
     run_dir: Option<PathBuf>,
-    /// Launch spec per session (re-review P0 fix 6): a run can involve
-    /// multiple sessions and each restart creates a new generation, so the
-    /// run records one entry per session id it has seen.
-    session_specs: HashMap<String, crate::session::state::LaunchSpec>,
-    /// First session recorded — the run's primary for cwd/root resolution.
-    primary_session: Option<String>,
     /// Checkpoints recorded during this run.
     pub checkpoints: CheckpointStore,
     /// In-progress scenario recordings by opaque id (re-review item 5:
@@ -320,16 +319,6 @@ pub struct RunContext {
     /// policy, not run bookkeeping); per-consumer event cursors moved into
     /// the evidence store's event ledger. RunContext delegates.
     coverage: coverage_state::CoverageState,
-    /// Set by `tui_run close`. Sessions are NOT touched by closing.
-    closed: bool,
-    /// Resume epoch (finding 32): 0 for a run in its original process,
-    /// incremented each time `reopen()` brings a closed persisted run
-    /// back to life. A reopened run is NOT the original process's run —
-    /// its later records live after a process boundary it did not choose.
-    /// Evidence recorded under epoch > 0 can be distinguished from the
-    /// original history (manifest + status carry the epoch; `reopen`
-    /// writes it down before anything else runs).
-    resume_epoch: u64,
     /// Audit P1-46: artifacts that could NOT be restored, with the reason —
     /// a damaged run comes back usable but DEGRADED, and the agent must
     /// know its evidence is incomplete. Populated only by `restore`;
@@ -400,7 +389,9 @@ impl RunContext {
         let dir = self
             .run_dir
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("run '{}' is ephemeral; no scenario storage", self.id))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("run '{}' is ephemeral; no scenario storage", self.id())
+            })?
             .join("scenarios");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
@@ -413,16 +404,16 @@ impl RunContext {
         };
         let manifest = RunManifest {
             schema: "tui-lab.run.v1".into(),
-            run_id: self.id.clone(),
-            started_at: self.started_at,
+            run_id: self.identity.id().to_string(),
+            started_at: self.identity.started_at(),
             launch_spec: self.primary_launch_spec().cloned(),
-            sessions: self.session_specs.clone(),
-            primary_session: self.primary_session.clone(),
+            sessions: self.sessions.all_specs().clone(),
+            primary_session: self.sessions.primary().map(str::to_string),
             history_complete: self.history_complete(),
             first_available_seq: self.evidence.transactions.first_available_seq(),
             dropped_records: self.evidence.transactions.dropped_records(),
-            closed: self.closed,
-            resume_epoch: self.resume_epoch,
+            closed: self.identity.closed(),
+            resume_epoch: self.identity.resume_epoch(),
         };
         let tmp = dir.join("run.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest)?)?;
@@ -430,9 +421,19 @@ impl RunContext {
         Ok(())
     }
 
+    /// The opaque run id (`run-<uuid simple>`).
+    pub fn id(&self) -> &str {
+        self.identity.id()
+    }
+
+    /// Wall-clock start (unix millis).
+    pub fn started_at(&self) -> u64 {
+        self.identity.started_at()
+    }
+
     /// Whether the run is marked closed (`tui_run close`).
     pub fn is_closed(&self) -> bool {
-        self.closed
+        self.identity.closed()
     }
 
     /// Refuse mutation on a closed run (review P0.1). A closed run is an
@@ -440,10 +441,10 @@ impl RunContext {
     /// never land in it, or "closed" stops meaning final. Read paths
     /// (replay, status, ledger) stay available on closed runs.
     fn ensure_open(&self) -> anyhow::Result<()> {
-        if self.closed {
+        if self.identity.closed() {
             anyhow::bail!(
                 "current run {} is closed; create or resume an open run before recording evidence",
-                self.id
+                self.identity.id()
             );
         }
         Ok(())
@@ -884,7 +885,7 @@ mod tests {
         assert_eq!(id, 1);
         assert_eq!(f.frame_id, Some(1));
         assert_eq!(f.cite(), "frame:1");
-        assert_eq!(f.run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(f.run_id.as_deref(), Some(run.id()));
 
         let mut g =
             crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(80, 24), 4, 10);
@@ -1105,7 +1106,7 @@ mod tests {
         let id = run.commit_frame(&mut f, Some("cf-sess")).expect("commit");
         assert_eq!(id, 1, "first committed frame gets id 1");
         assert_eq!(f.frame_id, Some(1));
-        assert_eq!(f.run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(f.run_id.as_deref(), Some(run.id()));
         assert_eq!(f.session_id.as_deref(), Some("cf-sess"));
 
         let path = run.run_dir().expect("dir").join("frames.jsonl");
@@ -1255,7 +1256,7 @@ mod tests {
     fn promote_preserves_identity_and_flushes_state() {
         let base = tempfile::tempdir().expect("base");
         let mut run = RunContext::ephemeral();
-        let run_id = run.id.clone();
+        let run_id = run.id().to_string();
 
         // Accumulate state while ephemeral: checkpoint, scenario, findings,
         // counters, state graph.
@@ -1279,7 +1280,7 @@ mod tests {
 
         let root = run.promote(base.path()).expect("promote");
         assert_eq!(root, graph_root, "promote uses the caller-provided base");
-        assert_eq!(run.id, run_id, "promotion preserves run identity");
+        assert_eq!(run.id(), run_id, "promotion preserves run identity");
         assert!(graph_root.join("run.json").exists(), "manifest flushed");
         assert!(
             graph_root
@@ -1468,7 +1469,7 @@ mod tests {
         let run_id = root.file_name().unwrap().to_string_lossy().to_string();
 
         let restored = RunContext::restore(&root).expect("restore");
-        assert_eq!(restored.id, run_id, "identity survives");
+        assert_eq!(restored.id(), run_id, "identity survives");
         assert!(restored.run_dir().is_some(), "durable root survives");
         assert_eq!(restored.transaction_total(), 1, "ledger count restored");
         assert_eq!(restored.transactions().len(), 1);
@@ -1794,7 +1795,7 @@ mod tests {
         run.close().expect("close");
         let e = run.record_event("s", "wait").expect_err("closed");
         let msg = format!("{e:#}");
-        assert!(msg.contains(&run.id), "names the run: {msg}");
+        assert!(msg.contains(run.id()), "names the run: {msg}");
         assert!(msg.contains("closed"), ": {msg}");
         assert!(msg.contains("resume"), "names the remedy: {msg}");
     }

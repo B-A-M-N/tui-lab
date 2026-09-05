@@ -248,7 +248,7 @@ impl RunContext {
             return Err(anyhow::anyhow!(
                 "scenario name '{}' is ambiguous in run '{}' — pass scenario_id instead",
                 key,
-                self.id
+                self.id()
             ));
         }
         // 3. Not held in memory: run-dir fallbacks for scenarios persisted by
@@ -296,7 +296,7 @@ impl RunContext {
         Err(anyhow::anyhow!(
             "scenario '{}' not found in run '{}' (use its scenario_id, or an unambiguous name)",
             key,
-            self.id
+            self.id()
         ))
     }
 

@@ -224,7 +224,7 @@ fn workflow_chain(
         "contract": expectation,
         "reproduction": reproduction,
         "verification": verification,
-        "run_id": run.id,
+        "run_id": run.id(),
         "sessions": sessions,
     })
 }
@@ -249,7 +249,7 @@ async fn inspect_finding(
                 ErrorCategory::InvalidRequest,
                 format!(
                     "unknown finding id '{finding_id}' in run '{}'. Record audits with label= to build baselines (stored: {})",
-                    run.id,
+                    run.id(),
                     if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
                 ),
             );
@@ -319,7 +319,7 @@ async fn verify_finding(
         let Some(finding) = run.findings().iter().find(|f| f.id == finding_id) else {
             return err(
                 ErrorCategory::InvalidRequest,
-                format!("unknown finding id '{finding_id}' in run '{}'", run.id),
+                format!("unknown finding id '{finding_id}' in run '{}'", run.id()),
             );
         };
         let (contexts, _) = run.diagnostic_contexts();

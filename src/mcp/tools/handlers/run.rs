@@ -51,7 +51,7 @@ pub(crate) async fn tui_run(
             {
                 let (run_id, lost) = {
                     let g = s.run.lock().unwrap();
-                    (g.id.clone(), loss["lost_if_dropped"].clone())
+                    (g.id().to_string(), loss["lost_if_dropped"].clone())
                 };
                 return err_with_details(
                     ErrorCategory::InvalidRequest,
@@ -76,10 +76,10 @@ pub(crate) async fn tui_run(
             };
             match flush_result {
                 Ok(()) => {
-                    let new_id = s.run.lock().unwrap().id.clone();
+                    let new_id = s.run.lock().unwrap().id().to_string();
                     ok(json!({
                         "new_run_id": new_id,
-                        "previous_run": old.id,
+                        "previous_run": old.id(),
                         "previous_flushed": old.run_dir().is_some(),
                         "mode": "ephemeral",
                         // Finding 33: name what a discard threw away, so a
@@ -121,7 +121,7 @@ pub(crate) async fn tui_run(
             let mut run = s.run.lock().unwrap();
             if run.run_dir().is_some() {
                 return ok(json!({
-                    "run_id": run.id,
+                    "run_id": run.id(),
                     "already_persistent": true,
                     "artifact_root": run.run_dir().map(|d| d.to_string_lossy().to_string()),
                 }));
@@ -134,7 +134,7 @@ pub(crate) async fn tui_run(
                 None => match run.primary_session_cwd() {
                     Some(cwd) => cwd.to_string(),
                     None => {
-                        let run_id = run.id.clone();
+                        let run_id = run.id().to_string();
                         return err(
                                 ErrorCategory::InvalidRequest,
                                 format!(
@@ -147,7 +147,7 @@ pub(crate) async fn tui_run(
             };
             match run.promote(std::path::Path::new(&base)) {
                 Ok(root) => ok(json!({
-                    "run_id": run.id,
+                    "run_id": run.id(),
                     "persistent": true,
                     "artifact_root": root.to_string_lossy(),
                     "promoted_from_ephemeral": true,
@@ -160,7 +160,7 @@ pub(crate) async fn tui_run(
             // process. Previous-run sessions may legitimately still be
             // alive after `tui_run new` (they are foreign); closing run B
             // must neither absorb their events nor kill them.
-            let run_id = s.run.lock().unwrap().id.clone();
+            let run_id = s.run.lock().unwrap().id().to_string();
             let owned: Vec<String> = {
                 let owners = s.session_owners.lock().unwrap();
                 s.sessions
@@ -307,7 +307,7 @@ pub(crate) async fn tui_run(
                         "base": base,
                         "runs": runs,
                         "skipped": skipped,
-                        "current_run": s.run.lock().unwrap().id.clone(),
+                        "current_run": s.run.lock().unwrap().id().to_string(),
                     }))
                 }
                 Err(e) => err(ErrorCategory::InvalidRequest, e.to_string()),
@@ -436,8 +436,8 @@ pub(crate) async fn tui_run(
             // 4. ATOMIC swap under a short lock (never across an await).
             let manifest_like = {
                 let mut guard = s.run.lock().unwrap();
-                let prev_id = guard.id.clone();
-                let restored_id = restored.id.clone();
+                let prev_id = guard.id().to_string();
+                let restored_id = restored.id().to_string();
                 let restored_dir = restored
                     .run_dir()
                     .map(|d| d.to_string_lossy().to_string())
@@ -521,7 +521,7 @@ pub(crate) async fn tui_run(
                         ErrorCategory::InvalidRequest,
                         format!(
                             "unknown finding id '{finding_id}' in run '{}'. Record audits with label= to build baselines (stored: {})",
-                            run.id,
+                            run.id(),
                             if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
                         ),
                     );

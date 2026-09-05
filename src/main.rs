@@ -102,12 +102,12 @@ fn replay(run_id: &str, root: Option<&str>, full: bool) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let _ = writeln!(out, "run {}", run.id);
-    let _ = writeln!(out, "{}", "=".repeat(16 + run.id.len()));
+    let _ = writeln!(out, "run {}", run.id());
+    let _ = writeln!(out, "{}", "=".repeat(16 + run.id().len()));
     let _ = writeln!(
         out,
         "started: {}  closed: {}  history_complete: {}",
-        chrono_like(run.started_at),
+        chrono_like(run.started_at()),
         manifest.closed,
         manifest.history_complete
     );
@@ -159,7 +159,7 @@ fn replay(run_id: &str, root: Option<&str>, full: bool) -> anyhow::Result<()> {
         let _ = writeln!(
             out,
             "  (full ledger: hermes-tui-lab replay {} --full)",
-            run.id
+            run.id(),
         );
     }
 
