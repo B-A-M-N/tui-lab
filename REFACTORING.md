@@ -130,7 +130,7 @@ test --all-features) verified green on the formatted tree.
 | 31 | ~~Only the run manifest carries a schema tag; ledger/frame/event/finding/scenario/contract formats unversioned~~ FIXED (`0b5b28e`) | — |
 | 32 | ~~`reopen()` flips `closed=false`; no resume epochs~~ FIXED (`7e3deca`) | — |
 | 33 | ~~`tui_run new` silently replaces an ephemeral run holding evidence (no `discard=true` / count refusal)~~ FIXED (`f9bb8fd`) | — |
-| 36-42 | Construction features: tui_inspect, multi-state scaffold, workflow object, regression-asset generation, semantic render diffs, framework diagnostic knowledge, adapter versioning | not started |
+| 36-42 | Construction features: ~~tui_inspect~~ (36, `e7018f8`), multi-state scaffold (37), workflow object (38), regression-asset generation (39), semantic render diffs (40), framework diagnostic knowledge (41), adapter versioning (42) | 36 done; 37-42 not started |
 | 43 | Partially done (registry-generated SKILL sections); full single-descriptor doc generation open | registry |
 
 ### FIXED (verified in code)
@@ -161,8 +161,9 @@ test --all-features) verified green on the formatted tree.
 - **31** Format versioning: `src/run/formats.rs` — Envelope (`{"schema": tag, "payload": old}`) for findings/coverage/focus graphs/state graph/scenarios; StreamHeader first line for ledger/frames/events streams; readers accept bare pre-versioning files, mismatched versions are NAMED restore warnings (`0b5b28e`)
 - **32** Resume epochs: `resume_epoch` on RunContext + RunManifest (`#[serde(default)]`, v1 manifests = epoch 0); `reopen()` bumps it and writes the manifest BEFORE returning, so a crash after resume still names the epoch; surfaced in `tui_run status` / `list` / `resume` responses; a reopened run is no longer indistinguishable from the original process's history (`7e3deca`)
 - **33** Evidence-discard gate: `RunContext::unsaved_evidence()` names what would be lost (transactions, unwritten events, checkpoints, scenarios, findings, held recordings, focus/state-graph records); `tui_run new` REFUSES over an ephemeral run with evidence unless `discard=true` (structured details: per-bucket counts + persist/discard hint), and the successful response names the accepted loss via `discarded_evidence`; persist-first still flush-then-swaps (`f9bb8fd`)
+- **36** First-class inspect: `tui_observe mode=inspect` — one call returns the frame citation (frame:N from the hot ring by structure hash) + fused semantic identity, per-control stable ids/bounds/state/affordances/joined ComponentIdentity with provenance-tiered source loci, clipped regions + native overlay health, and the loaded contract's component-presence violations on this frame (same conformance role rule + 0.6 confidence gate); `target=` narrows to one control by id/label/native-id with ambiguity refused and candidates named (`e7018f8`)
 
 ### Priority order (implementation sequence)
 
-Remaining P0: none. Remaining P1/P2: construction set 36-42, then 25 (tagged-union request shapes), 29 (risk attestation), 43 (full doc generation), 14 (supported/installed honesty).
+Remaining P0: none. Remaining P1/P2: construction set 37-42 (36 done), then 25 (tagged-union request shapes), 29 (risk attestation), 43 (full doc generation), 14 (supported/installed honesty).
 
