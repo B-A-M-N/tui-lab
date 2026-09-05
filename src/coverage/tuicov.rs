@@ -107,8 +107,17 @@ pub fn handle(p: &TuiCoverageParams) -> Result<String, anyhow::Error> {
 /// answers delta/summary/collect from accumulated evidence, and start/stop
 /// do not exist because collection is continuous (no instrumentation phase).
 pub fn snapshot() -> Result<serde_json::Value, String> {
+    snapshot_with_binary("tuicov")
+}
+
+/// [`snapshot`] with the binary path injectable. Production resolves
+/// `tuicov` from `PATH`; the test injects a fixture binary directly —
+/// mutating process-global `PATH` from a parallel test thread is a race
+/// against every other env reader in the process (the flake this replaces
+/// hit exactly that under full-suite load).
+fn snapshot_with_binary(binary: &str) -> Result<serde_json::Value, String> {
     use std::process::Command;
-    let out = Command::new("tuicov")
+    let out = Command::new(binary)
         .arg("--json")
         .output()
         .map_err(|e| format!("tuicov invocation failed: {e}"))?;
@@ -189,8 +198,8 @@ mod tests {
     }
 
     /// P0.7: tuicov's one real operation invokes a single `--json` snapshot —
-    /// no start/stop/delta/uncovered argv theater. We point it at a FAKE
-    /// `tuicov` on PATH that records the argv it received and echo a valid
+    /// no start/stop/delta/uncovered argv theater. We point the invoker at a
+    /// FAKE binary that records the argv it received and echoes a valid
     /// coverage shape, then assert exactly that one argument was passed.
     #[test]
     fn tuicov_snapshot_invokes_single_json_arg() {
@@ -211,15 +220,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Prepend the fake bin dir to PATH for the invocation.
-        let saved = std::env::var_os("PATH");
-        let mut paths: Vec<_> = std::env::split_paths(&saved.clone().unwrap_or_default()).collect();
-        paths.insert(0, bindir.clone());
-        std::env::set_var("PATH", std::env::join_paths(&paths).unwrap());
-
-        // snapshot() must fail if a previous parallel test raced us; run it
-        // and check both the argv and the reply.
-        let result = snapshot();
+        // Invoke the injectable form directly: NO process-global PATH
+        // mutation (parallel test threads read the environment, so a
+        // swapped PATH races every other env reader in the process — the
+        // load flake this test used to hit).
+        let result = snapshot_with_binary(&fake.to_string_lossy());
         let argv = std::fs::read_to_string(bindir.join("argv.log")).unwrap_or_else(|_| "".into());
         let argv: Vec<&str> = argv.trim().lines().collect();
         assert_eq!(
@@ -231,12 +236,6 @@ mod tests {
         assert_eq!(reply["files"], serde_json::json!(1));
         assert_eq!(reply["lines_covered"], serde_json::json!(2));
 
-        // Restore PATH.
-        if let Some(p) = saved {
-            std::env::set_var("PATH", p);
-        } else {
-            std::env::remove_var("PATH");
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
