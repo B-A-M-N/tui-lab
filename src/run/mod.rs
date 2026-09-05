@@ -369,6 +369,14 @@ pub struct RunContext {
     pub coverage_delta_cursor: u64,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
+    /// Resume epoch (finding 32): 0 for a run in its original process,
+    /// incremented each time `reopen()` brings a closed persisted run
+    /// back to life. A reopened run is NOT the original process's run —
+    /// its later records live after a process boundary it did not choose.
+    /// Evidence recorded under epoch > 0 can be distinguished from the
+    /// original history (manifest + status carry the epoch; `reopen`
+    /// writes it down before anything else runs).
+    resume_epoch: u64,
     /// Audit P1-46: artifacts that could NOT be restored, with the reason —
     /// a damaged run comes back usable but DEGRADED, and the agent must
     /// know its evidence is incomplete. Populated only by `restore`;
@@ -461,6 +469,7 @@ impl RunContext {
             first_available_seq: self.first_available_seq,
             dropped_records: self.dropped_records,
             closed: self.closed,
+            resume_epoch: self.resume_epoch,
         };
         let tmp = dir.join("run.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest)?)?;
@@ -1725,6 +1734,42 @@ mod tests {
         let restored = RunContext::restore(&root).expect("restore again");
         assert!(restored.is_closed(), "closed flag is durable");
         assert_eq!(restored.status(Vec::new())["closed"], true);
+    }
+
+    /// Finding 32: reopen is not invisible. Each `reopen()` bumps a
+    /// persisted run's resume epoch and writes it into the manifest before
+    /// returning, so records written after a resume are distinguishable
+    /// from the original process's history — and the epoch survives the
+    /// next restore.
+    #[test]
+    fn reopen_bumps_a_durable_resume_epoch() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        {
+            let mut run = RunContext::restore(&root).expect("restore");
+            assert_eq!(run.status(Vec::new())["resume_epoch"], 0);
+            run.reopen();
+            assert_eq!(run.status(Vec::new())["resume_epoch"], 1);
+            // Persisted BEFORE reopen returns (a crash right after must
+            // still name the epoch).
+            let m = crate::run::manifest::load(&root).expect("manifest");
+            assert_eq!(m.resume_epoch, 1, "manifest written by reopen itself");
+            assert!(!m.closed, "reopen also reopens the manifest's view");
+            run.reopen();
+        }
+        let again = RunContext::restore(&root).expect("restore once more");
+        assert_eq!(again.status(Vec::new())["resume_epoch"], 2);
+        // list_persisted names the epoch too, so a caller can pick a run
+        // knowing how many times it was resumed.
+        let listed = RunContext::list_persisted(base.path()).expect("list");
+        let entry = listed
+            .iter()
+            .find(|e| {
+                e.get("run_id").and_then(|r| r.as_str())
+                    == Some(root.file_name().unwrap().to_string_lossy().as_ref())
+            })
+            .expect("run listed");
+        assert_eq!(entry["resume_epoch"], 2);
     }
 
     /// Review P0.1 regression: a closed run is a sealed evidence bundle.
