@@ -50,7 +50,11 @@ fn wait_ready(b: &mut PortablePtyBackend) {
     let out = b
         .wait(WaitCond::Text("HEX-READY".into()), Duration::from_secs(10))
         .expect("child ready");
-    assert!(out.met, "child never entered raw mode: {:?}", out.state.viewport_text);
+    assert!(
+        out.met,
+        "child never entered raw mode: {:?}",
+        out.state.viewport_text
+    );
 }
 
 /// Spawn a python3 child that first writes init bytes to stdout (terminal

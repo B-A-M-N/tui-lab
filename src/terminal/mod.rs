@@ -240,6 +240,13 @@ impl TerminalProfile {
                 "with it: an existing TUI is attached (tmux); without: the session spawns its own child",
             ),
             (
+                "process_ownership",
+                "Process ownership",
+                caps.process_ownership == crate::backend::ProcessOwnership::SpawnedChild,
+                false,
+                "spawned_child: the session can signal the process and trust its exit code; attached: observe-only (or explicit kill-on-stop)",
+            ),
+            (
                 "query_response",
                 "Query/response probing",
                 caps.query_response,

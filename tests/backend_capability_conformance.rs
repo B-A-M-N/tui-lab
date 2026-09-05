@@ -24,7 +24,7 @@ use tui_lab::backend::portable_pty::PortablePtyBackend;
 use tui_lab::backend::tmux::TmuxBackend;
 use tui_lab::backend::{
     BackendError, BackendResult, Capabilities, EventCapability, Input, InputFamily, KeyCode,
-    KeyEvent, KeyModifiers, MouseButton, TerminalBackend, WaitCapability, WaitCond,
+    KeyEvent, KeyModifiers, MouseButton, TerminalBackend, WaitCapability, WaitCond, WaitReason,
 };
 
 /// A child that prints several distinct lines then idles — enough history for
@@ -196,6 +196,11 @@ fn portable_capabilities_are_backed_by_real_operations() {
     assert!(caps.recording, "portable records casts");
     assert!(caps.query_response, "portable answers device queries");
     assert!(!caps.attach, "portable spawns, it does not attach");
+    assert_eq!(
+        caps.process_ownership,
+        tui_lab::backend::ProcessOwnership::SpawnedChild,
+        "the child is ours: signals work, exit code is real"
+    );
     assert!(caps.event_types.contains(&EventCapability::Raw));
     assert!(caps.supported_waits.contains(&WaitCapability::CommandDone));
     assert!(caps.input_families.contains(&InputFamily::Mouse));
@@ -380,6 +385,20 @@ fn tmux_capabilities_are_honest_and_backed() {
         !caps.raw_input,
         "tmux send-keys cannot deliver arbitrary raw bytes"
     );
+    // Audit finding 6: ownership + native-channel + input-family honesty.
+    assert_eq!(
+        caps.process_ownership,
+        tui_lab::backend::ProcessOwnership::Attached,
+        "the pane is observed, not owned"
+    );
+    assert!(
+        !caps.native_semantic,
+        "attach cannot inject TUI_LAB_SEMANTIC into the child env"
+    );
+    assert!(
+        !caps.input_families.contains(&InputFamily::RawByte),
+        "UTF-8-only send-keys is not raw-byte input"
+    );
     assert!(
         !caps.exit_code,
         "tmux cannot report the (non-child) exit code"
@@ -429,6 +448,85 @@ fn tmux_capabilities_are_honest_and_backed() {
     });
 
     b.stop().expect("tmux detach");
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &sess])
+        .output();
+}
+
+/// Audit finding 6: tmux waits resolve with the reason of the condition
+/// that was WAITED FOR — not a blanket ScreenChange. A Text wait that
+/// resolves says `Text`; a Bell wait says `Bell`; a ProcessExit wait on a
+/// killed pane says `ProcessExit`.
+#[test]
+fn tmux_wait_reasons_name_the_condition_that_resolved() {
+    let Some(sess) = start_tmux() else {
+        eprintln!("SKIP: tmux unavailable — skipping tmux wait-reason conformance");
+        return;
+    };
+    let target = format!("{sess}:0.0");
+    let mut b = match TmuxBackend::attach(&target, 80, 24) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &sess])
+                .output();
+            panic!("attach to {target} failed: {e}");
+        }
+    };
+
+    // Print a unique marker, then wait for it: the met reason must be
+    // Text, not ScreenChange.
+    let marker = format!("REASON-{}", std::process::id());
+    // Drive the shell through send-keys text: the default shell echoes it.
+    b.send_input(Input::Text(format!("echo {marker}\n")))
+        .expect("send echo line");
+    let out = b
+        .wait(WaitCond::Text(marker.clone()), Duration::from_secs(10))
+        .expect("marker wait");
+    assert!(
+        out.met && out.reason == WaitReason::Text,
+        "a resolved Text wait says Text, got met={} reason={:?}",
+        out.met,
+        out.reason
+    );
+
+    // A screen-stable wait resolving on a quiet pane says ScreenStable.
+    let out = b
+        .wait(
+            WaitCond::ScreenStable {
+                quiet_for: Duration::from_millis(250),
+                after_screen_seq: None,
+            },
+            Duration::from_secs(10),
+        )
+        .expect("stable wait");
+    assert!(
+        out.met && out.reason == WaitReason::ScreenStable,
+        "a resolved ScreenStable wait says ScreenStable, got met={} reason={:?}",
+        out.met,
+        out.reason
+    );
+
+    // Kill the pane's process through tmux (operator action, not session
+    // stop): with remain-on-exit the pane object survives its process with
+    // pane_dead=1, so the ProcessExit wait can resolve on a REAL dead pane.
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-w", "-t", &target, "remain-on-exit", "on"])
+        .output();
+    let _ = std::process::Command::new("tmux")
+        .args(["send-keys", "-t", &target, "exit", "Enter"])
+        .output();
+    let out = b
+        .wait(WaitCond::ProcessExit, Duration::from_secs(10))
+        .expect("exit wait");
+    assert!(
+        out.met && out.reason == WaitReason::ProcessExit,
+        "a resolved ProcessExit wait says ProcessExit, got met={} reason={:?}",
+        out.met,
+        out.reason
+    );
+
+    b.stop().expect("detach");
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", &sess])
         .output();

@@ -771,7 +771,8 @@ impl TerminalBackend for PtyLineBackend {
             recording: true,                 // recording hook delivered on output/input
             native_semantic: true,           // session-provided side channel
             attach: false,                   // we spawn the child
-            query_response: false,           // no device-query responder
+            process_ownership: super::ProcessOwnership::SpawnedChild,
+            query_response: false, // no device-query responder
             event_types: vec![
                 EventCapability::Output,
                 EventCapability::Bell,

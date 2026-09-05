@@ -89,6 +89,25 @@ pub enum InputFamily {
     Signal,
 }
 
+/// Who owns the process a backend observes (audit finding 6): whether the
+/// backend spawned the child itself — and can therefore signal it and read
+/// its real exit status — or attached to a pre-existing target whose
+/// lifecycle it does not control. Every "can I stop/restart/signal this
+/// process and trust the exit record" decision keys off this instead of
+/// guessing from `attach`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessOwnership {
+    /// The backend launched the child. It is our direct child: signals are
+    /// deliverable and `process()` returns the REAL exit code/signal.
+    SpawnedChild,
+    /// The backend attached to a pre-existing target (tmux pane). The
+    /// process predates the session: it cannot be signaled, `process()`
+    /// reports only running/dead, and detach (without kill-on-stop) leaves
+    /// it running.
+    Attached,
+}
+
 /// Backend capability flags returned on session start (spec section 41).
 ///
 /// The `supported` boolean encodes *working behavior only*. Optional or
@@ -142,6 +161,11 @@ pub struct Capabilities {
     pub native_semantic: bool,
     /// Does the backend ATTACH an existing TUI rather than spawn a child?
     pub attach: bool,
+    /// Who owns the observed process (finding 6): the finer lifecycle fact
+    /// behind `attach` — a spawned child can be signaled and its exit code
+    /// trusted; an attached target can only be observed (or, with an
+    /// explicit kill-on-stop flag, killed).
+    pub process_ownership: ProcessOwnership,
     /// Can the backend do query/response probing (device-query responder)?
     pub query_response: bool,
     /// Which terminal event kinds the backend can observe/emit.
@@ -182,6 +206,9 @@ impl Default for Capabilities {
             // advertise once, for every backend, not a per-engine guess.
             native_semantic: true,
             attach: false,
+            // The default profile claims nothing about lifecycle authority;
+            // each backend states its own.
+            process_ownership: ProcessOwnership::SpawnedChild,
             query_response: false,
             event_types: Vec::new(),
             supported_waits: Vec::new(),

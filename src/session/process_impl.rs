@@ -169,9 +169,28 @@ impl Session {
         // process was already dead, `process()` carries its real code or
         // signal; if it was alive, the stop below terminates it (SIGTERM is
         // stop()'s mechanism), and the record says so.
+        //
+        // Finding 6 (ownership truth): the "we terminated it" claim is only
+        // legal for a SPAWNED child. An ATTACHED target (tmux pane) is not
+        // ours to signal — unless the operator explicitly asked for
+        // kill-on-stop, the detach leaves it running, and the ledger must
+        // not say "Terminated" about a process that is still alive.
         let old_state = self.backend.process();
+        let ownership = self.backend.capabilities().process_ownership;
+        let kill_on_stop = self.backend.kill_on_stop();
         self.backend.stop().ok();
-        if old_state.running {
+        if ownership == crate::backend::ProcessOwnership::Attached && !kill_on_stop {
+            if old_state.running {
+                // Detached from a live pane: NO exit event — the process
+                // outlives the session and its true exit is unobservable
+                // from here.
+            } else {
+                self.push_event(crate::events::TerminalEventKind::ProcessExited {
+                    exit_code: None,
+                    exit_signal: old_state.exit_signal,
+                });
+            }
+        } else if old_state.running {
             self.push_event(crate::events::TerminalEventKind::ProcessExited {
                 exit_code: None,
                 exit_signal: Some("Terminated".to_string()),

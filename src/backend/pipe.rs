@@ -745,6 +745,7 @@ impl TerminalBackend for PipeBackend {
             recording: true,       // recording hook delivered on output/input
             native_semantic: true, // session-provided side channel
             attach: false,         // we spawn the child
+            process_ownership: super::ProcessOwnership::SpawnedChild,
             query_response: false, // no device-query responder
             event_types: vec![
                 EventCapability::Output,
