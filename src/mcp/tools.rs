@@ -714,6 +714,23 @@ impl TuiLabServer {
         crate::mcp::tools::handlers::audit::tui_explain(self, p).await
     }
 
+    /// The construction-oriented workflow object (finding 38): one
+    /// finding's full chain — component identity → source refs →
+    /// framework context → contract expectation → minimal reproduction →
+    /// targeted validation — assembled as ONE object, plus a verify
+    /// action that runs the finding's own verification plan (replay +
+    /// targeted re-checks, lease-gated).
+    #[tool(
+        name = "tui_workflow",
+        description = "Construction workflow per finding: inspect (the full chain — component identity, source loci, framework context, contract expectation, minimal reproduction, targeted validation), verify (run the finding's verification plan live: replay the reproduction and report whether the finding still reproduces; lease-gated), diagnose (all findings' chains). Joins existing evidence; never invents."
+    )]
+    pub async fn tui_workflow(
+        &self,
+        p: Parameters<TuiWorkflowParams>,
+    ) -> rmcp::model::CallToolResult {
+        crate::mcp::tools::handlers::workflow::tui_workflow(self, p).await
+    }
+
     /// Coverage (spec section 5; Wave F item 64). Two providers, merged:
     /// the optional tuicov executable and the NativeSemanticProtocol
     /// coverage events the run ledger accumulates.

@@ -16,3 +16,4 @@ pub(crate) mod probe;
 pub(crate) mod run;
 pub(crate) mod scenario;
 pub(crate) mod session;
+pub(crate) mod workflow;

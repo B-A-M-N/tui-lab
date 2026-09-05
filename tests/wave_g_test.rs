@@ -1895,3 +1895,168 @@ async fn scaffold_explore_gathers_multi_state_contract() {
         .await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ────────────────────── workflow object (item 38) ──────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_inspect_diagnose_verify_construction_chain() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-workflow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // A TUI with a discoverability-relevant screen: textual `help` hint lines
+    // but no conventional key cues in the affordance set.
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start",
+                "command": "python3",
+                "args": ["focus_ring_tui.py"],
+                "cwd": "fixtures", "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+
+    // ── gather a real finding via the audit surface ──
+    let audit = unwrap_ok(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "discoverability", "id": sid,
+            })))
+            .await,
+        "discoverability audit",
+    );
+    let findings = audit["findings"].as_array().expect("findings array");
+    assert!(!findings.is_empty(), "audit produced findings: {audit}");
+    let first = findings[0].as_object().expect("finding object");
+    let finding_id = first["id"].as_str().expect("finding id").to_string();
+    assert_eq!(first["category"], "discoverability", "{first:?}");
+
+    // ── inspect: one object joins the whole construction chain ──
+    let inspect = unwrap_ok(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({
+                "action": "inspect", "finding_id": &finding_id,
+            })))
+            .await,
+        "workflow inspect",
+    );
+    assert_eq!(inspect["workflow"], "construction", "{inspect}");
+    assert_eq!(inspect["finding"]["id"], finding_id, "{inspect}");
+    // explain_finding returns a structured object; its top-level fields
+    // name the finding's rule.
+    assert_eq!(
+        inspect["explanation"]["category"], "discoverability",
+        "{inspect}"
+    );
+    assert_eq!(inspect["explanation"]["id"], finding_id, "{inspect}");
+    // component_identity cites the evidence target(s).
+    let identities = inspect["component_identity"]["identities"]
+        .as_array()
+        .expect("identities");
+    assert!(!identities.is_empty(), "{inspect}");
+    assert!(
+        identities.iter().any(|i| i["loci_known"].is_boolean()),
+        "each identity carries a loci_known bool: {identities:?}"
+    );
+    // framework context: detection names something or honestly says none.
+    assert!(
+        inspect["framework"].get("project_root").is_some(),
+        "framework context resolved: {inspect}"
+    );
+    assert!(
+        inspect["framework"]["primary"].is_null()
+            || inspect["framework"]["primary"].get("name").is_some(),
+        "primary is an object or null: {inspect}"
+    );
+    // contract expectation is honest (loaded=false when none loaded).
+    assert_eq!(inspect["contract"]["loaded"], false, "{inspect}");
+    // verify() requires no side effects on inspect; the reproduction leg
+    // is null (no scenario recorded) — construction is a JOIN, not a run.
+    assert!(
+        inspect["reproduction"].is_null() || inspect["reproduction"]["missing"] == true,
+        "reproduction reported honestly: {inspect}"
+    );
+
+    // ── diagnose: every finding's chain, list-level ──
+    let diagnose = unwrap_ok(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({ "action": "diagnose" })))
+            .await,
+        "workflow diagnose",
+    );
+    let chains = diagnose["findings"].as_array().expect("chains");
+    assert!(
+        !chains.is_empty(),
+        "diagnose lists at least the audit's findings: {diagnose}"
+    );
+    assert!(
+        chains.iter().any(|c| c["finding"]["id"] == finding_id),
+        "diagnose includes our finding: {diagnose}"
+    );
+
+    // ── verify: lease-gated replay + live audit recheck ──
+    let verify = unwrap_ok(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({
+                "action": "verify", "finding_id": &finding_id, "id": sid,
+            })))
+            .await,
+        "workflow verify",
+    );
+    assert_eq!(verify["workflow"], "verify", "{verify}");
+    // recheck_profile selects the finding's category surface.
+    assert_eq!(verify["recheck_profile"], "discoverability", "{verify}");
+    // The recheck leg actually ran (it is a live pass over the same frame).
+    let recheck = verify["recheck"].as_object().expect("recheck ran");
+    assert_eq!(recheck["profile"], "discoverability", "{recheck:?}");
+    assert!(
+        recheck["rule_refired"].is_boolean() || recheck["rule_refired"].is_null(),
+        "recheck verdict is a boolean or null — never a fabricated pass: {recheck:?}"
+    );
+    assert!(
+        verify["verdict"]["recheck"]["still_reproduces"].is_boolean()
+            || verify["verdict"]["recheck"]["still_reproduces"].is_null(),
+        "verdict carried: {verify}"
+    );
+
+    // ── unknown action / unknown finding refused, naming the set ──
+    let bad_action = unwrap_err(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({ "action": "explain" })))
+            .await,
+        "workflow unknown action",
+    );
+    assert!(
+        bad_action["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown workflow action"),
+        "{bad_action}"
+    );
+    let bad_finding = unwrap_err(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({
+                "action": "inspect", "finding_id": "DOES-NOT-EXIST",
+            })))
+            .await,
+        "workflow unknown finding",
+    );
+    assert!(
+        bad_finding["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown finding id"),
+        "{bad_finding}"
+    );
+
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid }),
+        ))
+        .await;
+    let _ = std::fs::remove_dir_all(&base);
+}
