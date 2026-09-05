@@ -115,6 +115,11 @@ pub const TOOLS: &[ToolCapability] = &[
         summary: "Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.",
         selector: None,
     },
+    ToolCapability {
+        name: "tui_workflow",
+        summary: "Construction workflow per finding (one object, no autonomy): inspect assembles finding → component identity → source loci → framework context → contract expectation → minimal reproduction → targeted validation; verify runs that verification plan live (replay + re-checks; lease-gated) and reports whether the finding still reproduces; diagnose lists every finding's chain.",
+        selector: Some(("action", <crate::mcp::params::WorkflowAction as EnumVariants>::VARIANTS)),
+    },
 ];
 
 /// One declared resource surface (templates + the fixed findings feed).

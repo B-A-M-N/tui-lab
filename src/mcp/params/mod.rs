@@ -28,6 +28,7 @@ mod probe;
 mod run;
 mod scenario;
 mod session;
+mod workflow;
 
 pub use audit::*;
 pub use common::*;
@@ -42,3 +43,4 @@ pub use probe::*;
 pub use run::*;
 pub use scenario::*;
 pub use session::*;
+pub use workflow::*;
