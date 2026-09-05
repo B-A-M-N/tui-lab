@@ -234,7 +234,7 @@ impl ControlSummary {
         ControlSummary {
             id: c.id.clone(),
             label: c.label.clone(),
-            kind: format!("{:?}", c.kind).to_lowercase(),
+            kind: kind_role_slug(&c.kind),
             focused: c.focused,
         }
     }
@@ -459,25 +459,38 @@ fn normalize_role(role: &str) -> String {
     role.trim().to_lowercase()
 }
 
-/// The role slug a control kind answers to (`"button"`, `"field"`).
+/// The role slug a control kind answers to (`"button"`, `"field"`,
+/// `"menu_item"`). Finding 28: this is the SERDE wire name
+/// (`rename_all = "snake_case"` on `ControlKind`), not the Debug spelling —
+/// `format!("{MenuItem:?}")` gave `"menuitem"`, so `role: "menu_item"`
+/// targets could never match, and any future variant with a multi-word
+/// name would drift the same way. One authority; both call sites use it.
 fn kind_role_slug(kind: &ControlKind) -> String {
-    format!("{kind:?}").to_lowercase()
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
 }
 
 /// Nearest candidates for a not-found error: focused control first, then
 /// interactive controls in reading order — the agent's likely intent lives
-/// there.
+/// there. (Finding 28: the doc promised focus-first but the sort key never
+/// saw the flag — now the focused control sorts ahead regardless of
+/// distance score.)
 fn nearest_candidates(controls: &[Control], target: &ActionTarget) -> Vec<ControlSummary> {
-    let mut scored: Vec<(u32, &Control)> = controls
+    let mut scored: Vec<(bool, u32, &Control)> = controls
         .iter()
         .filter(|c| c.focusable || matches!(c.kind, ControlKind::Button | ControlKind::MenuItem))
-        .map(|c| (text_distance_score(target, c), c))
+        .map(|c| (c.focused, text_distance_score(target, c), c))
         .collect();
-    scored.sort_by_key(|(score, c)| (*score, c.bounds.y, c.bounds.x));
+    // Focused wins outright; then text relatedness, then reading order.
+    scored.sort_by_key(|(focused, score, c)| {
+        (std::cmp::Reverse(*focused), *score, c.bounds.y, c.bounds.x)
+    });
     scored
         .into_iter()
         .take(5)
-        .map(|(_, c)| ControlSummary::of(c))
+        .map(|(_, _, c)| ControlSummary::of(c))
         .collect()
 }
 
