@@ -111,9 +111,7 @@ test --all-features) verified green on the formatted tree.
 
 ### OPEN — P0 blockers
 
-| # | Finding | Evidence |
-| - | ------- | -------- |
-| 2 | One driving authority: `drive_pipeline` exists + scenario replay uses it, but no `DriveOrigin` provenance and ~25 direct `execute_act` call sites remain (exploration, conformance, audit drivers) | `src/execution/drive.rs`, callers |
+(none — all nine fixed; see FIXED)
 
 ### OPEN — P1/P2
 
@@ -137,6 +135,7 @@ test --all-features) verified green on the formatted tree.
 
 ### FIXED (verified in code)
 
+- **2** One driving authority with provenance: `DriveOrigin` enum (act/intent/scenario/explore/repro/explore_semantic/audit/conformance/probe) rides every transaction and ledger row; ALL production drivers migrated off the untagged path (exploration ×3, audit drivers ×4, conformance, diagnostic probe, scenario replay); tui_act/intent responses carry origin on the wire; exploration ledger test proves every row is `origin=explore` (`117fda3`)
 - **9** Evidence health: `EvidenceHealth {frame_commits, ledger_recorded}` on DriveOutcome; failed frame commits are `null` + error in the frames response (never a fabricated `frame:0`), `evidence_health.healthy` + failures ride the tui_act/tui_intent responses and warnings; integration test proves open-run healthy vs closed-run honest (`c1a0163`)
 - **8** Adapter dead data: `NativeNode.actions` consumed — declared verbs become affordances (new honest `Invocation::Declared` for verbs with no conventional invocation), replacing inference for that control on both overlay shapes; native-only insertions carry verbs too. Textual ids are structural paths (widget id / type+sibling-index under parent path), never `id(widget)`. Textual mixin declares per-widget verbs + emits focus events, not snapshots alone (`a2d180f`)
 - **4** Lease completeness: release requires the `lease_id` token issued at acquire (wrong token → `control_leased` naming the holder; expiry needs none); restart, stop, and `tui_run close kill_sessions=true` all refuse live-leased sessions with holder + retry_after_ms (close checks via the pool — `with_sess` is run-closed-gated after close); fixed as `b5cbe20`, subsumes 13
@@ -157,5 +156,5 @@ test --all-features) verified green on the formatted tree.
 
 ### Priority order (implementation sequence)
 
-Remaining P0: 2 (DriveOrigin provenance), then P1/P2: 16/17/20/21/23/28/31/32/33, then construction set 36-42.
+Remaining P0: none. Next: P1/P2 — 16/17 (native resolution) → 20 (fake AUDIT-METRICS) → 21 (typed severity/category) → 23 (structured NextObservation) → 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
 
