@@ -57,13 +57,43 @@ async fn start_dialog_with_env(server: &TuiLabServer, env: serde_json::Value) ->
 }
 
 /// Observe first (plan_intent resolves against the last fused frame).
+///
+/// Under a concurrent host the fixture's first frame can race the initial
+/// draw: an observe landing before any control has been resolved reads as
+/// blank, and a subsequent intent finding "Completely Absent" then offers
+/// zero nearest candidates (nothing to offer). That is a timing artifact,
+/// not an honesty regression — the candidates are only empty because the
+/// semantic layer had not resolved a control yet. Settle the same way the
+/// render-delta e2e does: loop a bounded number of observes until a
+/// resolved control is present, so the intent resolves against a real
+/// frame and the self-correction candidates are exercised.
 async fn observe(server: &TuiLabServer, id: &str) {
-    let raw = server
-        .tui_observe(params_typed(
-            serde_json::json!({ "mode": "semantic", "id": id }),
-        ))
-        .await;
-    unwrap_ok(&raw, "observe");
+    for _ in 0..6 {
+        let raw = server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "summary", "id": id }),
+            ))
+            .await;
+        let v = unwrap_ok(&raw, "observe");
+        let controls = v["controls"].as_u64().unwrap_or(0);
+        if controls > 0 {
+            // Re-assert the semantic frame so plan_intent resolves against
+            // the fully-fused semantic read (the callers observe=true path).
+            let _ = unwrap_ok(
+                &server
+                    .tui_observe(params_typed(
+                        serde_json::json!({ "mode": "semantic", "id": id }),
+                    ))
+                    .await,
+                "observe semantic",
+            );
+            return;
+        }
+    }
+    panic!(
+        "intent fixture never resolved a control ({} observes); the frame stayed blank under load",
+        6
+    );
 }
 
 #[tokio::test]
