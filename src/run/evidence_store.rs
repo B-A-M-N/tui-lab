@@ -205,7 +205,9 @@ impl FrameLedger {
 }
 
 /// The terminal-event ledger: observed-event counts, the ephemeral-run
-/// hold backlog, and per-session incremental flush counts (item 38).
+/// hold backlog, per-session incremental flush counts (item 38), and the
+/// per-consumer ingestion cursors (re-review P1: exactly-once folding for
+/// coverage and other event-derived ledgers across tool calls).
 pub(super) struct EventLedger {
     /// Events observed in this run (observe/wait calls).
     count: u64,
@@ -217,6 +219,9 @@ pub(super) struct EventLedger {
     /// Events already written durably per session (item 38) — evidence for
     /// status: "events persisted incrementally" vs "held in memory".
     flushed_counts: HashMap<String, u64>,
+    /// Per-consumer event cursors (re-review P1): exactly-once ingestion
+    /// positions for coverage folding and other event-derived ledgers.
+    cursors: HashMap<String, u64>,
 }
 
 impl EventLedger {
@@ -225,6 +230,7 @@ impl EventLedger {
             count: 0,
             held: Vec::new(),
             flushed_counts: HashMap::new(),
+            cursors: HashMap::new(),
         }
     }
 
@@ -266,5 +272,15 @@ impl EventLedger {
     /// Total events currently held for flush.
     pub(super) fn held_count(&self) -> u64 {
         self.held.iter().map(|(_, e)| e.len() as u64).sum()
+    }
+
+    /// A named consumer's ingestion cursor.
+    pub(super) fn cursor(&self, consumer: &str) -> Option<u64> {
+        self.cursors.get(consumer).copied()
+    }
+
+    /// Advance a named consumer's ingestion cursor.
+    pub(super) fn set_cursor(&mut self, consumer: &str, seq: u64) {
+        self.cursors.insert(consumer.to_string(), seq);
     }
 }
