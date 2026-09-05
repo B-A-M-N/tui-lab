@@ -18,8 +18,8 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
   - assertion: text, text_absent, position, focus, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, focused_not, oracle
 - `tui_checkpoint` — Save and compare named UI state checkpoints (durable under persistent runs).
   - action: save, compare, list, delete
-- `tui_scenario` — Record, save, list, export, and replay interaction scenarios (session+generation scoped).
-  - action: list, record_start, record_stop, save, export, run
+- `tui_scenario` — Record, save, list, export, and replay interaction scenarios (session+generation scoped); regression_asset synthesizes review-gated regression assets (scenario/assertion/contract_rule/viewport_case) from a finding's own evidence (finding 39) — generated/inferred, never auto-run.
+  - action: list, record_start, record_stop, save, export, run, regression_asset
 - `tui_record` — Capture terminal output: asciicast .cast lifecycle (start/stop) plus one-shot SVG/PNG screen captures.
   - format: start, stop, cast, svg, png
 - `tui_explore` — Seeded random exploration, evidential candidate generation, screen-reading semantic exploration, and the state graph (modes: random, guided_candidates, semantic, state_graph). Driving: blocked while a human lease is live. Replay of discovered flows is tui_scenario's job.
