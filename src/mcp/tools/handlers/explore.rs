@@ -188,6 +188,13 @@ pub(crate) async fn tui_explore(
                                 "dead_ends": run_guard.state_graph.find_dead_ends().len(),
                             })
                         };
+                        // RELEASE run_guard BEFORE taking the run lock again:
+                        // the persist block below re-locks `run`, and
+                        // minimize_crash_finding locks `self.run` internally.
+                        // Holding a std::sync::MutexGuard across either (both
+                        // non-reentrant) self-deadlocks the server — the map
+                        // is a value now; nothing below needs the guard.
+                        drop(run_guard);
                         // Persist the graph when the run is persistent.
                         let graph_path = {
                             let run = run.lock().unwrap();
