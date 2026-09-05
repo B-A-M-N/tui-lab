@@ -60,10 +60,10 @@ pub(crate) async fn tui_framework(
     let fw_name = det.framework().map(str::to_string);
     let adapter_status = match p.id.as_deref() {
         None => None,
-        Some(sel) => match s.with_sess(Some(sel), |sess| sess.adapter_status()).await {
-            Ok(st) => Some(st),
-            Err(_e) => None,
-        },
+        Some(sel) => s
+            .with_sess(Some(sel), |sess| sess.adapter_status())
+            .await
+            .ok(),
     };
     let capability_json = json!({
         // The audit's distinct-axis contract (finding 34).

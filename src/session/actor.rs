@@ -52,8 +52,16 @@ enum Mail {
     },
 }
 
-/// One session's actor: a cloneable sender plus a join handle.
+/// One session's actor: a cloneable handle sharing one inner state object
+/// (finding 1). Every clone observes the SAME `closing` flag and the SAME
+/// join handle — a clone that initiates shutdown commits shutdown for all
+/// handles, and a join through any clone joins the real thread.
+#[derive(Clone)]
 pub struct SessionActor {
+    inner: std::sync::Arc<SessionActorInner>,
+}
+
+struct SessionActorInner {
     id: String,
     /// Bounded async mailbox (review item 13): `tokio::sync::mpsc` so a full
     /// mailbox applies *awaitable backpressure* on the caller instead of
@@ -61,24 +69,12 @@ pub struct SessionActor {
     /// would. The actor thread is a plain OS thread and drains via
     /// `blocking_recv()`; callers `send().await`.
     tx: tokio::sync::mpsc::Sender<Mail>,
-    /// Reader thread join handle, taken by `shutdown`.
+    /// Actor thread join handle, taken (once, under the mutex) by `shutdown`.
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Set once shutdown is requested (review P0.3): new `send`/`send_sync`
     /// reject immediately rather than enqueuing work behind a dying actor.
+    /// SHARED across every clone of the handle (finding 1).
     closing: std::sync::atomic::AtomicBool,
-}
-
-impl Clone for SessionActor {
-    fn clone(&self) -> Self {
-        SessionActor {
-            id: self.id.clone(),
-            tx: self.tx.clone(),
-            join: Mutex::new(None),
-            closing: std::sync::atomic::AtomicBool::new(
-                self.closing.load(std::sync::atomic::Ordering::SeqCst),
-            ),
-        }
-    }
 }
 
 impl SessionActor {
@@ -124,10 +120,12 @@ impl SessionActor {
             })
             .expect("spawn session actor");
         SessionActor {
-            id,
-            tx,
-            join: Mutex::new(Some(join)),
-            closing: std::sync::atomic::AtomicBool::new(false),
+            inner: std::sync::Arc::new(SessionActorInner {
+                id,
+                tx,
+                join: Mutex::new(Some(join)),
+                closing: std::sync::atomic::AtomicBool::new(false),
+            }),
         }
     }
 
@@ -143,27 +141,42 @@ impl SessionActor {
     /// ack, then drop our own sender so the actor's `blocking_recv` can
     /// return `None` and the thread join is attainable.
     async fn shutdown_ack(&self) -> Result<(), ActorError> {
-        self.closing
+        self.inner
+            .closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
         // Backpressured send: if the mailbox is full this awaits the actor
         // draining a slot, so the Shutdown mail always gets in (review P0.3
         // deadlock fix — never a dropped notification).
-        self.tx
+        self.inner
+            .tx
             .send(Mail::Shutdown {
-                session_filter: Some(self.id.clone()),
+                session_filter: Some(self.inner.id.clone()),
                 ack: ack_tx,
             })
             .await
-            .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
+            .map_err(|_| ActorError::ActorGone(self.inner.id.clone()))?;
         ack_rx
             .await
-            .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
+            .map_err(|_| ActorError::ActorGone(self.inner.id.clone()))?;
+        self.join().await;
         Ok(())
     }
 
+    /// Join the actor thread if it has not been joined yet (finding 1:
+    /// "thread demonstrably gone after successful stop"). The join runs on
+    /// a blocking thread so callers inside the async runtime never stall a
+    /// worker. Shared state: whichever caller gets here first joins; the
+    /// rest observe the taken slot and return immediately.
+    async fn join(&self) {
+        let handle = self.inner.join.lock().ok().and_then(|mut j| j.take());
+        if let Some(handle) = handle {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+        }
+    }
+
     pub fn id(&self) -> &str {
-        &self.id
+        &self.inner.id
     }
 
     /// Send a closure to run against the session and await its reply. The
@@ -175,8 +188,8 @@ impl SessionActor {
         R: Send + 'static,
         F: FnOnce(&mut Session) -> R + Send + 'static,
     {
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ActorError::ActorGone(self.id.clone()));
+        if self.inner.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ActorError::ActorGone(self.inner.id.clone()));
         }
         let (rtx, rrx) = tokio::sync::oneshot::channel::<R>();
         let job: Job = Box::new(move |session: &mut Session| {
@@ -185,12 +198,13 @@ impl SessionActor {
         // Async backpressure (review item 13): a full mailbox suspends THIS
         // task until the actor drains, rather than blocking a runtime worker
         // thread as std::sync::mpsc::SyncSender::send would.
-        self.tx
+        self.inner
+            .tx
             .send(Mail::Job(job))
             .await
-            .map_err(|_| ActorError::ActorGone(self.id.clone()))?;
+            .map_err(|_| ActorError::ActorGone(self.inner.id.clone()))?;
         rrx.await
-            .map_err(|_| ActorError::ActorDropped(self.id.clone()))
+            .map_err(|_| ActorError::ActorDropped(self.inner.id.clone()))
     }
 
     /// Try to send without awaiting: returns a oneshot receiver to await the
@@ -202,20 +216,20 @@ impl SessionActor {
         R: Send + 'static,
         F: FnOnce(&mut Session) -> R + Send + 'static,
     {
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ActorError::ActorGone(self.id.clone()));
+        if self.inner.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ActorError::ActorGone(self.inner.id.clone()));
         }
         let (rtx, rrx) = tokio::sync::oneshot::channel::<R>();
         let job: Job = Box::new(move |session: &mut Session| {
             let _ = rtx.send(job(session));
         });
-        match self.tx.try_send(Mail::Job(job)) {
+        match self.inner.tx.try_send(Mail::Job(job)) {
             Ok(()) => Ok(rrx),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                Err(ActorError::ActorBusy(self.id.clone()))
+                Err(ActorError::ActorBusy(self.id().to_string()))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                Err(ActorError::ActorGone(self.id.clone()))
+                Err(ActorError::ActorGone(self.id().to_string()))
             }
         }
     }
@@ -230,7 +244,8 @@ impl SessionActor {
     /// async path) uses `shutdown_ack` instead; this stays as a bounded
     /// fire-and-join option for non-async contexts.
     pub fn shutdown(&self) {
-        self.closing
+        self.inner
+            .closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
         // Retry `try_send` until it lands or the mailbox proves closed. A full
@@ -238,13 +253,13 @@ impl SessionActor {
         // never give up on healthily-busy actors. We sleep between attempts to
         // keep `closing` visible and avoid a tight spin.
         let mail = Mail::Shutdown {
-            session_filter: Some(self.id.clone()),
+            session_filter: Some(self.inner.id.clone()),
             ack: ack_tx,
         };
         let mut sent = false;
         let mut mail = mail;
         for _ in 0..100_000 {
-            match self.tx.try_send(mail) {
+            match self.inner.tx.try_send(mail) {
                 Ok(()) => {
                     sent = true;
                     break;
@@ -277,8 +292,10 @@ impl SessionActor {
             }
         }
         // Drop our sender so no keep-alive remains; the actor's blocking_recv
-        // then returns None if it hadn't already. Then join.
-        if let Ok(mut j) = self.join.lock() {
+        // then returns None if it hadn't already. Then join — through the
+        // SHARED join handle, so a shutdown driven from any clone joins the
+        // real thread (finding 1).
+        if let Ok(mut j) = self.inner.join.lock() {
             if let Some(handle) = j.take() {
                 let _ = handle.join();
             }
@@ -523,22 +540,27 @@ impl SessionPool {
     /// Stop a session and remove its actor. Idempotent: stopping an unknown
     /// id is success (the old manager's contract — "already gone").
     pub async fn stop(&self, id: &str) -> anyhow::Result<()> {
-        let Some(actor) = self.resolve(Some(id)) else {
-            return Ok(());
+        // Remove from the directory BEFORE shutting down (finding 1): once
+        // stop begins, `resolve` can no longer hand out handles that would
+        // race the shutdown with fresh sends. The removed actor is the last
+        // authority for this id.
+        let actor = {
+            let removed = self.directory.write().ok().and_then(|mut d| d.remove(id));
+            let Some(actor) = removed else {
+                return Ok(());
+            };
+            if self.active_id().as_deref() == Some(id) {
+                if let Ok(mut a) = self.active.lock() {
+                    *a = None;
+                }
+            }
+            actor
         };
         // Stop synchronously inside the actor FIRST (flushes backend state),
         // then shut the actor down (ack-awaited, so a full mailbox can never
-        // wedge us — review P0.3) and drop it from the directory.
+        // wedge us — review P0.3).
         let _ = actor.send(|s: &mut Session| s.stop()).await;
         actor.shutdown_ack().await?;
-        if let Ok(mut d) = self.directory.write() {
-            d.remove(id);
-        }
-        if self.active_id().as_deref() == Some(id) {
-            if let Ok(mut a) = self.active.lock() {
-                *a = None;
-            }
-        }
         Ok(())
     }
 
@@ -573,9 +595,13 @@ impl Drop for SessionPool {
                 // Senders dropping IS the fallback that unblocks the actor's
                 // blocking_recv. We never join here — Drop can run inside an
                 // async runtime where joining would block.
+                actor
+                    .inner
+                    .closing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel::<()>();
-                let _ = actor.tx.try_send(Mail::Shutdown {
-                    session_filter: Some(actor.id.clone()),
+                let _ = actor.inner.tx.try_send(Mail::Shutdown {
+                    session_filter: Some(actor.inner.id.clone()),
                     ack: ack_tx,
                 });
             }
@@ -782,6 +808,7 @@ mod tests {
             .expect("start");
         let actor = pool.resolve(Some(&id)).expect("actor present");
         actor
+            .inner
             .closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let err = actor
@@ -791,8 +818,127 @@ mod tests {
         assert!(matches!(err, ActorError::ActorGone(_)));
         // Restore so the pool can clean up normally.
         actor
+            .inner
             .closing
             .store(false, std::sync::atomic::Ordering::SeqCst);
         pool.stop(&id).await.ok();
+    }
+
+    /// Finding 1: every clone of an actor handle shares ONE closing flag.
+    /// A shutdown initiated through clone A is visible synchronously through
+    /// clone B — and a post-shutdown send through B is refused, not enqueued.
+    #[tokio::test]
+    async fn clones_share_closing_state() {
+        let pool = SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        let a = pool.resolve(Some(&id)).expect("actor present");
+        let b = a.clone();
+        // Mark closing through `a`; `b` must see it immediately (same inner).
+        a.inner
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            b.inner.closing.load(std::sync::atomic::Ordering::SeqCst),
+            "clone must observe the shared closing flag"
+        );
+        let err = b
+            .send(|_s: &mut Session| 1)
+            .await
+            .expect_err("send through the clone must be refused after shutdown began");
+        assert!(matches!(err, ActorError::ActorGone(_)));
+        // Restore so the pool can clean up normally.
+        a.inner
+            .closing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        pool.stop(&id).await.ok();
+    }
+
+    /// Finding 1: a full stop driven from a CLONE — the pool's directory
+    /// entry is gone afterwards and a fresh resolve returns nothing. This
+    /// is the race the old per-clone `closing` copy allowed: one handle
+    /// shutting down while the directory's handle kept accepting jobs.
+    #[tokio::test]
+    async fn stop_via_clone_removes_directory_entry() {
+        let pool = std::sync::Arc::new(SessionPool::new());
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        let clone = {
+            let actor = pool.resolve(Some(&id)).expect("actor present");
+            actor.clone()
+        };
+        // Concurrent send racing the stop: after stop is COMMITTED no job
+        // may execute — either the send is refused (closing already set) or
+        // it completed before the stop's session teardown; both are safe.
+        let racer = {
+            let pool = pool.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                pool.with_session(Some(&id), |s: &mut Session| s.id.clone())
+                    .await
+            })
+        };
+        pool.stop(&id).await.expect("stop");
+        assert!(!pool.contains(&id), "directory entry must be gone");
+        assert!(pool.resolve(Some(&id)).is_none(), "no handle after stop");
+        // The racer either failed (refused) or succeeded pre-stop; it must
+        // never hang. Awaiting it proves termination.
+        let _ = racer.await;
+        // The clone's shutdown state is shared: it reports closed too.
+        assert!(clone
+            .inner
+            .closing
+            .load(std::sync::atomic::Ordering::SeqCst));
+        // Stopping again is idempotent.
+        pool.stop(&id).await.expect("idempotent stop");
+    }
+
+    /// Finding 1: after a successful stop the actor thread is demonstrably
+    /// gone — the join handle (shared, through any clone) has exited.
+    #[tokio::test]
+    async fn actor_thread_is_gone_after_stop() {
+        let pool = SessionPool::new();
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        let actor = pool.resolve(Some(&id)).expect("actor present");
+        let clone = actor.clone();
+        pool.stop(&id).await.expect("stop");
+        // The clone sees the SAME join slot: already taken by the stop's
+        // join, so is_some() is false — the handle was joined to completion.
+        let joined = clone.inner.join.lock().expect("join lock").is_none();
+        assert!(joined, "join handle must be consumed by the stop's join");
     }
 }

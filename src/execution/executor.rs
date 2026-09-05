@@ -140,6 +140,7 @@ pub fn execute_act_with_guard(
 }
 
 /// The body of the canonical executor (was `execute_act_with_completion`).
+#[allow(clippy::too_many_arguments)]
 fn execute_act_inner(
     session: &mut Session,
     action: &CanonicalAction,
