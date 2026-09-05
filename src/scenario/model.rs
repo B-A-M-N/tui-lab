@@ -34,8 +34,28 @@ pub struct Scenario {
     /// parse error masquerading as a corrupt scenario.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<SensitiveParameter>,
+    /// What happens when a step fails (audit finding 5). `Stop` (the
+    /// default) halts the replay at the first failure and marks every
+    /// remaining step `skipped_due_to_prior_failure` — continuing to send
+    /// input after a step failed compounds whatever went wrong (a missed
+    /// modal means every later keystroke lands somewhere unintended).
+    /// `Continue` restores run-to-completion semantics for callers that
+    /// explicitly want a full pass/fail census.
+    #[serde(default)]
+    pub on_failure: FailurePolicy,
     /// Ordered steps to execute.
     pub steps: Vec<ScenarioStep>,
+}
+
+/// Replay failure policy (audit finding 5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    /// Halt at the first failed step; later steps are skipped and counted.
+    #[default]
+    Stop,
+    /// Run every step regardless of failures.
+    Continue,
 }
 
 fn default_inherit_session() -> bool {
@@ -172,6 +192,7 @@ impl Scenario {
             inherit_session: true,
             launch: None,
             parameters: Vec::new(),
+            on_failure: FailurePolicy::default(),
             steps: Vec::new(),
         }
     }

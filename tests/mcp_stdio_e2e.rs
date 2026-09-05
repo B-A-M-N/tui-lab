@@ -762,6 +762,66 @@ fn stdio_e2e_full_lifecycle() {
         "assert detail must state the expectation: {detail}"
     );
 
+    // Audit finding 5 (wire): the DEFAULT stop policy halts at the first
+    // failed step — later steps are `skipped_due_to_prior_failure`, the
+    // report says `stopped_on_failure`, and a skipped step fails `passed`.
+    let save_multi = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "save", "name": "fail-fast-flow",
+            "steps": [
+                { "kind": "assert", "assertion": "text", "text": "never-appears-xyz" },
+                { "kind": "assert", "assertion": "text", "text": "never-checked-2" }
+            ] }),
+    );
+    assert_eq!(
+        save_multi["category"], "success",
+        "save fail-fast scenario: {save_multi}"
+    );
+    let run_stop = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "run", "name": "fail-fast-flow", "id": sess_r2 }),
+    );
+    assert_eq!(run_stop["category"], "success", "{run_stop}");
+    assert_eq!(run_stop["data"]["passed"], false, "{run_stop}");
+    assert_eq!(
+        run_stop["data"]["status"], "stopped_on_failure",
+        "{run_stop}"
+    );
+    assert_eq!(run_stop["data"]["steps_total"], 2, "{run_stop}");
+    assert_eq!(run_stop["data"]["steps_failed"], 1, "{run_stop}");
+    assert_eq!(run_stop["data"]["steps_skipped"], 1, "{run_stop}");
+    assert!(
+        run_stop["data"]["step_results"][1]["detail"]
+            .to_string()
+            .contains("skipped_due_to_prior_failure"),
+        "{run_stop}"
+    );
+
+    // The `continue` override runs every step: status completed, both fail,
+    // nothing skipped.
+    let run_cont = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "run", "name": "fail-fast-flow",
+            "id": sess_r2, "on_failure": "continue" }),
+    );
+    assert_eq!(run_cont["category"], "success", "{run_cont}");
+    assert_eq!(run_cont["data"]["passed"], false, "{run_cont}");
+    assert_eq!(run_cont["data"]["status"], "completed", "{run_cont}");
+    assert_eq!(run_cont["data"]["steps_failed"], 2, "{run_cont}");
+    assert_eq!(run_cont["data"]["steps_skipped"], 0, "{run_cont}");
+
+    // An unknown policy is refused before anything runs.
+    let run_badpol = mcp.tool(
+        "tui_scenario",
+        serde_json::json!({ "action": "run", "name": "fail-fast-flow",
+            "id": sess_r2, "on_failure": "explode" }),
+    );
+    assert_eq!(run_badpol["category"], "invalid_request", "{run_badpol}");
+    assert!(
+        run_badpol.to_string().contains("on_failure"),
+        "error names the parameter: {run_badpol}"
+    );
+
     let _ = mcp.tool(
         "tui_session",
         serde_json::json!({ "action": "stop", "id": sess_r }),

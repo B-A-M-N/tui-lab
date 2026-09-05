@@ -18,12 +18,30 @@ pub struct StepResult {
     pub detail: String,
 }
 
+/// How a replay ended (audit finding 5): a stop-policy replay that hit a
+/// failure says `stopped_on_failure` — `completed` never appears next to a
+/// skipped step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// Every step ran to the end.
+    Completed,
+    /// A step failed under the stop policy; the rest were skipped.
+    StoppedOnFailure,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ScenarioRunReport {
     pub scenario_name: String,
+    /// How the replay ended (see [`RunStatus`]).
+    pub status: RunStatus,
     pub steps_total: usize,
     pub steps_passed: usize,
     pub steps_failed: usize,
+    /// Steps NOT attempted because the stop policy halted the replay after
+    /// an earlier failure (audit finding 5). Distinct from failed: a skipped
+    /// step proves nothing either way.
+    pub steps_skipped: usize,
     pub step_results: Vec<StepResult>,
 }
 
@@ -53,7 +71,20 @@ impl ScenarioRunner {
         values: &[ParameterValue],
         run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
     ) -> ScenarioRunReport {
-        Self::run_with_parameters_inner(scenario, session, values, run)
+        Self::run_inner(scenario, session, values, run, None)
+    }
+
+    /// [`Self::run_in_run`] with an explicit failure-policy override (audit
+    /// finding 5): the caller (the MCP `run` action) may pass `on_failure`
+    /// on the wire; `None` uses the scenario's own recorded policy.
+    pub fn run_in_run_with_policy(
+        scenario: &Scenario,
+        session: &mut crate::session::state::Session,
+        values: &[ParameterValue],
+        run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+        policy: Option<super::model::FailurePolicy>,
+    ) -> ScenarioRunReport {
+        Self::run_inner(scenario, session, values, run, policy)
     }
 
     /// Run a scenario with caller-supplied sensitive-parameter values
@@ -67,18 +98,28 @@ impl ScenarioRunner {
         session: &mut crate::session::state::Session,
         values: &[ParameterValue],
     ) -> ScenarioRunReport {
-        Self::run_with_parameters_inner(scenario, session, values, None)
+        Self::run_inner(scenario, session, values, None, None)
     }
 
-    fn run_with_parameters_inner(
+    fn run_inner(
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
         values: &[ParameterValue],
         run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+        policy_override: Option<super::model::FailurePolicy>,
     ) -> ScenarioRunReport {
         let mut results = Vec::new();
         let mut passed = 0;
         let mut failed = 0;
+        let mut skipped = 0;
+        // Effective policy: caller override wins over the recorded one; the
+        // serde default for old scenario files is stop — continuing past a
+        // failed step compounds the failure it should be reporting (audit
+        // finding 5).
+        let policy = policy_override.unwrap_or(scenario.on_failure);
+        // Set when the stop policy halts the replay; every later step is
+        // then recorded as skipped, and the report's status says stopped.
+        let mut stopped_at: Option<usize> = None;
 
         // Resolve the whole step list up front so ${NAME} references become
         // real payloads before any step executes. Unresolved references are
@@ -86,6 +127,23 @@ impl ScenarioRunner {
         let resolved_params = scenario.resolve_parameters(values);
 
         for (i, step) in scenario.steps.iter().enumerate() {
+            // Finding 5, fail-fast: once the stop policy triggered, the
+            // remaining steps are NOT run and NOT counted as failures —
+            // they are skipped, each with the reason and the step that
+            // caused the halt.
+            if let Some(at) = stopped_at {
+                results.push(StepResult {
+                    index: i,
+                    kind: format!("{:?}", step.kind).to_lowercase(),
+                    passed: false,
+                    detail: format!(
+                        "skipped_due_to_prior_failure: step {at} failed and the scenario's \
+                         on_failure policy is 'stop'; this step was not attempted"
+                    ),
+                });
+                skipped += 1;
+                continue;
+            }
             let params = resolved_params[i].clone();
             // Sensitive-parameter resolution check (re-review P0.3): before
             // anything executes, a step still carrying a ${NAME} reference
@@ -102,6 +160,9 @@ impl ScenarioRunner {
                     ),
                 });
                 failed += 1;
+                if policy == super::model::FailurePolicy::Stop {
+                    stopped_at = Some(i);
+                }
                 continue;
             }
             // Mutation guard (re-review Wave-2 + audit P0-19): a recorded
@@ -123,6 +184,9 @@ impl ScenarioRunner {
                             detail: format!("stale_state: {guard_detail}"),
                         });
                         failed += 1;
+                        if policy == super::model::FailurePolicy::Stop {
+                            stopped_at = Some(i);
+                        }
                         continue;
                     }
                     guard
@@ -137,6 +201,9 @@ impl ScenarioRunner {
                             detail: format!("stale_state: {guard_detail}"),
                         });
                         failed += 1;
+                        if policy == super::model::FailurePolicy::Stop {
+                            stopped_at = Some(i);
+                        }
                         continue;
                     }
                     None
@@ -364,6 +431,11 @@ impl ScenarioRunner {
                 passed += 1;
             } else {
                 failed += 1;
+                // Finding 5: the stop policy halts HERE — before the next
+                // step is attempted. `Continue` runs on as before.
+                if policy == super::model::FailurePolicy::Stop {
+                    stopped_at = Some(i);
+                }
             }
 
             results.push(StepResult {
@@ -376,9 +448,15 @@ impl ScenarioRunner {
 
         ScenarioRunReport {
             scenario_name: scenario.name.clone(),
+            status: if stopped_at.is_some() {
+                RunStatus::StoppedOnFailure
+            } else {
+                RunStatus::Completed
+            },
             steps_total: scenario.steps.len(),
             steps_passed: passed,
             steps_failed: failed,
+            steps_skipped: skipped,
             step_results: results,
         }
     }

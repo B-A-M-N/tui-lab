@@ -490,6 +490,34 @@ pub(crate) async fn tui_scenario(
                         .collect()
                 })
                 .unwrap_or_default();
+            // Finding 5: wire-level failure-policy override (stop|continue);
+            // an unrecognized value is refused before anything runs.
+            let policy_override: Option<crate::scenario::model::FailurePolicy> = match &p.on_failure
+            {
+                None => None,
+                Some(known) => match known.known() {
+                    Some(ScenarioFailurePolicy::Stop) => {
+                        Some(crate::scenario::model::FailurePolicy::Stop)
+                    }
+                    Some(ScenarioFailurePolicy::Continue) => {
+                        Some(crate::scenario::model::FailurePolicy::Continue)
+                    }
+                    None => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!(
+                            "unknown on_failure '{}' (expected one of: {})",
+                            match known {
+                                crate::mcp::params::Known::Other(o) => o.clone(),
+                                _ => String::new(),
+                            },
+                            <ScenarioFailurePolicy as crate::mcp::params::EnumVariants>::VARIANTS
+                                .join(", ")
+                        ),
+                        )
+                    }
+                },
+            };
             s.with_sess(selector.as_deref(), move |sess| {
                 // Wave G item 76: replay drives the app; a live human
                 // lease refuses the whole run before step one.
@@ -499,41 +527,41 @@ pub(crate) async fn tui_scenario(
                 // Audit P0-21: the replay runs inside the run context, so
                 // every executed act step lands in the transaction ledger
                 // and frame evidence through the shared driving pipeline.
-                let report = crate::scenario::runner::ScenarioRunner::run_in_run(
+                let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
                     &scenario,
                     sess,
                     &parameter_values,
                     Some(&run),
+                    policy_override,
                 );
                 let (sid, gen) = (sess.id.clone(), sess.generation);
                 let _ = run
                     .lock()
                     .unwrap()
                     .record_event(&sid, &format!("scenario_run:{}", scenario.name));
-                if report.steps_failed == 0 {
-                    ok(json!({
-                        "name": report.scenario_name,
-                        "session": sid,
-                        "generation": gen,
-                        "passed": true,
-                        "steps_total": report.steps_total,
-                        "steps_passed": report.steps_passed,
-                        "steps_failed": 0,
-                        "step_results": report.step_results,
-                    }))
+                let base = json!({
+                    "name": report.scenario_name,
+                    "session": sid,
+                    "generation": gen,
+                    "status": report.status,
+                    "steps_total": report.steps_total,
+                    "steps_passed": report.steps_passed,
+                    "steps_failed": report.steps_failed,
+                    "steps_skipped": report.steps_skipped,
+                    "step_results": report.step_results,
+                });
+                if report.steps_failed == 0 && report.steps_skipped == 0 {
+                    let mut v = base;
+                    v["passed"] = json!(true);
+                    ok(v)
                 } else {
-                    // Real regression: envelope stays success (transport ok),
-                    // payload reports the failure honestly.
-                    ok(json!({
-                        "name": report.scenario_name,
-                        "session": sid,
-                        "generation": gen,
-                        "passed": false,
-                        "steps_total": report.steps_total,
-                        "steps_passed": report.steps_passed,
-                        "steps_failed": report.steps_failed,
-                        "step_results": report.step_results,
-                    }))
+                    // Real regression (or a stop-policy halt): envelope stays
+                    // success (transport ok), payload reports the failure
+                    // honestly. `passed` is false the moment anything failed
+                    // OR was skipped — a skipped step is not a pass.
+                    let mut v = base;
+                    v["passed"] = json!(false);
+                    ok(v)
                 }
             })
             .await

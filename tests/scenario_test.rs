@@ -404,3 +404,114 @@ async fn event_wait_step_replays_through_shared_primitive() {
         report.step_results[0].detail
     );
 }
+
+/// Audit finding 5, the fail-fast contract: under the default stop policy
+/// a failed step HALTS the replay — later steps are skipped (each marked
+/// `skipped_due_to_prior_failure`, counted separately), the report says
+/// `stopped_on_failure`, and skipped steps never count as failures. The
+/// core proof that the later input was NOT sent: the scenario types a
+/// second marker after a failing assert, and that marker must be absent
+/// from the screen.
+#[tokio::test]
+async fn stop_policy_halts_and_marks_skipped() {
+    let scenario = Scenario::new("fail-fast")
+        .act(serde_json::json!({"action": "type", "text": "first-ok"}))
+        // Fails: the text never appears.
+        .assert(serde_json::json!({"assertion": "text", "text": "never-appears-xyz"}))
+        // Would corrupt the app under continue semantics; must NOT run.
+        .act(serde_json::json!({"action": "type", "text": "second-marker-never-sent"}))
+        .assert(serde_json::json!({"assertion": "text", "text": "also-never-checked"}));
+
+    let pool = tui_lab::session::SessionPool::new();
+    let args: Vec<String> = vec![
+        "-c".into(),
+        "print('test'); import time; time.sleep(10)".into(),
+    ];
+    let id = pool
+        .start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .await
+        .expect("start");
+
+    let (report, screen_has_second) = pool
+        .with_session(Some(&id), move |sess| {
+            let rep = ScenarioRunner::run(&scenario, sess);
+            let screen = sess.observe(60).expect("post-screen");
+            let has_second = screen
+                .viewport_text
+                .iter()
+                .any(|r| r.contains("second-marker-never-sent"));
+            (rep, has_second)
+        })
+        .await
+        .expect("run job");
+
+    assert_eq!(report.steps_total, 4);
+    assert_eq!(
+        report.status,
+        tui_lab::scenario::runner::RunStatus::StoppedOnFailure
+    );
+    assert_eq!(report.steps_passed, 1, "{:?}", report.step_results);
+    assert_eq!(report.steps_failed, 1, "{:?}", report.step_results);
+    assert_eq!(report.steps_skipped, 2, "{:?}", report.step_results);
+    // Steps 2 and 3 are marked skipped with the reason naming the halt.
+    for skipped in &report.step_results[2..] {
+        assert!(
+            skipped.detail.contains("skipped_due_to_prior_failure"),
+            "{:?}",
+            skipped
+        );
+    }
+    assert!(
+        !report.step_results[2].passed && !report.step_results[3].passed,
+        "skipped steps are not passes"
+    );
+    // The input after the failure genuinely never landed.
+    assert!(
+        !screen_has_second,
+        "stop policy must not send input after the failed step"
+    );
+}
+
+/// Audit finding 5, the explicit census path: `on_failure=continue` runs
+/// every step regardless, the status stays `completed`, nothing is
+/// skipped — and the wire override wins over a scenario that recorded
+/// stop.
+#[tokio::test]
+async fn continue_policy_runs_every_step() {
+    let mut scenario = Scenario::new("census")
+        .assert(serde_json::json!({"assertion": "text", "text": "nope-1"}))
+        .assert(serde_json::json!({"assertion": "text", "text": "nope-2"}));
+    // Scenario records stop; the CALLER overrides with continue.
+    scenario.on_failure = tui_lab::scenario::model::FailurePolicy::Stop;
+
+    let pool = tui_lab::session::SessionPool::new();
+    let args: Vec<String> = vec![
+        "-c".into(),
+        "print('test'); import time; time.sleep(10)".into(),
+    ];
+    let id = pool
+        .start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .await
+        .expect("start");
+
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            ScenarioRunner::run_in_run_with_policy(
+                &scenario,
+                sess,
+                &[],
+                None,
+                Some(tui_lab::scenario::model::FailurePolicy::Continue),
+            )
+        })
+        .await
+        .expect("run job");
+
+    assert_eq!(
+        report.status,
+        tui_lab::scenario::runner::RunStatus::Completed
+    );
+    assert_eq!(report.steps_failed, 2, "{:?}", report.step_results);
+    assert_eq!(report.steps_skipped, 0, "{:?}", report.step_results);
+    assert_eq!(report.steps_passed, 0, "{:?}", report.step_results);
+}
