@@ -86,21 +86,32 @@ impl StateResidue {
     }
 }
 
+/// Timing for one transactional audit run (finding 20). Metrics are run
+/// metadata — they ride the report, never masquerade as a finding.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditMetrics {
+    pub profile: String,
+    pub driver_ms: u64,
+    pub verify_ms: u64,
+    pub total_ms: u64,
+}
+
 /// Run `driver` under an audit transaction: capture pre-state, run, verify.
 /// Returns the driver's findings plus at most one `AUDIT-RESIDUE` finding
 /// appended when restoration was incomplete. A failed pre-state capture
 /// surfaces as `Err` — the caller reports an engine error rather than
 /// running an audit it cannot verify.
 ///
-/// Item 49: the driver and verify phases are timed and the numbers ride on
-/// the last evidence ref (`metrics: {driver_ms, verify_ms, total_ms}`) so
-/// "the audit was slow" is distinguishable from "the app was slow to
-/// respond" without re-running anything.
+/// Item 49: the driver and verify phases are timed and the numbers ride the
+/// returned `AuditMetrics` (finding 20: a clean run returns ZERO findings —
+/// no synthetic AUDIT-METRICS row, no stamping onto the last finding's
+/// evidence; "the audit was slow" vs "the app was slow to respond" stays
+/// answerable from the report, without re-running anything).
 pub fn run_verified<F>(
     session: &mut Session,
     profile: &str,
     driver: F,
-) -> Result<Vec<Finding>, String>
+) -> Result<(Vec<Finding>, AuditMetrics), String>
 where
     F: FnOnce(&mut Session) -> Vec<Finding>,
 {
@@ -113,6 +124,12 @@ where
     let residue = verify(session, &pre);
     let verify_ms = verify_started.elapsed().as_millis() as u64;
     let total_ms = started.elapsed().as_millis() as u64;
+    let metrics = AuditMetrics {
+        profile: profile.to_string(),
+        driver_ms,
+        verify_ms,
+        total_ms,
+    };
 
     match residue {
         Some(residue) => {
@@ -148,45 +165,9 @@ where
             });
         }
     }
-    // Stamp the metrics onto the LAST finding's evidence (the residue
-    // finding when present, else the driver's final finding). Audits that
-    // produced nothing still report timing via a dedicated info finding so
-    // the numbers are never lost.
-    let metrics = json!({
-        "profile": profile,
-        "driver_ms": driver_ms,
-        "verify_ms": verify_ms,
-        "total_ms": total_ms,
-    });
-    if let Some(last) = findings.last_mut() {
-        if let Some(ev) = last.evidence.last_mut() {
-            if ev.detail.is_null() {
-                ev.detail = json!({});
-            }
-            ev.detail["audit_metrics"] = metrics;
-        }
-    } else {
-        findings.push(Finding {
-            id: "AUDIT-METRICS".into(),
-            rule_id: None,
-            severity: "info".into(),
-            category: "audit".into(),
-            summary: format!(
-                "audit '{}' found nothing in {}ms (driver {}ms, verify {}ms)",
-                profile, total_ms, driver_ms, verify_ms
-            ),
-            evidence: vec![EvidenceRef::point(
-                EvidenceKind::Other,
-                "audit_timing",
-                "clean run timing",
-            )
-            .with_detail(json!({ "audit_metrics": metrics }))],
-            confidence: 1.0,
-            reproduction: None,
-            source_refs: Vec::new(),
-        });
-    }
-    Ok(findings)
+    // Finding 20: timing is metadata, not a finding. A clean run returns
+    // an empty findings vec; the metrics ride the report beside it.
+    Ok((findings, metrics))
 }
 
 /// Compare the live session against the captured pre-state — through the
@@ -315,12 +296,14 @@ mod tests {
     #[test]
     fn clean_driver_emits_no_residue() {
         let mut s = start("print('tx-clean'); input()");
-        let findings = run_verified(&mut s, "noop", |_s| Vec::new()).expect("run");
+        let (findings, metrics) = run_verified(&mut s, "noop", |_s| Vec::new()).expect("run");
         assert!(
             !findings.iter().any(|f| f.id == "AUDIT-RESIDUE"),
             "no-op driver must leave no residue: {:?}",
             findings
         );
+        assert!(findings.is_empty(), "finding 20: clean run, zero findings");
+        assert_eq!(metrics.profile, "noop");
         s.stop().ok();
     }
 

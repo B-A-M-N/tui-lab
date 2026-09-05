@@ -533,6 +533,9 @@ pub struct ProfileReport {
     /// merge it into the run's persistent graph; static profiles leave it
     /// empty.
     pub focus_graph: crate::semantic::focus_graph::FocusGraph,
+    /// Per-driver timing from the transactional runs (finding 20). Empty for
+    /// static/gated profiles. Metrics are report metadata — never findings.
+    pub metrics: Vec<crate::audit::transaction::AuditMetrics>,
 }
 
 /// Run one audit profile against a session (re-review P0 fix 2). The engine
@@ -660,6 +663,7 @@ pub fn run_profile_checked(
                 mode: "partial",
                 findings,
                 focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+                metrics: Vec::new(),
             });
         }
         return Ok(ProfileReport {
@@ -692,6 +696,7 @@ pub fn run_profile_checked(
                 source_refs: Vec::new(),
             }],
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+            metrics: Vec::new(),
         });
     }
     run_profile_inner(session, profile, contract, policy)
@@ -749,6 +754,7 @@ fn run_profile_with_contract_impl(
             mode: "composite",
             findings: report.findings(),
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+            metrics: Vec::new(),
         });
     }
 
@@ -765,6 +771,7 @@ fn run_profile_with_contract_impl(
             mode: "static",
             findings: crate::audit::run(name, &screen, &sem).map_err(|e| e.to_string())?,
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
+            metrics: Vec::new(),
         });
     }
 
@@ -788,26 +795,38 @@ fn run_profile_with_contract_impl(
     // residue it leaves becomes an honest AUDIT-RESIDUE finding instead of
     // silent session mutation (the old Tab-walk-left-focus-dirty bug).
     use crate::audit::transaction::run_verified;
-    let tx = |s: &mut Session, f: &mut dyn FnMut(&mut Session) -> Vec<Finding>| -> Vec<Finding> {
-        run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
-            vec![Finding {
-                id: "AUDIT-TX-ERR".into(),
-                rule_id: None,
-                severity: "error".into(),
-                category: "audit".into(),
-                summary: format!("audit transaction failed: {}", e),
-                evidence: vec![EvidenceRef::point(
-                    EvidenceKind::Other,
-                    "audit_transaction",
-                    "pre-state capture or post-verify failed",
+    let mut metrics: Vec<crate::audit::transaction::AuditMetrics> = Vec::new();
+    let mut tx =
+        |s: &mut Session, f: &mut dyn FnMut(&mut Session) -> Vec<Finding>| -> Vec<Finding> {
+            let (fs, m) = run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
+                (
+                    vec![Finding {
+                        id: "AUDIT-TX-ERR".into(),
+                        rule_id: None,
+                        severity: "error".into(),
+                        category: "audit".into(),
+                        summary: format!("audit transaction failed: {}", e),
+                        evidence: vec![EvidenceRef::point(
+                            EvidenceKind::Other,
+                            "audit_transaction",
+                            "pre-state capture or post-verify failed",
+                        )
+                        .with_detail(json!({ "profile": profile.name(), "error": e }))],
+                        confidence: 1.0,
+                        reproduction: None,
+                        source_refs: Vec::new(),
+                    }],
+                    crate::audit::transaction::AuditMetrics {
+                        profile: profile.name().to_string(),
+                        driver_ms: 0,
+                        verify_ms: 0,
+                        total_ms: 0,
+                    },
                 )
-                .with_detail(json!({ "profile": profile.name(), "error": e }))],
-                confidence: 1.0,
-                reproduction: None,
-                source_refs: Vec::new(),
-            }]
-        })
-    };
+            });
+            metrics.push(m);
+            fs
+        };
 
     // Wave 4 item 35 + audit P0-11: restart-replay between
     // PotentiallyMutating drivers. Under DeepIsolation, before each
@@ -848,6 +867,7 @@ fn run_profile_with_contract_impl(
                     source_refs: Vec::new(),
                 }],
                 focus_graph: graph,
+                metrics: Vec::new(),
             });
         }
         orchestration_notes.push(Finding {
@@ -1032,6 +1052,7 @@ fn run_profile_with_contract_impl(
         mode,
         findings,
         focus_graph: graph,
+        metrics,
     })
 }
 
