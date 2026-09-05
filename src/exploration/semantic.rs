@@ -178,7 +178,14 @@ pub fn run_evidenced(
         };
 
         // Execute via the one canonical executor.
-        let tx = crate::execution::execute_act(session, &action, 80, 900, false)?;
+        let tx = crate::execution::execute_act_as(
+            session,
+            crate::execution::DriveOrigin::ExploreSemantic,
+            &action,
+            80,
+            900,
+            false,
+        )?;
         // Audit finding 23: the action's IDENTITY is the exact canonical
         // signature (`mouse:left:click@12,3`), not the generic kind name —
         // distinct keys/targets must not collapse in the graph, history,

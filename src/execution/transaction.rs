@@ -74,6 +74,11 @@ pub struct InteractionTransaction {
     /// wait), each with its capture-time metadata. `None` unless the caller
     /// armed a transition capture.
     pub transition_capture: Option<serde_json::Value>,
+    /// Which subsystem drove the input (audit finding 2): the typed
+    /// provenance recorded in the ledger row. `None` only for
+    /// transactions built before the field existed (tests constructing
+    /// literals).
+    pub origin: Option<super::record::DriveOrigin>,
 }
 
 /// The causal render record of ONE action (re-review item 19): "pressing

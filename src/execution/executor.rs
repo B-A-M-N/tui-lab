@@ -41,6 +41,31 @@ pub fn execute_act(
     )
 }
 
+/// [`execute_act`] with typed provenance (audit finding 2): the caller
+/// names the subsystem driving the input, and that origin rides the
+/// transaction into the run ledger. New code MUST use this (or the
+/// pipeline); the bare [`execute_act`] remains for the default `Act`
+/// origin.
+pub fn execute_act_as(
+    session: &mut Session,
+    origin: super::record::DriveOrigin,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+) -> Result<InteractionTransaction, anyhow::Error> {
+    execute_act_with_completion_and_origin(
+        session,
+        origin,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        InputVisibility::Normal,
+        CompletionPolicy::StableScreen,
+    )
+}
+
 /// [`execute_act`] with an explicit [`InputVisibility`] policy. Sensitive
 /// visibility routes the send through [`Session::send_unrecorded`] and marks
 /// the transaction so every downstream recorder redacts. The completion
@@ -82,8 +107,35 @@ pub fn execute_act_with_completion(
     visibility: InputVisibility,
     completion: CompletionPolicy,
 ) -> Result<InteractionTransaction, anyhow::Error> {
-    execute_act_with_guard(
+    execute_act_with_completion_and_origin(
         session,
+        super::record::DriveOrigin::Act,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        visibility,
+        completion,
+    )
+}
+
+/// Full-form executor with explicit origin (audit finding 2) and
+/// completion policy. Guard-less; see [`execute_act_with_guard`] for the
+/// guarded form.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_act_with_completion_and_origin(
+    session: &mut Session,
+    origin: super::record::DriveOrigin,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+    visibility: InputVisibility,
+    completion: CompletionPolicy,
+) -> Result<InteractionTransaction, anyhow::Error> {
+    execute_act_with_guard_and_origin(
+        session,
+        origin,
         action,
         quiet_ms,
         settle_budget_ms,
@@ -116,6 +168,32 @@ pub fn execute_act_with_guard(
     completion: CompletionPolicy,
     guard: Option<&MutationGuard>,
 ) -> Result<InteractionTransaction, anyhow::Error> {
+    execute_act_with_guard_and_origin(
+        session,
+        super::record::DriveOrigin::Act,
+        action,
+        quiet_ms,
+        settle_budget_ms,
+        no_wait,
+        visibility,
+        completion,
+        guard,
+    )
+}
+
+/// [`execute_act_with_guard`] with typed provenance (audit finding 2).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_act_with_guard_and_origin(
+    session: &mut Session,
+    origin: super::record::DriveOrigin,
+    action: &CanonicalAction,
+    quiet_ms: u64,
+    settle_budget_ms: u64,
+    no_wait: bool,
+    visibility: InputVisibility,
+    completion: CompletionPolicy,
+    guard: Option<&MutationGuard>,
+) -> Result<InteractionTransaction, anyhow::Error> {
     // Guard validation happens FIRST — before the baseline capture, before
     // anything else touches the session — so the checked state is the state
     // the action lands in.
@@ -129,6 +207,7 @@ pub fn execute_act_with_guard(
     }
     execute_act_inner(
         session,
+        origin,
         action,
         quiet_ms,
         settle_budget_ms,
@@ -143,6 +222,7 @@ pub fn execute_act_with_guard(
 #[allow(clippy::too_many_arguments)]
 fn execute_act_inner(
     session: &mut Session,
+    origin: super::record::DriveOrigin,
     action: &CanonicalAction,
     quiet_ms: u64,
     settle_budget_ms: u64,
@@ -439,6 +519,7 @@ fn execute_act_inner(
         settle_ms,
         render,
         transition_capture: transition_frames_evidence,
+        origin: Some(origin),
     })
 }
 

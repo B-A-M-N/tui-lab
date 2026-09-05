@@ -146,6 +146,12 @@ pub struct TransactionRecord {
     /// live transaction (bounded there); the ledger carries the citation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render: Option<RenderSummary>,
+    /// Which subsystem drove the input (audit finding 2): typed
+    /// provenance from the transaction (`act`, `scenario`, `explore`,
+    /// `audit`, ...). `None` for pre-existing ledgers (serde default) and
+    /// non-interaction entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// Ledger-sized summary of a [`crate::execution::RenderTransaction`].
@@ -215,6 +221,7 @@ impl TransactionRecord {
                 full_repaint_ratio: r.full_repaint_ratio,
                 dirty_cells: r.dirty_cells,
             }),
+            origin: tx.origin.map(|o| o.as_str().to_string()),
         }
     }
 }
@@ -782,6 +789,63 @@ mod tests {
         assert_eq!(lines.len(), 2, "one NDJSON record per line: {body}");
         let first: TransactionRecord = serde_json::from_str(lines[0]).expect("parse");
         assert_eq!(first.action, "key");
+    }
+
+    /// Audit finding 2: the ledger row carries typed driving provenance —
+    /// the origin the executor was given (`act` by default, or the
+    /// caller's subsystem), and non-interaction entries carry none.
+    #[test]
+    fn ledger_rows_carry_driving_origin() {
+        let mut run = RunContext::ephemeral();
+        let dir = tempfile::tempdir().expect("tmp");
+        let screen = crate::screen::ScreenState::new(20, 5);
+        let mut tx = crate::execution::InteractionTransaction {
+            action: crate::execution::ActionEnvelope::new(
+                crate::execution::CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('q')),
+                },
+                crate::execution::InputVisibility::Normal,
+            ),
+            anchor: crate::execution::ObservationAnchor::default(),
+            before_frame: crate::backend::CanonicalFrame::new(screen.clone(), 1, 1),
+            after_frame: crate::backend::CanonicalFrame::new(screen, 1, 2),
+            settle: crate::execution::SettleStatus::Met,
+            transition: crate::screen::diff::diff(
+                &crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(20, 5), 1, 1)
+                    .state,
+                &crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(20, 5), 1, 2)
+                    .state,
+            ),
+            capture: None,
+            focus_before: None,
+            focus_after: None,
+            elapsed_ms: 1,
+            send_ms: 0,
+            settle_ms: 1,
+            render: None,
+            transition_capture: None,
+            origin: Some(crate::execution::DriveOrigin::Audit),
+        };
+        tx.before_frame.state.structure_hash = "b".into();
+        tx.after_frame.state.structure_hash = "a".into();
+        let _ = run.record_interaction("origin-sess", &tx);
+        let _ = run.record_event("origin-sess", "wait");
+        let ledger = run.transactions();
+        assert_eq!(ledger[0].origin.as_deref(), Some("audit"));
+        assert_eq!(ledger[1].origin, None, "non-interaction entries carry none");
+        // Round-trip: the slug survives persistence.
+        let line = serde_json::to_string(&ledger[0]).expect("ser");
+        let back: TransactionRecord = serde_json::from_str(&line).expect("de");
+        assert_eq!(back.origin.as_deref(), Some("audit"));
+        // And a pre-origin ledger row (serde default) still loads.
+        let mut legacy_json = serde_json::to_value(&ledger[0]).expect("val");
+        if let Some(obj) = legacy_json.as_object_mut() {
+            obj.remove("origin");
+        }
+        let legacy_row: TransactionRecord =
+            serde_json::from_value(legacy_json).expect("pre-origin rows deserialize");
+        assert_eq!(legacy_row.origin, None);
+        let _ = dir;
     }
 
     /// Audit P1-48: the ledger's memory window honors its declared bound —
@@ -1610,6 +1674,7 @@ mod tests {
             settle_ms: 0,
             render: None,
             transition_capture: None,
+            origin: None,
         };
         assert!(run.record_interaction("s", &tx).is_err());
         assert!(run.record_event("s", "wait").is_err());

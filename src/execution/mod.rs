@@ -21,10 +21,12 @@ mod transaction;
 mod wait;
 
 pub use executor::{
-    execute_act, execute_act_with_completion, execute_act_with_guard, execute_act_with_visibility,
+    execute_act, execute_act_as, execute_act_with_completion,
+    execute_act_with_completion_and_origin, execute_act_with_guard,
+    execute_act_with_guard_and_origin, execute_act_with_visibility,
 };
 pub use record::{
-    CanonicalAction, InputVisibility, ObservationAnchor, PersistedAction, SettleStatus,
+    CanonicalAction, DriveOrigin, InputVisibility, ObservationAnchor, PersistedAction, SettleStatus,
 };
 pub use transaction::{ActionEnvelope, InteractionTransaction, RenderOp, RenderTransaction};
 pub use wait::{execute_assert, execute_wait, execute_wait_event, WaitEventOutcome};

@@ -6,7 +6,7 @@
 //! behind. `super::mod` re-exports every `pub` entry point.
 
 use crate::backend::WaitCond;
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::{execute_act_as, CanonicalAction};
 use crate::semantic;
 use crate::session::state::Session;
 use serde_json::json;
@@ -172,8 +172,9 @@ pub fn mouse_audit(session: &mut Session, max_clicks: u32) -> Vec<Finding> {
         if session.observe(30).is_err() {
             break;
         }
-        let tx = match execute_act(
+        let tx = match execute_act_as(
             session,
+            crate::execution::DriveOrigin::Audit,
             &CanonicalAction::MouseClick {
                 button: MouseButton::Left,
                 x: cx,

@@ -6,7 +6,7 @@
 //! behind. `super::mod` re-exports every `pub` entry point.
 
 use crate::backend::{KeyCode, KeyEvent};
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::{execute_act_as, CanonicalAction};
 use crate::semantic;
 use crate::session::state::Session;
 use serde_json::json;
@@ -113,8 +113,9 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     if !disabled.is_empty() {
         let mut focused_disabled: Vec<String> = Vec::new();
         for _ in 0..max_tabs.min(10) {
-            let tx = match execute_act(
+            let tx = match execute_act_as(
                 session,
+                crate::execution::DriveOrigin::Audit,
                 &CanonicalAction::Key {
                     key: KeyEvent::new(KeyCode::Tab),
                 },
@@ -243,7 +244,14 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
         } else {
             KeyEvent::new(code)
         };
-        match execute_act(session, &CanonicalAction::Key { key }, 40, 300, false) {
+        match execute_act_as(
+            session,
+            crate::execution::DriveOrigin::Audit,
+            &CanonicalAction::Key { key },
+            40,
+            300,
+            false,
+        ) {
             Ok(_) => sent += 1,
             Err(_) => break,
         }

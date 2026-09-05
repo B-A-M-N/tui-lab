@@ -6,7 +6,7 @@
 //! behind. `super::mod` re-exports every `pub` entry point.
 
 use crate::backend::{KeyCode, KeyEvent};
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::{execute_act_as, CanonicalAction};
 use crate::session::state::Session;
 use serde_json::json;
 
@@ -60,8 +60,9 @@ pub fn keyboard_audit(
 
         // Tab via the canonical executor — same baseline-before-send and
         // anchored settle ordering as MCP `tui_act` (re-review P0).
-        let tx = match execute_act(
+        let tx = match execute_act_as(
             session,
+            crate::execution::DriveOrigin::Audit,
             &CanonicalAction::Key {
                 key: KeyEvent::new(KeyCode::Tab),
             },
@@ -194,8 +195,9 @@ pub fn keyboard_audit(
     // can name what a forward edge lacked.
     let mut reverse_ok = true;
     for _ in 0..successful_tabs.min(max_tabs) {
-        let r = execute_act(
+        let r = execute_act_as(
             session,
+            crate::execution::DriveOrigin::Audit,
             &CanonicalAction::Key {
                 key: KeyEvent::with_modifiers(KeyCode::Tab, crate::backend::KeyModifiers::SHIFT),
             },
@@ -342,8 +344,9 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
     if let Some(ref ctrl) = sem.focus.control {
         // Verify Tab changes focus (canonical executor; re-review P0).
         let focus_before = ctrl.clone();
-        let tx = match execute_act(
+        let tx = match execute_act_as(
             session,
+            crate::execution::DriveOrigin::Audit,
             &CanonicalAction::Key {
                 key: KeyEvent::new(KeyCode::Tab),
             },

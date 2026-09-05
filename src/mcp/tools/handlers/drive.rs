@@ -50,6 +50,8 @@ pub(crate) struct DriveSpec<'a> {
     /// `None` = do not touch scenario recordings (e.g. internal plan
     /// steps that are not themselves caller actions).
     pub scenario: Option<ScenarioCapture>,
+    /// Finding 2: typed provenance for the ledger row.
+    pub origin: crate::execution::DriveOrigin,
 }
 
 /// The evidence one driven act produced.
@@ -91,6 +93,7 @@ pub(crate) fn drive(
         completion: spec.completion,
         guard: spec.guard,
         scenario: spec.scenario,
+        origin: spec.origin,
     };
     crate::execution::drive_pipeline(sess, run, core)
         .map(|o| DriveOutcome {
