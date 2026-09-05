@@ -1,84 +1,94 @@
 //! Re-review Wave 3: mutation guards, canonical probe stimuli, capture
 //! strategies, and material-change detection.
 
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
-fn python_session(mgr: &mut SessionManager, code: &str) -> String {
+async fn python_session(pool: &SessionPool, code: &str) -> String {
     let args: Vec<String> = vec!["-c".to_string(), code.to_string()];
-    mgr.start("python3", &args, None, &[], 80, 24, "auto", "local")
+    pool.start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .await
         .expect("start python session")
 }
 
 // ── P0.9: mutation guards ────────────────────────────────────────────────
 
-#[test]
-fn guard_refuses_act_on_structure_drift() {
+#[tokio::test]
+async fn guard_refuses_act_on_structure_drift() {
     // Guard captured against a structure hash that cannot match: the
     // executor must refuse the input before it lands.
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let id = python_session(
-        &mut mgr,
+        &pool,
         "import sys; print('GUARD-READY', flush=True); \
          data = sys.stdin.read(1); \
          print('RECEIVED', repr(data), flush=True)",
-    );
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(300).expect("baseline");
-
-    let guard = tui_lab::execution::MutationGuard {
-        generation: None,
-        structure_hash: Some("not-the-live-hash".to_string()),
-        focus_control_id: None,
-    };
-    let err = tui_lab::execution::execute_act_with_guard(
-        sess,
-        &tui_lab::execution::CanonicalAction::Type { text: "X\n".into() },
-        100,
-        800,
-        false,
-        tui_lab::execution::InputVisibility::Normal,
-        tui_lab::capture::CompletionPolicy::StableScreen,
-        Some(&guard),
     )
-    .expect_err("guard must refuse");
-    let msg = err.to_string();
-    assert!(msg.contains("stale_state"), "structured refusal: {msg}");
-    assert!(
-        msg.contains("not-the-live-hash"),
-        "the refusal names expected vs actual: {msg}"
-    );
+    .await;
+    pool.with_session(Some(&id), move |sess| {
+        sess.observe(300).expect("baseline");
 
-    // Nothing was sent — the child never got input.
-    let screen = sess.observe(100).unwrap();
-    let echoed: String = screen.viewport_text.join("\n");
-    assert!(
-        !echoed.contains("RECEIVED"),
-        "a refused action must not reach the app: {echoed}"
-    );
+        let guard = tui_lab::execution::MutationGuard {
+            generation: None,
+            structure_hash: Some("not-the-live-hash".to_string()),
+            focus_control_id: None,
+        };
+        let err = tui_lab::execution::execute_act_with_guard(
+            sess,
+            &tui_lab::execution::CanonicalAction::Type { text: "X\n".into() },
+            100,
+            800,
+            false,
+            tui_lab::execution::InputVisibility::Normal,
+            tui_lab::capture::CompletionPolicy::StableScreen,
+            Some(&guard),
+        )
+        .expect_err("guard must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("stale_state"), "structured refusal: {msg}");
+        assert!(
+            msg.contains("not-the-live-hash"),
+            "the refusal names expected vs actual: {msg}"
+        );
+
+        // Nothing was sent — the child never got input.
+        let screen = sess.observe(100).unwrap();
+        let echoed: String = screen.viewport_text.join("\n");
+        assert!(
+            !echoed.contains("RECEIVED"),
+            "a refused action must not reach the app: {echoed}"
+        );
+    })
+    .await
+    .expect("guard job");
 }
 
-#[test]
-fn guard_allows_act_when_state_matches() {
-    let mut mgr = SessionManager::new();
-    let id = python_session(&mut mgr, "import time; time.sleep(10)");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(200).expect("baseline");
+#[tokio::test]
+async fn guard_allows_act_when_state_matches() {
+    let pool = SessionPool::new();
+    let id = python_session(&pool, "import time; time.sleep(10)").await;
+    let name = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(200).expect("baseline");
 
-    let guard = tui_lab::execution::MutationGuard::capture(sess);
-    let tx = tui_lab::execution::execute_act_with_guard(
-        sess,
-        &tui_lab::execution::CanonicalAction::Key {
-            key: tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Char('z')),
-        },
-        80,
-        600,
-        false,
-        tui_lab::execution::InputVisibility::Normal,
-        tui_lab::capture::CompletionPolicy::MayBeSilent,
-        Some(&guard),
-    )
-    .expect("matching guard lets the action through");
-    assert_eq!(tx.name(), "key");
+            let guard = tui_lab::execution::MutationGuard::capture(sess);
+            let tx = tui_lab::execution::execute_act_with_guard(
+                sess,
+                &tui_lab::execution::CanonicalAction::Key {
+                    key: tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Char('z')),
+                },
+                80,
+                600,
+                false,
+                tui_lab::execution::InputVisibility::Normal,
+                tui_lab::capture::CompletionPolicy::MayBeSilent,
+                Some(&guard),
+            )
+            .expect("matching guard lets the action through");
+            tx.name().to_string()
+        })
+        .await
+        .expect("guarded act job");
+    assert_eq!(name, "key");
 }
 
 #[test]
@@ -147,29 +157,34 @@ fn probe_capture_specs_deserialize() {
     }
 }
 
-#[test]
-fn frames_capture_records_distinct_post_stimulus_frames() {
+#[tokio::test]
+async fn frames_capture_records_distinct_post_stimulus_frames() {
     // A child that redraws continuously: a frames:3 capture must collect
     // distinct post-baseline frames through the microscope path.
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let id = python_session(
-        &mut mgr,
+        &pool,
         "import time,sys
 print('TICK-START', flush=True)
 for i in range(200):
     sys.stdout.write(f'TICK-{i}\\r'); sys.stdout.flush()
     time.sleep(0.02)",
-    );
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(300).expect("baseline");
+    )
+    .await;
+    let outcome = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(300).expect("baseline");
 
-    let anchor = sess.event_state().screen_seq;
-    let outcome = tui_lab::capture::capture_frame_sequence(
-        sess.backend_mut(),
-        3,
-        anchor,
-        std::time::Duration::from_millis(4000),
-    );
+            let anchor = sess.event_state().screen_seq;
+            tui_lab::capture::capture_frame_sequence(
+                sess.backend_mut(),
+                3,
+                anchor,
+                std::time::Duration::from_millis(4000),
+            )
+        })
+        .await
+        .expect("frames capture job");
     assert!(
         outcome.captured >= 2,
         "ticking child yields distinct frames: captured={} reason={}",
@@ -187,37 +202,43 @@ for i in range(200):
 
 // ── Item 14: material change detection ───────────────────────────────────
 
-#[test]
-fn style_only_change_counts_as_material() {
+#[tokio::test]
+async fn style_only_change_counts_as_material() {
     use tui_lab::diagnostic::ProbeResult;
     use tui_lab::execution::SettleStatus;
 
     // Reverse-video the same text: cells keep their characters, styles flip.
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let id = python_session(
-        &mut mgr,
+        &pool,
         "import sys, time
 print('STYLE-BASE', flush=True)
 time.sleep(0.2)
 sys.stdout.write('\\x1b[7mSTYLE-BASE\\x1b[0m'); sys.stdout.flush()",
-    );
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    let before = sess.observe(300).unwrap();
-    let after = sess.observe(400).unwrap();
-    let transition = tui_lab::screen::diff::diff(&before, &after);
+    )
+    .await;
+    let result = pool
+        .with_session(Some(&id), move |sess| {
+            let before = sess.observe(300).unwrap();
+            let after = sess.observe(400).unwrap();
+            let transition = tui_lab::screen::diff::diff(&before, &after);
 
-    let result = ProbeResult {
-        before: before.clone(),
-        after: after.clone(),
-        action: "test".into(),
-        settle: SettleStatus::Skipped,
-        terminal_events: vec![],
-        frames: vec![],
-        transition,
-        after_focus: None,
-        timing_ms: 0,
-        material_changes: vec![],
-    };
+            ProbeResult {
+                before,
+                after,
+                action: "test".into(),
+                settle: SettleStatus::Skipped,
+                terminal_events: vec![],
+                frames: vec![],
+                transition,
+                after_focus: None,
+                timing_ms: 0,
+                material_changes: vec![],
+                transition_capture: None,
+            }
+        })
+        .await
+        .expect("observe job");
     if result.transition.screen_diff.style_changes > 0
         && result.transition.screen_diff.changed_cells == 0
     {
@@ -261,6 +282,7 @@ fn bell_only_change_counts_as_material() {
         after_focus: None,
         timing_ms: 5,
         material_changes: vec![],
+        transition_capture: None,
     };
     assert!(
         result.has_changes(),
@@ -298,6 +320,7 @@ fn native_only_change_counts_as_material() {
         after_focus: None,
         timing_ms: 5,
         material_changes: vec![],
+        transition_capture: None,
     };
     assert!(
         result.has_changes(),

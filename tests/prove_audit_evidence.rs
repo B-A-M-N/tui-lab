@@ -9,7 +9,7 @@
 //! summaries, empty or invented evidence) fails here.
 
 use tui_lab::audit::{EvidenceKind, Finding};
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
 /// The fixture: real dialog TUI (buttons, regions, focus) so every profile
 /// has something true to find.
@@ -74,17 +74,20 @@ struct LiveTargets {
     region_ids: std::collections::HashSet<String>,
 }
 
-fn live_targets(mgr: &mut SessionManager, sid: &str) -> LiveTargets {
-    let sess = mgr.resolve_mut(Some(sid)).unwrap();
-    let (screen, sem, _, _) = sess.observe_fused(60).expect("observe for live targets");
-    LiveTargets {
-        structure_hashes: [screen.structure_hash.clone(), screen.visual_hash.clone()]
-            .into_iter()
-            .collect(),
-        control_ids: sem.controls.iter().map(|c| c.id.clone()).collect(),
-        control_labels: sem.controls.iter().map(|c| c.label.clone()).collect(),
-        region_ids: sem.regions.iter().map(|r| r.id.clone()).collect(),
-    }
+async fn live_targets(pool: &SessionPool, sid: &str) -> LiveTargets {
+    pool.with_session(Some(sid), |sess| {
+        let (screen, sem, _, _) = sess.observe_fused(60).expect("observe for live targets");
+        LiveTargets {
+            structure_hashes: [screen.structure_hash.clone(), screen.visual_hash.clone()]
+                .into_iter()
+                .collect(),
+            control_ids: sem.controls.iter().map(|c| c.id.clone()).collect(),
+            control_labels: sem.controls.iter().map(|c| c.label.clone()).collect(),
+            region_ids: sem.regions.iter().map(|r| r.id.clone()).collect(),
+        }
+    })
+    .await
+    .expect("live targets job")
 }
 
 /// The evidence contract itself: every finding of every profile carries
@@ -120,10 +123,10 @@ fn assert_findings_carry_real_evidence(findings: &[Finding], live: &LiveTargets,
 }
 
 /// Static profiles against one fixture frame.
-#[test]
-fn static_profiles_evidence_resolves() {
-    let mut mgr = SessionManager::new();
-    let sid = mgr
+#[tokio::test]
+async fn static_profiles_evidence_resolves() {
+    let pool = SessionPool::new();
+    let sid = pool
         .start(
             "python3",
             &[FIXTURE.to_string()],
@@ -134,12 +137,14 @@ fn static_profiles_evidence_resolves() {
             "auto",
             "local",
         )
+        .await
         .expect("start fixture");
-    {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    pool.with_session(Some(&sid), |sess| {
         sess.observe(300).expect("first frame");
-    }
-    let live = live_targets(&mut mgr, &sid);
+    })
+    .await
+    .expect("first frame job");
+    let live = live_targets(&pool, &sid).await;
     // Profiles whose clean-screen result is legitimately empty on this
     // well-formed fixture: unicode (no overlap/leak), layout/clipping (no
     // out-of-bounds region), controls (no orphans — the dialog's button
@@ -154,14 +159,18 @@ fn static_profiles_evidence_resolves() {
         "unicode",
         "controls",
     ] {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-        let report = tui_lab::audit::orchestrator::run_profile_checked(
-            sess,
-            profile,
-            None,
-            tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
-        )
-        .unwrap_or_else(|e| panic!("{profile} must run: {e}"));
+        let report = pool
+            .with_session(Some(&sid), move |sess| {
+                tui_lab::audit::orchestrator::run_profile_checked(
+                    sess,
+                    profile,
+                    None,
+                    tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+                )
+                .unwrap_or_else(|e| panic!("{profile} must run: {e}"))
+            })
+            .await
+            .expect("profile job");
         if !may_be_empty.contains(&profile) {
             assert!(
                 !report.findings.is_empty(),
@@ -170,15 +179,15 @@ fn static_profiles_evidence_resolves() {
         }
         assert_findings_carry_real_evidence(&report.findings, &live, profile);
     }
-    mgr.stop(&sid).ok();
+    pool.stop(&sid).await.ok();
 }
 
 /// Active (driving) profiles against the fixture — each may mutate, so
 /// AllowMutation, and each gets fresh live targets taken AFTER the run
 /// (drivers may legitimately cite the post-drive frame).
-#[test]
-fn active_profiles_evidence_resolves() {
-    let mut mgr = SessionManager::new();
+#[tokio::test]
+async fn active_profiles_evidence_resolves() {
+    let pool = SessionPool::new();
     for profile in [
         "keyboard",
         "focus",
@@ -196,7 +205,7 @@ fn active_profiles_evidence_resolves() {
         "lifecycle",
         "query_response",
     ] {
-        let sid = mgr
+        let sid = pool
             .start(
                 "python3",
                 &[FIXTURE.to_string()],
@@ -207,37 +216,41 @@ fn active_profiles_evidence_resolves() {
                 "auto",
                 "local",
             )
+            .await
             .unwrap_or_else(|e| panic!("{profile}: start fixture failed: {e}"));
-        {
-            let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+        pool.with_session(Some(&sid), |sess| {
             sess.observe(300).expect("first frame");
-        }
-        let report = {
-            let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-            tui_lab::audit::orchestrator::run_profile_checked(
-                sess,
-                profile,
-                None,
-                tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
-            )
-            .unwrap_or_else(|e| panic!("{profile} must run: {e}"))
-        };
-        let live = live_targets(&mut mgr, &sid);
+        })
+        .await
+        .expect("first frame job");
+        let report = pool
+            .with_session(Some(&sid), move |sess| {
+                tui_lab::audit::orchestrator::run_profile_checked(
+                    sess,
+                    profile,
+                    None,
+                    tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+                )
+                .unwrap_or_else(|e| panic!("{profile} must run: {e}"))
+            })
+            .await
+            .expect("profile job");
+        let live = live_targets(&pool, &sid).await;
         assert!(
             !report.findings.is_empty(),
             "{profile}: the fixture must yield at least one finding (an honest
              'nothing found' is an info finding, not an empty list)"
         );
         assert_findings_carry_real_evidence(&report.findings, &live, profile);
-        mgr.stop(&sid).ok();
+        pool.stop(&sid).await.ok();
     }
 }
 
 /// The `full` composite: every driver's findings at once, evidence-checked.
-#[test]
-fn full_composite_evidence_resolves() {
-    let mut mgr = SessionManager::new();
-    let sid = mgr
+#[tokio::test]
+async fn full_composite_evidence_resolves() {
+    let pool = SessionPool::new();
+    let sid = pool
         .start(
             "python3",
             &[FIXTURE.to_string()],
@@ -248,23 +261,27 @@ fn full_composite_evidence_resolves() {
             "auto",
             "local",
         )
+        .await
         .expect("start fixture");
-    {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    pool.with_session(Some(&sid), |sess| {
         sess.observe(300).expect("first frame");
-    }
-    let live_before = live_targets(&mut mgr, &sid);
-    let report = {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-        tui_lab::audit::orchestrator::run_profile_checked(
-            sess,
-            "full",
-            None,
-            tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
-        )
-        .expect("full runs")
-    };
-    let live_after = live_targets(&mut mgr, &sid);
+    })
+    .await
+    .expect("first frame job");
+    let live_before = live_targets(&pool, &sid).await;
+    let report = pool
+        .with_session(Some(&sid), |sess| {
+            tui_lab::audit::orchestrator::run_profile_checked(
+                sess,
+                "full",
+                None,
+                tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+            )
+            .expect("full runs")
+        })
+        .await
+        .expect("full job");
+    let live_after = live_targets(&pool, &sid).await;
     assert!(
         report.findings.len() >= 10,
         "the composite must exercise many drivers: {} findings",
@@ -306,7 +323,7 @@ fn full_composite_evidence_resolves() {
             );
         }
     }
-    mgr.stop(&sid).ok();
+    pool.stop(&sid).await.ok();
 }
 
 struct MergedTargets<'a> {

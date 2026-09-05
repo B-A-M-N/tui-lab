@@ -70,3 +70,9 @@ impl Session {
         self.events.last_seq()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // The tests live on the emission path: `emit_frame_events` is private
+    // to `state.rs`, so they run there.
+}

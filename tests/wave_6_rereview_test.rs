@@ -16,11 +16,12 @@
 use std::collections::HashMap;
 use std::fs;
 use tempfile::TempDir;
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
-fn python_session(mgr: &mut SessionManager, code: &str) -> String {
+async fn python_session(pool: &SessionPool, code: &str) -> String {
     let args: Vec<String> = vec!["-c".to_string(), code.to_string()];
-    mgr.start("python3", &args, None, &[], 80, 24, "auto", "local")
+    pool.start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .await
         .expect("start python session")
 }
 
@@ -38,14 +39,17 @@ fn write_project(dir: &TempDir, files: &HashMap<&str, &str>) {
 /// (zero frames) — and the serialized status carries both facts plus the
 /// healthy=false verdict, so an agent can tell "harness gap" from "app
 /// doesn't cooperate".
-#[test]
-fn adapter_status_reported_available_not_active() {
-    let mut mgr = SessionManager::new();
-    let sid = python_session(&mut mgr, "import time\ntime.sleep(30)");
-    let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-    sess.observe(200).expect("baseline");
-
-    let st = sess.adapter_status();
+#[tokio::test]
+async fn adapter_status_reported_available_not_active() {
+    let pool = SessionPool::new();
+    let sid = python_session(&pool, "import time\ntime.sleep(30)").await;
+    let st = pool
+        .with_session(Some(&sid), move |sess| {
+            sess.observe(200).expect("baseline");
+            sess.adapter_status()
+        })
+        .await
+        .expect("adapter status job");
     assert!(
         st.adapter_available,
         "the harness injected TUI_LAB_SEMANTIC: available"

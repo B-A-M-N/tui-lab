@@ -2,11 +2,12 @@
 //! sensitive scenario parameters, and honest native-role mapping.
 
 use tui_lab::scenario::{Scenario, ScenarioRunner};
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
-fn python_session(mgr: &mut SessionManager, code: &str) -> String {
+async fn python_session(pool: &SessionPool, code: &str) -> String {
     let args: Vec<String> = vec!["-c".to_string(), code.to_string()];
-    mgr.start("python3", &args, None, &[], 80, 24, "auto", "local")
+    pool.start("python3", &args, None, &[], 80, 24, "auto", "local")
+        .await
         .expect("start python session")
 }
 
@@ -53,8 +54,8 @@ fn completion_name_stays_backward_compatible() {
 
 // ── P0.2: scenario replay preserves completion semantics ─────────────────
 
-#[test]
-fn scenario_replay_preserves_process_exit_completion() {
+#[tokio::test]
+async fn scenario_replay_preserves_process_exit_completion() {
     // The recorded action: type "q\n" with completion=process_exit (the
     // child reads a line, echoes it, exits). Replay must wait for the child
     // to EXIT, not for a screen settle that never comes.
@@ -64,17 +65,21 @@ fn scenario_replay_preserves_process_exit_completion() {
         "completion": "process_exit"
     }));
 
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let id = python_session(
-        &mut mgr,
+        &pool,
         "import sys; print('READY', flush=True); \
          data = sys.stdin.read(1); \
          print('GOT', repr(data), flush=True)",
-    );
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(300).expect("baseline");
-
-    let report = ScenarioRunner::run(&scenario, sess);
+    )
+    .await;
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(300).expect("baseline");
+            ScenarioRunner::run(&scenario, sess)
+        })
+        .await
+        .expect("run job");
     assert_eq!(
         report.steps_failed, 0,
         "replay must honor the recorded completion: {:?}",
@@ -87,8 +92,8 @@ fn scenario_replay_preserves_process_exit_completion() {
     );
 }
 
-#[test]
-fn scenario_replay_preserves_recorded_quiet_window() {
+#[tokio::test]
+async fn scenario_replay_preserves_recorded_quiet_window() {
     // A recorded wait_ms travels with the step; replay uses the recorded
     // value, not the old hardcoded 150/1150.
     let scenario = Scenario::new("quiet-replay").act(serde_json::json!({
@@ -97,12 +102,15 @@ fn scenario_replay_preserves_recorded_quiet_window() {
         "wait_ms": 400
     }));
 
-    let mut mgr = SessionManager::new();
-    let id = python_session(&mut mgr, "import time; time.sleep(10)");
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(200).expect("baseline");
-
-    let report = ScenarioRunner::run(&scenario, sess);
+    let pool = SessionPool::new();
+    let id = python_session(&pool, "import time; time.sleep(10)").await;
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(200).expect("baseline");
+            ScenarioRunner::run(&scenario, sess)
+        })
+        .await
+        .expect("run job");
     let detail = &report.step_results[0].detail;
     // With a 400ms quiet window and a silent child, the settle SUCCEEDS
     // (400ms quiet < budget) — the old 150ms would too, so assert instead
@@ -149,8 +157,8 @@ fn sensitive_recording_declares_parameter_not_payload() {
     assert_eq!(back.parameter_names(), vec!["TEXT_1"]);
 }
 
-#[test]
-fn unresolved_parameter_fails_structured_not_parse_error() {
+#[tokio::test]
+async fn unresolved_parameter_fails_structured_not_parse_error() {
     let scenario = Scenario::new("param-check")
         .act(serde_json::json!({"action": "type", "text": "${PASSWORD}", "sensitive": true}));
     // Declare the parameter the way the recorder would.
@@ -163,17 +171,28 @@ fn unresolved_parameter_fails_structured_not_parse_error() {
             description: None,
         });
 
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let id = python_session(
-        &mut mgr,
+        &pool,
         "import sys; import time; sys.stdin.read(1); time.sleep(5)",
-    );
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(200).expect("baseline");
+    )
+    .await;
 
-    // No value supplied: the step fails as unresolved_parameter — and the
-    // literal ${PASSWORD} is never typed into the app.
-    let report = ScenarioRunner::run(&scenario, sess);
+    let (report, echoed) = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(200).expect("baseline");
+
+            // No value supplied: the step fails as unresolved_parameter — and the
+            // literal ${PASSWORD} is never typed into the app.
+            let report = ScenarioRunner::run(&scenario, sess);
+
+            // The screen must NOT have received the raw reference.
+            let screen = sess.observe(60).unwrap();
+            let echoed: String = screen.viewport_text.join("\n");
+            (report, echoed)
+        })
+        .await
+        .expect("run job");
     assert_eq!(report.steps_failed, 1);
     assert!(
         report.step_results[0]
@@ -183,17 +202,14 @@ fn unresolved_parameter_fails_structured_not_parse_error() {
         report.step_results[0].detail
     );
 
-    // The screen must NOT have received the raw reference.
-    let screen = sess.observe(60).unwrap();
-    let echoed: String = screen.viewport_text.join("\n");
     assert!(
         !echoed.contains("${PASSWORD}"),
         "an unresolved reference must never be sent as literal keystrokes: {echoed}"
     );
 }
 
-#[test]
-fn supplied_parameter_resolves_and_executes() {
+#[tokio::test]
+async fn supplied_parameter_resolves_and_executes() {
     use tui_lab::scenario::model::ParameterValue;
 
     let scenario = Scenario::new("param-ok")
@@ -208,29 +224,37 @@ fn supplied_parameter_resolves_and_executes() {
             description: None,
         });
 
-    let mut mgr = SessionManager::new();
+    let pool = SessionPool::new();
     let id = python_session(
-        &mut mgr,
+        &pool,
         "import sys; print('READY', flush=True); \
          line = sys.stdin.readline(); \
          print('GOT', line.strip(), flush=True)",
-    );
-    let sess = mgr.resolve_mut(Some(&id)).unwrap();
-    sess.observe(300).expect("baseline");
+    )
+    .await;
 
-    let values = vec![ParameterValue {
-        name: "PASSWORD".into(),
-        value: "hunter2".into(),
-    }];
-    let report = ScenarioRunner::run_with_parameters(&scenario, sess, &values);
+    let (report, echoed) = pool
+        .with_session(Some(&id), move |sess| {
+            sess.observe(300).expect("baseline");
+
+            let values = vec![ParameterValue {
+                name: "PASSWORD".into(),
+                value: "hunter2".into(),
+            }];
+            let report = ScenarioRunner::run_with_parameters(&scenario, sess, &values);
+
+            let screen = sess.observe(60).unwrap();
+            let echoed: String = screen.viewport_text.join("\n");
+            (report, echoed)
+        })
+        .await
+        .expect("run job");
     assert_eq!(
         report.steps_failed, 0,
         "supplied parameter resolves: {:?}",
         report.step_results
     );
 
-    let screen = sess.observe(60).unwrap();
-    let echoed: String = screen.viewport_text.join("\n");
     assert!(
         echoed.contains("GOT hunter2"),
         "the substituted value reached the app: {echoed}"

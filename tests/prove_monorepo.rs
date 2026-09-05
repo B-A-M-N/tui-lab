@@ -257,8 +257,8 @@ fn mcp_detect_from_member_reports_member_context() {
 /// and observations carry the member-relative provenance. The launch cwd
 /// rides on the session's LaunchSpec, so restart-replay reproduces the
 /// same member-relative launch rather than degrading to the server cwd.
-#[test]
-fn session_from_member_dir_keeps_launch_cwd_provenance() {
+#[tokio::test]
+async fn session_from_member_dir_keeps_launch_cwd_provenance() {
     let ws = cargo_workspace();
     let member = ws.path().join("crates").join("tui-app");
     // A tiny "app" inside the member: the member dir is the launch cwd.
@@ -267,8 +267,8 @@ fn session_from_member_dir_keeps_launch_cwd_provenance() {
         "import sys, time\nprint('MEMBER-APP')\nsys.stdout.flush()\ninput()\ntime.sleep(30)\n",
     )
     .expect("member app");
-    let mut mgr = tui_lab::session::SessionManager::new();
-    let sid = mgr
+    let pool = tui_lab::session::SessionPool::new();
+    let sid = pool
         .start(
             "python3",
             &["app.py".to_string()],
@@ -279,33 +279,46 @@ fn session_from_member_dir_keeps_launch_cwd_provenance() {
             "auto",
             "local",
         )
+        .await
         .expect("launch from member dir");
     {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-        sess.observe(300).expect("first frame");
-        let spec = sess.launch().expect("launched sessions carry their spec");
+        let member_path = member.to_str().unwrap().to_string();
+        let (cwd, out) = pool
+            .with_session(Some(&sid), move |sess| {
+                sess.observe(300).expect("first frame");
+                let spec = sess.launch().expect("launched sessions carry their spec");
+                let cwd = spec.cwd.clone();
+                // The member app actually runs.
+                let out = sess
+                    .wait(tui_lab::backend::WaitCond::Text("MEMBER-APP".into()), 5_000)
+                    .expect("wait");
+                (cwd, out)
+            })
+            .await
+            .expect("launch provenance job");
         assert_eq!(
-            spec.cwd.as_deref(),
-            Some(member.to_str().unwrap()),
+            cwd.as_deref(),
+            Some(member_path.as_str()),
             "the launch cwd is the member dir — restart-replay reproduces it"
         );
-        // The member app actually runs.
-        let out = sess
-            .wait(tui_lab::backend::WaitCond::Text("MEMBER-APP".into()), 5_000)
-            .expect("wait");
         assert!(
             out.met,
             "member app must run: {:?}",
             out.state.viewport_text
         );
-        // Restart reproduces the member-relative launch.
-        sess.restart().expect("restart");
-        let out2 = sess
-            .wait(tui_lab::backend::WaitCond::Text("MEMBER-APP".into()), 5_000)
-            .expect("wait after restart");
-        assert!(out2.met, "restarted member app must run again");
     }
-    mgr.stop(&sid).ok();
+    // Restart reproduces the member-relative launch.
+    pool.restart(&sid).await.expect("restart");
+    let restarted = pool
+        .with_session(Some(&sid), |sess| {
+            sess.wait(tui_lab::backend::WaitCond::Text("MEMBER-APP".into()), 5_000)
+                .expect("wait after restart")
+                .met
+        })
+        .await
+        .expect("restart wait job");
+    assert!(restarted, "restarted member app must run again");
+    pool.stop(&sid).await.ok();
 }
 
 /// The workspace root itself is NOT a package: ProjectContext from the

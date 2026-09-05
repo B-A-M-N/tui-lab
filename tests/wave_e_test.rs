@@ -6,11 +6,11 @@
 //! (item 49). Pure-logic unit tests live next to their modules.
 
 use tui_lab::design;
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
 /// Launch the modal fixture. Raw-mode python so keys deliver immediately.
-fn start_modal(mgr: &mut SessionManager) -> String {
-    mgr.start(
+async fn start_modal(pool: &SessionPool) -> String {
+    pool.start(
         "python3",
         &["fixtures/modal_tui.py".to_string()],
         None,
@@ -20,6 +20,7 @@ fn start_modal(mgr: &mut SessionManager) -> String {
         "auto",
         "local",
     )
+    .await
     .expect("start modal fixture")
 }
 
@@ -120,19 +121,23 @@ fn process_state() -> tui_lab::screen::ProcessState {
 /// interaction oracle "n → modal_open()" only passes if the app REALLY
 /// opened a modal, and "escape → modal_open(false)" only if Escape REALLY
 /// closed it — the report is earned, not assumed.
-#[test]
-fn conformance_drives_the_modal_fixture() {
+#[tokio::test]
+async fn conformance_drives_the_modal_fixture() {
     let contract =
         design::load_design_contract(std::path::Path::new("fixtures/modal_contract.yaml"))
             .expect("fixture contract loads");
 
-    let mut mgr = SessionManager::new();
-    let id = start_modal(&mut mgr);
+    let pool = SessionPool::new();
+    let id = start_modal(&pool).await;
     // Give the fixture a moment to draw its first frame.
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    let sess = mgr.resolve_mut(Some(&id)).expect("session");
-    let report = design::check_contract(sess, &contract).expect("conformance runs");
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            design::check_contract(sess, &contract).expect("conformance runs")
+        })
+        .await
+        .expect("conformance job");
 
     // The report must name every group it checked.
     let groups: std::collections::HashSet<&str> = report.results.iter().map(|r| r.group).collect();
@@ -237,10 +242,10 @@ fn loaded_contract_feeds_candidate_evidence() {
 
 /// Oracle in a scenario: the replay path evaluates `assertion: "oracle"`
 /// steps through the shared language.
-#[test]
-fn scenario_oracle_steps_replay() {
-    let mut mgr = SessionManager::new();
-    let _id = start_modal(&mut mgr);
+#[tokio::test]
+async fn scenario_oracle_steps_replay() {
+    let pool = SessionPool::new();
+    let id = start_modal(&pool).await;
     std::thread::sleep(std::time::Duration::from_millis(400));
 
     // Build a scenario: press n, then the oracle "modal_open()".
@@ -252,8 +257,12 @@ fn scenario_oracle_steps_replay() {
     );
     let scenario = recorder.build();
 
-    let sess = mgr.resolve_mut(None).expect("session");
-    let report = tui_lab::scenario::ScenarioRunner::run(&scenario, sess);
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            tui_lab::scenario::ScenarioRunner::run(&scenario, sess)
+        })
+        .await
+        .expect("scenario job");
     assert_eq!(report.steps_total, 3);
     assert_eq!(
         report.steps_failed,
@@ -268,18 +277,22 @@ fn scenario_oracle_steps_replay() {
 }
 
 /// A failing oracle fails the scenario honestly (the regression value).
-#[test]
-fn failing_oracle_fails_scenario_step() {
-    let mut mgr = SessionManager::new();
-    let _id = start_modal(&mut mgr);
+#[tokio::test]
+async fn failing_oracle_fails_scenario_step() {
+    let pool = SessionPool::new();
+    let id = start_modal(&pool).await;
     std::thread::sleep(std::time::Duration::from_millis(400));
 
     let mut recorder = tui_lab::scenario::recorder::ScenarioRecorder::new("oracle-fail");
     recorder.record_assert(serde_json::json!({"assertion": "oracle", "text": "modal_open()"}));
     let scenario = recorder.build();
 
-    let sess = mgr.resolve_mut(None).expect("session");
-    let report = tui_lab::scenario::ScenarioRunner::run(&scenario, sess);
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            tui_lab::scenario::ScenarioRunner::run(&scenario, sess)
+        })
+        .await
+        .expect("scenario job");
     assert_eq!(report.steps_failed, 1, "no modal is open: {:?}", report);
     assert!(
         report.step_results[0].detail.contains("modal"),
@@ -480,18 +493,22 @@ fn coverage_event_with_identity_attests_source_locus() {
 /// fixture's check drives the app (opens a modal, escapes it) — the report
 /// must EVIDENCE that the session came back clean: session_mutated=false
 /// with an empty residue list, and the serialized summary carries both.
-#[test]
-fn conformance_reports_session_mutation_residue() {
+#[tokio::test]
+async fn conformance_reports_session_mutation_residue() {
     let contract =
         design::load_design_contract(std::path::Path::new("fixtures/modal_contract.yaml"))
             .expect("fixture contract loads");
 
-    let mut mgr = SessionManager::new();
-    let id = start_modal(&mut mgr);
+    let pool = SessionPool::new();
+    let id = start_modal(&pool).await;
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    let sess = mgr.resolve_mut(Some(&id)).expect("session");
-    let report = design::check_contract(sess, &contract).expect("conformance runs");
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            design::check_contract(sess, &contract).expect("conformance runs")
+        })
+        .await
+        .expect("conformance job");
 
     assert!(
         report.driven_actions > 0,

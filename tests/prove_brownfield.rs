@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-use tui_lab::session::SessionManager;
+use tui_lab::session::SessionPool;
 
 /// A directory with no manifest, no VCS marker, no recognizable shape —
 /// and a python file inside it launched BY ABSOLUTE PATH (the "arbitrary
@@ -94,28 +94,34 @@ fn bare_tree_locator_falls_back_to_cwd_without_vcs() {
 /// context) and every audit surface works against it. Nothing knows what
 /// project this is; nothing errors; findings describe the screen, not a
 /// guessed provenance.
-#[test]
-fn arbitrary_path_app_launches_and_audits_honestly() {
+#[tokio::test]
+async fn arbitrary_path_app_launches_and_audits_honestly() {
     let (dir, app) = bare_fixture_dir();
-    let mut mgr = SessionManager::new();
-    let sid = mgr
+    let pool = SessionPool::new();
+    let sid = pool
         .start("python3", &[app], None, &[], 80, 24, "auto", "local")
+        .await
         .expect("launch from an arbitrary path must work");
-    {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    pool.with_session(Some(&sid), |sess| {
         sess.observe(300).expect("first frame");
-    }
+    })
+    .await
+    .expect("first frame job");
 
     // Static audit profiles run on the unknown app's frame.
     for profile in ["focus", "discoverability", "keyboard"] {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
-        let report = tui_lab::audit::orchestrator::run_profile_checked(
-            sess,
-            profile,
-            None,
-            tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
-        )
-        .unwrap_or_else(|e| panic!("{profile} must run on an unknown app: {e}"));
+        let report = pool
+            .with_session(Some(&sid), move |sess| {
+                tui_lab::audit::orchestrator::run_profile_checked(
+                    sess,
+                    profile,
+                    None,
+                    tui_lab::audit::orchestrator::SafetyPolicy::AllowMutation,
+                )
+                .unwrap_or_else(|e| panic!("{profile} must run on an unknown app: {e}"))
+            })
+            .await
+            .expect("profile job");
         for f in &report.findings {
             assert!(
                 !f.evidence.is_empty(),
@@ -127,8 +133,7 @@ fn arbitrary_path_app_launches_and_audits_honestly() {
     // An active, observational profile too — the raw app has no negotiated
     // modes, so these must report their honest "nothing negotiated" shape
     // rather than erroring.
-    {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    pool.with_session(Some(&sid), |sess| {
         let report = tui_lab::audit::orchestrator::run_profile_checked(
             sess,
             "terminal_modes",
@@ -137,17 +142,22 @@ fn arbitrary_path_app_launches_and_audits_honestly() {
         )
         .expect("terminal_modes runs on any app");
         let _ = report; // shape asserted above via findings-evidence rule
-    }
+    })
+    .await
+    .expect("terminal_modes job");
 
     // The adapter-status split stays honest: env injected, app silent.
-    {
-        let sess = mgr.resolve(Some(&sid)).unwrap();
-        let st = sess.adapter_status();
-        assert!(st.adapter_available, "harness did its part");
-        assert!(!st.native_channel_active, "a bare app never cooperates");
-        assert!(!st.healthy);
-    }
-    mgr.stop(&sid).ok();
+    let (adapter_available, native_channel_active, healthy) = pool
+        .with_session(Some(&sid), |sess| {
+            let st = sess.adapter_status();
+            (st.adapter_available, st.native_channel_active, st.healthy)
+        })
+        .await
+        .expect("adapter status job");
+    assert!(adapter_available, "harness did its part");
+    assert!(!native_channel_active, "a bare app never cooperates");
+    assert!(!healthy);
+    pool.stop(&sid).await.ok();
     let _ = dir;
 }
 
@@ -157,15 +167,15 @@ fn arbitrary_path_app_launches_and_audits_honestly() {
 /// (A session we started does carry a LaunchSpec; prove the honest note
 /// by asserting the opposite arm — that OUR session restarts cleanly and
 /// the ATTACHED-arm note shape exists for the truly brownfield case.)
-#[test]
-fn brownfield_deep_isolation_contract_is_declared() {
+#[tokio::test]
+async fn brownfield_deep_isolation_contract_is_declared() {
     let (dir, app) = bare_fixture_dir();
-    let mut mgr = SessionManager::new();
-    let sid = mgr
+    let pool = SessionPool::new();
+    let sid = pool
         .start("python3", &[app], None, &[], 80, 24, "auto", "local")
+        .await
         .expect("launch");
-    {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    pool.with_session(Some(&sid), |sess| {
         sess.observe(200).expect("frame");
         // We launched it, so restart-replay IS available: deep isolation
         // must not produce ORCH-NO-RESTART for this session.
@@ -180,37 +190,35 @@ fn brownfield_deep_isolation_contract_is_declared() {
             !report.findings.iter().any(|f| f.id == "ORCH-NO-RESTART"),
             "a launched session restarts cleanly — no honest-degradation note expected"
         );
-    }
-
-    // The genuinely brownfield case: a TmuxBackend attach has NO launch
-    // spec. Its restart() path is unavailable, which the deep-isolation
-    // note is FOR. Verify the condition the note keys on, without
-    // requiring a live tmux server: Session::launch() is None exactly
-    // when no spec was recorded — asserted via the API contract the
-    // orchestrator reads.
-    {
-        let sess = mgr.resolve(Some(&sid)).unwrap();
+        // The genuinely brownfield case: a TmuxBackend attach has NO launch
+        // spec. Its restart() path is unavailable, which the deep-isolation
+        // note is FOR. Verify the condition the note keys on, without
+        // requiring a live tmux server: Session::launch() is None exactly
+        // when no spec was recorded — asserted via the API contract the
+        // orchestrator reads.
         assert!(
             sess.launch().is_some(),
             "launched sessions carry their spec (the orchestrator's `deep` condition)"
         );
-    }
-    mgr.stop(&sid).ok();
+    })
+    .await
+    .expect("deep isolation job");
+    pool.stop(&sid).await.ok();
     let _ = dir;
 }
 
 /// The no-.git provenance case end-to-end: source-ref joins on findings
 /// stay EMPTY (nothing can name a file:line without coverage events), and
 /// the run ledger still records everything that happened.
-#[test]
-fn no_git_findings_carry_no_invented_source_refs() {
+#[tokio::test]
+async fn no_git_findings_carry_no_invented_source_refs() {
     let (dir, app) = bare_fixture_dir();
-    let mut mgr = SessionManager::new();
-    let sid = mgr
+    let pool = SessionPool::new();
+    let sid = pool
         .start("python3", &[app], None, &[], 80, 24, "auto", "local")
+        .await
         .expect("launch");
-    {
-        let sess = mgr.resolve_mut(Some(&sid)).unwrap();
+    pool.with_session(Some(&sid), |sess| {
         sess.observe(300).expect("frame");
         let report = tui_lab::audit::orchestrator::run_profile_checked(
             sess,
@@ -226,8 +234,10 @@ fn no_git_findings_carry_no_invented_source_refs() {
                 f.source_refs
             );
         }
-    }
-    mgr.stop(&sid).ok();
+    })
+    .await
+    .expect("focus job");
+    pool.stop(&sid).await.ok();
     let _ = dir;
 }
 
