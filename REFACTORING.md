@@ -125,7 +125,7 @@ test --all-features) verified green on the formatted tree.
 | 22 | Audit uncertainty: no Unverified/LowConfidence/Ambiguous verdicts | drivers |
 | 23 | ~~`NextObservation` is prose (`suggestion`/`rationale`), no structured tool+arguments~~ FIXED (`1dc4bbc`) | — |
 | 25 | `action + dozens of Option<T>` request shapes (tagged unions) | `src/mcp/params/*` |
-| 28 | Target resolution: `format!("{kind:?}")` wire slug (`vocab.rs:440`); comment-priority mismatch in nearest_candidates | `src/intent/vocab.rs` |
+| 28 | ~~Target resolution: `format!("{kind:?}")` wire slug (`vocab.rs:440`); comment-priority mismatch in nearest_candidates~~ FIXED (`037e2e4`) | — |
 | 29 | Risk classification: label heuristics remain the authority; no native/contract risk attestation | `src/intent/vocab.rs` |
 | 31 | Only the run manifest carries a schema tag; ledger/frame/event/finding/scenario/contract formats unversioned | `src/run/manifest.rs:61` |
 | 32 | `reopen()` flips `closed=false`; no resume epochs | `src/run/persistence_impl.rs:458` |
@@ -157,8 +157,9 @@ test --all-features) verified green on the formatted tree.
 - **20** Audit timing is report metadata: `run_verified` returns `(findings, AuditMetrics)`; clean runs produce zero findings (no synthetic AUDIT-METRICS row, no stamping onto finding evidence); `ProfileReport.metrics` + `metrics` on the tui_audit response carry the numbers (`a1349b7`)
 - **21** Typed severity/category + occurrence identity: `Severity` closed ordered enum (wire-compatible slugs, typos are parse errors), `Category` typed domain set + lossless `Other(String)` for contract groups, `Finding.occurrence_id` = versioned hash over SORTED key material (rule, category, all evidence targets) assigned at `instance()`; `compare::fingerprint` delegates to it (`5d60884`)
 - **23** NextObservation structured: every observation names its MCP tool (`tui_probe` / `tui_act` / `tui_run`) + ready-to-send arguments in the canonical grammar; prose stays for display (`1dc4bbc`)
+- **28** Vocab slugs: role matching uses the serde wire name (`menu_item`, not Debug's `menuitem`); ControlSummary echoes the same slug; nearest_candidates actually sorts focused-first (`037e2e4`)
 
 ### Priority order (implementation sequence)
 
-Remaining P0: none. Next: P1/P2 — 28 (vocab slugs) → 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
+Remaining P0: none. Next: P1/P2 — 31 (format versioning) → 32 (reopen epochs) → 33 (ephemeral evidence discard), then construction set 36-42.
 
