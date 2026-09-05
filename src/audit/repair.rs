@@ -124,6 +124,11 @@ pub struct ReplayCheck {
 
 /// Review §2: one observation-shaped next step. An instruction to LOOK,
 /// not to change: probe, inspect, compare, replay, read, capture.
+///
+/// Finding 23: the step carries its invocation STRUCTURALLY — the MCP tool
+/// name and the exact arguments — so an agent can act without parsing the
+/// prose. `suggestion`/`rationale` remain for display; `tool` +
+/// `arguments` are the contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct NextObservation {
     /// Short imperative in observation space, e.g.
@@ -131,6 +136,14 @@ pub struct NextObservation {
     pub suggestion: String,
     /// Why this observation would move the investigation.
     pub rationale: String,
+    /// The MCP tool that performs this observation (`tui_probe`,
+    /// `tui_act`, `tui_observe`, `tui_run`, …). `None` when the step is a
+    /// human-space read (source files) with no tool surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The exact arguments for `tool`, ready to send. Empty object when
+    /// `tool` is `None` or the step needs no parameters.
+    pub arguments: serde_json::Value,
 }
 
 impl DiagnosticContext {
@@ -238,7 +251,8 @@ impl DiagnosticContext {
 
 /// Review §2: observation-shaped next steps derived from the finding's
 /// own evidence — what to LOOK at to sharpen the diagnosis, never an
-/// edit instruction.
+/// edit instruction. Each step names its MCP tool and exact arguments
+/// (finding 23): the prose describes, the structure executes.
 fn next_observations(finding: &crate::audit::Finding) -> Vec<NextObservation> {
     let mut out = Vec::new();
     for e in finding.evidence.iter() {
@@ -247,25 +261,46 @@ fn next_observations(finding: &crate::audit::Finding) -> Vec<NextObservation> {
         };
         match e.kind {
             crate::audit::EvidenceKind::Control => {
+                // Probe the control: send Tab (the focus primitive) and
+                // capture the settled frame + material changes.
                 out.push(NextObservation {
                     suggestion: format!("tui_probe the control '{target}' after focusing it — capture the settled frame and its material changes"),
                     rationale: "a control-targeted probe separates 'the control is absent' from 'the control is present but clipped/unresponsive'".into(),
+                    tool: Some("tui_probe".into()),
+                    arguments: serde_json::json!({
+                        "stimulus": { "action": { "kind": "key", "key": "tab" } },
+                        "completion": "stable",
+                        "id": format!("diagnose-focus-{target}"),
+                    }),
                 });
                 out.push(NextObservation {
                     suggestion: "read the source loci in source_refs (opening with the attested ones) before editing anything".to_string(),
                     rationale: "provenance-tiered loci point at where the evidence was earned; correlated loci are leads, not cause sites".into(),
+                    tool: None,
+                    arguments: serde_json::json!({}),
                 });
             }
             crate::audit::EvidenceKind::Region => {
+                // Two-size compare: resize, observe, resize back, observe —
+                // the caller re-runs the region check on both frames.
                 out.push(NextObservation {
                     suggestion: format!("capture frames at two terminal sizes (tui_act resize, then tui_observe) and compare region '{target}'"),
                     rationale: "a region complaint that moves with size is layout math; one that persists across sizes is content or styling".into(),
+                    tool: Some("tui_act".into()),
+                    arguments: serde_json::json!({
+                        "action": { "kind": "resize", "cols": 120, "rows": 40 },
+                        "id": format!("diagnose-resize-{target}"),
+                    }),
                 });
             }
             _ => {
                 out.push(NextObservation {
                     suggestion: format!("inspect the run's transaction ledger around the finding's evidence target '{target}'"),
                     rationale: "the interaction that preceded the observation often names the trigger the finding only implies".into(),
+                    tool: Some("tui_run".into()),
+                    arguments: serde_json::json!({
+                        "action": "context",
+                    }),
                 });
             }
         }
@@ -355,6 +390,47 @@ mod tests {
                 obs.suggestion
             );
         }
+        // Finding 23: each observation carries its invocation structurally —
+        // tool name + ready-to-send arguments — so no prose parsing is
+        // needed to act.
+        for obs in &ctx.suggested_next_observations {
+            match &obs.tool {
+                Some(tool) => {
+                    assert!(
+                        tool.starts_with("tui_"),
+                        "tool names the MCP surface: {tool}"
+                    );
+                    assert!(
+                        obs.arguments.is_object(),
+                        "arguments are a JSON object: {}",
+                        obs.arguments
+                    );
+                }
+                None => assert!(
+                    obs.arguments.is_object(),
+                    "human-space steps carry an empty object"
+                ),
+            }
+        }
+        // The control-targeted probe is a real tui_probe call over the
+        // canonical action grammar.
+        let probe = ctx
+            .suggested_next_observations
+            .iter()
+            .find(|o| o.tool.as_deref() == Some("tui_probe"))
+            .expect("control evidence → tui_probe step");
+        assert_eq!(
+            probe.arguments["stimulus"]["action"]["kind"],
+            serde_json::json!("key"),
+            "stimulus uses the canonical grammar: {}",
+            probe.arguments
+        );
+        let serialized = serde_json::to_value(&ctx).unwrap();
+        let first = &serialized["suggested_next_observations"][0];
+        assert!(
+            first.get("tool").is_some() && first.get("arguments").is_some(),
+            "tool + arguments ride the wire: {first}"
+        );
     }
 
     /// Review §3's exact defect: a static finding (no reproduction) with
