@@ -107,11 +107,32 @@ class NSPMixin:
     def _nsp_path(self):
         return os.environ.get("TUI_LAB_SEMANTIC")
 
-    def _nsp_node(self, widget):
+    def _nsp_id(self, widget, parent_path):
+        # Audit finding 8: ids must be STABLE across frames and runs.
+        # (The old fallback here was the widget's memory address, which
+        # changes every launch and made cross-frame correlation meaningless.)
+        # Derived path instead: widget id if the app set one, else the
+        # widget class + sibling index walked from the root — the same
+        # widget in the same layout yields the same path every time.
+        if widget.id:
+            return f"#{widget.id}"
+        idx = 0
+        for sib in widget.parent.children if widget.parent else ():
+            if sib is widget:
+                break
+            if type(sib).__name__ == type(widget).__name__:
+                idx += 1
+        name = f"@{type(widget).__name__}"
+        if idx:
+            name += f"[{idx}]"
+        return f"{parent_path}/{name}" if parent_path else name
+
+    def _nsp_node(self, widget, parent_path=""):
         from textual.widget import Widget
         role = ROLE_MAP.get(type(widget).__name__, "widget")
+        wid = self._nsp_id(widget, parent_path)
         node = {
-            "id": f"#{widget.id}" if widget.id else f"@{type(widget).__name__}/{id(widget):x}",
+            "id": wid,
             "role": role,
         }
         label = getattr(widget, "label", None) or getattr(widget, "value", None)
@@ -122,10 +143,23 @@ class NSPMixin:
             node["bounds"] = [r.x, r.y, r.width, r.height]
         except Exception:
             pass
+        # Audit finding 8: declared verbs per widget class — what THIS
+        # widget can actually do, not what a heuristic guesses.
+        actions = ["activate"] if widget.can_focus else []
+        if isinstance(widget, __import__("textual.widgets").Input):
+            actions = ["focus", "type"]
+        elif isinstance(widget, __import__("textual.widgets").TextArea):
+            actions = ["focus", "type"]
+        elif type(widget).__name__ in ("CheckBox", "RadioSet", "Switch"):
+            actions = ["focus", "toggle"]
+        elif type(widget).__name__ in ("ListView", "DataTable", "Tree", "Select"):
+            actions = ["focus", "select"]
+        if actions:
+            node["actions"] = actions
         node["focusable"] = widget.can_focus
         node["focused"] = widget.has_focus
         node["enabled"] = not widget.has_class("-disabled")
-        children = [self._nsp_node(c) for c in widget.children]
+        children = [self._nsp_node(c, wid) for c in widget.children]
         if children:
             node["children"] = children
         return node
@@ -146,6 +180,30 @@ class NSPMixin:
                 f.write(json.dumps(frame, separators=(",", ":")) + "\n")
         except OSError:
             pass  # a broken side channel must never break the app
+
+    def _nsp_write_event(self, frame):
+        path = self._nsp_path()
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(frame, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+
+    # Audit finding 8: snapshots say what the tree IS; events say what
+    # HAPPENED. Focus changes are the signal inference gets wrong most
+    # often (style-queue guesses), so they are declared here with the
+    # widget's stable id.
+    def on_focus(self, event):
+        try:
+            wid = event.widget.id
+        except Exception:
+            wid = None
+        if wid:
+            self._nsp_write_event(
+                {"v": 1, "type": "event", "event": "focus", "target": f"#{wid}"}
+            )
 
     # Textual render hook: called after each frame is composed.
     def on_mount(self):
@@ -281,5 +339,41 @@ mod tests {
                 body.contains("snapshot") && (body.contains("type") && body.contains("snapshot"));
             assert!(emits_snapshot, "{fw}: must emit a snapshot frame");
         }
+    }
+
+    /// Audit finding 8: adapter-generated ids must be STABLE — never
+    /// `id(widget)`, a memory address that changes every run and makes
+    /// cross-frame correlation (and any tui_act target naming) meaningless.
+    /// A regression to the address-based fallback must fail here.
+    #[test]
+    fn textual_ids_are_never_memory_addresses() {
+        let s = snippet_for("textual").expect("textual snippet");
+        assert!(
+            !s.contains("id(widget)"),
+            "the id(widget) memory-address fallback is the finding-8 defect"
+        );
+        // The structural fallback is present: type name + sibling index
+        // walked from the parent path.
+        assert!(
+            s.contains("type(widget).__name__") && s.contains("parent_path"),
+            "structural path fallback (type + sibling index under parent path)"
+        );
+    }
+
+    /// Audit finding 8: `NativeNode.actions` is a consumed contract, not
+    /// dead data — snippets must declare the verbs a widget supports, and
+    /// the Textual mixin must also emit focus EVENTS (what happened),
+    /// not only snapshots (what the tree is).
+    #[test]
+    fn textual_snippet_declares_actions_and_emits_events() {
+        let s = snippet_for("textual").expect("textual snippet");
+        assert!(
+            s.contains("\"actions\""),
+            "the mixin declares per-widget action verbs"
+        );
+        assert!(
+            s.contains("\"event\"") && s.contains("on_focus"),
+            "the mixin emits focus event frames, not snapshots alone"
+        );
     }
 }

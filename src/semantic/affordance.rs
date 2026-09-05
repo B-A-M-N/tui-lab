@@ -27,6 +27,13 @@ pub enum Invocation {
     Mouse { action: String },
     /// Movement/selection (arrows, tab traversal).
     Navigate { key: String },
+    /// The application declared this verb natively over the semantic side
+    /// channel (audit finding 8) and the harness has no conventional
+    /// invocation for it. Honest default: report the verb as the app
+    /// stated it rather than guessing an invocation that may not exist.
+    /// Mapping known verbs onto Key/Mouse/Activate happens at overlay
+    /// time (`native.rs`); only genuinely unknown verbs land here.
+    Declared { verb: String },
 }
 
 /// How visible the affordance's cue is on this screen.
