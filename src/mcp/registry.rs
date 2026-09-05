@@ -55,7 +55,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_probe",
-        summary: "Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition, watched material changes. stimulus {kind:none} = drift probe.",
+        summary: "Run one small experiment and get EVERYTHING materially different: baseline vs settled after-frame, causal events inside the probe window, transition (with finding-40 control_deltas — per-control WHAT changed, e.g. 'button/save moved x:65→71', not just changed_cells), watched material changes. stimulus {kind:none} = drift probe.",
         selector: Some(("completion", <crate::mcp::params::ProbeCompletion as EnumVariants>::VARIANTS)),
     },
     ToolCapability {

@@ -72,11 +72,73 @@ pub struct ScreenDiff {
     pub style_changes: usize,
 }
 
+/// A per-control description of WHAT changed in a transition (finding 40:
+/// semantic render diff — "which control the app draws differently and how",
+/// not a raw cell count). One delta per changed control, with a human
+/// summary ("button/save moved x:65→71") plus the resolved before/after
+/// values for each changed property, so a caller can reason about render
+/// drift without re-analyzing two frames.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlRenderDelta {
+    /// The control's stable semantic id (`button/save`, …).
+    pub id: String,
+    /// Human prose: what the control looks like before vs after.
+    pub summary: String,
+    /// Bounds delta when the control moved/resized, else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<BoundsDelta>,
+    /// Label delta (renamed), else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<ValueChange<String>>,
+    /// Value delta (text/field content), else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<ValueChange<String>>,
+    /// Focus delta (gained/lost focus), else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+    /// Selection delta, else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+    /// Checked delta, else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    /// Enabled delta (grayed -> active or back), else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// How a control's bounds moved (finding 40): the `before`/`after` corners
+/// plus a prose phrase encoding the motion (`moved x:65→71`, `resized
+/// w:12→14`, `moved x:65→71 and resized h:3→4`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundsDelta {
+    pub before: ControlBoundsSer,
+    pub after: ControlBoundsSer,
+    /// Human phrase, e.g. `"moved x:65→71"` or `"resized h:3→4"`.
+    pub motion: String,
+    /// Stable flag: did the control actually move/resize (vs true copy).
+    pub geo_changed: bool,
+}
+
+/// Serializable mirror of [`crate::semantic::ControlBounds`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlBoundsSer {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// Semantic diff: changes in regions, controls, and focus.
 ///
 /// Audit item 14: expanded from numeric counts (all-zero placeholder) to
 /// full ID lists plus counts.  Old serialized data without the new Vec
 /// fields still deserializes because they have `#[serde(default)]`.
+///
+/// Finding 40: adds `control_deltas` — a per-control `ControlRenderDelta`
+/// describing WHAT changed (moved/resized/relabeled/re-focused), so a
+/// render change reads as "button/save moved x:65→71", never just
+/// `changed_cells: 47`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticDiff {
     /// Control IDs added in the transition.
@@ -90,6 +152,9 @@ pub struct SemanticDiff {
     /// Control IDs that changed.
     #[serde(default)]
     pub controls_changed: Vec<String>,
+    /// Per-control render deltas for the changed controls (finding 40).
+    #[serde(default)]
+    pub control_deltas: Vec<ControlRenderDelta>,
     /// Region IDs added in the transition.
     #[serde(default)]
     pub regions_added: Vec<String>,
@@ -294,6 +359,7 @@ fn compute_semantic_diff(before: &ScreenState, after: &ScreenState) -> SemanticD
             controls_added.push(id.to_string());
         }
     }
+    let mut control_deltas: Vec<ControlRenderDelta> = Vec::new();
     for (id, before_ctrl) in &before_controls {
         if !after_controls.contains_key(id) {
             controls_removed.push(id.to_string());
@@ -301,6 +367,12 @@ fn compute_semantic_diff(before: &ScreenState, after: &ScreenState) -> SemanticD
             let after_ctrl = after_controls.get(id).unwrap();
             if control_properties_differ(before_ctrl, after_ctrl) {
                 controls_changed.push(id.to_string());
+                // Finding 40: only emit a delta when the control's rendered
+                // state actually changed — the delta is the semantic
+                // description of HOW it changed, not a phantom no-op row.
+                if let Some(delta) = control_render_delta(before_ctrl, after_ctrl) {
+                    control_deltas.push(delta);
+                }
             }
         }
     }
@@ -341,6 +413,7 @@ fn compute_semantic_diff(before: &ScreenState, after: &ScreenState) -> SemanticD
         controls_removed,
         controls_changed_count: controls_changed.len(),
         controls_changed,
+        control_deltas,
         regions_added,
         regions_removed,
         regions_changed,
@@ -362,6 +435,195 @@ fn control_properties_differ(a: &semantic::Control, b: &semantic::Control) -> bo
         || a.selected != b.selected
         || a.focused != b.focused
         || a.enabled != b.enabled
+}
+
+/// Build a per-control render delta (finding 40) for a control that exists
+/// in both frames but whose rendered state differs. Returns `None` for a
+/// control whose differing property is not a *render* concern (or when the
+/// two sides are identical — a guard for drift). The delta carries a prose
+/// summary plus the resolved before/after for each changed property.
+fn control_render_delta(
+    before: &crate::semantic::Control,
+    after: &crate::semantic::Control,
+) -> Option<ControlRenderDelta> {
+    // Bounds delta.
+    let bounds_changed = before.bounds.x != after.bounds.x
+        || before.bounds.y != after.bounds.y
+        || before.bounds.width != after.bounds.width
+        || before.bounds.height != after.bounds.height;
+    let bounds = if bounds_changed {
+        Some(BoundsDelta {
+            before: ControlBoundsSer {
+                x: before.bounds.x,
+                y: before.bounds.y,
+                width: before.bounds.width,
+                height: before.bounds.height,
+            },
+            after: ControlBoundsSer {
+                x: after.bounds.x,
+                y: after.bounds.y,
+                width: after.bounds.width,
+                height: after.bounds.height,
+            },
+            motion: bounds_motion_phrase(&before.bounds, &after.bounds),
+            geo_changed: true,
+        })
+    } else {
+        None
+    };
+
+    let label = if before.label != after.label {
+        Some(ValueChange {
+            before: Some(before.label.clone()),
+            after: Some(after.label.clone()),
+        })
+    } else {
+        None
+    };
+    let value = if before.value != after.value {
+        Some(ValueChange {
+            before: before.value.clone(),
+            after: after.value.clone(),
+        })
+    } else {
+        None
+    };
+    let focused = if before.focused != after.focused {
+        Some(after.focused)
+    } else {
+        None
+    };
+    let selected = if before.selected != after.selected {
+        Some(after.selected)
+    } else {
+        None
+    };
+    let checked = if before.checked != after.checked {
+        Some(after.checked)
+    } else {
+        None
+    };
+    let enabled = if before.enabled != after.enabled {
+        Some(after.enabled)
+    } else {
+        None
+    };
+
+    // If nothing is a render hazard, return None (the diff loop already
+    // gated on control_properties_differ, so a changed control always has
+    // at least one differing field; this is defense against drift).
+    if bounds.is_none()
+        && label.is_none()
+        && value.is_none()
+        && focused.is_none()
+        && selected.is_none()
+        && checked.is_none()
+        && enabled.is_none()
+    {
+        return None;
+    }
+
+    // Human summary: "button/save moved x:65→71", "button/save label
+    // 'Save'→'Save All'", "button/save gained focus", … Concatenate the
+    // non-trivial clauses.
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(b) = &bounds {
+        parts.push(b.motion.clone());
+    }
+    if let Some(l) = &label {
+        parts.push(format!(
+            "label {:?} → {:?}",
+            l.before.as_deref().unwrap_or(""),
+            l.after.as_deref().unwrap_or("")
+        ));
+    }
+    if let Some(v) = &value {
+        parts.push(format!(
+            "value {:?} → {:?}",
+            v.before.as_deref().unwrap_or(""),
+            v.after.as_deref().unwrap_or("")
+        ));
+    }
+    if focused.is_some() {
+        parts.push(if after.focused {
+            "gained focus".to_string()
+        } else {
+            "lost focus".to_string()
+        });
+    }
+    if selected.is_some() {
+        parts.push(if after.selected {
+            "selected".to_string()
+        } else {
+            "deselected".to_string()
+        });
+    }
+    if checked.is_some() {
+        parts.push(if after.checked {
+            "checked".to_string()
+        } else {
+            "unchecked".to_string()
+        });
+    }
+    if enabled.is_some() {
+        parts.push(if after.enabled {
+            "enabled".to_string()
+        } else {
+            "disabled".to_string()
+        });
+    }
+    // Dedup identical clauses (motion may repeat "moved x…" form) and join.
+    let mut seen = std::collections::HashSet::new();
+    parts.retain(|p| seen.insert(p.clone()));
+    let summary = format!("{} {}", after.id, parts.join(", "));
+    Some(ControlRenderDelta {
+        id: after.id.clone(),
+        summary,
+        bounds,
+        label,
+        value,
+        focused,
+        selected,
+        checked,
+        enabled,
+    })
+}
+
+/// Human phrase encoding how bounds moved (finding 40): "moved x:65→71",
+/// "resized w:12→14", or a combined clause. Only names dimensions that
+/// actually changed, so a pure resize never reads as a move.
+fn bounds_motion_phrase(
+    before: &crate::semantic::ControlBounds,
+    after: &crate::semantic::ControlBounds,
+) -> String {
+    let moved = before.x != after.x || before.y != after.y;
+    let resized = before.width != after.width || before.height != after.height;
+    let mut clauses = Vec::new();
+    if moved {
+        let mut dims = Vec::new();
+        if before.x != after.x {
+            dims.push(format!("x:{}→{}", before.x, after.x));
+        }
+        if before.y != after.y {
+            dims.push(format!("y:{}→{}", before.y, after.y));
+        }
+        clauses.push(format!("moved {}", dims.join(" ")));
+    }
+    if resized {
+        let mut dims = Vec::new();
+        if before.width != after.width {
+            dims.push(format!("w:{}→{}", before.width, after.width));
+        }
+        if before.height != after.height {
+            dims.push(format!("h:{}→{}", before.height, after.height));
+        }
+        clauses.push(format!("resized {}", dims.join(" ")));
+    }
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        clauses.join(" and ")
+    }
 }
 
 /// Compare two regions for differences in observable properties.
@@ -448,5 +710,68 @@ mod tests {
         let t = diff(&a, &b);
         assert_eq!(t.before_structure_hash, a.structure_hash);
         assert_eq!(t.after_structure_hash, b.structure_hash);
+    }
+
+    // ── finding 40: semantic render deltas (per-control WHAT changed) ──
+
+    fn ctrl(id: &str, x: u16, y: u16, w: u16, h: u16, focused: bool) -> crate::semantic::Control {
+        crate::semantic::Control {
+            id: id.to_string(),
+            kind: crate::semantic::ControlKind::Button,
+            label: id.to_string(),
+            value: None,
+            bounds: crate::semantic::ControlBounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            region_id: None,
+            focusable: true,
+            focused,
+            enabled: true,
+            selected: false,
+            checked: false,
+            shortcut: None,
+            confidence: crate::semantic::Confidence::inferred(0.9, &[]),
+            evidence: Vec::new(),
+            source: "inferred".to_string(),
+        }
+    }
+
+    #[test]
+    fn render_delta_describes_moved_control() {
+        // "button/save moved x:65→71" — the finding 40 headline.
+        let before = ctrl("button/save", 65, 3, 8, 1, false);
+        let after = ctrl("button/save", 71, 3, 8, 1, false);
+        let d = control_render_delta(&before, &after).expect("delta");
+        assert_eq!(d.id, "button/save");
+        assert!(d.summary.contains("moved x:65\u{2192}71"), "{}", d.summary);
+        let b = d.bounds.as_ref().expect("bounds delta");
+        assert_eq!((b.before.x, b.after.x), (65, 71));
+        assert!(d.label.is_none() && d.focused.is_none(), "pure move");
+    }
+
+    #[test]
+    fn render_delta_describes_focus_and_resize() {
+        // Focus gain + resize in one transition → two clauses.
+        let before = ctrl("button/beta", 10, 5, 12, 1, false);
+        let after = ctrl("button/beta", 10, 5, 14, 1, true);
+        let d = control_render_delta(&before, &after).expect("delta");
+        assert!(d.summary.contains("gained focus"), "{}", d.summary);
+        assert!(d.summary.contains("resized w:12→14"), "{}", d.summary);
+        assert_eq!(d.focused, Some(true));
+        let b = d.bounds.as_ref().expect("bounds");
+        assert_eq!((b.before.width, b.after.width), (12, 14));
+    }
+
+    #[test]
+    fn identical_controls_produce_no_delta() {
+        let a = ctrl("button/save", 3, 3, 8, 1, false);
+        let b = ctrl("button/save", 3, 3, 8, 1, false);
+        assert!(
+            control_render_delta(&a, &b).is_none(),
+            "no delta for identical"
+        );
     }
 }

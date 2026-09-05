@@ -243,6 +243,11 @@ pub(crate) async fn tui_probe(
                             "style_changes": result.transition.screen_diff.style_changes,
                             "controls_added": result.transition.semantic_diff.controls_added,
                             "controls_removed": result.transition.semantic_diff.controls_removed,
+                            "controls_changed": result.transition.semantic_diff.controls_changed,
+                            // Finding 40: semantic render deltas — per
+                            // control WHAT changed ("button/save moved
+                            // x:65→71"), not just a raw cell count.
+                            "control_deltas": &result.transition.semantic_diff.control_deltas,
                             "focus_before": result.transition.semantic_diff.focus_before,
                             "focus_after": result.transition.semantic_diff.focus_after,
                         },
