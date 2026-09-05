@@ -5,6 +5,7 @@
 
 pub mod model;
 pub mod recorder;
+pub mod regression_asset;
 pub mod runner;
 
 pub use model::{Scenario, ScenarioMetadata, ScenarioStep, StepKind};

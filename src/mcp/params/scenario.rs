@@ -14,6 +14,19 @@ selector_enum!(
     [
         List => "list", RecordStart => "record_start", RecordStop => "record_stop",
         Save => "save", Export => "export", Run => "run",
+        RegressionAsset => "regression_asset",
+    ]
+);
+
+selector_enum!(
+    /// `tui_scenario action=regression_asset` asset kind (finding 39). The
+    /// generator emits only asset kinds the finding's own evidence can
+    /// justify; an unavailable kind is refused with the reason, never
+    /// synthesized from nothing.
+    RegressionAssetType;
+    [
+        Scenario => "scenario", Assertion => "assertion",
+        ContractRule => "contract_rule", ViewportCase => "viewport_case",
     ]
 );
 
@@ -56,6 +69,14 @@ pub struct TuiScenarioParams {
     /// `on_failure` for this replay only.
     #[serde(default)]
     pub on_failure: Option<Known<ScenarioFailurePolicy>>,
+    /// regression_asset (finding 39): the finding whose evidence the asset
+    /// is synthesized from (from tui_audit or tui://findings).
+    #[serde(default)]
+    pub finding_id: Option<String>,
+    /// regression_asset: which asset kind to synthesize. Omitted → the
+    /// generator emits every kind the finding's evidence can justify.
+    #[serde(default)]
+    pub asset_type: Option<Known<RegressionAssetType>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
