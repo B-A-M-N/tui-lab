@@ -113,12 +113,8 @@ test --all-features) verified green on the formatted tree.
 
 | # | Finding | Evidence |
 | - | ------- | -------- |
-| 1 | SessionActor ownership/shutdown: `closing` copied by value in `Clone`; no shared inner; no cancellation for long jobs | `src/session/actor.rs:77` |
 | 2 | One driving authority: `drive_pipeline` exists + scenario replay uses it, but no `DriveOrigin` provenance and ~25 direct `execute_act` call sites remain (exploration, conformance, audit drivers) | `src/execution/drive.rs`, callers |
-| 3 | Intent: `Focus` plans a left click (`vocab.rs:350`); `EnsureFocus` uses a click as focus primitive so Activate/Toggle can double-fire (`plan.rs:82`); `Open` is `Safe` + Enter for every control (`vocab.rs:394`); `execute=true` still fuses plan+authorization (no `plan_id`/`max_risk` two-step) | `src/intent/{plan,vocab}.rs`, `src/mcp/params/intent.rs` |
 | 4 | Lease completeness: release needs no token; restart checks run-ownership but not the human lease; `stop` checks neither; `tui_run close kill_sessions=true` kills leased sessions ungated. (Stale sub-claim: `probe_query_response` no longer writes to the PTY — it drains the parser engine-side, `portable_pty.rs:639`; the orchestrator comment saying otherwise is wrong.) | `src/session/lease.rs`, `handlers/session.rs:193,250`, `handlers/run.rs:164` |
-| 5 | Scenario fail-fast: failed step increments and the loop continues; no `on_failure=stop`, no `skipped_due_to_prior_failure` | `src/scenario/runner.rs:88-360` |
-| 6 | tmux honesty: every wait returns `WaitReason::ScreenChange` (`tmux.rs:586`); `input_families` lists `RawByte` while `raw_input:false`; `native_semantic:true` claimed for attach; no `ProcessOwnership` model; synthetic ProcessExited on detach | `src/backend/tmux.rs` |
 | 7 | Native channel: `read_line` has no max-frame bound; channel file grows unbounded (offset advances, never truncated). (Landed half: bounded event ring + seq cursors + truncation detection.) | `src/semantic/native.rs:247` |
 | 8 | Native adapters: `NativeNode.actions` parsed but consumed nowhere (dead data); Textual fallback id is `id(widget)` memory address; snippets emit snapshots only | `src/semantic/node.rs`, `src/framework/adapters.rs:114` |
 | 9 | Evidence health: no `EvidenceHealth` model on DriveOutcome; frame-commit failures can still yield citable defaults | `src/execution/drive.rs` |
@@ -127,7 +123,6 @@ test --all-features) verified green on the formatted tree.
 
 | # | Finding | Evidence |
 | - | ------- | -------- |
-| 12 | `ActorBusy` maps to `NoSession`; no `session_busy`/retryable category | `src/session/actor.rs:305` |
 | 13 | Lifecycle mutation vs lease (subsumed by #4) | — |
 | 16 | Native suffix match takes first hit, no uniqueness/ambiguity report | `src/semantic/native.rs:822` |
 | 17 | Native focus rewrites headline + matched node but never clears stale `focused=true` on other controls | `src/semantic/native.rs:364-430` |
@@ -146,6 +141,11 @@ test --all-features) verified green on the formatted tree.
 
 ### FIXED (verified in code)
 
+- **1** SessionActor shared ownership: `Arc<SessionActorInner>` (shared `closing` + join slot); stop removes from directory first, acks, joins (`049c144`)
+- **3** Intent semantics: focus moves are PROVEN FocusGraph Tab traversals (never clicks); AssertFocus guard between hops and payload; `Focus` Safe + payload-free; `Open` Mutating and MenuItem-only; plan/execute two-step contract (plan_id execute-once tickets + `max_risk` fence); E2E activation-ledger proves exactly-once (`33de5cf`)
+- **5** Scenario fail-fast: `on_failure` (stop|continue, stop default) on the model + wire override; `skipped_due_to_prior_failure` marking, `steps_skipped` count, `status: stopped_on_failure`; a skipped step fails `passed` (`a30290c`)
+- **6** tmux truth: per-condition WaitReasons (live-tmux conformance-pinned); `RawByte` dropped from input_families; `native_semantic:false` on attach; `ProcessOwnership` model (SpawnedChild/Attached) + `kill_on_stop()` trait method; restart ledger records Terminated only for owned processes (`2328666`)
+- **12** `session_busy` retryable category (distinct from `no_session`) with structured `retry_after_ms` details; ActorDropped → backend_error (`09e618e`)
 - **26** BackendParam VARIANTS ↔ enum consistent; tmux parses (serde-typed enum; no FromStr drift surface)
 - **30** Coverage delta stateless via caller-owned `since_seq` (`handlers/coverage.rs:86`)
 - **34** Completion honesty: `MayBeSilent`/`OutputClosed`/`BudgetExpired` vocabulary; budget plumbed through every strategy
@@ -157,5 +157,5 @@ test --all-features) verified green on the formatted tree.
 
 ### Priority order (implementation sequence)
 
-1→3→4→5→6→7→8→9→2 as P0, then 12/16/17/20/21/23, then construction set.
+Remaining P0: 4 (lease completeness, subsumes 13) → 7 (native channel bounds) → 8 (adapter dead data) → 9 (evidence health) → 2 (DriveOrigin provenance), then P1/P2: 16/17/20/21/23/28/31/32/33, then construction set 36-42.
 
