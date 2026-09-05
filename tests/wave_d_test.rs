@@ -247,3 +247,90 @@ async fn random_exploration_enters_run_ledger_with_exact_signatures() {
         );
     }
 }
+
+/// Audit finding 9: evidence health is honest. With the run OPEN, a driven
+/// act's frame commits and ledger record all succeed (healthy). After the
+/// run closes mid-session, the SAME drive path must NOT fabricate
+/// "frame:0" — the frame legs are null + error, `healthy` is false, and
+/// the act itself still succeeded (the TUI received the input).
+#[tokio::test]
+async fn drive_outcome_reports_evidence_health_not_fabricated_frames() {
+    let pool = SessionPool::new();
+    let id = start(
+        &pool,
+        &[
+            "-c".into(),
+            "import sys,tty; tty.setraw(0); print('HEALTH READY'); sys.stdin.buffer.read(1)".into(),
+        ],
+    )
+    .await;
+
+    pool.with_session(Some(&id), move |sess| {
+        let action = tui_lab::execution::CanonicalAction::Key {
+            key: tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Char('x')),
+        };
+        let make_spec = || tui_lab::execution::CoreDriveSpec {
+            action: &action,
+            quiet_ms: 120,
+            budget_ms: 1200,
+            no_wait: false,
+            visibility: tui_lab::execution::InputVisibility::Normal,
+            completion: tui_lab::capture::CompletionPolicy::StableScreen,
+            guard: None,
+            scenario: None,
+        };
+
+        // Open run: everything commits, outcome is healthy, frames carry
+        // real ids.
+        let run = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
+        let ok =
+            tui_lab::execution::drive_pipeline(sess, &run, make_spec()).expect("drive on open run");
+        assert!(
+            ok.health.healthy(),
+            "open run: all evidence legs commit: {:?}",
+            ok.health.failures()
+        );
+        let before_ref = ok.frames["before"]["ref"].as_str().expect("ref");
+        assert!(
+            before_ref != "frame:0" && before_ref.starts_with("frame:"),
+            "committed leg cites a real frame id: {before_ref}"
+        );
+
+        // Closed run: the commit path refuses; the act STILL executes (the
+        // TUI got the key — that fact does not change), but the outcome
+        // must say its evidence is not citable instead of defaulting.
+        run.lock().unwrap().close().expect("close run");
+        let closed = tui_lab::execution::drive_pipeline(sess, &run, make_spec())
+            .expect("drive on closed run");
+        assert!(
+            !closed.health.healthy(),
+            "closed run: frame commits refused, health says so"
+        );
+        assert!(
+            !closed.health.ledger_recorded,
+            "the ledger leg is named as not recorded too"
+        );
+        for leg in ["before", "after"] {
+            let f = &closed.frames[leg];
+            assert!(
+                f["ref"].is_null(),
+                "{leg} leg must not fabricate an id: {f}"
+            );
+            assert!(
+                f["error"].is_string(),
+                "{leg} leg names why it did not commit: {f}"
+            );
+        }
+        let failures = closed.health.failures();
+        assert!(
+            failures.iter().any(|s| s.contains("before")),
+            "failures name each leg: {failures:?}"
+        );
+        assert!(
+            failures.iter().any(|s| s.contains("ledger")),
+            "failures name the ledger: {failures:?}"
+        );
+    })
+    .await
+    .expect("drive health job");
+}

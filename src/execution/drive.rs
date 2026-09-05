@@ -52,6 +52,61 @@ pub struct DriveSpec<'a> {
     pub scenario: Option<ScenarioCapture>,
 }
 
+/// Finding 9: how healthy the run-level evidence for one driven act is.
+/// Frame commits and the ledger record CAN fail (run closed mid-drive,
+/// disk full, append error) — before this model the failures were
+/// `.unwrap_or_default()`-ed into frame id 0 and the outcome still cited
+/// `"frame:0"` as if it were evidence. Health names exactly which
+/// evidence legs committed and which did not, so a consumer citing the
+/// run knows what stands behind it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EvidenceHealth {
+    /// Per-frame commit result, in [before, after] order: `Ok(frame_id)`
+    /// or `Err(reason)`.
+    pub frame_commits: [Result<u64, String>; 2],
+    /// Whether the interaction transaction was recorded in the run
+    /// ledger (the reconstructable record; sensitive payloads redacted).
+    pub ledger_recorded: bool,
+}
+
+impl EvidenceHealth {
+    /// True only when every evidence leg committed. A `false` here does
+    /// not invalidate the act — the TUI still received the input (the
+    /// execution itself succeeded) — it means the run's citable record
+    /// is incomplete and the response says so.
+    pub fn healthy(&self) -> bool {
+        self.frame_commits.iter().all(|r| r.is_ok()) && self.ledger_recorded
+    }
+
+    /// Human-readable list of what failed, for warnings surfaces.
+    pub fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let names = ["before", "after"];
+        for (i, r) in self.frame_commits.iter().enumerate() {
+            if let Err(reason) = r {
+                out.push(format!("{} frame not committed: {reason}", names[i]));
+            }
+        }
+        if !self.ledger_recorded {
+            out.push("interaction not recorded in the run ledger".to_string());
+        }
+        out
+    }
+
+    /// The wire shape: committed ids stay `"frame:N"`; failed legs are
+    /// `null` with the reason beside them, never a fabricated default id.
+    pub fn frames_json(&self) -> serde_json::Value {
+        let leg = |r: &Result<u64, String>| match r {
+            Ok(id) => json!({ "ref": format!("frame:{id}") }),
+            Err(reason) => json!({ "ref": serde_json::Value::Null, "error": reason }),
+        };
+        json!({
+            "before": leg(&self.frame_commits[0]),
+            "after": leg(&self.frame_commits[1]),
+        })
+    }
+}
+
 /// The evidence one driven act produced.
 pub struct DriveOutcome {
     /// The full interaction transaction (frames, settle, transition,
@@ -59,6 +114,10 @@ pub struct DriveOutcome {
     pub tx: crate::execution::InteractionTransaction,
     /// Frame references: `{"before": "frame:N", "after": "frame:M"}`.
     pub frames: serde_json::Value,
+    /// Finding 9: how much of that evidence actually committed to the
+    /// run. The act succeeding and the evidence committing are separate
+    /// facts; both are reported.
+    pub health: EvidenceHealth,
 }
 
 /// THE driving pipeline. Runs inside the session's actor (call it from a
@@ -79,38 +138,29 @@ pub fn drive(
         spec.completion,
         spec.guard,
     )?;
-    // Commit evidence under one short lock on the actor thread.
-    let frames = {
+    // Commit evidence under one short lock on the actor thread. Finding 9:
+    // commit results are RECORDED, not swallowed — a failed frame commit
+    // used to `.unwrap_or_default()` into frame id 0 and the outcome still
+    // cited "frame:0" as if it were evidence. The act itself already
+    // happened either way; health says which legs of the run's record
+    // stand behind it.
+    let (frames, health) = {
         let (sid, gen) = (sess.id.clone(), sess.generation);
         let mut run = run.lock().unwrap();
         // Frame commit pipeline (re-review item 40): both frames through
         // the ONE commit path — id + provenance + incremental append.
-        let b = run
-            .commit_frame(
-                &mut {
-                    let mut f = tx.before_frame.clone();
-                    f.session_id = Some(sid.clone());
-                    f.generation = Some(gen);
-                    f
-                },
-                Some(&sid),
-            )
-            .unwrap_or_default();
-        let a = run
-            .commit_frame(
-                &mut {
-                    let mut f = tx.after_frame.clone();
-                    f.session_id = Some(sid.clone());
-                    f.generation = Some(gen);
-                    f
-                },
-                Some(&sid),
-            )
-            .unwrap_or_default();
+        let mut commit = |f: &crate::backend::CanonicalFrame| {
+            let mut f = f.clone();
+            f.session_id = Some(sid.clone());
+            f.generation = Some(gen);
+            run.commit_frame(&mut f, Some(&sid))
+                .map_err(|e| e.to_string())
+        };
+        let frame_commits = [commit(&tx.before_frame), commit(&tx.after_frame)];
         // Run ledger (Wave-2 item 15): the reconstructable transaction
         // record. Sensitive payloads are projected to Redacted(kind,
         // byte_len) by the ledger itself.
-        let _ = run.record_interaction(&sid, &tx);
+        let ledger_recorded = run.record_interaction(&sid, &tx).is_ok();
         // Scenario capture (re-review P0.3): sensitive text payloads are
         // recorded as ${PARAM} references; sensitive non-text payloads as
         // an opaque redacted step; everything else verbatim.
@@ -152,13 +202,18 @@ pub fn drive(
                 }
             }
         }
-        json!({ "before": format!("frame:{b}"), "after": format!("frame:{a}") })
+        let health = EvidenceHealth {
+            frame_commits,
+            ledger_recorded,
+        };
+        let frames = health.frames_json();
+        (frames, health)
     };
     // Universal evidence fold (audit §28): the session's event queue lands
     // in the run (incremental persistence + native coverage) after EVERY
     // driven act, not only on observe sweeps.
     fold_session_events(sess, run);
-    Ok(DriveOutcome { tx, frames })
+    Ok(DriveOutcome { tx, frames, health })
 }
 
 /// Fold the session's event queue into the run: incremental event

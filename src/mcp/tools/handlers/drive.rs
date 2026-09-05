@@ -57,8 +57,14 @@ pub(crate) struct DriveOutcome {
     /// The full interaction transaction (frames, settle, transition,
     /// render evidence).
     pub tx: crate::execution::InteractionTransaction,
-    /// Frame references: `{"before": "frame:N", "after": "frame:M"}`.
+    /// Frame references: `{"before": "frame:N", "after": "frame:M"}` —
+    /// failed legs are `null` + `error` (finding 9), never a fabricated
+    /// default id.
     pub frames: serde_json::Value,
+    /// Finding 9: which evidence legs actually committed. A healthy
+    /// `false` means the input landed but the run's citable record is
+    /// incomplete — consumers citing frames must see that.
+    pub health: crate::execution::drive::EvidenceHealth,
 }
 
 /// THE driving pipeline, MCP flavor: lease authorization (Wave G item 76,
@@ -90,6 +96,7 @@ pub(crate) fn drive(
         .map(|o| DriveOutcome {
             tx: o.tx,
             frames: o.frames,
+            health: o.health,
         })
         .map_err(execution_error)
 }
