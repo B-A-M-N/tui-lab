@@ -346,6 +346,9 @@ pub enum DriveOrigin {
     Conformance,
     /// The diagnostic probe (tui_probe stimulus path).
     Probe,
+    /// The contract scaffold's multi-state gather pass (finding 37):
+    /// Tab/Escape/resize steps recorded while building a scaffold.
+    Scaffold,
 }
 
 impl DriveOrigin {
@@ -361,6 +364,7 @@ impl DriveOrigin {
             DriveOrigin::Audit => "audit",
             DriveOrigin::Conformance => "conformance",
             DriveOrigin::Probe => "probe",
+            DriveOrigin::Scaffold => "scaffold",
         }
     }
 }

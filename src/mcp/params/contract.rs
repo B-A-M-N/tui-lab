@@ -23,12 +23,24 @@ selector_enum!(
       Scaffold => "scaffold", Baseline => "baseline" ]
 );
 
+selector_enum!(
+    /// `tui_contract action=scaffold` gather mode (finding 37).
+    ScaffoldMode;
+    [ Current => "current", Explore => "explore" ]
+);
+
 /// Wave E items 45–47: contract loading, validation, conformance status,
 /// and comparison against a saved baseline.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TuiContractParams {
     /// load | validate | status | compare | scaffold
     pub action: Known<ContractAction>,
+    /// scaffold (finding 37): current = one observed frame (the original
+    /// behavior); explore = a bounded SAFE multi-state pass (initial
+    /// screen, Tab focus walk, Escape, viewport probes) and the scaffold
+    /// cites every state it saw. Defaults to current.
+    #[serde(default)]
+    pub scaffold_mode: Option<Known<ScaffoldMode>>,
     /// Path to the contract document (YAML or JSON).
     #[serde(default)]
     pub path: Option<String>,

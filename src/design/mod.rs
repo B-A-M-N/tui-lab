@@ -12,6 +12,7 @@ pub mod conformance;
 pub mod loader;
 pub mod oracle;
 pub mod rules;
+pub mod scaffold;
 pub mod schema;
 
 pub use conformance::{
@@ -24,6 +25,9 @@ pub use oracle::{
     OracleError, OracleOutcome, KNOWN_PREDICATES,
 };
 pub use rules::ContractRules;
+pub use scaffold::{
+    gather_states, scaffold_multi_state, GatheredStates, ScaffoldBudget, ScaffoldState,
+};
 pub use schema::{
     ComponentContract, ContractMode, ContractSchema, InteractionContract, Keybinding,
     LaunchContract, LayoutConstraint, OracleDecl, ProjectContract, ViewportReq,
