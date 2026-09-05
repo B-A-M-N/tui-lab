@@ -22,7 +22,16 @@
 //!   injects `TUI_LAB_SEMANTIC=<path>` into the child's env. Apps that
 //!   never look at the variable are completely unaffected.
 //! - Frames are *observations from the app*, not commands. The harness
-//!   never writes into the channel.
+//!   never *originates* content in the channel; its only write is
+//!   compaction (audit finding 7) — once consumed history passes
+//!   [`COMPACT_THRESHOLD_BYTES`], the file is rewritten to the unconsumed
+//!   tail via atomic rename so disk stays bounded for a long session.
+//!   Apps append per frame, so their next write lands on the new file
+//!   untouched.
+//! - Frames are byte-capped ([`MAX_FRAME_BYTES`]): an unterminated line
+//!   wider than the cap is refused (counted in `frames_invalid`) and
+//!   skipped at the next newline — a runaway writer cannot grow the
+//!   reader's memory.
 //! - Malformed frames are skipped and counted (`frames_invalid`) — a buggy
 //!   adapter degrades to inference, never breaks observation.
 //! - Native data is merged over inference with `source: "native"` and
@@ -32,7 +41,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::PathBuf;
 
 /// One native event: a timestamped focus/activate/coverage signal from the app.
@@ -64,6 +73,22 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The env var injected into session children.
 pub const ENV_VAR: &str = "TUI_LAB_SEMANTIC";
+
+/// Per-frame byte cap (audit finding 7). A read_line with no bound lets a
+/// single unterminated line — a buggy writer, or an app that dumps a
+/// snapshot with newlines stripped — grow memory without limit. 1 MiB is
+/// orders of magnitude past any honest UI tree; a line that reaches it is
+/// refused as invalid (counted in frames_invalid) and the reader resyncs
+/// at the next newline.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Channel-file compaction threshold (audit finding 7). The channel is
+/// append-only from the app's side; once consumed bytes pile up past this,
+/// poll() compacts — truncating everything before the current offset — so
+/// the file stays O(unconsumed frames), not O(total session traffic). 8
+/// MiB of history is far past any replay need (events live in the bounded
+/// ring; snapshots in `latest`).
+pub const COMPACT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A native node as declared by the application. Everything optional — the
 /// adapter ships what it knows; the harness validates shapes, not intent.
@@ -231,7 +256,6 @@ impl NativeChannel {
             let Ok(f) = std::fs::File::open(path) else {
                 return;
             };
-            use std::io::Seek;
             let mut f = f;
             if f.seek(std::io::SeekFrom::Start(self.consumed_to)).is_err() {
                 return;
@@ -242,9 +266,19 @@ impl NativeChannel {
             return;
         };
         loop {
-            let mut line = String::new();
+            let mut raw: Vec<u8> = Vec::new();
             let before_read = self.consumed_to;
-            match reader.read_line(&mut line) {
+            // Finding 7: bounded read. take() caps how much a single read
+            // may buffer, so a runaway line cannot grow memory without
+            // limit; the newline check below still distinguishes a complete
+            // frame from a partial one. (read_until on bytes rather than
+            // read_line: a non-UTF-8 frame must be *refused and skipped*,
+            // not left to error the same offset forever.)
+            match reader
+                .by_ref()
+                .take(MAX_FRAME_BYTES as u64)
+                .read_until(b'\n', &mut raw)
+            {
                 Ok(0) => break, // EOF; keep reader for next poll
                 Ok(_) => {
                     // A frame is only complete when newline-terminated; a
@@ -253,12 +287,35 @@ impl NativeChannel {
                     // start of that line and drop the reader — its buffer
                     // may hold bytes the app rewrites, so the next poll
                     // must reopen at the rolled-back offset.
-                    if !line.ends_with('\n') {
-                        self.consumed_to = before_read;
+                    if !raw.ends_with(b"\n") {
+                        if raw.len() >= MAX_FRAME_BYTES {
+                            // Finding 7: the line filled the whole take()
+                            // window with no newline — beyond any honest
+                            // frame. Advance PAST the bytes read (each
+                            // window counts one invalid frame) and resync
+                            // at the first newline after the garbage; the
+                            // next poll continues the skip in bounded
+                            // steps instead of re-reading the same
+                            // megabyte forever.
+                            self.frames_invalid += 1;
+                            self.consumed_to = before_read + raw.len() as u64;
+                        } else {
+                            self.consumed_to = before_read;
+                        }
                         self.reader = None;
                         break;
                     }
-                    self.consumed_to += line.len() as u64;
+                    self.consumed_to += raw.len() as u64;
+                    // Protocol says UTF-8: a non-UTF-8 line is an invalid
+                    // frame like any other — count it and move on, keeping
+                    // the channel live for the frames behind it.
+                    let line = match std::str::from_utf8(&raw) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            self.frames_invalid += 1;
+                            continue;
+                        }
+                    };
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -305,6 +362,68 @@ impl NativeChannel {
                 Err(_) => break,
             }
         }
+        // Finding 7: drained what there was to drain — now reclaim the
+        // consumed history before it accumulates for the session's life.
+        self.compact_if_needed();
+    }
+
+    /// Finding 7: keep the channel file bounded. The file is append-only
+    /// from the app's side, so after a long session consumed history just
+    /// piles up on disk forever. Once the file exceeds the compaction
+    /// threshold, rewrite it to only the unconsumed tail: write the tail to
+    /// a sibling temp file, fsync, rename over the original (atomic — a
+    /// concurrent app writer either lands wholly in the old file or wholly
+    /// in the new one), then reopen our reader at offset 0. Any app frame
+    /// written in the race window between our tail read and the rename is
+    /// dropped, which is the same outcome as a dropped frame anywhere else
+    /// in the pipeline: observation degrades, the session does not.
+    fn compact_if_needed(&mut self) {
+        let Some(path) = &self.path else { return };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        // Nothing consumed → nothing to reclaim (the "tail" would be the
+        // whole file, and the rewrite a pointless copy).
+        if meta.len() < COMPACT_THRESHOLD_BYTES || self.consumed_to == 0 {
+            return;
+        }
+        // Read the unconsumed tail out first (the reader, if any, may sit
+        // mid-file; a fresh handle seeked to the offset is the truth).
+        let Ok(mut src) = std::fs::File::open(path) else {
+            return;
+        };
+        use std::io::Seek;
+        if src
+            .seek(std::io::SeekFrom::Start(self.consumed_to))
+            .is_err()
+        {
+            return;
+        }
+        let mut tail = Vec::new();
+        if src.read_to_end(&mut tail).is_err() {
+            return;
+        }
+        drop(src);
+        let mut tmp = path.clone();
+        tmp.set_extension("compact-tmp");
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp);
+        let Ok(mut out) = write else { return };
+        use std::io::Write;
+        if out.write_all(&tail).is_err() || out.sync_all().is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        // Swap in the compacted file, then restart consumption from zero.
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        self.consumed_to = 0;
+        self.reader = None;
     }
 
     /// Merge the latest native snapshot over an inferred tree. Returns the
@@ -1037,6 +1156,191 @@ mod tests {
         .expect("write full");
         ch.poll();
         assert_eq!(ch.frames_accepted, 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Finding 7: an unterminated run of garbage wider than one frame cap
+    // is skipped in bounded steps (one window per poll — poll() does
+    // bounded work) and counted invalid — never re-read forever, never
+    // buffered whole.
+    #[test]
+    fn oversize_line_is_refused_and_channel_stays_live() {
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        // Two windows' worth of newline-less garbage, then a valid frame.
+        let junk_len = MAX_FRAME_BYTES + 4096;
+        let mut blob = vec![b'x'; junk_len];
+        blob.push(b'\n');
+        blob.extend_from_slice(
+            r##"{"v":1,"type":"snapshot","root":{"id":"#after","role":"screen"}}"##.as_bytes(),
+        );
+        blob.push(b'\n');
+        std::fs::write(&path, &blob).expect("write junk");
+        ch.poll();
+        assert_eq!(ch.frames_invalid, 1, "the full window was refused");
+        assert_eq!(
+            ch.consumed_to as usize, MAX_FRAME_BYTES,
+            "advanced exactly one bounded window, not the whole line"
+        );
+        assert_eq!(ch.frames_accepted, 0, "no garbage parsed as a frame");
+        // The next poll continues the skip and finds the valid frame
+        // behind the garbage.
+        ch.poll();
+        assert!(ch.frames_invalid >= 2, "residual junk counted too");
+        assert_eq!(ch.frames_accepted, 1, "channel recovered after the junk");
+        assert_eq!(ch.latest.as_ref().expect("latest").id, "#after");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Finding 7: the oversized frame never lives in memory whole — each
+    /// poll buffers at most one MAX_FRAME_BYTES window.
+    #[test]
+    fn oversize_read_is_bounded_by_the_frame_cap() {
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        let junk_len = MAX_FRAME_BYTES * 3 + 12345;
+        let mut blob = vec![b'x'; junk_len];
+        blob.push(b'\n');
+        std::fs::write(&path, &blob).expect("write");
+        ch.poll();
+        assert_eq!(ch.frames_invalid, 1);
+        assert_eq!(
+            ch.consumed_to as usize, MAX_FRAME_BYTES,
+            "one bounded window per poll — never the whole line"
+        );
+        // Keep polling: the skip advances window by window to the newline.
+        for _ in 0..6 {
+            ch.poll();
+        }
+        assert_eq!(ch.frames_accepted, 0);
+        assert!(
+            ch.frames_invalid >= 4,
+            "every window counted: {}",
+            ch.frames_invalid
+        );
+        assert_eq!(
+            ch.consumed_to as usize,
+            junk_len + 1,
+            "the skip ended at (and consumed) the newline"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Finding 7: a non-UTF-8 line is refused as one invalid frame and the
+    /// channel keeps parsing what follows (read_until semantics, not
+    /// read_line error-loops).
+    #[test]
+    fn non_utf8_line_is_skipped_not_sticky() {
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        let mut blob = b"\xff\xfe garbage\n".to_vec();
+        blob.extend_from_slice(
+            r##"{"v":1,"type":"snapshot","root":{"id":"#ok","role":"screen"}}"##.as_bytes(),
+        );
+        blob.push(b'\n');
+        std::fs::write(&path, &blob).expect("write");
+        ch.poll();
+        assert_eq!(ch.frames_invalid, 1);
+        assert_eq!(ch.frames_accepted, 1);
+        assert_eq!(ch.latest.as_ref().expect("latest").id, "#ok");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Finding 7: after heavy traffic the channel file compacts to the
+    /// unconsumed tail — bounded disk, not O(total session traffic) — and
+    /// consumption restarts from zero with nothing lost.
+    #[test]
+    fn channel_file_compacts_to_unconsumed_tail() {
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        // History: a valid frame the channel HAS consumed…
+        let good = r##"{"v":1,"type":"snapshot","root":{"id":"#old","role":"screen"}}"##;
+        std::fs::write(&path, format!("{good}\n")).expect("write");
+        ch.poll();
+        assert_eq!(ch.frames_accepted, 1);
+        // …then past-threshold traffic in sub-cap complete lines (so the
+        // oversize skip stays out of the way): 32 × 256 KiB of garbage.
+        let junk_line = format!("y{}\n", "y".repeat(256 * 1024));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            for _ in 0..32 {
+                f.write_all(junk_line.as_bytes()).expect("append junk");
+            }
+        }
+        ch.poll();
+        assert_eq!(ch.frames_invalid, 32, "every garbage line counted");
+        let size_after = std::fs::metadata(&path).expect("meta").len();
+        assert!(
+            size_after < 1024,
+            "consumed history reclaimed: file is {size_after} bytes"
+        );
+        assert_eq!(ch.consumed_to, 0, "offset restarted at zero");
+        // …and the next write lands behind the new reader and still parses.
+        let good2 = r##"{"v":1,"type":"snapshot","root":{"id":"#new","role":"screen"}}"##;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            f.write_all(good2.as_bytes()).expect("append");
+            f.write_all(b"\n").expect("newline");
+        }
+        ch.poll();
+        assert_eq!(ch.frames_accepted, 2, "post-compaction frame accepted");
+        assert_eq!(ch.latest.as_ref().expect("latest").id, "#new");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Finding 7: compaction never reclaims bytes not yet consumed. The one
+    /// state where bytes legitimately survive a compaction is a partial
+    /// trailing line (rolled back, unconsumed) — it must be carried through
+    /// the rewrite byte-for-byte and parse once the app finishes it.
+    #[test]
+    fn compaction_preserves_unconsumed_frames() {
+        let mut ch = NativeChannel::create().expect("create");
+        let path = ch.path.clone().expect("path");
+        let good = r##"{"v":1,"type":"snapshot","root":{"id":"#old","role":"screen"}}"##;
+        std::fs::write(&path, format!("{good}\n")).expect("write");
+        ch.poll();
+        assert_eq!(ch.frames_accepted, 1);
+        // Past-threshold garbage + a partial trailing frame (no newline).
+        let good2 = r##"{"v":1,"type":"snapshot","root":{"id":"#pending","role":"screen"}}"##;
+        let junk_line = format!("z{}\n", "z".repeat(256 * 1024));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            for _ in 0..32 {
+                f.write_all(junk_line.as_bytes()).expect("append junk");
+            }
+            f.write_all(good2.as_bytes())
+                .expect("partial frame, no newline");
+        }
+        ch.poll();
+        assert_eq!(ch.frames_accepted, 1, "partial frame not parsed");
+        assert!(
+            std::fs::metadata(&path).expect("meta").len() < 1024,
+            "compaction ran; only the partial tail remains"
+        );
+        // The app finishes the frame; it must parse from the compacted file.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            f.write_all(b"\n").expect("complete the frame");
+        }
+        ch.poll();
+        assert_eq!(ch.frames_accepted, 2, "pending frame survived compaction");
+        assert_eq!(ch.latest.as_ref().expect("latest").id, "#pending");
         std::fs::remove_file(&path).ok();
     }
 
