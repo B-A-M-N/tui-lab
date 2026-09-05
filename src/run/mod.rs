@@ -31,6 +31,7 @@ mod artifacts_impl;
 mod contract_impl;
 mod contract_state;
 mod coverage_impl;
+mod coverage_state;
 mod evidence_impl;
 mod evidence_store;
 mod finding_store;
@@ -313,25 +314,12 @@ pub struct RunContext {
     /// Round-2 (G1): moved into [`ContractState`] so the contract domain has
     /// its own cohesive holder; RunContext delegates.
     contract: ContractState,
-    /// Wave F item 64: native coverage ledger. Entries accumulate from
-    /// NativeSemanticProtocol `coverage` events: target → (hits, sessions).
-    /// This is interaction-correlated coverage: "did my last act exercise
-    /// new app code" is answerable by diffing before/after a step.
-    pub coverage_ledger: std::collections::BTreeMap<String, CoverageEntry>,
-    /// Per-consumer event cursors (re-review P1): exactly-once ingestion
-    /// positions for coverage folding and other event-derived ledgers.
-    pub event_cursors: std::collections::HashMap<String, u64>,
-    /// Monotonic coverage sequence (review P0.7). Incremented on every
-    /// ledger insert/update so a real `delta` cursor exists. Defaults to 0
-    /// (pre-P0.7 persisted runs) — every target then reads as "new" on the
-    /// first delta after upgrade, which is honest.
-    pub coverage_seq: u64,
-    /// The caller's last `delta` cursor (review P0.7): the `coverage_seq`
-    /// value from the previous delta. Targets with `first_seq > ` this are
-    /// newly-reported since the previous delta. Without more state we cannot
-    /// represent per-caller cursors; this is the single process-wide cursor
-    /// the MCP tool advances on each delta call and reports in the response.
-    pub coverage_delta_cursor: u64,
+    /// Wave F item 64: native coverage. Round-2 (G1): ledger + monotonic
+    /// seq + the process-wide delta cursor moved into
+    /// [`coverage_state::CoverageState`] (the delta cursor is coverage
+    /// policy, not run bookkeeping); per-consumer event cursors moved into
+    /// the evidence store's event ledger. RunContext delegates.
+    coverage: coverage_state::CoverageState,
     /// Set by `tui_run close`. Sessions are NOT touched by closing.
     closed: bool,
     /// Resume epoch (finding 32): 0 for a run in its original process,
@@ -1796,7 +1784,7 @@ mod tests {
         );
         assert!(run.findings().is_empty(), "no post-close findings");
         assert!(run.artifacts().is_empty(), "no post-close artifacts");
-        assert!(run.coverage_ledger.is_empty(), "no post-close coverage");
+        assert!(run.coverage_ledger().is_empty(), "no post-close coverage");
     }
 
     /// The error names the run and the remedy (the agent-facing message).
@@ -1962,26 +1950,26 @@ mod source_ref_tests {
         // First two targets arrive.
         let _ = run.record_coverage_event("s1", "src/a.rs");
         let _ = run.record_coverage_event("s1", "src/b.rs");
-        assert!(run.coverage_seq >= 2);
+        assert!(run.coverage_seq() >= 2);
 
         // Delta from cursor 0 reports both as new and advances the cursor.
-        let cur = run.coverage_delta_cursor;
+        let cur = run.coverage_delta_cursor();
         let new: Vec<String> = run
-            .coverage_ledger
+            .coverage_ledger()
             .iter()
             .filter(|(_, e)| e.first_seq > cur)
             .map(|(t, _)| t.clone())
             .collect();
         assert_eq!(new.len(), 2);
-        run.coverage_delta_cursor = run.coverage_seq;
+        run.set_coverage_delta_cursor(run.coverage_seq());
 
         // A re-hit of an existing target must NOT reappear as new on the next
         // delta, because its first_seq is unchanged.
         let _ = run.record_coverage_event("s1", "src/a.rs");
         let new2: Vec<String> = run
-            .coverage_ledger
+            .coverage_ledger()
             .iter()
-            .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor)
+            .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor())
             .map(|(t, _)| t.clone())
             .collect();
         assert_eq!(
@@ -1993,9 +1981,9 @@ mod source_ref_tests {
         // A genuinely new target after the cursor IS new.
         let _ = run.record_coverage_event("s1", "src/c.rs");
         let new3: Vec<String> = run
-            .coverage_ledger
+            .coverage_ledger()
             .iter()
-            .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor)
+            .filter(|(_, e)| e.first_seq > run.coverage_delta_cursor())
             .map(|(t, _)| t.clone())
             .collect();
         assert_eq!(new3, vec!["src/c.rs".to_string()]);

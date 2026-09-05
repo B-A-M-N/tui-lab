@@ -32,10 +32,7 @@ impl RunContext {
             journal: None,
             persistence_unhealthy: false,
             contract: contract_state::ContractState::new(),
-            coverage_ledger: std::collections::BTreeMap::new(),
-            event_cursors: std::collections::HashMap::new(),
-            coverage_seq: 0,
-            coverage_delta_cursor: 0,
+            coverage: coverage_state::CoverageState::new(),
             closed: false,
             resume_epoch: 0,
             restore_warnings: Vec::new(),
@@ -366,13 +363,18 @@ impl RunContext {
         if let Some(v) = state_graph_json {
             run.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
         }
-        // Coverage ledger.
+        // Coverage ledger. Round-2 (G1): read into a local, then adopt;
+        // `coverage_seq` stays 0 (sequence order reflects live events
+        // since reopen — unchanged behavior).
+        let mut loaded_coverage: std::collections::BTreeMap<String, CoverageEntry> =
+            std::collections::BTreeMap::new();
         load_json!(
             "coverage.json",
             crate::run::formats::tags::COVERAGE,
             std::collections::BTreeMap<String, CoverageEntry>,
-            run.coverage_ledger
+            loaded_coverage
         );
+        run.coverage.set_entries(loaded_coverage);
         // Saved scenarios from the durable dir (id-keyed; name index rebuilt).
         let scen_dir = run_dir.join("scenarios");
         if let Ok(entries) = std::fs::read_dir(&scen_dir) {
@@ -681,13 +683,13 @@ impl RunContext {
         )?;
         std::fs::rename(&ftmp, dir.join("findings.json"))?;
         // Wave F item 64: the native coverage ledger.
-        if !self.coverage_ledger.is_empty() {
+        if !self.coverage.entries().is_empty() {
             let ctmp = dir.join("coverage.json.tmp");
             std::fs::write(
                 &ctmp,
                 format_envelope(
                     crate::run::formats::tags::COVERAGE,
-                    &serde_json::to_value(&self.coverage_ledger)?,
+                    &serde_json::to_value(self.coverage.entries())?,
                 )?,
             )?;
             std::fs::rename(&ctmp, dir.join("coverage.json"))?;

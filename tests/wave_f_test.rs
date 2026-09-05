@@ -495,7 +495,7 @@ fn coverage_ledger_accumulates_native_events() {
     // rescan double-counted on every call).
     let folded = run.ingest_native_coverage_batch("sess-x", &ch.events_since(0));
     assert_eq!(folded, 3, "all coverage events folded");
-    let ledger = &run.coverage_ledger;
+    let ledger = run.coverage_ledger();
     assert_eq!(ledger.len(), 2, "two distinct targets");
     assert_eq!(ledger.get("src/lib.rs:42").expect("entry").hits, 2);
     assert!(

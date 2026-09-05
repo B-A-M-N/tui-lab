@@ -35,14 +35,14 @@ impl RunContext {
         self.ensure_open()?;
         // Coverage targets that are real file loci.
         let file_targets: Vec<&String> = self
-            .coverage_ledger
+            .coverage_ledger()
             .keys()
             .filter(|t| target_is_file_locus(t))
             .collect();
         // Widget-ish targets (widget:<id>, #id, bare id) → the app declared
         // coverage for that component in the same channel.
         let widget_targets: Vec<&String> = self
-            .coverage_ledger
+            .coverage_ledger()
             .keys()
             .filter(|t| !target_is_file_locus(t))
             .collect();
@@ -65,7 +65,7 @@ impl RunContext {
                     continue;
                 };
                 // Attested first: the matched entry's own app-declared loci.
-                if let Some(entry) = self.coverage_ledger.get(*matched_widget) {
+                if let Some(entry) = self.coverage_ledger().get(*matched_widget) {
                     refs.extend(entry.source_refs.iter().cloned().map(|mut sr| {
                         sr.provenance = crate::semantic::source_ref::Provenance::Attested;
                         sr
@@ -120,7 +120,7 @@ impl RunContext {
         // where that widget lives. Ledger KEYS that are file loci are the
         // weaker, correlational join and only fill gaps.
         let widget_targets: Vec<&String> = self
-            .coverage_ledger
+            .coverage_ledger()
             .keys()
             .filter(|t| !target_is_file_locus(t))
             .collect();
@@ -140,7 +140,7 @@ impl RunContext {
             // This is the direct chain the provenance tier calls attested:
             // the finding's control matched a coverage target the app
             // declared a native id AND a source locus for (review §4).
-            if let Some(entry) = self.coverage_ledger.get(*w) {
+            if let Some(entry) = self.coverage_ledger().get(*w) {
                 refs.extend(entry.source_refs.iter().cloned().map(|mut sr| {
                     sr.provenance = crate::semantic::source_ref::Provenance::Attested;
                     sr
@@ -155,7 +155,7 @@ impl RunContext {
             // attested, and sits below the actionable fence (review §4: a
             // 0.7 float must not turn correlation into a cause site).
             for ft in self
-                .coverage_ledger
+                .coverage_ledger()
                 .keys()
                 .filter(|t| target_is_file_locus(t))
             {

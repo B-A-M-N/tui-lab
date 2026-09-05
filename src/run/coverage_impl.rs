@@ -10,32 +10,7 @@ impl RunContext {
     /// the ledger only counts and correlates, never interprets.
     pub fn record_coverage_event(&mut self, session: &str, target: &str) -> anyhow::Result<()> {
         self.ensure_open()?;
-        if target.is_empty() {
-            return Ok(());
-        }
-        let now = now_ms();
-        // Monotonic coverage sequence (review P0.7): each hit advances it so
-        // delta can tell "new since my last delta" from "hit again".
-        self.coverage_seq = self.coverage_seq.saturating_add(1);
-        let seq = self.coverage_seq;
-        let entry = self
-            .coverage_ledger
-            .entry(target.to_string())
-            .or_insert_with(|| CoverageEntry {
-                hits: 0,
-                sessions: Vec::new(),
-                first_seen: now,
-                last_seen: now,
-                first_seq: seq,
-                last_seq: seq,
-                source_refs: Vec::new(),
-            });
-        entry.hits += 1;
-        entry.last_seen = now;
-        entry.last_seq = seq;
-        if !entry.sessions.iter().any(|s| s == session) {
-            entry.sessions.push(session.to_string());
-        }
+        self.coverage.record(session, target, now_ms());
         Ok(())
     }
 
@@ -54,18 +29,7 @@ impl RunContext {
         mut source_ref: crate::semantic::source_ref::SourceRef,
     ) -> anyhow::Result<()> {
         self.record_coverage_event(session, target)?;
-        let Some(entry) = self.coverage_ledger.get_mut(target) else {
-            return Ok(());
-        };
-        // Native id → coverage event → locus: the app drew every edge.
-        source_ref.provenance = crate::semantic::source_ref::Provenance::Attested;
-        if !entry
-            .source_refs
-            .iter()
-            .any(|r| r.location() == source_ref.location())
-        {
-            entry.source_refs.push(source_ref);
-        }
+        self.coverage.attach_source_ref(target, source_ref);
         Ok(())
     }
 
@@ -116,12 +80,36 @@ impl RunContext {
 
     /// A named consumer's event cursor (re-review P1: per-consumer cursors
     /// live in the run so ingestion is exactly-once across tool calls).
+    /// Round-2 (G1): stored in the evidence store's event ledger.
     pub fn event_cursor(&self, consumer: &str) -> Option<u64> {
-        self.event_cursors.get(consumer).copied()
+        self.evidence.events.cursor(consumer)
     }
 
     /// Advance a named consumer's event cursor.
     pub fn set_event_cursor(&mut self, consumer: &str, seq: u64) {
-        self.event_cursors.insert(consumer.to_string(), seq);
+        self.evidence.events.set_cursor(consumer, seq);
+    }
+
+    /// The coverage ledger (target → entry), for readers that fold over
+    /// all entries. Round-2 (G1): delegates to
+    /// [`coverage_state::CoverageState`].
+    pub fn coverage_ledger(&self) -> &std::collections::BTreeMap<String, CoverageEntry> {
+        self.coverage.entries()
+    }
+
+    /// The monotonic coverage sequence (review P0.7).
+    pub fn coverage_seq(&self) -> u64 {
+        self.coverage.seq()
+    }
+
+    /// The caller's last `delta` cursor (review P0.7).
+    pub fn coverage_delta_cursor(&self) -> u64 {
+        self.coverage.delta_cursor()
+    }
+
+    /// Advance the process-wide delta cursor (the historical
+    /// single-consumer `delta` contract).
+    pub fn set_coverage_delta_cursor(&mut self, v: u64) {
+        self.coverage.set_delta_cursor(v);
     }
 }

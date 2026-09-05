@@ -457,7 +457,7 @@ fn coverage_event_with_identity_attests_source_locus() {
         },
     );
     let _ = run.record_coverage_event("s1", "#save.activate"); // plain hits still fold
-    let entry = run.coverage_ledger.get("#save.activate").expect("entry");
+    let entry = run.coverage_ledger().get("#save.activate").expect("entry");
     assert_eq!(entry.hits, 2);
     assert_eq!(entry.source_refs.len(), 1, "deduped by location");
     assert_eq!(entry.source_refs[0].file, "src/ui/save.rs");
@@ -542,7 +542,7 @@ fn coverage_delta_since_seq_is_caller_owned() {
     let mut run = tui_lab::run::RunContext::ephemeral();
     let _ = run.record_coverage_event("s1", "#save.activate");
     let _ = run.record_coverage_event("s1", "#cancel.activate");
-    let seq_two = run.coverage_seq;
+    let seq_two = run.coverage_seq();
     let server = tui_lab::mcp::tools::TuiLabServer::with_run(run);
 
     // Consumer A: stateless delta from 0 — sees both targets, and the run

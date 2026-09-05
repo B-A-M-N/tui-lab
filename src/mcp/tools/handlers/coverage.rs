@@ -26,7 +26,7 @@ pub(crate) async fn tui_coverage(
         Some(CV::Ledger) | Some(CV::Summary) => {
             let run = s.run.lock().unwrap();
             let entries: Vec<serde_json::Value> = run
-                .coverage_ledger
+                .coverage_ledger()
                 .iter()
                 .map(|(target, e)| {
                     json!({
@@ -41,8 +41,8 @@ pub(crate) async fn tui_coverage(
                     })
                 })
                 .collect();
-            let total_hits: u64 = run.coverage_ledger.values().map(|e| e.hits).sum();
-            let sessions_seen = run.coverage_seq > 0;
+            let total_hits: u64 = run.coverage_ledger().values().map(|e| e.hits).sum();
+            let sessions_seen = run.coverage_seq() > 0;
             ok(json!({
                 "ledger": entries,
                 "targets": entries.len(),
@@ -65,8 +65,8 @@ pub(crate) async fn tui_coverage(
             // This honestly reports that, plus what has accumulated, and
             // never pretends a silent no-op "collected" (review P0.7).
             let run = s.run.lock().unwrap();
-            let targets = run.coverage_ledger.len();
-            let total_hits: u64 = run.coverage_ledger.values().map(|e| e.hits).sum();
+            let targets = run.coverage_ledger().len();
+            let total_hits: u64 = run.coverage_ledger().values().map(|e| e.hits).sum();
             ok(json!({
                 "mode": "continuous",
                 "provider": "native-events",
@@ -85,11 +85,11 @@ pub(crate) async fn tui_coverage(
             let mut run = s.run.lock().unwrap();
             let (cur, caller_owned) = match p.since_seq {
                 Some(seq) => (seq, true),
-                None => (run.coverage_delta_cursor, false),
+                None => (run.coverage_delta_cursor(), false),
             };
             let mut new_targets = Vec::new();
             let mut hits_since: u64 = 0;
-            for (target, e) in &run.coverage_ledger {
+            for (target, e) in run.coverage_ledger() {
                 if e.first_seq > cur {
                     new_targets.push(json!({
                         "target": target,
@@ -100,9 +100,9 @@ pub(crate) async fn tui_coverage(
                 }
             }
             new_targets.sort_by(|a, b| a["first_seq"].as_u64().cmp(&b["first_seq"].as_u64()));
-            let new_cursor = run.coverage_seq;
+            let new_cursor = run.coverage_seq();
             if !caller_owned {
-                run.coverage_delta_cursor = new_cursor;
+                run.set_coverage_delta_cursor(new_cursor);
             }
             ok(json!({
                 "new_targets": new_targets,
