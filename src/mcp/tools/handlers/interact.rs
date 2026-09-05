@@ -296,7 +296,7 @@ pub(crate) async fn tui_intent(
         // Unsupported with the remedy named.
         let graph_snapshot = {
             let run = run.lock().unwrap();
-            run.focus_graph.clone()
+            run.graphs().focus_graph.clone()
         };
         let plan = match crate::intent::plan_intent_with_graph(
             &semantic,

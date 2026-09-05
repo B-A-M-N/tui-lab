@@ -36,6 +36,7 @@ mod evidence_impl;
 mod evidence_store;
 mod finding_store;
 mod findings_impl;
+mod graph_state;
 mod identity;
 mod launch_impl;
 mod ledger_impl;
@@ -269,17 +270,10 @@ pub struct RunContext {
     /// Wave F item 57: screen captures held while the run is ephemeral
     /// (name, bytes, format).
     held_captures: Vec<(String, Vec<u8>, String)>,
-    /// Focus-transition ledger: (unix_ms, session, from, to) recorded from
-    /// semantic analysis of every observation. The run's focus graph.
-    focus_transitions: Vec<(u64, String, Option<String>, Option<String>)>,
-    /// The real FocusGraph (Wave D items 36–37): focus transitions as edges
-    /// keyed on stable control IDs with the input that produced them, so Tab
-    /// order and Shift+Tab reversal are provable, not suggested. Recorded
-    /// from the same observations as `focus_transitions` (labels) plus the
-    /// audit drivers (driven edges).
-    pub focus_graph: crate::semantic::focus_graph::FocusGraph,
-    /// Exploration state graph (owned here so audits/exploration share it).
-    pub state_graph: StateGraph,
+    /// Focus history + exploration graphs. Round-2 (G1): focus_transitions,
+    /// focus_graph, and state_graph moved into [`graph_state::RunGraphs`];
+    /// RunContext delegates and exposes `graphs()`/`graphs_mut()`.
+    graphs: graph_state::RunGraphs,
     /// Findings + labeled baselines. Round-2 (G1): moved into
     /// [`FindingStore`]; RunContext delegates.
     findings: FindingStore,
@@ -1396,7 +1390,7 @@ mod tests {
         // The graph has at least one driven edge tagged with the EXACT
         // action identity (re-review P0): a Right keypress reads `right`,
         // not the useless kind-only `key`.
-        let edges = &run.focus_graph.edges;
+        let edges = &run.graphs().focus_graph.edges;
         assert!(
             edges.iter().any(|e| e.via == "right"),
             "transaction fed a via=right edge: {:?}",

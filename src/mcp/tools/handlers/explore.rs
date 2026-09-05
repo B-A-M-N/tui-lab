@@ -35,20 +35,20 @@ pub(crate) async fn tui_explore(
     if emode == EM::StateGraph {
         let run = s.run.lock().unwrap();
         return ok(json!({
-            "states": run.state_graph.state_count(),
-            "transitions": run.state_graph.transition_count(),
-            "dead_ends": run.state_graph
+            "states": run.graphs().state_graph.state_count(),
+            "transitions": run.graphs().state_graph.transition_count(),
+            "dead_ends": run.graphs().state_graph
                 .find_dead_ends()
                 .into_iter()
                 .map(|n| n.structure_hash.clone())
                 .collect::<Vec<String>>(),
-            "edges": run.state_graph.edge_list(),
-            "visit_counts": run.state_graph.visit_counts(),
-            "budget_exhausted": run.state_graph.budget_exhausted(),
+            "edges": run.graphs().state_graph.edge_list(),
+            "visit_counts": run.graphs().state_graph.visit_counts(),
+            "budget_exhausted": run.graphs().state_graph.budget_exhausted(),
             // The ID-keyed focus graph (Wave D item 36): Tab order
             // and reverse-traversal proof, accumulated across every
             // observe and audit in this run.
-            "focus_graph": run.focus_graph.summary(),
+            "focus_graph": run.graphs().focus_graph.summary(),
         }));
     }
     let selector = p.id.clone();
@@ -109,13 +109,14 @@ pub(crate) async fn tui_explore(
                         .iter()
                         .map(|t| t.action.clone())
                         .collect();
-                    let coverage: Vec<String> = run.focus_graph.nodes.keys().cloned().collect();
+                    let coverage: Vec<String> =
+                        run.graphs().focus_graph.nodes.keys().cloned().collect();
                     // Item 49: a loaded contract feeds the `contract` evidence
                     // source — declared keys never exercised become candidates
                     // citing the contract, not guesses.
                     let contract = run.contract();
                     let ctx = crate::exploration::candidates::CandidateContext {
-                        state_graph: &run.state_graph,
+                        state_graph: &run.graphs().state_graph,
                         current,
                         action_history: &action_history,
                         coverage: &coverage,
@@ -154,10 +155,12 @@ pub(crate) async fn tui_explore(
                         .map(|r| r.to_risk())
                         .unwrap_or(crate::intent::ActionRisk::Safe);
                     crate::exploration::random::Budget {
-                        max_actions: p.actions.unwrap_or(run.state_graph.budget().max_actions),
+                        max_actions: p
+                            .actions
+                            .unwrap_or(run.graphs().state_graph.budget().max_actions),
                         allowed_risk,
                         ..crate::exploration::random::Budget::from_graph_budget(
-                            run.state_graph.budget(),
+                            run.graphs().state_graph.budget(),
                         )
                     }
                 };
@@ -179,13 +182,13 @@ pub(crate) async fn tui_explore(
                         // the real action), not from post-hoc hash lists.
                         let graph_summary = {
                             crate::exploration::random::record_steps(
-                                &mut run_guard.state_graph,
+                                &mut run_guard.graphs_mut().state_graph,
                                 &report.steps,
                             );
                             json!({
-                                "states": run_guard.state_graph.state_count(),
-                                "transitions": run_guard.state_graph.transition_count(),
-                                "dead_ends": run_guard.state_graph.find_dead_ends().len(),
+                                "states": run_guard.graphs().state_graph.state_count(),
+                                "transitions": run_guard.graphs().state_graph.transition_count(),
+                                "dead_ends": run_guard.graphs().state_graph.find_dead_ends().len(),
                             })
                         };
                         // RELEASE run_guard BEFORE taking the run lock again:
@@ -202,9 +205,9 @@ pub(crate) async fn tui_explore(
                                 Some(dir) => {
                                     let path = dir.join("state_graph.json");
                                     let payload = json!({
-                                        "edges": run.state_graph.edge_list(),
-                                        "visit_counts": run.state_graph.visit_counts(),
-                                        "known_states": run.state_graph.known_states(),
+                                        "edges": run.graphs().state_graph.edge_list(),
+                                        "visit_counts": run.graphs().state_graph.visit_counts(),
+                                        "known_states": run.graphs().state_graph.known_states(),
                                     });
                                     std::fs::write(&path, payload.to_string())
                                         .ok()
@@ -242,10 +245,10 @@ pub(crate) async fn tui_explore(
                 let (graph_budget, run_graph_summary, contract) = {
                     let run = run.lock().unwrap();
                     (
-                        run.state_graph.budget().clone(),
+                        run.graphs().state_graph.budget().clone(),
                         (
-                            run.state_graph.state_count(),
-                            run.state_graph.transition_count(),
+                            run.graphs().state_graph.state_count(),
+                            run.graphs().state_graph.transition_count(),
                         ),
                         run.contract().cloned(),
                     )
@@ -275,8 +278,8 @@ pub(crate) async fn tui_explore(
                 };
                 // Merge what actually happened into the run's graphs.
                 {
-                    run_guard.state_graph.merge(&local_graph);
-                    run_guard.focus_graph.merge(&focus_graph);
+                    run_guard.graphs_mut().state_graph.merge(&local_graph);
+                    run_guard.graphs_mut().focus_graph.merge(&focus_graph);
                 }
                 ok(json!({
                     "mode": "semantic",

@@ -51,7 +51,9 @@ impl RunContext {
         let (before_focus, after_focus) = (tx.focus_before.clone(), tx.focus_after.clone());
         if before_focus.as_ref().map(|f| &f.0) != after_focus.as_ref().map(|f| &f.0) {
             if let (Some((Some(f), _)), Some((Some(t), _))) = (before_focus, after_focus) {
-                self.focus_graph.transition(&f, &t, None, &tx.signature());
+                self.graphs
+                    .focus_graph
+                    .transition(&f, &t, None, &tx.signature());
             }
             // Legacy label ledger for display continuity (label pair form).
             let (b_label, a_label) = (
@@ -59,8 +61,12 @@ impl RunContext {
                 tx.focus_after.as_ref().and_then(|f| f.1.clone()),
             );
             if b_label != a_label {
-                self.focus_transitions
-                    .push((now_ms(), session.to_string(), b_label, a_label));
+                self.graphs.focus_transitions.push((
+                    now_ms(),
+                    session.to_string(),
+                    b_label,
+                    a_label,
+                ));
             }
         }
         Ok(())
@@ -188,10 +194,14 @@ impl RunContext {
             ("scenarios", self.saved_scenarios.len() as u64),
             ("findings", self.findings.len() as u64),
             ("held_recordings", self.held_recordings.len() as u64),
-            ("focus_transitions", self.focus_transitions.len() as u64),
+            (
+                "focus_transitions",
+                self.graphs.focus_transitions.len() as u64,
+            ),
             (
                 "state_graph_records",
-                (self.state_graph.state_count() + self.state_graph.transition_count()) as u64,
+                (self.graphs.state_graph.state_count() + self.graphs.state_graph.transition_count())
+                    as u64,
             ),
         ];
         let evidence: serde_json::Value = counts
@@ -223,10 +233,10 @@ impl RunContext {
             "scenarios": self.saved_scenarios.len(),
             "findings": self.findings.len(),
             "held_recordings": self.held_recordings.len(),
-            "focus_transitions": self.focus_transitions.len(),
-            "focus_graph_edges": self.focus_graph.edges.len(),
-            "state_graph_states": self.state_graph.state_count(),
-            "state_graph_transitions": self.state_graph.transition_count(),
+            "focus_transitions": self.graphs.focus_transitions.len(),
+            "focus_graph_edges": self.graphs.focus_graph.edges.len(),
+            "state_graph_states": self.graphs.state_graph.state_count(),
+            "state_graph_transitions": self.graphs.state_graph.transition_count(),
             "frames": self.evidence.frames.next_id(),
             "artifacts": self.artifacts.len(),
         })

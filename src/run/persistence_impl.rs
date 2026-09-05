@@ -23,9 +23,7 @@ impl RunContext {
             scenario_names: HashMap::new(),
             held_recordings: Vec::new(),
             held_captures: Vec::new(),
-            focus_transitions: Vec::new(),
-            focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
-            state_graph: StateGraph::new(ExplorationBudget::default()),
+            graphs: graph_state::RunGraphs::new(),
             findings: FindingStore::new(),
             evidence: evidence_store::EvidenceStore::new(),
             artifacts: Vec::new(),
@@ -325,13 +323,13 @@ impl RunContext {
             "focus_graph.json",
             crate::run::formats::tags::FOCUS_LEGACY,
             Vec<(u64, String, Option<String>, Option<String>)>,
-            run.focus_transitions
+            run.graphs.focus_transitions
         );
         load_json!(
             "focus_graph_ids.json",
             crate::run::formats::tags::FOCUS_IDS,
             crate::semantic::focus_graph::FocusGraph,
-            run.focus_graph
+            run.graphs.focus_graph
         );
         // State graph (from its export snapshot; keeps the default budget).
         // Parsed as raw JSON, then converted — a conversion failure after a
@@ -362,7 +360,7 @@ impl RunContext {
             slot
         };
         if let Some(v) = state_graph_json {
-            run.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
+            run.graphs.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
         }
         // Coverage ledger. Round-2 (G1): read into a local, then adopt;
         // `coverage_seq` stays 0 (sequence order reflects live events
@@ -568,7 +566,7 @@ impl RunContext {
             }
         }
         // State graph.
-        let graph = self.state_graph.export();
+        let graph = self.graphs.state_graph.export();
         let tmp = dir.join("state_graph.json.tmp");
         std::fs::write(
             &tmp,
@@ -581,7 +579,7 @@ impl RunContext {
             &ftmp,
             format_envelope(
                 crate::run::formats::tags::FOCUS_LEGACY,
-                &serde_json::to_value(&self.focus_transitions)?,
+                &serde_json::to_value(&self.graphs.focus_transitions)?,
             )?,
         )?;
         std::fs::rename(&ftmp, dir.join("focus_graph.json"))?;
@@ -590,7 +588,7 @@ impl RunContext {
             &gtmp,
             format_envelope(
                 crate::run::formats::tags::FOCUS_IDS,
-                &serde_json::to_value(&self.focus_graph)?,
+                &serde_json::to_value(&self.graphs.focus_graph)?,
             )?,
         )?;
         std::fs::rename(&gtmp, dir.join("focus_graph_ids.json"))?;

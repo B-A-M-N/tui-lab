@@ -16,16 +16,24 @@ impl RunContext {
         from: Option<String>,
         to: Option<String>,
     ) {
-        if from == to {
-            return;
-        }
-        self.focus_transitions
-            .push((now_ms(), session_id.to_string(), from, to));
+        self.graphs.record_transition(session_id, from, to);
     }
 
     /// The focus-transition ledger.
     pub fn focus_transitions(&self) -> &[(u64, String, Option<String>, Option<String>)] {
-        &self.focus_transitions
+        &self.graphs.focus_transitions
+    }
+
+    /// The run's graphs (focus history + exploration), for readers that
+    /// fold over them directly. Round-2 (G1): delegates to
+    /// [`graph_state::RunGraphs`].
+    pub fn graphs(&self) -> &graph_state::RunGraphs {
+        &self.graphs
+    }
+
+    /// Mutable access to the run's graphs (audit drivers, exploration).
+    pub fn graphs_mut(&mut self) -> &mut graph_state::RunGraphs {
+        &mut self.graphs
     }
 
     /// Record one focus transition into BOTH focus ledgers (Wave D item
@@ -43,19 +51,8 @@ impl RunContext {
         to_id: Option<&str>,
         via: &str,
     ) {
-        // Legacy label ledger (unchanged shape, skips no-op transitions).
-        if from_label != to_label {
-            self.focus_transitions.push((
-                now_ms(),
-                session_id.to_string(),
-                from_label.clone(),
-                to_label.clone(),
-            ));
-        }
-        // ID-keyed graph.
-        if let (Some(f), Some(t)) = (from_id, to_id) {
-            self.focus_graph.transition(f, t, to_label.as_deref(), via);
-        }
+        self.graphs
+            .record_observation(session_id, from_label, to_label, from_id, to_id, via);
     }
 
     /// Assign the next citable frame id (Wave B item 11) and stamp the
