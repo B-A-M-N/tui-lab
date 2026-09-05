@@ -50,6 +50,10 @@ pub struct DriveSpec<'a> {
     /// `None` = do not touch scenario recordings (e.g. internal plan
     /// steps that are not themselves caller actions).
     pub scenario: Option<ScenarioCapture>,
+    /// Finding 2: which subsystem is driving. Stamped on the transaction
+    /// and the ledger row, so "WHO sent this input" is recorded evidence,
+    /// not an inference from context.
+    pub origin: crate::execution::DriveOrigin,
 }
 
 /// Finding 9: how healthy the run-level evidence for one driven act is.
@@ -128,8 +132,9 @@ pub fn drive(
     run: &std::sync::Arc<std::sync::Mutex<RunContext>>,
     spec: DriveSpec<'_>,
 ) -> Result<DriveOutcome, anyhow::Error> {
-    let tx = crate::execution::execute_act_with_guard(
+    let tx = crate::execution::execute_act_with_guard_and_origin(
         sess,
+        spec.origin,
         spec.action,
         spec.quiet_ms,
         spec.budget_ms,

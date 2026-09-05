@@ -160,6 +160,7 @@ pub(crate) async fn tui_act(
                         params: serde_json::to_value(&p).unwrap_or_default(),
                         sensitive,
                     }),
+                    origin: crate::execution::DriveOrigin::Act,
                 },
             ) {
                 Ok(o) => o,
@@ -203,6 +204,10 @@ pub(crate) async fn tui_act(
             warnings.extend(health.failures());
             ok(json!({
                 "action": tx.name(),
+                // Finding 2: typed provenance — this response came from the
+                // `act` driver; every driver tags its acts the same way and
+                // the ledger row carries the same slug.
+                "origin": tx.origin.map(|o| o.as_str()),
                 "settled": tx.settled(),
                 "settle_status": tx.settle,
                 "settle_reason": tx.settle_reason(),
@@ -480,6 +485,7 @@ pub(crate) async fn tui_intent(
                             // Internal plan step: evidenced in the ledger,
                             // but not a caller-authored scenario act.
                             scenario: None,
+                            origin: crate::execution::DriveOrigin::Intent,
                         },
                     ) {
                         Ok(o) => o,
@@ -533,6 +539,7 @@ pub(crate) async fn tui_intent(
                                 params: act_request_json(action),
                                 sensitive,
                             }),
+                            origin: crate::execution::DriveOrigin::Intent,
                         },
                     ) {
                         Ok(o) => o,
@@ -541,6 +548,7 @@ pub(crate) async fn tui_intent(
                     executed.push(json!({
                         "step": "act", "action": action.name(),
                         "signature": action.signature(),
+                        "origin": outcome.tx.origin.map(|o| o.as_str()),
                         "settled": outcome.tx.settled(),
                         "settle": format!("{:?}", outcome.tx.settle).to_lowercase(),
                         "frames": outcome.frames,

@@ -316,6 +316,55 @@ impl CanonicalAction {
     }
 }
 
+/// Which subsystem drove one interaction (audit finding 2: one driving
+/// authority, with provenance). Every act lands in the same canonical
+/// executor and the same run ledger; the origin is the typed answer to
+/// "WHO sent this input" — `tui_act`, a scenario replay, the explorer,
+/// an audit driver — recorded per transaction instead of being
+/// reconstructable only from context. The scenario runner, exploration,
+/// audit drivers, conformance, and the diagnostic probe all tag their
+/// acts; the ledger row carries the slug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriveOrigin {
+    /// The `tui_act` MCP tool — the agent's direct request.
+    Act,
+    /// An executed intent plan (`tui_intent execute`), including its
+    /// internal focus-move steps.
+    Intent,
+    /// Scenario replay (tui_scenario run / recording playback).
+    Scenario,
+    /// Random exploration.
+    Explore,
+    /// Reproduction replay (crash minimization candidate).
+    Repro,
+    /// Semantic/exploration candidate driving.
+    ExploreSemantic,
+    /// An audit driver (keyboard, states, layout, interaction, ...).
+    Audit,
+    /// Backend/design conformance probing.
+    Conformance,
+    /// The diagnostic probe (tui_probe stimulus path).
+    Probe,
+}
+
+impl DriveOrigin {
+    /// The ledger/wire slug.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DriveOrigin::Act => "act",
+            DriveOrigin::Intent => "intent",
+            DriveOrigin::Scenario => "scenario",
+            DriveOrigin::Explore => "explore",
+            DriveOrigin::Repro => "repro",
+            DriveOrigin::ExploreSemantic => "explore_semantic",
+            DriveOrigin::Audit => "audit",
+            DriveOrigin::Conformance => "conformance",
+            DriveOrigin::Probe => "probe",
+        }
+    }
+}
+
 /// Settlement outcome for one interaction (re-review P1: `no_wait` must not
 /// report `settled` — "I did not test settlement" is not "it settled").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

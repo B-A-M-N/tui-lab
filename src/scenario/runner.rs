@@ -258,20 +258,24 @@ impl ScenarioRunner {
                                                 completion,
                                                 guard: expect_guard.as_ref(),
                                                 scenario: None,
+                                                origin: crate::execution::DriveOrigin::Scenario,
                                             };
                                             crate::execution::drive_pipeline(session, run, spec)
                                                 .map(|o| o.tx)
                                         }
-                                        None => crate::execution::execute_act_with_guard(
-                                            session,
-                                            &action,
-                                            quiet,
-                                            quiet.saturating_add(1000),
-                                            req.no_wait(),
-                                            vis,
-                                            completion,
-                                            expect_guard.as_ref(),
-                                        ),
+                                        None => {
+                                            crate::execution::execute_act_with_guard_and_origin(
+                                                session,
+                                                crate::execution::DriveOrigin::Scenario,
+                                                &action,
+                                                quiet,
+                                                quiet.saturating_add(1000),
+                                                req.no_wait(),
+                                                vis,
+                                                completion,
+                                                expect_guard.as_ref(),
+                                            )
+                                        }
                                     };
                                     match outcome {
                                         Ok(tx) => (

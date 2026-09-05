@@ -6,7 +6,7 @@
 //! behind. `super::mod` re-exports every `pub` entry point.
 
 use crate::backend::KeyEvent;
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::{execute_act_as, CanonicalAction};
 use crate::semantic;
 use crate::session::state::Session;
 use serde_json::json;
@@ -339,8 +339,9 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             };
             let focusable = sem_before.controls.iter().filter(|c| c.focusable).count();
             let before_id = sem_before.focus.control_id.clone();
-            let tx = match execute_act(
+            let tx = match execute_act_as(
                 session,
+                crate::execution::DriveOrigin::Audit,
                 &CanonicalAction::Key { key: class.forward },
                 60,
                 400,
@@ -370,8 +371,9 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
                 Err(_) => break,
             };
             let before_id = sem_before.focus.control_id.clone();
-            let Ok(tx) = execute_act(
+            let Ok(tx) = execute_act_as(
                 session,
+                crate::execution::DriveOrigin::Audit,
                 &CanonicalAction::Key { key: class.inverse },
                 60,
                 400,

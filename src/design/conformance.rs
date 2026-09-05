@@ -27,7 +27,7 @@
 use super::oracle::{self, ActiveArgs, OracleOutcome};
 use super::schema::{ComponentContract, InteractionContract, LayoutConstraint, ProjectContract};
 use crate::audit::{EvidenceKind, EvidenceRef, Finding};
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::{execute_act_as, CanonicalAction};
 use crate::semantic::{self, node::Role};
 use crate::session::state::Session;
 use serde_json::json;
@@ -288,8 +288,9 @@ pub fn check_contract_with_mode(
     // Restore the viewport we came in with.
     // Canonical transaction (re-review P1 item 22): the restore is evidence,
     // not a side effect — same anchor/ledger/settle semantics as MCP acts.
-    let _ = execute_act(
+    let _ = execute_act_as(
         session,
+        crate::execution::DriveOrigin::Conformance,
         &CanonicalAction::Resize {
             cols: orig_cols,
             rows: orig_rows,
@@ -672,7 +673,14 @@ fn run_interaction(
                 )
             }
         };
-        if let Err(e) = execute_act(session, &action, 80, 900, false) {
+        if let Err(e) = execute_act_as(
+            session,
+            crate::execution::DriveOrigin::Conformance,
+            &action,
+            80,
+            900,
+            false,
+        ) {
             return CheckResult::fail(
                 "interaction",
                 inter.name.clone(),
@@ -784,8 +792,9 @@ fn check_layout(session: &mut Session, contract: &ProjectContract) -> Vec<CheckR
 
     // Canonical transaction (re-review P1 item 22): the restore is evidence,
     // not a side effect — same anchor/ledger/settle semantics as MCP acts.
-    let _ = execute_act(
+    let _ = execute_act_as(
         session,
+        crate::execution::DriveOrigin::Conformance,
         &CanonicalAction::Resize {
             cols: orig_cols,
             rows: orig_rows,
@@ -802,8 +811,9 @@ fn check_viewport(session: &mut Session, cols: u16, rows: u16, name: String) -> 
     // settle semantics and lands in the run ledger like any other action.
     // Item 23: the transaction's after-frame IS the authoritative
     // post-resize frame — no extra observe().
-    let tx = match execute_act(
+    let tx = match execute_act_as(
         session,
+        crate::execution::DriveOrigin::Conformance,
         &CanonicalAction::Resize { cols, rows },
         150,
         2000,
@@ -952,7 +962,16 @@ fn check_behavior(
                         .ok()
                         .and_then(|r| CanonicalAction::from_request(&r).ok());
                     if let Some(r) = action {
-                        if execute_act(session, &r, 80, 900, false).is_ok() {
+                        if execute_act_as(
+                            session,
+                            crate::execution::DriveOrigin::Conformance,
+                            &r,
+                            80,
+                            900,
+                            false,
+                        )
+                        .is_ok()
+                        {
                             *driven += 1;
                             opened = true;
                         }
@@ -1016,7 +1035,16 @@ fn check_behavior(
                 .ok()
                 .and_then(|r| CanonicalAction::from_request(&r).ok());
             if let Some(action) = okc {
-                if execute_act(session, &action, 80, 900, false).is_ok() {
+                if execute_act_as(
+                    session,
+                    crate::execution::DriveOrigin::Conformance,
+                    &action,
+                    80,
+                    900,
+                    false,
+                )
+                .is_ok()
+                {
                     *driven += 1;
                     let after = session.observe(60).ok();
                     let modal_after = after
@@ -1076,7 +1104,14 @@ fn check_behavior(
             else {
                 break;
             };
-            let Ok(tx) = execute_act(session, &action, 80, 600, false) else {
+            let Ok(tx) = execute_act_as(
+                session,
+                crate::execution::DriveOrigin::Conformance,
+                &action,
+                80,
+                600,
+                false,
+            ) else {
                 break;
             };
             *driven += 1;
@@ -1108,7 +1143,14 @@ fn check_behavior(
                 reverse_ok = false;
                 break;
             };
-            let Ok(tx) = execute_act(session, &action, 80, 600, false) else {
+            let Ok(tx) = execute_act_as(
+                session,
+                crate::execution::DriveOrigin::Conformance,
+                &action,
+                80,
+                600,
+                false,
+            ) else {
                 reverse_ok = false;
                 break;
             };
@@ -1190,7 +1232,16 @@ fn drive_escape_check(session: &mut Session) -> bool {
     else {
         return false;
     };
-    if execute_act(session, &action, 80, 900, false).is_err() {
+    if execute_act_as(
+        session,
+        crate::execution::DriveOrigin::Conformance,
+        &action,
+        80,
+        900,
+        false,
+    )
+    .is_err()
+    {
         return false;
     }
     session

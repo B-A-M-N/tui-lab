@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::backend::{KeyEvent, KeyModifiers};
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::CanonicalAction;
 use crate::session::state::Session;
 
 /// Why an exploration actually stopped (re-review item 13).
@@ -266,7 +266,14 @@ pub fn run_evidenced(
         // anchored settle-wait ordering match MCP `tui_act` exactly
         // (re-review P0 "one canonical executor").
         let action = mk();
-        let tx = match execute_act(session, &action, 120, 1500, false) {
+        let tx = match crate::execution::execute_act_as(
+            session,
+            crate::execution::DriveOrigin::Explore,
+            &action,
+            120,
+            1500,
+            false,
+        ) {
             Ok(tx) => tx,
             Err(_e) => {
                 exits.push(ProcessExit {

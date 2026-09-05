@@ -12,7 +12,7 @@
 //! saved into the run → its ID rides on the Finding as `reproduction`, so a
 //! human (or another agent) can replay the failure with one call.
 
-use crate::execution::{execute_act, CanonicalAction};
+use crate::execution::CanonicalAction;
 use crate::exploration::random::ExplorationStep;
 use crate::exploration::repro_minimizer::{ReproAction, ReproResult};
 use crate::scenario::model::Scenario;
@@ -146,7 +146,14 @@ fn test_candidate(
     let _ = session.observe(50);
 
     for ra in candidate {
-        match execute_act(session, &ra.action, 80, 600, false) {
+        match crate::execution::execute_act_as(
+            session,
+            crate::execution::DriveOrigin::Repro,
+            &ra.action,
+            80,
+            600,
+            false,
+        ) {
             Ok(tx) => {
                 let after = tx.after();
                 if let Some(kind) = FailureKind::from_process(

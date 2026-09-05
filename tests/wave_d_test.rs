@@ -210,7 +210,7 @@ async fn random_exploration_enters_run_ledger_with_exact_signatures() {
         ],
     )
     .await;
-    let (ledger_len, step_actions) = pool
+    let (ledger_len, step_actions, origins) = pool
         .with_session(Some(&id), move |sess| {
             let budget = random::Budget {
                 max_actions: 3,
@@ -227,7 +227,13 @@ async fn random_exploration_enters_run_ledger_with_exact_signatures() {
                 random::run_evidenced(sess, 7, budget, None, Some(&mut run)).expect("explore");
             let ledger = run.transactions().len();
             let actions: Vec<String> = report.steps.iter().map(|s| s.action.clone()).collect();
-            (ledger, actions)
+            // Finding 2: the driving provenance each ledger row carries.
+            let origins: Vec<Option<String>> = run
+                .transactions()
+                .iter()
+                .map(|t| t.origin.clone())
+                .collect();
+            (ledger, actions, origins)
         })
         .await
         .expect("explore job");
@@ -244,6 +250,18 @@ async fn random_exploration_enters_run_ledger_with_exact_signatures() {
         assert!(
             action != "key" && action != "mouse_click" && !action.is_empty(),
             "step identity must be the canonical signature, not the kind: {action}"
+        );
+    }
+    // Finding 2: every exploration ledger row names its driver.
+    assert!(
+        !origins.is_empty(),
+        "the exploration produced ledger rows to inspect"
+    );
+    for o in &origins {
+        assert_eq!(
+            o.as_deref(),
+            Some("explore"),
+            "exploration transactions carry origin=explore: {origins:?}"
         );
     }
 }
@@ -278,6 +296,7 @@ async fn drive_outcome_reports_evidence_health_not_fabricated_frames() {
             completion: tui_lab::capture::CompletionPolicy::StableScreen,
             guard: None,
             scenario: None,
+            origin: tui_lab::execution::DriveOrigin::Act,
         };
 
         // Open run: everything commits, outcome is healthy, frames carry
