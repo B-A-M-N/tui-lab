@@ -251,36 +251,160 @@ pub(crate) async fn tui_contract(
                 }
             }
         }
-        // ── scaffold (Wave 5 item 43): starter contract from the
-        // observed UI ──
+        // ── scaffold (Wave 5 item 43 + finding 37): starter contract
+        // from the observed UI — one frame (mode=current) or a bounded
+        // SAFE multi-state pass (mode=explore) ──
         CT::Scaffold => {
+            use crate::mcp::params::ScaffoldMode as SM;
+            let scaffold_mode = match p.scaffold_mode.as_ref() {
+                None => SM::Current,
+                Some(crate::mcp::params::Known::Known(m)) => *m,
+                Some(crate::mcp::params::Known::Other(o)) => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "unknown scaffold_mode '{}' (expected one of: {})",
+                            o,
+                            <SM as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                        ),
+                    );
+                }
+            };
             let selector = p.id.clone();
-            let scaffolded = s
-                .with_sess(selector.as_deref(), |sess| {
-                    let (screen, sem, _tree, _report) =
-                        sess.observe_fused(60).map_err(|e| e.to_string())?;
-                    Ok::<_, String>(crate::design::ProjectContract::scaffold_from(&screen, &sem))
-                })
-                .await;
-            let contract = match scaffolded {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => return err(ErrorCategory::BackendError, e),
-                Err(e) => return e,
-            };
-            let yaml = match serde_yaml::to_string(&contract) {
-                Ok(y) => y,
-                Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
-            };
-            ok(json!({
-                "action": "scaffold",
-                "inferred": true,
-                "contract_name": contract.schema.name,
-                "components": contract.components.len(),
-                "oracles": contract.oracles.len(),
-                "viewports": contract.viewports.iter().map(|v| json!({"cols": v.cols, "rows": v.rows})).collect::<Vec<_>>(),
-                "note": "scaffolded from ONE observed frame — everything declared was seen, nothing is yet required. Edit required=true / mode=validation as you fix intent, then tui_contract action=validate.",
-                "yaml": yaml,
-            }))
+            let run = s.run.clone();
+            if scaffold_mode == SM::Explore {
+                // The multi-state pass DRIVES the app (Tab / Escape /
+                // resize), so the human control lease gates it exactly
+                // like every other driver.
+                let scaffolded = s
+                    .with_sess(selector.as_deref(), move |sess| {
+                        if let Some(refused) = crate::mcp::helpers::lease_refused(sess) {
+                            return Err(refused);
+                        }
+                        let (screen, sem, _tree, _report) = sess
+                            .observe_fused(60)
+                            .map_err(|e| e.to_string())
+                            .map_err(|e| err(ErrorCategory::BackendError, e))?;
+                        let (cols, rows) = (sess.cols(), sess.rows());
+                        // The pass's session touches, as ONE object: drive
+                        // through the ONE pipeline (origin=scaffold) so
+                        // evidence + ledger stay uniform with every other
+                        // driver; observations go through the fused
+                        // authority.
+                        struct ScaffoldSession<'a> {
+                            sess: &'a mut crate::session::Session,
+                            run: &'a std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
+                        }
+                        impl crate::design::scaffold::ScaffoldIo for ScaffoldSession<'_> {
+                            fn observe(
+                                &mut self,
+                                idle_ms: u64,
+                            ) -> anyhow::Result<(
+                                crate::screen::ScreenState,
+                                crate::semantic::SemanticScreen,
+                            )> {
+                                let (s, sem, _, _) = self.sess.observe_fused(idle_ms)?;
+                                Ok((s, sem))
+                            }
+                            fn act(
+                                &mut self,
+                                name: &str,
+                                action: crate::execution::CanonicalAction,
+                            ) -> anyhow::Result<()> {
+                                let spec = crate::execution::CoreDriveSpec {
+                                    action: &action,
+                                    quiet_ms: 120,
+                                    budget_ms: 1500,
+                                    no_wait: false,
+                                    visibility: crate::execution::InputVisibility::Normal,
+                                    completion: crate::capture::CompletionPolicy::StableScreen,
+                                    guard: None,
+                                    scenario: None,
+                                    origin: crate::execution::DriveOrigin::Scaffold,
+                                };
+                                crate::execution::drive_pipeline(self.sess, self.run, spec)
+                                    .map(|_| ())
+                                    .map_err(|e| anyhow::anyhow!("{name} failed: {e}"))
+                            }
+                        }
+                        let mut io = ScaffoldSession { sess, run: &run };
+                        let gathered = crate::design::scaffold::gather_states(
+                            (screen, sem),
+                            cols,
+                            rows,
+                            crate::design::scaffold::ScaffoldBudget::default(),
+                            &mut io,
+                        )
+                        .map_err(|e| err(ErrorCategory::BackendError, e.to_string()))?;
+                        Ok::<_, rmcp::model::CallToolResult>(
+                            crate::design::scaffold::scaffold_multi_state(&gathered, (cols, rows)),
+                        )
+                    })
+                    .await;
+                let contract = match scaffolded {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => return e,
+                    Err(e) => return e,
+                };
+                let yaml = match serde_yaml::to_string(&contract) {
+                    Ok(y) => y,
+                    Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
+                };
+                // The extension blob names the states, so the response can
+                // cite what the pass actually saw.
+                let ext = contract
+                    .schema
+                    .extensions
+                    .get("scaffold.inferred")
+                    .cloned()
+                    .unwrap_or_default();
+                let state_count = ext["states"].as_array().map(Vec::len).unwrap_or(0);
+                ok(json!({
+                    "action": "scaffold",
+                    "scaffold_mode": "explore",
+                    "inferred": true,
+                    "contract_name": contract.schema.name,
+                    "states_observed": state_count,
+                    "components": contract.components.len(),
+                    "interactions": contract.interactions.len(),
+                    "oracles": contract.oracles.len(),
+                    "viewports": contract.viewports.iter().map(|v| json!({"cols": v.cols, "rows": v.rows})).collect::<Vec<_>>(),
+                    "states": ext["states"],
+                    "focus_order": ext["states"].as_array().map(|_| ()),
+                    "note": "scaffolded from a SAFE multi-state pass (initial screen, Tab focus walk, Escape, viewport probes) — everything declared was SEEN, nothing is yet required. Edit required=true / mode=validation as you fix intent, then tui_contract action=validate.",
+                    "yaml": yaml,
+                }))
+            } else {
+                let scaffolded = s
+                    .with_sess(selector.as_deref(), |sess| {
+                        let (screen, sem, _tree, _report) =
+                            sess.observe_fused(60).map_err(|e| e.to_string())?;
+                        Ok::<_, String>(crate::design::ProjectContract::scaffold_from(
+                            &screen, &sem,
+                        ))
+                    })
+                    .await;
+                let contract = match scaffolded {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => return err(ErrorCategory::BackendError, e),
+                    Err(e) => return e,
+                };
+                let yaml = match serde_yaml::to_string(&contract) {
+                    Ok(y) => y,
+                    Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
+                };
+                ok(json!({
+                    "action": "scaffold",
+                    "scaffold_mode": "current",
+                    "inferred": true,
+                    "contract_name": contract.schema.name,
+                    "components": contract.components.len(),
+                    "oracles": contract.oracles.len(),
+                    "viewports": contract.viewports.iter().map(|v| json!({"cols": v.cols, "rows": v.rows})).collect::<Vec<_>>(),
+                    "note": "scaffolded from ONE observed frame — everything declared was seen, nothing is yet required. Edit required=true / mode=validation as you fix intent, then tui_contract action=validate. mode=explore gathers a multi-state pass.",
+                    "yaml": yaml,
+                }))
+            }
         }
         // ── baseline (re-review item 31): run conformance NOW and
         // store the report under an explicit label. The status action

@@ -105,7 +105,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_contract",
-        summary: "Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (regions become components, named controls become oracle assertions; carries the scaffold.inferred marker; edit from observation toward intent).",
+        summary: "Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (scaffold_mode=current) or from a bounded SAFE multi-state pass — initial screen, Tab focus walk, Escape, viewport probes (scaffold_mode=explore; lease-gated; every state cited in the scaffold.inferred extension; edit from observation toward intent).",
         selector: Some(("action", <crate::mcp::params::ContractAction as EnumVariants>::VARIANTS)),
     },
     ToolCapability {

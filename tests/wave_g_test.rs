@@ -1772,3 +1772,126 @@ async fn inspect_mode_one_call_construction_view() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Finding 37: `tui_contract action=scaffold mode=explore` — a bounded
+/// SAFE multi-state pass (initial screen, Tab focus walk, Escape,
+/// viewport probes) scaffolds a contract that cites every state it saw.
+/// Every requirement stays non-required; the pass leaves the app at its
+/// launch viewport. Real python child throughout.
+#[tokio::test]
+async fn scaffold_explore_gathers_multi_state_contract() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-scaffold-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    // A focus ring that MOVES with Tab (reverse-video focus — the
+    // semantic focus inferencer's evidence), so the walk records states.
+    // cwd = fixtures/ so the relative script path resolves.
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["focus_ring_tui.py"],
+                "cwd": "fixtures", "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+
+    // ── mode=current still works (backward compat: default) ──
+    let current = unwrap_ok(
+        &server
+            .tui_contract(params_typed(
+                serde_json::json!({ "action": "scaffold", "id": sid }),
+            ))
+            .await,
+        "scaffold current",
+    );
+    assert_eq!(current["scaffold_mode"], "current", "{current}");
+    assert_eq!(current["states_observed"], serde_json::Value::Null);
+
+    // ── mode=explore: multi-state gather ──
+    let explore = unwrap_ok(
+        &server
+            .tui_contract(params_typed(serde_json::json!(
+                { "action": "scaffold", "scaffold_mode": "explore", "id": sid }
+            )))
+            .await,
+        "scaffold explore",
+    );
+    assert_eq!(explore["scaffold_mode"], "explore", "{explore}");
+    let states = explore["states"].as_array().expect("states array");
+    assert!(
+        !states.is_empty(),
+        "at least the initial state recorded: {explore}"
+    );
+    assert_eq!(
+        states[0]["via"], "initial",
+        "state 0 is the initial screen: {states:?}"
+    );
+    // The Tab walk is expected to visit the focusable controls.
+    let tab_states: Vec<&serde_json::Value> = states
+        .iter()
+        .filter(|s| s["via"].as_str().unwrap_or("").starts_with("tab:"))
+        .collect();
+    assert!(
+        !tab_states.is_empty(),
+        "the focus walk recorded states: {states:?}"
+    );
+    // Viewports include the launch size (80x24) and the probed sizes.
+    let viewports = explore["viewports"].as_array().expect("viewports");
+    assert!(
+        viewports.iter().any(|v| v["cols"] == 80 && v["rows"] == 24),
+        "launch viewport declared: {viewports:?}"
+    );
+    // Every inferred requirement stays optional.
+    let yaml = explore["yaml"].as_str().unwrap_or_default();
+    assert!(
+        !yaml
+            .lines()
+            .any(|l| l.trim_start().starts_with("required:") && l.contains("true")),
+        "nothing observed becomes required: {yaml}"
+    );
+    // The scaffold.inferred extension names the mode.
+    assert!(
+        yaml.contains("inferred: true") || explore["inferred"] == true,
+        "inferred marker present: {yaml}"
+    );
+
+    // ── the app was left at its launch viewport ──
+    let after = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "summary", "id": sid }),
+            ))
+            .await,
+        "post-scaffold observe",
+    );
+    assert_eq!(after["screen"], "80x24", "viewport restored: {after}");
+
+    // ── unknown scaffold_mode refused with the accepted set ──
+    let bad = unwrap_err(
+        &server
+            .tui_contract(params_typed(serde_json::json!(
+                { "action": "scaffold", "scaffold_mode": "explor", "id": sid }
+            )))
+            .await,
+        "scaffold typo",
+    );
+    assert!(
+        bad["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("scaffold_mode"),
+        "{bad}"
+    );
+
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid }),
+        ))
+        .await;
+    let _ = std::fs::remove_dir_all(&base);
+}
