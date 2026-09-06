@@ -34,21 +34,19 @@ impl Session {
         // pump that drains them runs within that same call, so fold them now
         // (item 22: measured query/response evidence lands in the stream).
         self.absorb_query_answers();
-        // Take the previous last ONCE: it becomes both the diff base for
-        // event emission and the new `previous`. (A second `take()` on the
-        // now-empty slot returned `None` every time — emit_frame_events was
-        // dead and every observation pushed a spurious ProcessStarted.)
-        match self.last.take() {
+        // Advance the observation window ONCE: the returned old `last` is
+        // both the diff base for event emission and the new `previous`
+        // (the holder makes the take-then-install pairing atomic, so the
+        // old double-take spurious-ProcessStarted bug cannot recur).
+        match self.observation.advance(s.screen.clone()) {
             Some(p) => {
                 self.emit_frame_events(&p, &s.screen);
-                self.previous = Some(p);
             }
             None => {
                 // First observation of a generation: process started.
                 self.push_event(crate::events::TerminalEventKind::ProcessStarted);
             }
         }
-        self.last = Some(s.screen.clone());
         Ok(s.screen)
     }
 
@@ -201,13 +199,13 @@ impl Session {
 
     /// The most recent observation.
     pub fn last(&self) -> Option<&ScreenState> {
-        self.last.as_ref()
+        self.observation.last()
     }
 
     /// The observation before `last`, if two observations have been made since
     /// the last (re)start. Used for real previous→current diffs (audit item 12).
     pub fn previous(&self) -> Option<&ScreenState> {
-        self.previous.as_ref()
+        self.observation.previous()
     }
 
     /// Semantic analysis of the last settled frame, served from the per-session

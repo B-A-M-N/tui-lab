@@ -249,11 +249,9 @@ pub struct Session {
     /// which re-queries the backend so post-start negotiation (mouse, paste,
     /// title) is visible (audit item 11).
     caps_at_start: Capabilities,
-    /// The last *settled* observation (what `observe()` returned).
-    last: Option<ScreenState>,
-    /// The observation before `last` — set by `observe()` so `mode=diff` and
-    /// `diff()` always compare previous→current, never self→self (audit item 12).
-    previous: Option<ScreenState>,
+    /// The settled-observation window `(previous, last)` (G4): see
+    /// [`super::observation::ObservationState`].
+    observation: super::observation::ObservationState,
     /// Optional asciicast recorder for capturing the full PTY byte stream.
     recorder: Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>>,
     record_input: bool,
@@ -393,8 +391,7 @@ impl Session {
             launch: None,
             backend: Box::new(PortablePtyBackend::new(80, 24)),
             caps_at_start: Capabilities::default(),
-            last: None,
-            previous: None,
+            observation: super::observation::ObservationState::new(),
             recorder: None,
             record_input: false,
             recording_slot: crate::backend::new_recording_hook_slot(),
