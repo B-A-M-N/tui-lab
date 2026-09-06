@@ -252,9 +252,9 @@ pub struct Session {
     /// The settled-observation window `(previous, last)` (G4): see
     /// [`super::observation::ObservationState`].
     observation: super::observation::ObservationState,
-    /// Optional asciicast recorder for capturing the full PTY byte stream.
-    recorder: Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>>,
-    record_input: bool,
+    /// Recording sink + input flag (G4): see
+    /// [`super::recording_state::RecordingState`].
+    recording: super::recording_state::RecordingState,
     /// Raw PTY byte-stream hook slot; attached to the backend at start.
     recording_slot: RecordingHookSlot,
     /// Byte/resize facts observed by the reader thread, pending absorption
@@ -375,8 +375,7 @@ impl Session {
             backend: Box::new(PortablePtyBackend::new(80, 24)),
             caps_at_start: Capabilities::default(),
             observation: super::observation::ObservationState::new(),
-            recorder: None,
-            record_input: false,
+            recording: super::recording_state::RecordingState::new(),
             recording_slot: crate::backend::new_recording_hook_slot(),
             pending_ingest: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             hook_recorder: std::sync::Arc::new(std::sync::Mutex::new(None)),
