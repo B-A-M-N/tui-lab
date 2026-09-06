@@ -137,10 +137,11 @@ impl Session {
         ));
         self.launch = Some(spec);
         // A new process generation invalidates prior frame tracking.
-        self.previous = None;
-        self.last = None;
+        self.observation.clear();
         let s = self.backend.state()?;
-        self.last = Some(s);
+        // Seed the window directly: the process-start event belongs to the
+        // generation start (pushed below), not the first observe().
+        let _ = self.observation.advance(s);
         // The process-start event belongs to the generation start, not the
         // first observation: `last` is seeded here, so an observe()-only
         // emission would never fire it.
@@ -221,7 +222,7 @@ impl Session {
 
     pub fn stop(&mut self) -> anyhow::Result<()> {
         self.backend.stop()?;
-        self.last = None;
+        self.observation.clear();
         Ok(())
     }
 
