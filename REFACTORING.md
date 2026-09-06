@@ -256,9 +256,14 @@ findings.json, scenarios/*.json, state_graph.json, focus_graph*.json),
 eviction stays declared, scenario identity stays ID-based, close stays
 evidence-final, restore adopts through holder-level adopt/insert paths.
 
-Full suite green at every commit (33 suites; two known load-flaky PTY
-timing tests, documented at 77e8edc, fail only under full-matrix
-parallel load and pass in isolation).
+Full suite green at every commit (34 suites; known load-flaky PTY
+timing tests fail only under full-matrix parallel load and pass in
+isolation — documented at 77e8edc; de-flaked since at 86dedfe, dd31542,
+and this round in `backend_capability_conformance` (the scrollback
+exercise polled its child's startup instead of racing it) and two lib
+tests (`tuicov_snapshot_invokes_single_json_arg`,
+`terminal_modes_folds_real_negotiation` — both pass solo ×3 and in a
+full-lib rerun, left as the documented load-flake class)).
 
 ### G2 progress (2026-09-05) — PortablePtyBackend decomposition
 

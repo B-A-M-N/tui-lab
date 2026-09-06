@@ -137,7 +137,10 @@ pub(crate) async fn tui_act(
     let completion = p
         .completion()
         .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
-    s.with_sess(selector.as_deref(), move |sess| {
+    // Beta-audit P0-6: the authorized entry — the run ticket is captured
+    // under the same lock window as with_sess's closed-run + ownership
+    // guards, and every evidence commit verifies it.
+    s.with_sess_authorized(selector.as_deref(), move |sess, ticket| {
             // The ONE driving pipeline (audit P0-1): lease refusal, guarded
             // canonical execution, frame commits, ledger record, scenario
             // capture, event/coverage fold — all in the shared boundary.
@@ -161,6 +164,7 @@ pub(crate) async fn tui_act(
                         sensitive,
                     }),
                     origin: crate::execution::DriveOrigin::Act,
+                    ticket: Some(ticket),
                 },
             ) {
                 Ok(o) => o,
@@ -268,7 +272,11 @@ pub(crate) async fn tui_intent(
     // into the closure instead of capturing `s` (whose borrow cannot cross
     // the actor await).
     let intent_plans = s.plans_handle();
-    s.with_sess(selector.as_deref(), move |sess| {
+    // Beta-audit P0-6: execution drives the TUI and commits evidence, so
+    // it uses the authorized entry (ticket captured with the guards).
+    // Planning is observation-only; it still gets the ticket so both arms
+    // share one closure shape.
+    s.with_sess_authorized(selector.as_deref(), move |sess, ticket| {
         // Planning reads the session's LAST fused frame (observe-before-act):
         // the semantic truth the agent would have seen from tui_observe.
         // Execution below re-observes fresh instead.
@@ -477,6 +485,7 @@ pub(crate) async fn tui_intent(
                             // but not a caller-authored scenario act.
                             scenario: None,
                             origin: crate::execution::DriveOrigin::Intent,
+                            ticket: Some(ticket.clone()),
                         },
                     ) {
                         Ok(o) => o,
@@ -531,6 +540,7 @@ pub(crate) async fn tui_intent(
                                 sensitive,
                             }),
                             origin: crate::execution::DriveOrigin::Intent,
+                            ticket: Some(ticket.clone()),
                         },
                     ) {
                         Ok(o) => o,

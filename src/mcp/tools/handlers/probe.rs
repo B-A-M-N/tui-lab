@@ -109,7 +109,9 @@ pub(crate) async fn tui_probe(
     let budget_ms = p.budget_ms.unwrap_or(5000);
     let selector = p.id.clone();
     let run = s.run.clone();
-    s.with_sess(selector.as_deref(), move |sess| {
+    // Beta-audit P0-6: the authorized entry — the run ticket rides the
+    // same authorization lock window; the ledger commit verifies it.
+    s.with_sess_authorized(selector.as_deref(), move |sess, ticket| {
             // Audit P0-2: a stimulus that sends input IS machine driving.
             // The human control lease refuses it exactly like tui_act —
             // leasing the terminal means no key reaches it from any tool.
@@ -145,7 +147,19 @@ pub(crate) async fn tui_probe(
                     {
                         let (sid, gen) = (sess.id.clone(), sess.generation);
                         let mut run = run.lock().unwrap();
-                        let _ = run.record_event(&sid, "probe");
+                        // Beta-audit P0-7: a stimulated probe commits its
+                        // ACTUAL interaction transaction (frames, settle,
+                        // render provenance, before/after hashes) — the
+                        // durable ledger row is causal, not a generic
+                        // counter bump. Drift probes (no stimulus) keep
+                        // the plain marker event.
+                        if let Some(tx) = &result.transaction {
+                            if ticket.verify(&run).is_ok() {
+                                let _ = run.record_interaction(&sid, tx);
+                            }
+                        } else {
+                            let _ = run.record_event(&sid, "probe");
+                        }
                         // Audit P0-17: a probe is not a `wait` step. The old
                         // recording stuffed the whole TuiProbeParams into a
                         // wait step — a grammar the replay runner parses as

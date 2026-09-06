@@ -25,6 +25,44 @@ use crate::execution::CanonicalAction;
 use crate::run::RunContext;
 use rmcp::serde_json::json;
 
+/// The authorized run identity (beta-audit P0-6): the run id captured when
+/// an actor job is QUEUED (the same lock window `with_sess`'s closed-run +
+/// ownership guards read), checked again at every EVIDENCE COMMIT. Between
+/// those two moments `tui_run new`/`resume` can swap the shared run
+/// context; without the check, a transaction authorized under run A could
+/// land in run B's ledger — foreign evidence spilling across a run switch,
+/// the exact invariant the ownership map exists to protect.
+///
+/// The ticket names what to do: the evidence is DROPPED (never committed
+/// to the wrong run) and the caller reports `run_switched`.
+#[derive(Debug, Clone)]
+pub struct RunTicket {
+    pub(crate) run_id: String,
+}
+
+impl RunTicket {
+    /// Capture at authorization time (with the same lock that decides the
+    /// session's authorization).
+    pub fn capture(run: &std::sync::Mutex<RunContext>) -> Self {
+        RunTicket {
+            run_id: run.lock().unwrap().id().to_string(),
+        }
+    }
+
+    /// Verify at commit time. `Err` names both identities.
+    pub fn verify(&self, run: &RunContext) -> Result<(), String> {
+        if run.id() == self.run_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "run switched under an in-flight operation: authorized under run '{}', current run is '{}'; the evidence was DROPPED, not committed to the wrong run",
+                self.run_id,
+                run.id()
+            ))
+        }
+    }
+}
+
 /// Scenario capture for one driven act: the wire-shape request, so a
 /// recording replays the exact step the caller sent. Sensitive acts are
 /// recorded as `${PARAM}` references (payload stripped) — the same policy
@@ -54,6 +92,9 @@ pub struct DriveSpec<'a> {
     /// and the ledger row, so "WHO sent this input" is recorded evidence,
     /// not an inference from context.
     pub origin: crate::execution::DriveOrigin,
+    /// Beta-audit P0-6: the run identity captured at authorization,
+    /// verified at every commit.
+    pub ticket: RunTicket,
 }
 
 /// Finding 9: how healthy the run-level evidence for one driven act is.
@@ -126,7 +167,10 @@ pub struct DriveOutcome {
 
 /// THE driving pipeline. Runs inside the session's actor (call it from a
 /// `with_sess` closure only): guarded execute → frames → ledger →
-/// scenario → event/coverage fold.
+/// scenario → event/coverage fold. Beta-audit P0-6: `ticket` is the run
+/// identity captured at authorization; every commit below verifies it, so
+/// a run switch mid-drive drops the evidence instead of spilling it into
+/// the new run.
 pub fn drive(
     sess: &mut crate::session::Session,
     run: &std::sync::Arc<std::sync::Mutex<RunContext>>,
@@ -152,6 +196,13 @@ pub fn drive(
     let (frames, health) = {
         let (sid, gen) = (sess.id.clone(), sess.generation);
         let mut run = run.lock().unwrap();
+        // Beta-audit P0-6: a run switch between authorization and commit
+        // aborts the whole evidence commit — the transaction belongs to
+        // the run that authorized it, and that run is gone.
+        if let Err(mismatch) = spec.ticket.verify(&run) {
+            drop(run);
+            return Err(anyhow::anyhow!(mismatch));
+        }
         // Frame commit pipeline (re-review item 40): both frames through
         // the ONE commit path — id + provenance + incremental append.
         let mut commit = |f: &crate::backend::CanonicalFrame| {
@@ -217,7 +268,7 @@ pub fn drive(
     // Universal evidence fold (audit §28): the session's event queue lands
     // in the run (incremental persistence + native coverage) after EVERY
     // driven act, not only on observe sweeps.
-    fold_session_events(sess, run);
+    fold_session_events(sess, run, &spec.ticket);
     Ok(DriveOutcome { tx, frames, health })
 }
 
@@ -225,11 +276,18 @@ pub fn drive(
 /// persistence via the run's own consumer cursor, then native coverage
 /// ingestion. Extracted from the observe `sweep` so every driving path
 /// shares one fold; idempotent per event (seqs are unique).
+/// Beta-audit P0-6: a run switch between authorization and fold drops
+/// the fold (events stay in the session queue; a later fold under the
+/// right run picks them up — nothing is lost or misrouted).
 pub fn fold_session_events(
     sess: &mut crate::session::Session,
     run: &std::sync::Arc<std::sync::Mutex<RunContext>>,
+    ticket: &RunTicket,
 ) {
     let mut run = run.lock().unwrap();
+    if ticket.verify(&run).is_err() {
+        return; // run switched mid-operation; skip this fold
+    }
     {
         let cursor_key = format!("persistence:{}", sess.id);
         let from = run.event_cursor(&cursor_key).unwrap_or(0);
