@@ -117,7 +117,7 @@ impl RunContext {
     /// spec; the live session list lives in the SessionManager, which the run
     /// does not own. The MCP layer fills it in.
     pub fn status(&self, sessions: Vec<serde_json::Value>) -> serde_json::Value {
-        let journal = self.journal.as_ref().map(|j| j.health_snapshot());
+        let journal = self.artifacts_store.journal().map(|j| j.health_snapshot());
         json!({
             "run_id": self.id(),
             "mode": if self.run_dir.is_some() { "persistent" } else { "ephemeral" },
@@ -147,7 +147,7 @@ impl RunContext {
                 "oracles": c.oracles.len(),
             })),
             "contract_baselines": self.contract.baselines().keys().cloned().collect::<Vec<_>>(),
-            "artifacts": self.artifacts.iter().map(|a| serde_json::json!({
+            "artifacts": self.artifacts_store.artifacts().iter().map(|a| serde_json::json!({
                 "id": a.id,
                 "kind": a.kind,
                 "path": a.path.as_ref().map(|p| p.to_string_lossy().to_string()),
@@ -157,7 +157,7 @@ impl RunContext {
             "journal": journal,
             // Audit P1-46: restored runs report their damage — what the
             // restorer could not bring back. Absent on fresh runs (null).
-            "restore": if self.restore_warnings.is_empty() {
+            "restore": if self.artifacts_store.restore_degraded() {
                 serde_json::Value::Null
             } else {
                 self.restore_health()
@@ -193,7 +193,10 @@ impl RunContext {
             ("checkpoints", self.checkpoints.count() as u64),
             ("scenarios", self.scenarios.len() as u64),
             ("findings", self.findings.len() as u64),
-            ("held_recordings", self.held_recordings.len() as u64),
+            (
+                "held_recordings",
+                self.artifacts_store.held_recordings().len() as u64,
+            ),
             (
                 "focus_transitions",
                 self.graphs.focus_transitions.len() as u64,
@@ -232,13 +235,13 @@ impl RunContext {
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.scenarios.len(),
             "findings": self.findings.len(),
-            "held_recordings": self.held_recordings.len(),
+            "held_recordings": self.artifacts_store.held_recordings().len(),
             "focus_transitions": self.graphs.focus_transitions.len(),
             "focus_graph_edges": self.graphs.focus_graph.edges.len(),
             "state_graph_states": self.graphs.state_graph.state_count(),
             "state_graph_transitions": self.graphs.state_graph.transition_count(),
             "frames": self.evidence.frames.next_id(),
-            "artifacts": self.artifacts.len(),
+            "artifacts": self.artifacts_store.artifacts().len(),
         })
     }
 }

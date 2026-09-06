@@ -11,8 +11,7 @@ impl RunContext {
     /// Wave F item 57: retain a screen capture (SVG/PNG bytes) in run
     /// memory while ephemeral; `flush` writes it under `captures/`.
     pub fn hold_capture(&mut self, file_name: String, body: Vec<u8>, format: &str) {
-        self.held_captures
-            .push((file_name, body, format.to_string()));
+        self.artifacts_store.hold_capture(file_name, body, format);
     }
 
     /// Register a produced artifact and get its typed ref (Wave B item 15).
@@ -25,7 +24,7 @@ impl RunContext {
         summary: impl Into<String>,
     ) -> anyhow::Result<ArtifactRef> {
         self.ensure_open()?;
-        let n = self.artifacts.len() + 1;
+        let n = self.artifacts_store.artifact_count() + 1;
         let r = ArtifactRef {
             id: format!("art-{}", n),
             kind,
@@ -34,12 +33,12 @@ impl RunContext {
             session,
             summary: summary.into(),
         };
-        self.artifacts.push(r.clone());
+        self.artifacts_store.push_artifact(r.clone());
         Ok(r)
     }
 
     /// All artifacts registered in this run.
     pub fn artifacts(&self) -> &[ArtifactRef] {
-        &self.artifacts
+        self.artifacts_store.artifacts()
     }
 }

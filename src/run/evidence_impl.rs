@@ -165,7 +165,7 @@ impl RunContext {
                 .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
             {
                 Ok(()) => {}
-                Err(_) => self.persistence_unhealthy = true,
+                Err(_) => self.artifacts_store.mark_unhealthy(),
             }
         }
         Ok(id)
@@ -191,7 +191,7 @@ impl RunContext {
         if let Some(dir) = self.run_dir.as_ref() {
             let ev_dir = dir.join("events");
             if std::fs::create_dir_all(&ev_dir).is_err() {
-                self.persistence_unhealthy = true;
+                self.artifacts_store.mark_unhealthy();
                 self.evidence.events.hold(session, events);
                 return Ok(());
             }
@@ -225,7 +225,8 @@ impl RunContext {
                     let artifact_path =
                         std::path::PathBuf::from("events").join(format!("{}.jsonl", safe));
                     if !self
-                        .artifacts
+                        .artifacts_store
+                        .artifacts()
                         .iter()
                         .any(|a| a.path.as_ref() == Some(&artifact_path))
                     {
@@ -242,7 +243,7 @@ impl RunContext {
                     return Ok(());
                 }
                 Err(_) => {
-                    self.persistence_unhealthy = true;
+                    self.artifacts_store.mark_unhealthy();
                     // Fall through to the in-memory hold so flush retries.
                 }
             }
