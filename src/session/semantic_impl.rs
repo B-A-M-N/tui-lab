@@ -254,7 +254,7 @@ impl Session {
         crate::semantic::native::NativeOverlayReport,
     )> {
         let screen = self.last()?;
-        let key = fused_key(screen, self.native_events_absorbed_seq);
+        let key = fused_key(screen, self.event_state.native_absorbed_seq());
         if let Some(memo) = self.fused_memo.borrow().as_ref() {
             if memo.key == key {
                 self.fused_memo_hits.set(self.fused_memo_hits.get() + 1);

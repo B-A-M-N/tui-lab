@@ -266,24 +266,10 @@ pub struct Session {
     hook_recorder: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<AsciicastRecorder>>>>,
     >,
-    /// Monotonic anchor sequence (re-review P1: `ObservationAnchor.index`
-    /// must be a real per-session counter, not a hardcoded 0). Allocated by
-    /// [`Session::next_anchor`]; shared by every executor path.
-    next_anchor_seq: u64,
-    /// Item 22: the answered counter last folded into the event queue —
-    /// dedup anchor for `absorb_query_answers`.
-    last_query_answered_seq: u64,
-    /// Per-session terminal event queue (Wave B item 12): every observe,
-    /// send, resize, and process-state change appends here. Waits, audits,
-    /// incremental observation, and run persistence all read this one
-    /// stream.
-    events: crate::events::TerminalEventQueue,
-    /// Per-consumer observation cursors (Wave B item 13): named consumers
-    /// (`hermes`, `audit`, `explorer`, `recording`, ...) each remember their
-    /// own position in the event stream. Cursors live in the session so a
-    /// reconnecting consumer resumes where it left off, but reading is
-    /// stateless — `events_since` never mutates a cursor implicitly.
-    cursors: std::collections::HashMap<String, u64>,
+    /// Event stream + absorption bookkeeping (G4): the queue, per-consumer
+    /// cursors, anchor counter, and the query/native watermarks — see
+    /// [`super::event_state::SessionEventState`].
+    event_state: super::event_state::SessionEventState,
     /// Per-frame semantic cache (Wave G review): repeated `semantic::analyze`
     /// on an unchanged frame (same `structure_hash`) is served from cache
     /// instead of re-running all seven detectors. Interior-mutated by the
@@ -306,9 +292,6 @@ pub struct Session {
     /// child's env; cooperative apps write their real semantic tree there
     /// and observation merges it over inference.
     native: crate::semantic::native::NativeChannel,
-    /// How many native-channel events have already been folded into the
-    /// session event queue (re-review P1: mode-independent ingestion).
-    native_events_absorbed_seq: u64,
     /// Wave G item 76: the human control lease, when one is held.
     lease: crate::session::lease::LeaseState,
     /// Wave G item 77: what the current generation's launch actually got
@@ -397,15 +380,11 @@ impl Session {
             recording_slot: crate::backend::new_recording_hook_slot(),
             pending_ingest: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             hook_recorder: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            next_anchor_seq: 0,
-            last_query_answered_seq: 0,
-            events: crate::events::TerminalEventQueue::new(),
-            cursors: std::collections::HashMap::new(),
+            event_state: super::event_state::SessionEventState::new(),
             semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
             fused_memo: std::cell::RefCell::new(None),
             fused_memo_hits: std::cell::Cell::new(0),
             native: crate::semantic::native::NativeChannel::default(),
-            native_events_absorbed_seq: 0,
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
         };
@@ -457,8 +436,8 @@ impl Session {
         // honestly never report answers.
         let (class, answered_seq) = self.backend.last_query_answer();
         if let Some(class) = class {
-            if answered_seq > self.last_query_answered_seq {
-                self.last_query_answered_seq = answered_seq;
+            if answered_seq > self.event_state.last_query_answered_seq() {
+                self.event_state.set_query_answered_seq(answered_seq);
                 self.push_event(crate::events::TerminalEventKind::QueryAnswered {
                     class: class.to_string(),
                 });
@@ -510,7 +489,7 @@ impl Session {
         {
             let mut cache = self.semantic_cache.borrow_mut();
             emit_semantic_frame_events(
-                &mut self.events,
+                self.event_state.queue_mut(),
                 &self.id,
                 self.generation,
                 prev,
@@ -528,7 +507,9 @@ impl Session {
 
     /// Append to the session's event queue.
     fn push_event(&mut self, kind: crate::events::TerminalEventKind) {
-        self.events.push(&self.id, self.generation, kind);
+        self.event_state
+            .queue_mut()
+            .push(&self.id, self.generation, kind);
     }
 
     /// Fold new native-channel events (focus / activate / coverage / any
@@ -541,13 +522,13 @@ impl Session {
     /// long-run absorption stall). A restart resets the channel with the
     /// session, so the cursor (reset to 0) stays aligned.
     fn absorb_native_events(&mut self) {
-        let cursor = self.native_events_absorbed_seq;
+        let cursor = self.event_state.native_absorbed_seq();
         let fresh = self.native.events_since(cursor);
         if fresh.is_empty() {
             return;
         }
         for ev in &fresh {
-            self.events.push(
+            self.event_state.queue_mut().push(
                 &self.id,
                 self.generation,
                 crate::events::TerminalEventKind::NativeEvent {
@@ -556,7 +537,8 @@ impl Session {
                 },
             );
         }
-        self.native_events_absorbed_seq = self.native.last_native_seq();
+        let seq = self.native.last_native_seq();
+        self.event_state.set_native_absorbed_seq(seq);
     }
 
     /// Wait, returning the full [`WaitOutcome`] — MCP and audit callers get
