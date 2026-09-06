@@ -385,8 +385,11 @@ pub static PROFILES: &[AuditProfileDescriptor] = &[
         full_group: 0,
         driver: |s, _graph| crate::audit::driver::lifecycle_audit(s),
     },
-    // Writes one device query (CSI 6n) to the child's stdin; the reply is
-    // engine-generated and no UI semantics change, so it stays lease-safe.
+    // Probes the ENGINE-side device-query responder (a real `CSI 6n` fed
+    // through the live parser); nothing is written to the child's stdin
+    // and no UI semantics change, so it stays lease-safe. (Finding 16:
+    // the old comment claimed the query goes to the child — the
+    // implementation correctly keeps the probe engine-side.)
     AuditProfileDescriptor {
         id: "query_response",
         profile: AuditProfile::QueryResponse,

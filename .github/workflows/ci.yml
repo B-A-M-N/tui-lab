@@ -20,6 +20,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  msrv:
+    name: MSRV (1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - run: cargo build
+      - run: cargo build --all-features
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

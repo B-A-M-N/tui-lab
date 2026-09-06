@@ -41,6 +41,12 @@ hermes-tui-lab replay <run_id> [--root <dir>] [--full]
 
 ## Run lifecycle
 
+### tui_run
+The run lifecycle tool — `status`, `persist`, `close`, `list`, `resume`,
+`diagnose`/`repair` (per-finding diagnostic contexts), `bundle` (one
+finding's context + regression diff), and `context` (the capability
+registry as JSON).
+
 Server startup is side-effect-free: `hermes-tui-lab mcp` opens an **ephemeral**
 run — no filesystem mutation. Every ephemeral run has a real `run_id`, event
 history, scenarios, checkpoints, and a state graph in memory; "ephemeral" means
@@ -163,6 +169,21 @@ The `semantic` payload includes the Wave-4 semantic surfaces: `affordances`
 tables/trees/scrollbars), and `relationships` (normalized spatial relations
 keyed by stable IDs with re-derivable geometry reasons).
 
+### tui_intent
+Act by semantic intent instead of by coordinates or key guesses.
+
+**Params:** `target` (by=`id`|`text`|`role`|`focused`) + `verb`
+(`activate`, `focus`, `click`, `toggle`, `select`, `open`, `type`)
+
+The verb resolves into a focus-secured execution plan; the response names
+every step and the risk class BEFORE anything is sent. `execute=true` runs
+the plan — and requires the `plan_id` returned by the preview: the plan_id
+binds the whole previewed plan (target, verb, risk, step shape), so a
+previewed plan cannot be replayed against a different verb or control, and
+a preview older than five minutes expires. Unresolved targets return
+`target_error` with structured candidates, not prose. Sensitive `type`
+payloads are redacted to `${NAME}` parameter references in recordings.
+
 ### tui_act
 Drive keyboard/mouse input. Returns a screen transition.
 
@@ -172,6 +193,19 @@ Each act captures the event-sequence baseline before sending, waits anchored to
 that baseline, and reports `settled` honestly — plus `warnings` when the screen
 did not reach stability within the settle budget. `sensitive: true` keeps the
 payload out of scenario recordings.
+
+### tui_probe
+Run one small experiment and get everything materially different.
+
+One call returns: the baseline frame, the settled after-frame, the causal
+events inside the probe window, the transition (with per-control render
+deltas — "button/save moved x:65→71", not just `changed_cells`), and the
+watched material changes. `stimulus {kind:none}` is a drift probe: watch
+what changes when you change nothing. The probe's settle behavior is
+declared by `completion` (stable_screen, first_change, any_change,
+text_appears, text_disappears, process_exit, command_done, bell,
+semantic_change, may_be_silent, no_wait) so a silent or exiting action is
+never misreported.
 
 ### tui_wait
 Block until a condition holds.
@@ -256,13 +290,41 @@ Run deterministic UX audits and return evidence-backed findings.
 Active profiles (keyboard, focus, resize/layout, clipping, navigation, mouse,
 color, performance, states, errors, and `full` as the composite) drive the app
 through the session and observe real transitions — which makes them machine
-driving: blocked while a human lease is live. Static profiles
-(`discoverability`) read the current screen only.
+driving: blocked while a human lease is live (observational readers — color,
+rendering, terminal_modes, input_protocol, shell_cli, lifecycle,
+query_response — stay allowed during a lease). Static profiles
+(`discoverability`) read the current screen only. The safe-only default
+withholds invasive profiles (an ORCH-GATED finding names how to allow them)
+until `allow_mutation=true`; `restart_between_mutations=true` additionally
+restart-replays between mutating drivers (requires `allow_mutation=true`;
+restarting the app does not undo external side effects). `lifecycle_exit`
+consumes the target and needs `allow_process_restart=true`. Label passes
+with `label=` and diff them with `compare_to=`.
 `navigation` is the traversal-proof audit: it drives Tab forward and Shift+Tab
 back, records every transition into the ID-keyed focus graph, and reports the
 proven Tab order, the wrap-around cycle, and — edge for edge — whether
 Shift+Tab truly reverses Tab (missing inverses are named by control ID, not
 shrugged at).
+
+### tui_explain
+Explain one audit finding: each evidence ref traced to its source, plus the
+terminal capabilities (via the live profile) the finding is conditional on.
+Also available read-only as the `tui://findings/{finding_id}` resource.
+
+### tui_workflow
+The construction workflow per finding — one object per answer, no autonomy.
+
+**Actions:** `inspect`, `verify`, `diagnose`
+
+`inspect` assembles the whole chain in one object: finding → component
+identity → source loci (provenance-tiered) → framework context (rooted at
+the run's recorded launch cwd, with `root_provenance` naming where the root
+came from) → contract expectation → minimal reproduction → targeted
+validation. `verify` runs that verification plan live — replay the recorded
+reproduction, re-run the finding's cheapest audit surface — and reports
+whether the finding still reproduces (lease-gated when the surface drives).
+`diagnose` lists every finding's chain. Nothing here edits code or prescribes
+fixes; everything cites the run's own evidence.
 
 ### tui_coverage
 Coverage with two providers, merged honestly. Native coverage: a cooperative
