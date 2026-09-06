@@ -259,3 +259,27 @@ evidence-final, restore adopts through holder-level adopt/insert paths.
 Full suite green at every commit (33 suites; two known load-flaky PTY
 timing tests, documented at 77e8edc, fail only under full-matrix
 parallel load and pass in isolation).
+
+### G2 progress (2026-09-05) — PortablePtyBackend decomposition
+
+Same cadence — one extraction per commit, public behavior unchanged,
+the single canonical `pump()` untouched (invariant 4):
+
+| Commit | Module | Moved |
+| --- | --- | --- |
+| 9c70140 | `backend::raw_capture::RawCapture` | raw ring, declared head eviction, absolute stream total (+ `clear()` on `start()` as a documented correctness improvement: a new child stream restarts offsets) |
+| 62008e9 | `backend::input` | `encode_key` / `encode_key_kitty` / `encode_mouse_event` + their byte-level conformance fixtures (29 tests) |
+| 61b3d3a | `backend::event_clock::BackendEventClock` | five seq counters, wall+monotonic stamps, bounded per-change log, query-answer bookkeeping (+6 unit tests) |
+| (this)  | `backend::protocol` | `BackendCallbacks` (title/bells/OSC8/kitty/OSC133/query responder) + typed `QueryClass` enum |
+
+The `QueryClass` enum replaces the plan-flagged stringly
+`Option<&'static str>` pending-class plumbing internally;
+`QueryClass::as_str` renders the stable persisted names (`"da1"`,
+`"dsr_cpr"`, …) at the API boundary so the `QueryAnswered { class }`
+event format is byte-identical (invariant 13) and the audit driver's
+`"dsr_cpr"` matching still holds. A unit test pins all eight strings.
+
+Remaining G2 slices: `emulator.rs` (Parser + normalization policy +
+scrollback state), `process.rs` (PtyProcess: master/child/writer/reader/
+chunk_rx/pid), `wait.rs` (WaitEvaluator), then optionally migrating
+line_cli.rs's duplicate raw ring onto the shared RawCapture.
