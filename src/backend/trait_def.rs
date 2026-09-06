@@ -143,6 +143,39 @@ pub trait TerminalBackend: Send {
         (0, 0)
     }
 
+    /// Item 22: the responder's most recent delivered answer —
+    /// `(class, answered_counter)`; `(None, 0)` from engines without a
+    /// device-query responder. Measured at the write that delivered the
+    /// bytes back to the PTY. (G3: replaces the session layer's
+    /// downcast to the concrete portable engine.)
+    fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
+        (None, 0)
+    }
+
+    /// Item 22: measured conformance probe — feed `query` through the same
+    /// parser the child's output uses and return the responder's exact
+    /// answer bytes `(class, answer)`. Nothing reaches the child; nothing
+    /// enters the output ring. `(None, empty)` from engines without a
+    /// responder.
+    fn probe_query_response(&mut self, _query: &[u8]) -> (Option<&'static str>, Vec<u8>) {
+        (None, Vec::new())
+    }
+
+    /// Item 26: `(screen_seq, unix_ms)` for every screen change at/after
+    /// `after_seq`, oldest first — the measured evidence for an action's
+    /// first-frame latency. Empty when the engine keeps no per-change log.
+    fn screen_changes_since(&mut self, _after_seq: u64) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Wave-2 (streams): genuine stdout/stderr line separation —
+    /// `(stdout, stderr)`. `(empty, empty)` on engines that interleave by
+    /// construction (a single PTY carries both). (G3: replaces the
+    /// session layer's downcast to the concrete pipe engine.)
+    fn separated_streams(&mut self) -> (Vec<String>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+
     /// Downcast hook for engine-specific capability surfaces (the pipe
     /// backend's stdout/stderr separation). Engines return `self`.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;

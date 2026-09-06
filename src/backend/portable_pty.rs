@@ -339,6 +339,18 @@ impl TerminalBackend for PortablePtyBackend {
         self
     }
 
+    fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
+        PortablePtyBackend::last_query_answer(self)
+    }
+
+    fn probe_query_response(&mut self, query: &[u8]) -> (Option<&'static str>, Vec<u8>) {
+        PortablePtyBackend::probe_query_response(self, query)
+    }
+
+    fn screen_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        PortablePtyBackend::screen_changes_since(self, after_seq)
+    }
+
     fn start(
         &mut self,
         command: &str,
