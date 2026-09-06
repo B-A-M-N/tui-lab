@@ -403,18 +403,40 @@ async fn full_audit_leaves_no_state_residue() {
         .expect("start");
     pool.with_session(Some(&id), |sess| {
         let report = tui_lab::audit::orchestrator::run_profile(sess, "full").expect("full runs");
-        // The last driver restores what it changed; the transaction verify pass
-        // must find focus/size unchanged, so NO residue finding appears.
+        // The last driver restores what it changed; the transaction verify
+        // pass must find focus/size/cursor/title unchanged, so NO genuine
+        // (WARN) residue finding appears. Audit P1 (finding 15): a
+        // structure-ONLY change is contextual evidence, reported at INFO
+        // — the drivers' control bytes echo into this plain `input()`
+        // child's screen, which moves the structure hash while leaving
+        // every owned axis intact — so an INFO AUDIT-RESIDUE row is
+        // allowed and a WARN one is not.
+        let genuine: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.id == "AUDIT-RESIDUE" && f.severity == tui_lab::audit::Severity::Warn)
+            .collect();
         assert!(
-            !report.findings.iter().any(|f| f.id == "AUDIT-RESIDUE"),
-            "full audit must restore state (or honestly report it — here restoration works): {:?}",
-            report
-                .findings
+            genuine.is_empty(),
+            "full audit must restore the state it is responsible for: {:?}",
+            genuine
                 .iter()
-                .filter(|f| f.id == "AUDIT-RESIDUE")
                 .map(|f| &f.summary)
                 .collect::<Vec<_>>()
         );
+        for f in report.findings.iter().filter(|f| f.id == "AUDIT-RESIDUE") {
+            assert_eq!(
+                f.severity,
+                tui_lab::audit::Severity::Info,
+                "structure-only residue is INFO context, never a defect: {}",
+                f.summary
+            );
+            assert!(
+                f.summary.contains("structure changed"),
+                "INFO rows are the structure-only class: {}",
+                f.summary
+            );
+        }
         let screen = sess.observe(40).expect("post-audit observe");
         assert_eq!(
             (screen.cols, screen.rows),
@@ -2300,6 +2322,272 @@ async fn tui_act_carries_semantic_render_deltas() {
         .tui_session(params_typed(
             serde_json::json!({ "action": "stop", "id": sid }),
         ))
+        .await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// Audit P1 (response freshness): a close response's "final" summary must
+// describe the run AFTER the close — the pre-close snapshot reported
+// closed:false and pre-flush counts, so a "successful" close handed back
+// a final object that predated the very flush it certified. Likewise an
+// already-persistent `tui_run action=persist` is not a bare echo: it
+// flushes and answers with the CURRENT durability picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_and_persist_responses_report_fresh_final_state() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let base = std::env::temp_dir().join(format!("tui-lab-fresh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", "print('fresh'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "session start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+            ))
+            .await,
+        "act",
+    );
+
+    // Persist, then accumulate MORE in-memory state (another act).
+    unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "persist" })))
+            .await,
+        "persist",
+    );
+    unwrap_ok(
+        &server
+            .tui_act(params_typed(
+                serde_json::json!({ "action": "key", "key": "escape", "id": sid }),
+            ))
+            .await,
+        "act after persist",
+    );
+
+    // already-persistent persist: the response's "final" must show the
+    // run's CURRENT counts (including the post-persist act), not a stale
+    // echo — and the flush it performs must succeed cleanly.
+    let again = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "persist" })))
+            .await,
+        "persist (already persistent)",
+    );
+    assert_eq!(again["already_persistent"], true, "{again}");
+    assert!(
+        again["flush_error"].is_null(),
+        "flush of an already-persistent run must succeed: {again}"
+    );
+    let final_again = &again["final"];
+    assert!(
+        final_again.is_object() && final_again["closed"] == false,
+        "final carries the live (post-flush, pre-close) state: {again}"
+    );
+    let tx_at_persist = final_again["counts"]["transactions"]
+        .as_u64()
+        .expect("tx count");
+
+    // Close: "final" must report closed:true and the settled counts.
+    let close = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "close" })))
+            .await,
+        "close",
+    );
+    assert_eq!(close["closed"], true, "{close}");
+    let final_close = &close["final"];
+    assert!(
+        final_close.is_object(),
+        "final is present: {close}"
+    );
+    assert_eq!(
+        final_close["closed"], true,
+        "the final summary describes the run AFTER the close, not the \
+         pre-close snapshot (which said closed:false): {close}"
+    );
+    assert_eq!(
+        final_close["counts"]["transactions"].as_u64(),
+        Some(tx_at_persist),
+        "final counts are the settled totals, not pre-flush values: {close}"
+    );
+    assert_eq!(
+        final_close["run_id"], again["run_id"],
+        "{close}"
+    );
+
+    // Cross-check against a fresh status call: identical totals.
+    let after = unwrap_ok(
+        &server
+            .tui_run(params_typed(serde_json::json!({ "action": "status" })))
+            .await,
+        "status after close",
+    );
+    assert_eq!(
+        after["counts"]["transactions"].as_u64(),
+        final_close["counts"]["transactions"].as_u64(),
+        "final matches the post-close status: {after} vs {close}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// Audit P1 (finding 13): the restart-replay flag no longer implies
+// mutating consent. `restart_between_mutations=true` without
+// `allow_mutation=true` is refused at the wire with the reason named;
+// the old `deep_isolation` spelling still parses (deprecated alias) but
+// is subject to the SAME consent rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_between_mutations_requires_explicit_mutation_consent() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let id = start_session(&server, "print('rbm'); input()").await;
+
+    // Alone: refused — the restart does not undo external side effects,
+    // so the consent for those must come from allow_mutation explicitly.
+    let refused = unwrap_err(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "keyboard",
+                "id": id,
+                "restart_between_mutations": true,
+            })))
+            .await,
+        "rbm without allow_mutation",
+    );
+    let msg = serde_json::to_string(&refused).expect("envelope");
+    assert!(
+        msg.contains("allow_mutation"),
+        "refusal names the missing consent: {msg}"
+    );
+
+    // The deprecated alias is subject to the same rule.
+    let alias = unwrap_err(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "keyboard",
+                "id": id,
+                "deep_isolation": true,
+            })))
+            .await,
+        "deep_isolation alias without allow_mutation",
+    );
+    let alias_msg = serde_json::to_string(&alias).expect("envelope");
+    assert!(
+        alias_msg.contains("allow_mutation"),
+        "the old spelling gets the same consent rule: {alias_msg}"
+    );
+
+    // With consent: the policy is accepted and reported under its new
+    // name (an observational session can't exercise the restarts, but
+    // the policy selection is visible).
+    let allowed = unwrap_ok(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "keyboard",
+                "id": id,
+                "restart_between_mutations": true,
+                "allow_mutation": true,
+            })))
+            .await,
+        "rbm with allow_mutation",
+    );
+    assert_eq!(
+        allowed["policy"], "restart_between_mutations",
+        "policy surfaced under the honest name: {allowed}"
+    );
+
+    server
+        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+        .await;
+}
+
+// Audit P1 (finding 14): the construction workflow's framework context is
+// rooted at the RUN's recorded LaunchSpec.cwd — where the audited app
+// actually lives — never silently at the server process's cwd. An explicit
+// `cwd` parameter is a conscious override and its provenance is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_framework_root_follows_recorded_launch_cwd() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+
+    // The session is launched with cwd=base — an isolated directory
+    // OUTSIDE the repo, so upward manifest walking cannot reach the
+    // server process's project. The workflow must detect against `base`,
+    // citing the recorded launch cwd (a server-cwd fallback would have
+    // produced the repo root instead).
+    let base = std::env::temp_dir().join(format!("tui-lab-wfcwd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+    let start = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start",
+                "command": "python3",
+                "args": ["-c", "print('wf-cwd'); input()"],
+                "cwd": base.to_string_lossy(), "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start",
+    );
+    let sid = start["session"].as_str().unwrap().to_string();
+
+    let audit = unwrap_ok(
+        &server
+            .tui_audit(params_typed(serde_json::json!({
+                "profile": "discoverability", "id": sid,
+            })))
+            .await,
+        "audit",
+    );
+    let finding_id = audit["findings"][0]["id"]
+        .as_str()
+        .expect("finding id")
+        .to_string();
+
+    let inspect = unwrap_ok(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({
+                "action": "inspect", "finding_id": &finding_id,
+            })))
+            .await,
+        "inspect",
+    );
+    let fw = &inspect["framework"];
+    assert_eq!(
+        fw["root_provenance"], "recorded_launch_cwd",
+        "root comes from the recorded launch cwd, not the server cwd: {fw}"
+    );
+    assert_eq!(
+        fw["project_root"], base.to_string_lossy().as_ref(),
+        "detection resolved against the app's own directory: {fw}"
+    );
+
+    // An explicit cwd is a conscious override, labeled as such.
+    let overridden = unwrap_ok(
+        &server
+            .tui_workflow(params_typed(serde_json::json!({
+                "action": "inspect", "finding_id": &finding_id,
+                "cwd": ".",
+            })))
+            .await,
+        "inspect with explicit cwd",
+    );
+    assert_eq!(
+        overridden["framework"]["root_provenance"], "explicit_override",
+        "{overridden}"
+    );
+
+    server
+        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": sid })))
         .await;
     let _ = std::fs::remove_dir_all(&base);
 }

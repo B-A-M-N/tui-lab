@@ -11,9 +11,11 @@
 //! `RunContext` keeps the public methods as thin delegations; the
 //! closed-run guard (`ensure_open`) stays on the facade. On-disk format
 //! unchanged: `coverage.json` is still a plain `BTreeMap<String,
-//! CoverageEntry>`, and `coverage_seq` is deliberately NOT persisted — a
-//! restored run's sequence order reflects only live events since reopen,
-//! which status honestly reports.
+//! CoverageEntry>` and `coverage_seq` is still not persisted — it is
+//! RECONSTRUCTED on restore as the entries' max `last_seq` (audit P1,
+//! coverage sequence identity), so post-resume events continue strictly
+//! above every pre-close cursor instead of restarting at 0. Pre-cursor-era
+//! files (all seqs 0) restore to 0, which the summary note reports.
 
 use super::CoverageEntry;
 use std::collections::BTreeMap;
@@ -107,7 +109,21 @@ impl CoverageState {
     }
 
     /// Adopt a loaded ledger (restore path; the file is authoritative).
+    /// The sequence high-water mark is RECONSTRUCTED from the entries'
+    /// `last_seq` — a fresh `seq = 0` after restore would hand new
+    /// post-resume events sequence values BELOW the previous epoch's
+    /// cursor, so a client holding a pre-close coverage cursor would
+    /// never see them again (audit P1, coverage sequence identity).
+    /// With the high-water restored, post-resume `record()`s continue
+    /// strictly above every persisted sequence, and the run's delta
+    /// cursor starts at the high-water too: a post-resume delta reports
+    /// only genuinely new targets, not the whole restored ledger as
+    /// "new". (Pre-cursor-era files — every seq 0 — stay at 0, which the
+    /// summary's honest note still reports.)
     pub(super) fn set_entries(&mut self, ledger: BTreeMap<String, CoverageEntry>) {
+        let high_water = ledger.values().map(|e| e.last_seq).max().unwrap_or(0);
+        self.seq = high_water;
+        self.delta_cursor = high_water;
         self.ledger = ledger;
     }
 

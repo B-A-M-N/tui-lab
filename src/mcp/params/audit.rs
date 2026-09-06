@@ -62,11 +62,19 @@ pub struct TuiAuditParams {
     /// potentially-mutating drivers — but NOT process-consuming audits.
     #[serde(default)]
     pub allow_mutation: Option<bool>,
-    /// Wave 4 item 37: deep-audit mode — restart-replay between
-    /// mutating drivers so each sees a fresh app (requires a session we
-    /// launched; degrades honestly on attached sessions).
-    #[serde(default)]
-    pub deep_isolation: Option<bool>,
+    /// Audit P1 (beta stability, finding 13): the former
+    /// `deep_isolation` — renamed because "isolation" overstated the
+    /// guarantee. This is RESTART-REPLAY between mutating drivers so each
+    /// sees a fresh in-process app state; it is NOT a general side-effect
+    /// boundary: a file write, network request, or external mutation the
+    /// app performs is NOT undone by restarting it (the isolation
+    /// profiles in `session::isolation` are likewise not a security
+    /// boundary). Requires a session we launched (degrades honestly —
+    /// refused, not run in place — on attached sessions), and requires
+    /// `allow_mutation=true` alongside it so external-side-effect consent
+    /// is never implied by the isolation-like name.
+    #[serde(default, alias = "deep_isolation")]
+    pub restart_between_mutations: Option<bool>,
     /// Explicit authorization for PROCESS-CONSUMING audits (`lifecycle_exit`):
     /// the profile will exit and relaunch the target. Deliberately NOT
     /// implied by `allow_mutation` — killing/restarting the app under audit

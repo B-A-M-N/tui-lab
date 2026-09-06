@@ -85,7 +85,7 @@ pub const TOOLS: &[ToolCapability] = &[
     },
     ToolCapability {
         name: "tui_audit",
-        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; deep_isolation=true restart-replays between mutating drivers. Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.",
+        summary: "Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; restart_between_mutations=true restart-replays between mutating drivers (with allow_mutation=true; not an external-side-effect boundary). Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.",
         selector: Some(("profile", <crate::mcp::params::AuditProfile as EnumVariants>::VARIANTS)),
     },
     ToolCapability {

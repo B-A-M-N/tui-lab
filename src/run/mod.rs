@@ -1172,6 +1172,63 @@ mod tests {
         run.close().ok();
     }
 
+    /// Audit P1 (coverage sequence identity): a restored run must continue
+    /// the persisted coverage sequence, not restart it at zero — otherwise
+    /// post-resume events get seq values BELOW the previous epoch's cursor
+    /// and a client holding a pre-close coverage cursor never sees them.
+    #[test]
+    fn restored_coverage_continues_the_sequence_high_water_mark() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut run = RunContext::persistent(tmp.path()).expect("run");
+        let _ = run.record_coverage_event("s1", "#save.activate");
+        let _ = run.record_coverage_event("s1", "#cancel.activate");
+        let _ = run.record_coverage_event("s1", "#save.activate");
+        let pre_close_seq = run.coverage_seq();
+        assert!(pre_close_seq >= 3);
+        let pre_close_cursor = {
+            // Seed a post-resume cursor to compare against: the last_seq of
+            // the newest entry is the high-water a client would have read.
+            run.coverage_ledger()
+                .values()
+                .map(|e| e.last_seq)
+                .max()
+                .expect("entries")
+        };
+        run.flush().expect("flush");
+        run.close().expect("close");
+
+        let mut restored = RunContext::restore(run.run_dir().unwrap()).expect("restore");
+        // Resume epoch: a restored run stays closed until an explicit
+        // reopen (the resume contract); coverage only folds while open.
+        restored.reopen().expect("reopen");
+        assert_eq!(
+            restored.coverage_seq(), pre_close_seq,
+            "restore reconstructs the sequence high-water from last_seq"
+        );
+        // New post-resume events continue STRICTLY ABOVE every persisted
+        // sequence — never below a client's pre-close cursor.
+        let _ = restored.record_coverage_event("s2", "#menu.open");
+        let menu = restored
+            .coverage_ledger()
+            .get("#menu.open")
+            .expect("post-resume entry");
+        assert!(
+            menu.first_seq > pre_close_cursor,
+            "post-resume seq must exceed the pre-close high-water: \
+             first_seq={} vs cursor={pre_close_cursor}",
+            menu.first_seq
+        );
+        // A caller holding the PRE-CLOSE cursor sees exactly the new target
+        // — monotonic delta cursors survive the resume epoch.
+        restored.set_coverage_delta_cursor(pre_close_cursor);
+        let fresh = restored
+            .coverage_ledger()
+            .iter()
+            .filter(|(_, e)| e.first_seq > pre_close_cursor)
+            .count();
+        assert_eq!(fresh, 1, "exactly the post-resume target is new");
+    }
+
     #[test]
     fn same_named_scenarios_do_not_collide() {
         let tmp = tempfile::tempdir().expect("tmpdir");

@@ -858,10 +858,10 @@ fn run_profile_with_contract_impl(
                     rule_id: None,
                     severity: Severity::Warn,
                     category: Category::Orchestration,
-                    summary: "deep isolation requested but unattainable (no launch spec — attached brownfield): the requested profile is invasive, so it was REFUSED, not run in place. Re-run with a launched session, allow_mutation (explicit in-place consent), or an observational profile.".to_string(),
+                    summary: "restart_between_mutations requested but unattainable (no launch spec — attached brownfield): the requested profile is invasive, so it was REFUSED, not run in place. Re-run with a launched session, allow_mutation (explicit in-place consent), or an observational profile.".to_string(),
                     evidence: vec![EvidenceRef::point(
                         EvidenceKind::Other,
-                        "deep_isolation_unavailable",
+                        "restart_replay_unavailable",
                         "restart-replay needs a recorded LaunchSpec; invasive profiles are refused rather than degraded",
                     )
                     .with_detail(json!({ "profile": profile_name, "risk": requested_risk.name() }))],
@@ -879,10 +879,10 @@ fn run_profile_with_contract_impl(
             rule_id: None,
             severity: Severity::Info,
             category: Category::Orchestration,
-            summary: "deep isolation requested but this session has no launch spec (attached brownfield) — the requested profile is observational (no mutation), so it runs unaffected.".to_string(),
+            summary: "restart_between_mutations requested but this session has no launch spec (attached brownfield) — the requested profile is observational (no mutation), so it runs unaffected.".to_string(),
             evidence: vec![EvidenceRef::point(
                 EvidenceKind::Other,
-                "deep_isolation_unavailable",
+                "restart_replay_unavailable",
                 "restart-replay needs a recorded LaunchSpec; observational profiles do not need it",
             )
             .with_detail(json!({ "profile": profile.name() }))],
@@ -998,11 +998,11 @@ fn run_profile_with_contract_impl(
                     severity: Severity::Warn,
                     category: Category::Orchestration,
                     summary: format!(
-                        "deep isolation: run ABORTED after {restarts} restart gap(s) — a restart failed and the remaining active drivers were not run against the un-isolated app"
+                        "restart_between_mutations: run ABORTED after {restarts} restart gap(s) — a restart failed and the remaining active drivers were not run against the un-isolated app"
                     ),
                     evidence: vec![EvidenceRef::point(
                         EvidenceKind::Other,
-                        "deep_isolation_aborted",
+                        "restart_replay_aborted",
                         "restart failure aborts remaining active members (audit P0-11)",
                     )
                     .with_detail(json!({ "restarts": restarts }))],
@@ -1018,11 +1018,11 @@ fn run_profile_with_contract_impl(
                     severity: Severity::Info,
                     category: Category::Orchestration,
                     summary: format!(
-                        "deep isolation: {restarts} restart-replay gap(s) inserted between mutating drivers"
+                        "restart_between_mutations: {restarts} restart-replay gap(s) inserted between mutating drivers"
                     ),
                     evidence: vec![EvidenceRef::point(
                         EvidenceKind::Other,
-                        "deep_isolation_summary",
+                        "restart_replay_summary",
                         "restart count for this composite run",
                     )
                     .with_detail(json!({ "restarts": restarts }))],

@@ -18,10 +18,21 @@ pub(crate) fn persist(
 ) -> rmcp::model::CallToolResult {
     let mut run = s.run.lock().unwrap();
     if run.run_dir().is_some() {
+        // Audit P1 (response freshness): "already persistent" is not a
+        // no-op answer — a run can be persistent yet hold unflushed
+        // in-memory state. Flush (best-effort here; a failure is
+        // reported, not swallowed) and answer with the CURRENT
+        // durability picture, not a bare echo.
+        let flush = run.flush().err().map(|e| e.to_string());
+        let run_id = run.id().to_string();
+        let artifact_root = run.run_dir().map(|d| d.to_string_lossy().to_string());
+        let summary = run.status(Vec::new());
         return ok(json!({
-            "run_id": run.id(),
+            "run_id": run_id,
             "already_persistent": true,
-            "artifact_root": run.run_dir().map(|d| d.to_string_lossy().to_string()),
+            "artifact_root": artifact_root,
+            "flush_error": flush,
+            "final": summary,
         }));
     }
     let base: String = match p.root.clone() {

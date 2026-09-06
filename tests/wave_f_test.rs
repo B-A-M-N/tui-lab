@@ -967,13 +967,25 @@ fn clean_audit_run_has_no_fake_metrics_finding() {
         "finding 20: no synthetic metrics finding: {:?}",
         report.findings.iter().map(|f| &f.id).collect::<Vec<_>>()
     );
-    assert!(
-        report
-            .findings
-            .iter()
-            .all(|f| f.severity != tui_lab::audit::Severity::Info || !f.id.starts_with("AUDIT-")),
-        "timing must not masquerade as an audit finding"
-    );
+    // Finding 20 as amended by audit P1 (finding 15): timing never
+    // masquerades as a finding — and the only AUDIT-* rows allowed on a
+    // clean run are structure-only AUDIT-RESIDUE rows at INFO (contextual
+    // evidence; this echo child shows the drivers' own control bytes).
+    // Any WARN/ERROR AUDIT-* row on a clean run is a synthetic masquerade.
+    for f in report.findings.iter().filter(|f| f.id.starts_with("AUDIT-")) {
+        assert!(
+            f.id == "AUDIT-RESIDUE" && f.severity == tui_lab::audit::Severity::Info,
+            "timing must not masquerade as an audit finding, and only \
+             structure-only INFO residue may appear on a clean run: {} {}",
+            f.id,
+            f.summary
+        );
+        assert!(
+            f.summary.contains("structure changed"),
+            "the INFO row is the contextual-evidence class: {}",
+            f.summary
+        );
+    }
     assert!(
         !report.metrics.is_empty(),
         "transactional drivers report timing as report metadata"

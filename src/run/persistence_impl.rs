@@ -356,9 +356,12 @@ impl RunContext {
         if let Some(v) = state_graph_json {
             run.graphs.state_graph = StateGraph::from_export(&v, ExplorationBudget::default());
         }
-        // Coverage ledger. Round-2 (G1): read into a local, then adopt;
-        // `coverage_seq` stays 0 (sequence order reflects live events
-        // since reopen — unchanged behavior).
+        // Coverage ledger. Round-2 (G1): read into a local, then adopt.
+        // `set_entries` reconstructs the sequence high-water mark (and the
+        // run delta cursor) from the entries' max `last_seq`, so post-resume
+        // coverage continues above every pre-close cursor (audit P1,
+        // coverage sequence identity) — pre-cursor-era files (all seqs 0)
+        // stay at 0, which the summary note still reports honestly.
         let mut loaded_coverage: std::collections::BTreeMap<String, CoverageEntry> =
             std::collections::BTreeMap::new();
         load_json!(

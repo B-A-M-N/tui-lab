@@ -121,11 +121,25 @@ pub(crate) async fn tui_audit(
     // Wave 4 items 34/36/37: the mutation-safety policy. Default is
     // safe-only (observational profiles run, invasive ones are
     // withheld with an ORCH-GATED finding naming how to allow them);
-    // allow_mutation=true lifts it; deep_isolation=true additionally
-    // restart-replays between mutating drivers. The engine applies the
+    // allow_mutation=true lifts it; restart_between_mutations=true
+    // additionally restart-replays between mutating drivers. Audit P1
+    // (finding 13): the restart-replay flag does NOT by itself authorize
+    // mutating profiles — external side effects (file writes, network
+    // calls) are not undone by a restart, so in-place mutation consent
+    // must be given explicitly alongside it. The engine applies the
     // policy — the MCP layer only picks which one and surfaces the
     // risk class in the response.
-    let policy = if p.deep_isolation.unwrap_or(false) {
+    let policy = if p.restart_between_mutations.unwrap_or(false) {
+        if !p.allow_mutation.unwrap_or(false) {
+            return err(
+                ErrorCategory::InvalidRequest,
+                "restart_between_mutations=true requires allow_mutation=true: \
+                 restart-replay gives each driver a fresh in-process app, but it \
+                 does NOT undo external side effects (file writes, network \
+                 requests) a mutating driver causes — that consent must be \
+                 explicit, never implied by the isolation-like name",
+            );
+        }
         crate::audit::orchestrator::SafetyPolicy::DeepIsolation
     } else if p.allow_mutation.unwrap_or(false) {
         crate::audit::orchestrator::SafetyPolicy::AllowMutation
@@ -238,7 +252,9 @@ pub(crate) async fn tui_audit(
                 "policy": match policy {
                     crate::audit::orchestrator::SafetyPolicy::SafeOnly => "safe_only",
                     crate::audit::orchestrator::SafetyPolicy::AllowMutation => "allow_mutation",
-                    crate::audit::orchestrator::SafetyPolicy::DeepIsolation => "deep_isolation",
+                    crate::audit::orchestrator::SafetyPolicy::DeepIsolation => {
+                        "restart_between_mutations"
+                    }
                 },
                 // Info-split (review P1 item 9): `finding_count` has always
                 // counted every row, and informational orchestration records
