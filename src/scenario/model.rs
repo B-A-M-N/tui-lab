@@ -95,7 +95,7 @@ fn default_rows() -> u16 {
 /// A single step in a scenario.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioStep {
-    /// The kind of step: "act", "wait", or "assert".
+    /// The kind of step: "act", "wait", "assert", or "intent" (P0-9).
     pub kind: StepKind,
     /// The action or assertion parameters.
     #[serde(flatten)]
@@ -131,6 +131,12 @@ pub enum StepKind {
     Act,
     Wait,
     Assert,
+    /// Beta-audit P0-9: a recorded semantic intent. The step carries the
+    /// INTENT (target selector + verb), not raw keys — replay re-resolves
+    /// the target against the live screen and runs the same focus-secured
+    /// plan engine, so a recording survives layout/focus changes that
+    /// would break a replayed key sequence.
+    Intent,
 }
 
 /// One declared scenario parameter (re-review P0.3): a named, typed slot the
@@ -201,6 +207,17 @@ impl Scenario {
     pub fn act(mut self, params: serde_json::Value) -> Self {
         self.steps.push(ScenarioStep {
             kind: StepKind::Act,
+            params,
+            expect: None,
+        });
+        self
+    }
+
+    /// Add an intent step (beta-audit P0-9): target + verb recorded as
+    /// semantic facts; replay re-resolves and focus-secures.
+    pub fn intent(mut self, params: serde_json::Value) -> Self {
+        self.steps.push(ScenarioStep {
+            kind: StepKind::Intent,
             params,
             expect: None,
         });
