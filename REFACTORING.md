@@ -325,3 +325,18 @@ the two hook-shared slots, the native side channel, the human lease
 evidence. No new locks anywhere (invariant 15) — every holder is plain
 state behind the actor's single-threaded ownership. observe() remains the
 compositional orchestrator.
+
+### G5 (2026-09-06) — the MCP surface: tui_run split + TuiLabServer residue
+
+Three commits:
+
+| Commit | Slice | What moved |
+| --- | --- | --- |
+| cdd2bc1 | G5a | `ownership.rs`: SessionOwnership (bind/owner_of/owned_by/sessions_of/foreign_sessions/unbind) + IntentPlanStore (bounded cap 64, `store()` oldest-eviction, `consume()` remove-and-return = at-most-once as STORE policy, finding 3D). `resources.rs`: the whole tui:// resolver (findings feed, run evidence, session views, run_scoped_payload, running_id, SessionView). Server keeps the same Arc handles — no lock-discipline change |
+| 80ff6e4 | G5b | `tui_run`'s 600-line match → 60-line dispatcher + three action-family modules: `run/lifecycle.rs` (new/close/resume — evidence-safety ordering verbatim), `run/persist.rs` (persist/list), `run/diagnostics.rs` (status/context/diagnose/bundle) |
+| 1b08735 | G5c | `minimize_crash_finding` → `handlers/explore/crash_finding.rs`; contract check/diff helpers → `handlers/contract/check.rs`. TuiLabServer is now the thin façade (tool-table delegates + with_sess + ownership handles + resource delegate); tools.rs 1086 → 476 lines |
+
+Server round 2 done: RunContext composed of holders (G1), backend
+composed (G2), typed engine surfaces (G3), Session composed (G4), and
+the MCP surface decomposed (G5). Invariants 2, 4, 13, 15 held at every
+gate; suite green at each commit.
