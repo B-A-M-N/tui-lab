@@ -15,12 +15,7 @@
 //!   * title and bell are tracked via parser callbacks;
 //!   * [`Capabilities`] reports only working behavior.
 
-use std::io::{Read, Write};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
-
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::backend::{
     new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
@@ -40,23 +35,16 @@ pub struct PortablePtyBackend {
     /// Grid + normalization policy + scrollback (G2): see
     /// [`super::emulator::TerminalEmulator`].
     emulator: super::emulator::TerminalEmulator,
-    master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    writer: Option<Box<dyn Write + Send>>,
-    // Reader thread -> main parse loop.
-    reader_handle: Option<thread::JoinHandle<()>>,
-    chunk_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Child process + PTY plumbing (G2): see [`super::process::PtyProcess`].
+    process_pty: super::process::PtyProcess,
     // Recording hook slot (audit item 24/25/26).
     recording_slot: RecordingHookSlot,
-    // Hook clone carried into the reader thread at start().
+    // Hook clone carried into the reader thread at start() and used by
+    // write_input's notify path.
     reader_recording_hook: Option<super::RecordingHookSlot>,
-    // Wave G item 77: clear the inherited env before applying pairs at the
-    // next start() (clean/strict isolation profiles).
-    clear_env_on_start: bool,
     // Event sequencing state (spec section 1): counters, stamps, the
     // bounded per-change log, and query-answer bookkeeping (G2).
     events: super::event_clock::BackendEventClock,
-    child_pid: Option<u32>,
     /// Wave-2 (protocol diagnostics): bounded raw-byte capture — the
     /// child's REAL output bytes (escape sequences, OSC, DCS and all) so
     /// the protocol decoder can reconstruct "what did this TUI actually
@@ -71,16 +59,10 @@ impl PortablePtyBackend {
             cols,
             rows,
             emulator: super::emulator::TerminalEmulator::new(cols, rows),
-            master: None,
-            child: None,
-            writer: None,
-            reader_handle: None,
-            chunk_rx: None,
+            process_pty: super::process::PtyProcess::new(),
             recording_slot: new_recording_hook_slot(),
             reader_recording_hook: None,
-            clear_env_on_start: false,
             events: super::event_clock::BackendEventClock::new(),
-            child_pid: None,
             raw: super::raw_capture::RawCapture::new(),
         }
     }
@@ -103,15 +85,9 @@ impl PortablePtyBackend {
     fn pump(&mut self) -> BackendResult<(String, String)> {
         let before_contents = self.emulator.screen().contents();
         let before_fp = self.interaction_fingerprint();
-        // Drain into a local buffer first so `absorb_raw` can take `&mut self`
-        // without holding the `chunk_rx` borrow across the mutation.
-        let mut drained_chunks: Vec<Vec<u8>> = Vec::new();
-        if let Some(rx) = self.chunk_rx.as_ref() {
-            // Non-blocking drain of everything currently buffered.
-            while let Ok(chunk) = rx.try_recv() {
-                drained_chunks.push(chunk);
-            }
-        }
+        // Drain into a local buffer first so the rest of the pump can take
+        // `&mut self` freely.
+        let drained_chunks = self.process_pty.drain();
         for chunk in &drained_chunks {
             // Raw-output ring first (Wave-2 protocol diagnostics): the
             // child's real bytes, before the parser interprets them.
@@ -322,12 +298,7 @@ impl PortablePtyBackend {
     /// Write bytes to the PTY via the writer and notify the recording hook
     /// (audit item 24).
     fn write_input(&mut self, bytes: &[u8]) -> BackendResult<()> {
-        let writer = match self.writer.as_mut() {
-            Some(w) => w,
-            None => return Err(BackendError::NoSession),
-        };
-        writer.write_all(bytes).map_err(BackendError::Io)?;
-        writer.flush().map_err(BackendError::Io)?;
+        self.process_pty.write(bytes)?;
         // Notify input hook via the reader thread's hook clone.
         if let Some(ref hook) = self.reader_recording_hook {
             if let Ok(slot) = hook.lock() {
@@ -380,117 +351,16 @@ impl TerminalBackend for PortablePtyBackend {
         self.cols = cols;
         self.rows = rows;
         self.emulator.reset(cols, rows);
+        self.process_pty
+            .spawn(command, args, cwd, env, cols, rows, &self.recording_slot)?;
+        // Also keep a hook clone on the struct for write_input usage.
+        self.reader_recording_hook = Some(self.recording_slot.clone());
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| BackendError::Spawn(e.to_string()))?;
-
-        let mut cmd = CommandBuilder::new(command);
-        for a in args {
-            cmd.arg(a);
-        }
-        // portable-pty's CommandBuilder defaults a child with no explicit
-        // cwd to $HOME — not the parent's cwd like std::process. A test
-        // harness launching relative-path targets ("python3 fixtures/app.py")
-        // from the project dir would silently run from ~. Inherit the
-        // parent's cwd instead; an explicit `cwd` still wins.
-        let cwd_owned: String;
-        let cwd_arg: Option<&str> = match cwd {
-            Some(c) => Some(c),
-            None => match std::env::current_dir() {
-                Ok(d) => {
-                    cwd_owned = d.to_string_lossy().to_string();
-                    Some(cwd_owned.as_str())
-                }
-                Err(_) => None,
-            },
-        };
-        if let Some(c) = cwd_arg {
-            cmd.cwd(c);
-        }
-        // Isolation profile (Wave G item 77): clean/strict launches drop the
-        // inherited environment first so the child sees only the caller's
-        // pairs. Local keeps portable-pty's base-env inheritance.
-        if self.clear_env_on_start {
-            cmd.env_clear();
-        }
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| BackendError::Spawn(e.to_string()))?;
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| BackendError::Io(std::io::Error::other(e.to_string())))?;
-        let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
-        // Clone the recording hook slot for the reader thread (audit item 24).
-        let reader_hook_for_thread = self.recording_slot.clone();
-        let reader_hook_for_struct = self.recording_slot.clone();
-        let rh = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        if std::env::var("TUI_LAB_DEBUG_PTY").is_ok() {
-                            eprintln!("[tui-lab reader] EOF");
-                        }
-                        break;
-                    }
-                    Ok(n) => {
-                        let chunk = buf[..n].to_vec();
-                        // Feed the recording hook if attached.
-                        if let Ok(slot) = reader_hook_for_thread.lock() {
-                            if let Some(ref hook) = *slot {
-                                hook.on_output(&chunk);
-                            }
-                        }
-                        if chunk_tx.send(chunk).is_err() {
-                            if std::env::var("TUI_LAB_DEBUG_PTY").is_ok() {
-                                eprintln!("[tui-lab reader] channel closed, terminating");
-                            }
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if std::env::var("TUI_LAB_DEBUG_PTY").is_ok() {
-                            eprintln!("[tui-lab reader] read error, terminating: {e}");
-                        }
-                        break;
-                    }
-                }
-            }
-        });
-        self.reader_handle = Some(rh);
-        self.chunk_rx = Some(chunk_rx);
-        // Also store the hook clone on the struct for write_input usage.
-        self.reader_recording_hook = Some(reader_hook_for_struct);
-
-        // take writer
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| BackendError::Io(std::io::Error::other(e.to_string())))?;
-
-        self.master = Some(pair.master);
-        self.child = Some(child);
-        self.writer = Some(writer);
         // A new child stream is a new output stream: counters and offsets
         // restart.
         self.events.clear();
         self.raw.clear();
         self.emulator.callbacks_mut().query_responses.clear();
-        self.child_pid = self.child.as_ref().and_then(|c| c.process_id());
 
         // give the process a moment to emit initial frame
         std::thread::sleep(Duration::from_millis(150));
@@ -500,27 +370,10 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn stop(&mut self) -> BackendResult<()> {
-        // Signal the child process group, then the direct child, then drain.
-        if let Some(pid) = self.child_pid {
-            #[cfg(unix)]
-            unsafe {
-                // Negative pid targets the process group (killpg semantics).
-                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-            }
-        }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // Drop writer/master so the reader hits EOF.
-        self.writer = None;
-        self.master = None;
-        if let Some(h) = self.reader_handle.take() {
-            let _ = h.join();
-        }
-        self.chunk_rx = None;
+        // Signal the child process group, then the direct child, then drain
+        // the reader — ordering lives in PtyProcess::terminate.
+        self.process_pty.terminate();
         self.reader_recording_hook = None;
-        self.child_pid = None;
         Ok(())
     }
 
@@ -563,7 +416,7 @@ impl TerminalBackend for PortablePtyBackend {
         self.sync_parser_counters();
         // Resolve negotiated modes up front (clone, so no lingering borrow).
         let modes = self.current_modes();
-        if self.writer.is_none() {
+        if !self.process_pty.has_session() {
             return Err(BackendError::NoSession);
         }
         // For Keys we parse ergonomic strings into typed KeyEvents at the
@@ -667,27 +520,7 @@ impl TerminalBackend for PortablePtyBackend {
                 return self.resize(cols, rows);
             }
             Input::Signal(sig) => {
-                #[cfg(unix)]
-                {
-                    if let Some(pid) = self.child_pid {
-                        // Deliver to the process group so spawned subprocesses
-                        // are also signalled (spec section 7).
-                        let r = unsafe { libc::kill(-(pid as i32), sig) };
-                        if r != 0 {
-                            // fall back to killing the direct child only
-                            let _ = unsafe { libc::kill(pid as i32, sig) };
-                        }
-                        return Ok(());
-                    }
-                    return Err(BackendError::NoSession);
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = sig;
-                    return Err(BackendError::Unsupported(
-                        "arbitrary POSIX signals are only available on Unix".into(),
-                    ));
-                }
+                return self.process_pty.signal_group(sig);
             }
         }
         Ok(())
@@ -696,16 +529,7 @@ impl TerminalBackend for PortablePtyBackend {
     fn resize(&mut self, cols: u16, rows: u16) -> BackendResult<()> {
         self.cols = cols;
         self.rows = rows;
-        if let Some(master) = self.master.as_ref() {
-            master
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|e| BackendError::Spawn(e.to_string()))?;
-        }
+        self.process_pty.resize_master(cols, rows)?;
         // Resize the vt100 parser as well so our parsed screen matches the
         // child's notion of dimensions (spec section 3).
         self.emulator.set_size(rows, cols);
@@ -953,34 +777,7 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn process(&mut self) -> ProcessState {
-        match self.child.as_mut() {
-            Some(child) => match child.try_wait() {
-                Ok(Some(status)) => {
-                    let (code, sig) = exit_status_parts(status);
-                    ProcessState {
-                        running: false,
-                        exit_code: Some(code),
-                        exit_signal: sig,
-                        cwd: None,
-                        pid: self.child_pid,
-                    }
-                }
-                _ => ProcessState {
-                    running: true,
-                    exit_code: None,
-                    exit_signal: None,
-                    cwd: None,
-                    pid: self.child_pid,
-                },
-            },
-            None => ProcessState {
-                running: false,
-                exit_code: None,
-                exit_signal: None,
-                cwd: None,
-                pid: None,
-            },
-        }
+        self.process_pty.process_state()
     }
 
     fn input_modes(&self) -> InputModes {
@@ -1021,7 +818,7 @@ impl TerminalBackend for PortablePtyBackend {
     /// Wave G item 77: clear the inherited environment before applying the
     /// caller's pairs on the next `start()` (clean/strict isolation).
     fn set_clear_env(&mut self, clear: bool) {
-        self.clear_env_on_start = clear;
+        self.process_pty.set_clear_env(clear);
     }
 
     /// Observe current terminal state with optional idle-wait.
@@ -1066,12 +863,6 @@ fn color_to_u32(c: vt100::Color) -> u32 {
             0x1000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
         }
     }
-}
-
-fn exit_status_parts(status: portable_pty::ExitStatus) -> (i32, Option<String>) {
-    let code = status.exit_code() as i32;
-    let sig = status.signal().map(|s| s.to_string());
-    (code, sig)
 }
 
 // `chunk_rx` is stored on the struct (declared near top) and drained in `pump`.
