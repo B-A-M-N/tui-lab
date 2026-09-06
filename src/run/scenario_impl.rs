@@ -256,12 +256,13 @@ impl RunContext {
     /// Retain a completed PTY recording in run memory. When the run is (or
     /// becomes) persistent, `flush` writes it under `recordings/`.
     pub fn hold_recording(&mut self, file_name: String, ndjson: String) {
-        self.held_recordings.push((file_name, ndjson));
+        self.artifacts_store.hold_recording(file_name, ndjson);
     }
 
     /// Recordings held in memory (name + event count preview).
     pub fn held_recordings(&self) -> Vec<serde_json::Value> {
-        self.held_recordings
+        self.artifacts_store
+            .held_recordings()
             .iter()
             .map(|(name, body)| {
                 json!({

@@ -19,6 +19,7 @@
 //! server holds a `RunContext` and every subsystem hangs off it. This is what
 //! turns "implemented modules" into "product paths".
 
+mod artifact_store;
 pub mod artifacts;
 pub mod formats;
 pub mod journal;
@@ -256,13 +257,12 @@ pub struct RunContext {
     /// Round-2 (G1): moved into [`scenario_store::ScenarioStore`]; the
     /// name-index invariant is store policy now. RunContext delegates.
     scenarios: scenario_store::ScenarioStore,
-    /// Completed PTY recordings retained in memory (run promotion must carry
-    /// them into the durable root even when they were stopped while
-    /// ephemeral). Keyed by suggested file name.
-    held_recordings: Vec<(String, String)>,
-    /// Wave F item 57: screen captures held while the run is ephemeral
-    /// (name, bytes, format).
-    held_captures: Vec<(String, Vec<u8>, String)>,
+    /// Artifact registry + ephemeral media holds + journal + persistence
+    /// health + restore damage. Round-2 (G1): moved into
+    /// [`artifact_store::ArtifactStore`]; RunContext delegates. The
+    /// artifact-root PATH stays a RunContext field — it is the one value
+    /// promote/restore rewrite directly and half the IO paths read it.
+    artifacts_store: artifact_store::ArtifactStore,
     /// Focus history + exploration graphs. Round-2 (G1): focus_transitions,
     /// focus_graph, and state_graph moved into [`graph_state::RunGraphs`];
     /// RunContext delegates and exposes `graphs()`/`graphs_mut()`.
@@ -275,27 +275,6 @@ pub struct RunContext {
     /// [`EvidenceStore`] (internally: TransactionLedger / FrameLedger /
     /// EventLedger); RunContext delegates.
     evidence: EvidenceStore,
-    /// Artifact registry (Wave B item 15): typed references to every large
-    /// artifact the run produced (recordings, event logs). Tools return an
-    /// [`ArtifactRef`] instead of inlining multi-kilobyte payloads.
-    artifacts: Vec<ArtifactRef>,
-    /// True once the ledger has been appended to transactions.jsonl for a
-    /// persistent run (drives incremental appends, Wave B item 14).
-    /// SUPERSEDED as the flush authority by `journal` (background writer,
-    /// audit item: run-journal writer): the watermark now lives in the
-    /// writer and `flush` drains through it. Kept as the restore-time
-    /// watermark when a run is re-opened from an existing file.
-    ledger_flushed_upto: u64,
-    /// Background journal writer (audit item: run-journal writer). The
-    /// driving path hands pre-serialized ledger lines to a dedicated thread
-    /// and never waits on the filesystem; `flush`/`Drop` drain it. `None`
-    /// for ephemeral runs (nothing is written) and for restored runs
-    /// until their first new record.
-    journal: Option<JournalHandle>,
-    /// True when ledger persistence has failed (writer spawn error or a
-    /// terminal write error) — surfaced by `flush` and status instead of
-    /// silently degrading to memory-only.
-    persistence_unhealthy: bool,
     /// The loaded project contract + conformance baselines (Wave E).
     /// Round-2 (G1): moved into [`ContractState`] so the contract domain has
     /// its own cohesive holder; RunContext delegates.
@@ -306,11 +285,6 @@ pub struct RunContext {
     /// policy, not run bookkeeping); per-consumer event cursors moved into
     /// the evidence store's event ledger. RunContext delegates.
     coverage: coverage_state::CoverageState,
-    /// Audit P1-46: artifacts that could NOT be restored, with the reason —
-    /// a damaged run comes back usable but DEGRADED, and the agent must
-    /// know its evidence is incomplete. Populated only by `restore`;
-    /// a live run always starts empty.
-    restore_warnings: Vec<RestoreWarning>,
 }
 
 /// One artifact the restorer could not bring back (audit P1-46).
@@ -431,26 +405,28 @@ impl RunContext {
         // wait on the filesystem. The file remains the authoritative
         // history; memory is only a bounded window. The watermark lives in
         // the writer — `flush` drains through `wait_for`.
-        if let Some(dir) = self.run_dir.as_ref() {
-            if let Some(j) = &self.journal {
+        if self.run_dir.is_some() {
+            if self.artifacts_store.has_journal() {
                 if let Ok(line) = serde_json::to_string(&record) {
-                    j.submit(record.seq, line);
+                    self.artifacts_store
+                        .journal()
+                        .map(|j| j.submit(record.seq, line));
                 }
             } else {
                 // First record of a persistent run: spawn the writer now
                 // (lazily, so a run that never records anything pays
                 // nothing). A spawn failure degrades to the memory window
                 // only — flush reports persistence_unhealthy.
-                let path = dir.join("transactions.jsonl");
-                match journal::JournalHandle::spawn(path) {
-                    Ok(j) => {
+                let path = self.run_dir.as_ref().map(|d| d.join("transactions.jsonl"));
+                match path.map(journal::JournalHandle::spawn) {
+                    Some(Ok(j)) => {
                         if let Ok(line) = serde_json::to_string(&record) {
                             j.submit(record.seq, line);
                         }
-                        self.journal = Some(j);
+                        self.artifacts_store.set_journal(j);
                     }
-                    Err(_) => {
-                        self.persistence_unhealthy = true;
+                    _ => {
+                        self.artifacts_store.mark_unhealthy();
                     }
                 }
             }

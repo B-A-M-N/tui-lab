@@ -19,18 +19,12 @@ impl RunContext {
             run_dir: None,
             checkpoints: CheckpointStore::new(),
             scenarios: scenario_store::ScenarioStore::new(),
-            held_recordings: Vec::new(),
-            held_captures: Vec::new(),
             graphs: graph_state::RunGraphs::new(),
             findings: FindingStore::new(),
             evidence: evidence_store::EvidenceStore::new(),
-            artifacts: Vec::new(),
-            ledger_flushed_upto: 0,
-            journal: None,
-            persistence_unhealthy: false,
+            artifacts_store: artifact_store::ArtifactStore::new(),
             contract: contract_state::ContractState::new(),
             coverage: coverage_state::CoverageState::new(),
-            restore_warnings: Vec::new(),
         }
     }
 
@@ -64,7 +58,7 @@ impl RunContext {
     /// life so every status/summary can say "degraded, here is what is
     /// missing".
     pub fn restore_warnings(&self) -> &[RestoreWarning] {
-        &self.restore_warnings
+        self.artifacts_store.restore_warnings()
     }
 
     /// The restore health block for status/resume responses: fully restored
@@ -232,7 +226,8 @@ impl RunContext {
                 }
             }
         }
-        run.ledger_flushed_upto = run.evidence.transactions.total(); // 0 — file is authoritative
+        run.artifacts_store
+            .set_ledger_flushed_upto(run.evidence.transactions.total()); // 0 — file is authoritative
 
         // Transaction ledger: every line that is still parseable comes back.
         // A torn final line (crash mid-append) is skipped and *counted*, not
@@ -248,7 +243,7 @@ impl RunContext {
                 Ok(Some(rest)) => rest,
                 Ok(None) => &body[..],
                 Err(e) => {
-                    run.restore_warnings.push(RestoreWarning {
+                    run.artifacts_store.note_restore_warning(RestoreWarning {
                         artifact: "transactions.jsonl".to_string(),
                         error: e.to_string(),
                     });
@@ -267,7 +262,8 @@ impl RunContext {
             if torn > 0 {
                 run.evidence.transactions.note_dropped(torn);
             }
-            run.ledger_flushed_upto = run.evidence.transactions.total();
+            run.artifacts_store
+                .set_ledger_flushed_upto(run.evidence.transactions.total());
         }
 
         // Findings. Audit P1-46: a present-but-unparseable artifact is a
@@ -280,7 +276,7 @@ impl RunContext {
             ($file:expr, $tag:expr, $ty:ty, $slot:expr) => {
                 match std::fs::read(run_dir.join($file)) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => run.restore_warnings.push(RestoreWarning {
+                    Err(e) => run.artifacts_store.note_restore_warning(RestoreWarning {
                         artifact: $file.to_string(),
                         error: format!("unreadable: {e}"),
                     }),
@@ -295,7 +291,7 @@ impl RunContext {
                             Ok(v) => {
                                 $slot = v;
                             }
-                            Err(e) => run.restore_warnings.push(RestoreWarning {
+                            Err(e) => run.artifacts_store.note_restore_warning(RestoreWarning {
                                 artifact: $file.to_string(),
                                 error: format!("corrupt: {e}"),
                             }),
@@ -337,7 +333,7 @@ impl RunContext {
             let mut slot = state_graph_json;
             match std::fs::read(run_dir.join("state_graph.json")) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => run.restore_warnings.push(RestoreWarning {
+                Err(e) => run.artifacts_store.note_restore_warning(RestoreWarning {
                     artifact: "state_graph.json".to_string(),
                     error: format!("unreadable: {e}"),
                 }),
@@ -348,7 +344,7 @@ impl RunContext {
                         crate::run::formats::tags::STATE_GRAPH,
                     ) {
                         Ok(v) => slot = Some(v),
-                        Err(e) => run.restore_warnings.push(RestoreWarning {
+                        Err(e) => run.artifacts_store.note_restore_warning(RestoreWarning {
                             artifact: "state_graph.json".to_string(),
                             error: format!("corrupt: {e}"),
                         }),
@@ -393,7 +389,7 @@ impl RunContext {
                             Ok(sc) => {
                                 run.scenarios.insert_loaded(sc);
                             }
-                            Err(e) => run.restore_warnings.push(RestoreWarning {
+                            Err(e) => run.artifacts_store.note_restore_warning(RestoreWarning {
                                 artifact: path
                                     .strip_prefix(run_dir)
                                     .unwrap_or(&path)
@@ -403,7 +399,7 @@ impl RunContext {
                             }),
                         }
                     }
-                    Err(e) => run.restore_warnings.push(RestoreWarning {
+                    Err(e) => run.artifacts_store.note_restore_warning(RestoreWarning {
                         artifact: path
                             .strip_prefix(run_dir)
                             .unwrap_or(&path)
@@ -431,7 +427,7 @@ impl RunContext {
             rel: std::path::PathBuf,
             summary: String,
         ) {
-            run.artifacts.push(crate::run::ArtifactRef {
+            run.artifacts_store.push_artifact(crate::run::ArtifactRef {
                 id: format!("art-{}", n),
                 kind,
                 path: Some(rel.clone()),
@@ -597,17 +593,18 @@ impl RunContext {
         // wait, honest timeout) so a crash loses at most the in-flight
         // channel tail, and `flush` never reports success while lines are
         // still unwritten.
-        if let Some(j) = &self.journal {
+        if let Some(j) = self.artifacts_store.journal() {
             let target = self.evidence.transactions.total();
             let reached = j.wait_for(target, std::time::Duration::from_secs(5));
             if reached < target || j.is_unhealthy() {
-                self.persistence_unhealthy = true;
+                self.artifacts_store.mark_unhealthy();
             }
-            self.ledger_flushed_upto = reached;
-        } else if self.evidence.transactions.total() > self.ledger_flushed_upto {
+            self.artifacts_store.set_ledger_flushed_upto(reached);
+        } else if self.evidence.transactions.total() > self.artifacts_store.ledger_flushed_upto() {
             // Restored run with no writer yet (no new records since
             // restore): the file is already authoritative; nothing to do.
-            self.ledger_flushed_upto = self.evidence.transactions.total();
+            self.artifacts_store
+                .set_ledger_flushed_upto(self.evidence.transactions.total());
         }
         // Terminal-event logs (Wave B item 12/14).
         let ev_dir = dir.join("events");
@@ -639,7 +636,7 @@ impl RunContext {
         let rec_dir = dir.join("recordings");
         std::fs::create_dir_all(&rec_dir)?;
         let mut still_held = Vec::new();
-        for (name, body) in std::mem::take(&mut self.held_recordings) {
+        for (name, body) in self.artifacts_store.take_held_recordings() {
             // Names come from the recorder (session id + millis): already
             // path-safe, so preserve them verbatim rather than re-sanitizing
             // (which would rewrite '.' to '_').
@@ -648,12 +645,12 @@ impl RunContext {
                 Err(_) => still_held.push((name, body)),
             }
         }
-        self.held_recordings = still_held;
+        self.artifacts_store.set_held_recordings(still_held);
         // Wave F item 57: screen captures held while ephemeral.
         let cap_dir = dir.join("captures");
         std::fs::create_dir_all(&cap_dir)?;
         let mut still_held_caps = Vec::new();
-        for (name, body, format) in std::mem::take(&mut self.held_captures) {
+        for (name, body, format) in self.artifacts_store.take_held_captures() {
             match std::fs::write(cap_dir.join(&name), &body) {
                 Ok(()) => {
                     self.register_artifact(
@@ -667,7 +664,7 @@ impl RunContext {
                 Err(_) => still_held_caps.push((name, body, format)),
             }
         }
-        self.held_captures = still_held_caps;
+        self.artifacts_store.set_held_captures(still_held_caps);
         // Findings.
         let fdir = dir.join("findings");
         std::fs::create_dir_all(&fdir)?;
@@ -739,7 +736,8 @@ impl RunContext {
                     }
                 }
             }
-            self.ledger_flushed_upto = self.evidence.transactions.total();
+            self.artifacts_store
+                .set_ledger_flushed_upto(self.evidence.transactions.total());
         }
         // Flush everything accumulated while ephemeral into the new root.
         self.flush()?;
@@ -750,7 +748,7 @@ impl RunContext {
     /// Wait for the background journal writer to drain (bounded). Returns
     /// the watermark reached. A no-op for ephemeral runs.
     pub fn wait_for_journal(&self, deadline: std::time::Duration) -> u64 {
-        match &self.journal {
+        match self.artifacts_store.journal() {
             Some(j) => j.wait_for(self.evidence.transactions.total(), deadline),
             None => self.evidence.transactions.total(),
         }
@@ -759,6 +757,10 @@ impl RunContext {
     /// Whether ledger persistence has failed and the run is degrading to
     /// memory-only (writer spawn error or terminal write error).
     pub fn persistence_unhealthy(&self) -> bool {
-        self.persistence_unhealthy || self.journal.as_ref().is_some_and(|j| j.is_unhealthy())
+        self.artifacts_store.unhealthy()
+            || self
+                .artifacts_store
+                .journal()
+                .is_some_and(|j| j.is_unhealthy())
     }
 }
