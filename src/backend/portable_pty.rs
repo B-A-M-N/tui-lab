@@ -291,13 +291,6 @@ impl vt100::Callbacks for BackendCallbacks {
     }
 }
 
-/// Wave-2 (protocol diagnostics): how many raw output bytes the backend
-/// retains for the protocol decoder. 256 KiB covers generous terminal
-/// traffic (a full-screen redraw is typically well under 8 KiB) at a small
-/// fixed cost; a firehose beyond it degrades by dropping the head, which
-/// `raw_output_stats` declares.
-const RAW_RING_CAPACITY: usize = 256 * 1024;
-
 pub struct PortablePtyBackend {
     cols: u16,
     rows: u16,
@@ -351,18 +344,12 @@ pub struct PortablePtyBackend {
     /// Wave F item 53: whether any scrollback row was ever captured —
     /// `Capabilities.scrollback` is promoted only on this evidence.
     scrollback_seen: bool,
-    /// Wave-2 (protocol diagnostics): bounded ring of the child's REAL raw
-    /// output bytes — escape sequences, OSC, DCS and all — so the protocol
-    /// decoder can reconstruct "what did this TUI actually emit".
-    raw_ring: std::collections::VecDeque<u8>,
-    /// Bytes dropped off the raw ring's head (declared eviction).
-    raw_dropped: u64,
-    /// Total raw bytes EVER absorbed (re-review item 19): the absolute
-    /// stream position of the next byte. The CURRENT window covers absolute
-    /// offsets `[raw_bytes_total - raw_ring.len(), raw_bytes_total)`, so a
-    /// transaction can cite its exact byte range in the child's output
-    /// stream even after head eviction.
-    raw_bytes_total: u64,
+    /// Wave-2 (protocol diagnostics): bounded raw-byte capture — the
+    /// child's REAL output bytes (escape sequences, OSC, DCS and all) so
+    /// the protocol decoder can reconstruct "what did this TUI actually
+    /// emit". Round-2 (G2): ring + declared eviction + absolute total
+    /// moved into [`super::raw_capture::RawCapture`].
+    raw: super::raw_capture::RawCapture,
 }
 
 impl PortablePtyBackend {
@@ -396,9 +383,7 @@ impl PortablePtyBackend {
             normalization_policy: std::sync::Arc::new(crate::screen::NormalizationPolicy::default()),
             scrollback_cache: Vec::new(),
             scrollback_seen: false,
-            raw_ring: std::collections::VecDeque::new(),
-            raw_dropped: 0,
-            raw_bytes_total: 0,
+            raw: super::raw_capture::RawCapture::new(),
         }
     }
 
@@ -570,24 +555,14 @@ impl PortablePtyBackend {
     /// ring, declaring head eviction. Bounded at [`RAW_RING_CAPACITY`] so a
     /// firehose child cannot grow memory without limit.
     fn absorb_raw(&mut self, bytes: &[u8]) {
-        self.raw_bytes_total += bytes.len() as u64;
-        for &b in bytes {
-            if self.raw_ring.len() >= RAW_RING_CAPACITY {
-                self.raw_ring.pop_front();
-                self.raw_dropped += 1;
-            }
-            self.raw_ring.push_back(b);
-        }
+        self.raw.absorb(bytes);
     }
 
     /// The retained raw output (oldest first) plus declared drop stats.
     pub fn raw_output_window(&mut self) -> (Vec<u8>, usize, u64) {
         let _ = self.pump();
-        (
-            self.raw_ring.iter().copied().collect(),
-            RAW_RING_CAPACITY,
-            self.raw_dropped,
-        )
+        let (cap, dropped) = self.raw.stats();
+        (self.raw.window(), cap, dropped)
     }
 
     /// The absolute byte range the retained window covers in the child's
@@ -596,16 +571,14 @@ impl PortablePtyBackend {
     /// the ring has wrapped (re-review item 19).
     pub fn raw_window_range(&mut self) -> (u64, u64) {
         let _ = self.pump();
-        let end = self.raw_bytes_total;
-        let start = end.saturating_sub(self.raw_ring.len() as u64);
-        (start, end)
+        self.raw.range()
     }
 
     /// The absolute stream position at this instant — the offset the NEXT
     /// byte will get. Snapshot before and after an action to bracket it.
     pub fn raw_bytes_total(&mut self) -> u64 {
         let _ = self.pump();
-        self.raw_bytes_total
+        self.raw.total()
     }
 
     /// Item 22: the responder's most recent answer actually written back to
@@ -878,6 +851,8 @@ impl TerminalBackend for PortablePtyBackend {
         self.last_output_at_ms = 0;
         self.last_screen_change_at_ms = 0;
         self.screen_change_log.clear();
+        // A new child stream is a new output stream: offsets restart.
+        self.raw.clear();
         self.scrollback_cache.clear();
         self.scrollback_seen = false;
         self.parser.callbacks_mut().query_responses.clear();

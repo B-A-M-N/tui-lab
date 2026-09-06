@@ -18,6 +18,7 @@ pub mod line_cli;
 pub mod line_types;
 pub mod pipe;
 pub mod portable_pty;
+pub mod raw_capture;
 pub mod tmux;
 pub mod trait_def;
 
