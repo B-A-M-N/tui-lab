@@ -91,19 +91,13 @@ pub struct PtyLineBackend {
     edge_snaps: std::collections::VecDeque<(u64, ScreenState)>,
     /// Wave-2 (protocol diagnostics): bounded ring of the child's real raw
     /// output bytes (escape sequences included) for the protocol decoder.
-    raw_ring: std::collections::VecDeque<u8>,
-    /// Bytes dropped off the raw ring's head (declared eviction).
-    raw_dropped: u64,
+    /// Round-2 (G2): shared [`crate::backend::raw_capture::RawCapture`].
+    raw: crate::backend::raw_capture::RawCapture,
 }
 
 /// How many per-edge snapshots to retain. Covers realistic redraw bursts
 /// (progress bars, table refreshes) with a small fixed cost per edge.
 const EDGE_SNAP_CAP: usize = 64;
-
-/// Wave-2 (protocol diagnostics): raw-output ring capacity, shared contract
-/// with the portable PTY backend — 256 KiB, head-drop declared through
-/// `raw_output_stats`.
-const RAW_RING_CAPACITY: usize = 256 * 1024;
 
 impl PtyLineBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -134,8 +128,7 @@ impl PtyLineBackend {
             pending: String::new(),
             lines_evicted: 0,
             edge_snaps: std::collections::VecDeque::new(),
-            raw_ring: std::collections::VecDeque::new(),
-            raw_dropped: 0,
+            raw: crate::backend::raw_capture::RawCapture::new(),
         }
     }
 
@@ -215,25 +208,17 @@ impl PtyLineBackend {
     }
 
     /// Wave-2 (protocol diagnostics): push raw child bytes into the bounded
-    /// ring, declaring head eviction. Bounded at [`RAW_RING_CAPACITY`].
+    /// ring, declaring head eviction. Bounded at
+    /// [`crate::backend::raw_capture::RAW_RING_CAPACITY`].
     fn absorb_raw(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if self.raw_ring.len() >= RAW_RING_CAPACITY {
-                self.raw_ring.pop_front();
-                self.raw_dropped += 1;
-            }
-            self.raw_ring.push_back(b);
-        }
+        self.raw.absorb(bytes);
     }
 
     /// The retained raw output (oldest first) plus declared drop stats.
     pub fn raw_output_window(&mut self) -> (Vec<u8>, usize, u64) {
         self.pump();
-        (
-            self.raw_ring.iter().copied().collect(),
-            RAW_RING_CAPACITY,
-            self.raw_dropped,
-        )
+        let (cap, dropped) = self.raw.stats();
+        (self.raw.window(), cap, dropped)
     }
 
     fn pump(&mut self) {
