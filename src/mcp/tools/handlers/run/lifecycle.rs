@@ -117,18 +117,11 @@ pub(crate) async fn close(
         }
     }
     let already;
-    let summary;
     let kill;
     let result;
     {
         let mut run = s.run.lock().unwrap();
         already = run.is_closed();
-        summary = run.status(
-            owned
-                .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        );
         kill = p.kill_sessions.unwrap_or(false);
         result = run.close();
     }
@@ -138,6 +131,17 @@ pub(crate) async fn close(
             format!("close flush failed: {e}"),
         );
     }
+    // Audit P1 (response freshness): the "final" summary is computed AFTER
+    // the close — the pre-close snapshot reported pre-flush counts and
+    // pre-close durability state, so a "successful close" could hand back
+    // a "final" object that was not final (it predated the very flush it
+    // was supposed to certify).
+    let summary = s.run.lock().unwrap().status(
+        owned
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect(),
+    );
     // OWNED sessions survive close unless explicitly requested;
     // foreign sessions are NEVER touched by another run's close.
     // Finding 4/13: a LEASED session is never killed by close

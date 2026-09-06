@@ -48,9 +48,29 @@ pub(crate) async fn tui_workflow(
 /// resolution the finding investigation cares about (primary = the app
 /// framework; terminal_io/styling are architecture context, not
 /// framework claims).
-fn framework_context(cwd: Option<&str>) -> serde_json::Value {
-    let cwd = cwd.unwrap_or(".");
-    let project = crate::session::ProjectLocator::locate(None, cwd);
+///
+/// Audit P1 (finding 14): the root is derived from the RUN's recorded
+/// `LaunchSpec.cwd` — where the audited app actually lives — never from
+/// this server process's cwd. A finding generated against a TUI launched
+/// elsewhere must not be paired with framework detection from the
+/// server's own directory (that would join evidence from different
+/// projects while looking authoritative). An explicit `cwd` parameter is
+/// a conscious override and is reported as such.
+fn framework_context(
+    recorded_cwd: Option<&str>,
+    explicit_cwd: Option<&str>,
+) -> serde_json::Value {
+    let (root, provenance) = match explicit_cwd {
+        Some(c) => (c.to_string(), "explicit_override".to_string()),
+        // The primary session's recorded launch cwd is the app's home;
+        // fall back to "." only when nothing recorded exists (e.g. no
+        // session ever launched), and say so.
+        None => match recorded_cwd {
+            Some(c) => (c.to_string(), "recorded_launch_cwd".to_string()),
+            None => (".".to_string(), "no_launch_cwd_recorded_fell_back_to_server_cwd".to_string()),
+        },
+    };
+    let project = crate::session::ProjectLocator::locate(None, &root);
     let det = crate::framework::detect::detect(project.root());
     let primary = det.primary.as_ref().map(|c| {
         json!({
@@ -62,6 +82,7 @@ fn framework_context(cwd: Option<&str>) -> serde_json::Value {
     });
     json!({
         "project_root": project.root(),
+        "root_provenance": provenance,
         "primary": primary,
         "terminal_io": det.terminal_io,
         "styling": det.styling,
@@ -240,7 +261,10 @@ async fn inspect_finding(
             "inspect requires 'finding_id' (from tui_audit or tui://findings)",
         );
     };
-    let framework = framework_context(p.cwd.as_deref());
+    let framework = {
+        let run = s.run.lock().unwrap();
+        framework_context(run.primary_session_cwd(), p.cwd.as_deref())
+    };
     let chain = {
         let run = s.run.lock().unwrap();
         let Some(finding) = run.findings().iter().find(|f| f.id == finding_id) else {
@@ -265,7 +289,10 @@ async fn diagnose_all(
     s: &crate::mcp::tools::TuiLabServer,
     p: &TuiWorkflowParams,
 ) -> rmcp::model::CallToolResult {
-    let framework = framework_context(p.cwd.as_deref());
+    let framework = {
+        let run = s.run.lock().unwrap();
+        framework_context(run.primary_session_cwd(), p.cwd.as_deref())
+    };
     let (chains, skipped) = {
         let run = s.run.lock().unwrap();
         let joined: Vec<_> = run
@@ -407,10 +434,21 @@ async fn verify_finding(
                 .rule_id
                 .clone()
                 .unwrap_or_else(|| finding_snapshot.id.clone());
+            // Audit P1 (finding 14): the lease gate follows the audit
+            // descriptor's OWN classification, not a blanket refusal —
+            // an observational re-check surface (color, rendering,
+            // terminal_modes, …) stays available during a human lease,
+            // exactly as it does on tui_audit itself; only a surface
+            // that sends input/resizes/consumes the process waits.
+            let exclusive = crate::audit::orchestrator::AuditProfile::parse(&profile)
+                .map(|ap| ap.requires_exclusive_control())
+                .unwrap_or(true);
             let result = s
                 .with_sess_authorized(p.id.as_deref(), move |sess, _ticket| {
-                    if let Some(refused) = lease_refused(sess) {
-                        return Err(refused);
+                    if exclusive {
+                        if let Some(refused) = lease_refused(sess) {
+                            return Err(refused);
+                        }
                     }
                     let contract = run.lock().unwrap().contract().cloned();
                     match crate::audit::orchestrator::run_profile_checked(
