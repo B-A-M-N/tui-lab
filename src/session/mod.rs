@@ -19,6 +19,7 @@ pub mod locator;
 pub(crate) mod observation;
 pub(crate) mod recording_state;
 pub mod scratch;
+pub(crate) mod semantic_state;
 pub mod state;
 
 /// Legacy global-Mutex manager, test-only. Audit P1-54: it used to stay

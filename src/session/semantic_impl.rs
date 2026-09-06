@@ -215,21 +215,21 @@ impl Session {
     /// detectors (Wave G review P1 15/16).
     pub fn analyze_frame(&self) -> Option<crate::semantic::CacheResult> {
         let screen = self.last()?;
-        Some(self.semantic_cache.borrow_mut().analyze(screen))
+        Some(self.semantic.cache().borrow_mut().analyze(screen))
     }
 
     /// Structural-cache health (re-review item 41): hit counts surfaced on
     /// summary so the cache's work is evidence, not folklore.
     pub fn semantic_cache_hits(&self) -> u64 {
-        self.semantic_cache.borrow().hits()
+        self.semantic.cache().borrow().hits()
     }
 
     pub fn semantic_cache_misses(&self) -> u64 {
-        self.semantic_cache.borrow().misses()
+        self.semantic.cache().borrow().misses()
     }
 
     pub fn semantic_cache_hit_rate(&self) -> f32 {
-        self.semantic_cache.borrow().hit_rate()
+        self.semantic.cache().borrow().hit_rate()
     }
 
     /// The fused semantic truth for the last settled frame (re-review
@@ -254,28 +254,27 @@ impl Session {
         crate::semantic::native::NativeOverlayReport,
     )> {
         let screen = self.last()?;
-        let key = fused_key(screen, self.event_state.native_absorbed_seq());
-        if let Some(memo) = self.fused_memo.borrow().as_ref() {
-            if memo.key == key {
-                self.fused_memo_hits.set(self.fused_memo_hits.get() + 1);
-                return Some((memo.sem.clone(), memo.tree.clone(), memo.report.clone()));
-            }
+        let key = crate::session::semantic_state::fused_key(
+            screen,
+            self.event_state.native_absorbed_seq(),
+        );
+        if let Some(hit) = self.semantic.memo_hit(&key) {
+            return Some(hit);
         }
-        let (sem, tree, report) =
-            crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
-        *self.fused_memo.borrow_mut() = Some(FusedMemo {
-            key,
-            sem: sem.clone(),
-            tree: tree.clone(),
-            report: report.clone(),
-        });
+        let (sem, tree, report) = crate::semantic::fuse(
+            screen,
+            &mut self.semantic.cache().borrow_mut(),
+            &self.native,
+        );
+        self.semantic
+            .store_memo(key, sem.clone(), tree.clone(), report.clone());
         Some((sem, tree, report))
     }
 
     /// How many fused reads the memo served without recompute (item 52
     /// evidence, surfaced next to the structural cache stats).
     pub fn fused_memo_hits(&self) -> u64 {
-        self.fused_memo_hits.get()
+        self.semantic.fused_memo_hits()
     }
 
     /// Drop the fused memo. Callers that change fused inputs OUTSIDE the
@@ -284,7 +283,7 @@ impl Session {
     /// explicit invalidation hook so the reactive contract has a manual
     /// escape hatch.
     pub fn invalidate_fused(&self) {
-        *self.fused_memo.borrow_mut() = None;
+        self.semantic.invalidate_fused();
     }
 
     /// Fused analysis of an ARBITRARY frame owned by a transaction (re-view
@@ -297,8 +296,11 @@ impl Session {
         &self,
         screen: &crate::screen::ScreenState,
     ) -> crate::semantic::SemanticScreen {
-        let (sem, _tree, _report) =
-            crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        let (sem, _tree, _report) = crate::semantic::fuse(
+            screen,
+            &mut self.semantic.cache().borrow_mut(),
+            &self.native,
+        );
         sem
     }
 
@@ -316,8 +318,11 @@ impl Session {
         crate::semantic::SemanticScreen,
         crate::semantic::node::SemanticTree,
     )> {
-        let (sem, tree, _report) =
-            crate::semantic::fuse(screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        let (sem, tree, _report) = crate::semantic::fuse(
+            screen,
+            &mut self.semantic.cache().borrow_mut(),
+            &self.native,
+        );
         Some((sem, tree))
     }
 
@@ -358,8 +363,11 @@ impl Session {
         &self,
         screen: crate::screen::ScreenState,
     ) -> crate::session::state::FrameAnalysis {
-        let (sem, tree, native) =
-            crate::semantic::fuse(&screen, &mut self.semantic_cache.borrow_mut(), &self.native);
+        let (sem, tree, native) = crate::semantic::fuse(
+            &screen,
+            &mut self.semantic.cache().borrow_mut(),
+            &self.native,
+        );
         let semantic_identity = crate::semantic::semantic_identity_fused(&sem, &tree);
         crate::session::state::FrameAnalysis {
             frame: screen,
