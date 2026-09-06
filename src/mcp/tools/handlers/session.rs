@@ -195,12 +195,13 @@ pub(crate) async fn tui_session(
                 Some(i) => i,
                 None => return err(ErrorCategory::NoSession, "no session to restart"),
             };
-            // Audit P0-10: authorize BEFORE mutating. Restart kills the
-            // child process; doing that before the run-closed / ownership
-            // checks let a foreign-run session be restarted (or a closed
-            // run's guard fire after the process was already gone). The
-            // same rules `with_sess` enforces for driving apply here, in
-            // the same order, before the destructive call.
+            // Audit P0-10 + beta-audit P0-4: authorize BEFORE mutating,
+            // on the dedicated lifecycle path — the live lease FIRST
+            // (resolved on the actor directly, so a closed run or a
+            // foreign binding cannot mask it), then ownership. Restart
+            // kills the child process; the old with_sess-based gate
+            // discarded the Err for foreign/closed cases and let the
+            // kill proceed.
             if s.run.lock().unwrap().is_closed() {
                 let run_id = s.run.lock().unwrap().id().to_string();
                 return err(
@@ -210,51 +211,8 @@ pub(crate) async fn tui_session(
                     ),
                 );
             }
-            // Finding 4/13: a live human lease blocks restart too —
-            // restart kills the process the human is driving. Wait out the
-            // TTL or ask for the lease back.
-            let lease_gate_id = id.clone();
-            if let Ok(Some(refused)) = s
-                .with_sess(Some(&id), move |sess| {
-                    sess.driving_blocked().map(|lease| {
-                        err_with_details(
-                            ErrorCategory::ControlLeased,
-                            format!(
-                                "session '{}' is leased to '{}' ({}ms remaining); restart would kill the process they are driving",
-                                lease_gate_id,
-                                lease.holder,
-                                lease.remaining_ms()
-                            ),
-                            json!({
-                                "session": lease_gate_id,
-                                "holder": lease.holder,
-                                "retry_after_ms": lease.remaining_ms(),
-                            }),
-                        )
-                    })
-                })
-                .await
-            {
+            if let Err(refused) = s.authorize_lifecycle(&id, "restart").await {
                 return refused;
-            }
-            {
-                let cur_run = s.run.lock().unwrap().id().to_string();
-                let bound = s
-                    .session_owners
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.owner_of(&id));
-                if let Some(own) = bound {
-                    if own != cur_run {
-                        return err(
-                            ErrorCategory::NoSession,
-                            format!(
-                                "session '{}' is bound to run {own}, not the current run {cur_run}; it cannot be restarted from here",
-                                id
-                            ),
-                        );
-                    }
-                }
             }
             // Restart the SAME logical session: same id, next generation,
             // reusing the stored LaunchSpec (spec section 13).
@@ -281,29 +239,12 @@ pub(crate) async fn tui_session(
             };
             // Finding 4/13: stop kills the process the lease holder may be
             // driving — the lease gates it the same way it gates driving.
-            // (Restart above has the same gate; this is the sibling.)
-            let lease_gate_id = id.clone();
-            if let Ok(Some(refused)) = s
-                .with_sess(Some(&id), move |sess| {
-                    sess.driving_blocked().map(|lease| {
-                        err_with_details(
-                            ErrorCategory::ControlLeased,
-                            format!(
-                                "session '{}' is leased to '{}' ({}ms remaining); stop would kill the process they are driving",
-                                lease_gate_id,
-                                lease.holder,
-                                lease.remaining_ms()
-                            ),
-                            json!({
-                                "session": lease_gate_id,
-                                "holder": lease.holder,
-                                "retry_after_ms": lease.remaining_ms(),
-                            }),
-                        )
-                    })
-                })
-                .await
-            {
+            // Beta-audit P0-4: authorization is the dedicated lifecycle
+            // path (lease FIRST, then ownership), not with_sess — whose
+            // closed-run/foreign guards run before any lease read and
+            // whose Err the old code silently discarded, letting a leased
+            // foreign session be killed.
+            if let Err(refused) = s.authorize_lifecycle(&id, "stop").await {
                 return refused;
             }
             match s.sessions.stop(&id).await {

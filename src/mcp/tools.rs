@@ -73,6 +73,14 @@ impl TuiLabServer {
         }
     }
 
+    /// Test/lifecycle escape: the pool handle. Integration tests use it
+    /// for cleanup kills that deliberately bypass lifecycle authorization
+    /// (mirrors `with_run`'s doc-hidden test surface; not a public API).
+    #[doc(hidden)]
+    pub fn pool_handle(&self) -> std::sync::Arc<SessionPool> {
+        self.sessions.clone()
+    }
+
     /// Finding 3D: the shared intent-plan store handle for the handler
     /// family (child modules cannot capture `&self` across the actor
     /// await, so they take the Arc).
@@ -328,12 +336,81 @@ impl TuiLabServer {
         crate::mcp::tools::handlers::audit::tui_explain(self, p).await
     }
 
+    /// Lifecycle authorization for session-mutating operations (stop/
+    /// restart/lease-release) — deliberately NOT the driving gate
+    /// (with_sess). Beta-audit P0-4: those lifecycle handlers previously
+    /// piggybacked on with_sess to read the lease, but with_sess refuses
+    /// BEFORE the lease is read when the run is closed or the session is
+    /// foreign — and the handlers discarded that Err and stopped the
+    /// process anyway. A leased foreign (or leased-under-closed-run)
+    /// session could be terminated, violating both the lease guarantee
+    /// and run provenance.
+    ///
+    /// Check order is the safety order: (1) the LIVE LEASE on the actor
+    /// itself — resolved regardless of run-open state; (2) ownership —
+    /// a session bound to another run is not this run's to mutate.
+    /// `Ok(())` means the caller may proceed with the mutation.
+    async fn authorize_lifecycle(
+        &self,
+        id: &str,
+        operation: &str,
+    ) -> Result<(), rmcp::model::CallToolResult> {
+        // 1. The lease lives on the session actor: resolve it directly
+        // through the pool, never through with_sess (whose run guards run
+        // first and would mask the lease).
+        if !self.sessions.list().iter().any(|s| s == id) {
+            // A session that no longer resolves has nothing to authorize;
+            // the caller's mutation is idempotent ("already gone" is
+            // success at the pool, stop's own contract).
+            return Ok(());
+        }
+        let lease = self
+            .sessions
+            .with_session(Some(id), |sess| sess.driving_blocked())
+            .await;
+        match lease {
+            Ok(Some(lease)) => {
+                return Err(crate::mcp::helpers::err_with_details(
+                    ErrorCategory::ControlLeased,
+                    format!(
+                        "session '{id}' is leased to '{}' ({}ms remaining); {operation} would kill the process they are driving",
+                        lease.holder,
+                        lease.remaining_ms()
+                    ),
+                    serde_json::json!({
+                        "session": id,
+                        "holder": lease.holder,
+                        "retry_after_ms": lease.remaining_ms(),
+                    }),
+                ));
+            }
+            // Lease expired or absent: fall through to the ownership check.
+            _ => {}
+        }
+        // 2. Ownership: a session bound to a DIFFERENT run is not this
+        // run's to stop/restart — its lifecycle belongs to that run.
+        // (Unbound sessions carry no objection here, matching the
+        // driving gate's adoption rule.)
+        let cur_run = self.run.lock().unwrap().id().to_string();
+        let owner = self
+            .session_owners
+            .lock()
+            .ok()
+            .and_then(|m| m.owner_of(id));
+        if let Some(own) = owner {
+            if own != cur_run {
+                return Err(err(
+                    ErrorCategory::NoSession,
+                    format!(
+                        "session '{id}' is bound to run {own}, not the current run {cur_run}; {operation} is refused — resume run {own} to manage its sessions",
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The construction-oriented workflow object (finding 38): one
-    /// finding's full chain — component identity → source refs →
-    /// framework context → contract expectation → minimal reproduction →
-    /// targeted validation — assembled as ONE object, plus a verify
-    /// action that runs the finding's own verification plan (replay +
-    /// targeted re-checks, lease-gated).
     #[tool(
         name = "tui_workflow",
         description = "Construction workflow per finding: inspect (the full chain — component identity, source loci, framework context, contract expectation, minimal reproduction, targeted validation), verify (run the finding's verification plan live: replay the reproduction and report whether the finding still reproduces; lease-gated), diagnose (all findings' chains). Joins existing evidence; never invents."
