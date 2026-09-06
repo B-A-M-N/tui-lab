@@ -238,19 +238,18 @@ pub(crate) async fn resume(
             "resume requires 'run_id' (from tui_run action=list) or 'run_dir'",
         );
     };
-    // 1. PROVE the target is restorable BEFORE anything destructive.
+    // 1. PROVE the target is restorable BEFORE anything destructive —
+    // and (audit P0, beta stability) keep restore OBSERVATIONAL: the
+    // restored context is read for validation only, and the fallible
+    // reopen (epoch bump + manifest commit) happens LAST, after every
+    // earlier stage has succeeded. The old order ran reopen() right
+    // here, so a resume that was later REFUSED (foreign sessions, flush
+    // failure) had already mutated the target's on-disk manifest —
+    // assigning a new epoch to a run that never went live, which
+    // invalidates resume_epoch's provenance meaning. A refused resume
+    // must leave the target bit-for-bit logically closed.
     let mut restored = match crate::run::RunContext::restore(&run_dir) {
-        Ok(mut r) => {
-            // Resume is the designated re-open operation: a run
-            // restored while `closed` becomes live again so the
-            // resumed run can accept driving and new evidence
-            // (review P0.1). Its own driving-refusal message says
-            // "resume it ... before driving", so resume must do
-            // exactly that — otherwise a persisted run could never
-            // be driven again.
-            r.reopen();
-            r
-        }
+        Ok(r) => r,
         Err(e) => {
             return err(
                 ErrorCategory::InvalidRequest,
@@ -299,12 +298,42 @@ pub(crate) async fn resume(
     }
     // 3. DETACH foreign sessions (audit P0-8: only after the
     // target proved restorable and the live run's evidence is
-    // safely persisted).
+    // safely persisted). Audit P0 (beta stability): a stop that
+    // FAILED does not unbind its session — unbinding would orphan a
+    // still-live process with no owner — and aborts the resume with
+    // the exact session named; nothing has been swapped yet, so the
+    // abort leaves both the live run and the target untouched.
+    let mut detached: Vec<String> = Vec::new();
     for sid in &foreign {
-        let _ = s.sessions.stop(sid).await;
-        s.session_owners.lock().unwrap().unbind(sid);
+        match s.sessions.stop(sid).await {
+            Ok(()) => {
+                s.session_owners.lock().unwrap().unbind(sid);
+                detached.push(sid.clone());
+            }
+            Err(e) => {
+                return err(
+                    ErrorCategory::BackendError,
+                    format!(
+                        "resume ABORTED: session '{sid}' failed to stop during detach ({e}); the current run is unchanged and the target run was not opened"
+                    ),
+                );
+            }
+        }
     }
-    // 4. ATOMIC swap under a short lock (never across an await).
+    let _ = detached;
+    // 4. REOPEN the candidate (the run's designated re-open operation,
+    // review P0.1): bump the epoch and commit the manifest NOW — the
+    // last fallible stage before the swap. On failure the target stays
+    // closed at its previous epoch and the live run is unchanged.
+    if let Err(e) = restored.reopen() {
+        return err(
+            ErrorCategory::InternalError,
+            format!(
+                "resume ABORTED: reopening the target failed ({e}); the current run is unchanged"
+            ),
+        );
+    }
+    // 5. ATOMIC swap under a short lock (never across an await).
     let manifest_like = {
         let mut guard = s.run.lock().unwrap();
         let prev_id = guard.id().to_string();

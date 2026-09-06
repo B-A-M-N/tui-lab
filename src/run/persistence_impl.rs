@@ -502,29 +502,49 @@ impl RunContext {
     /// A reopened run is NOT the original process's run: its later records
     /// live after a process boundary it did not choose, and evidence taken
     /// across that boundary is distinguishable via the epoch.
-    pub fn reopen(&mut self) {
-        self.identity
-            .set_resume_epoch(self.identity.resume_epoch() + 1);
+    ///
+    /// Audit P0 (beta stability): reopen is fallible and atomic-in-spirit —
+    /// if the manifest write fails, NOTHING changed: the run stays closed at
+    /// its previous epoch. A half-reopened run on disk (bumped epoch, closed
+    /// in the manifest) would invalidate the epoch's provenance meaning.
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
+        // Fallible manifest commit FIRST, against the would-be new epoch —
+        // only after it lands do the in-memory identity fields move.
+        let new_epoch = self.identity.resume_epoch() + 1;
+        self.identity.set_resume_epoch(new_epoch);
         self.identity.set_closed(false);
-        // Persist the epoch before returning: if the resumed process dies
-        // mid-transaction, the manifest still names the epoch everything
-        // after it belongs to.
         if let Err(e) = self.write_manifest() {
-            tracing::warn!(run = %self.id(), error = %e, "reopen: manifest write failed");
+            // Roll back: the run was never observably reopened.
+            self.identity.set_resume_epoch(new_epoch - 1);
+            self.identity.set_closed(true);
+            return Err(e.context("reopen: manifest write failed; the run remains closed at its previous epoch"));
         }
+        Ok(())
     }
 
     /// Mark the run closed and flush durable state. Does NOT touch sessions —
     /// killing them is the caller's explicit decision.
+    ///
+    /// Audit P0 (beta stability): the durable write (flush + manifest) must
+    /// SUCCEED before close reports success. On failure the flag is rolled
+    /// back — a caller that sees a close error finds the run still open and
+    /// able to flush (and re-close), not half-closed with the durable state
+    /// ambiguous.
     pub fn close(&mut self) -> anyhow::Result<()> {
         if self.identity.closed() {
             return Ok(());
         }
+        // The manifest serializes the flag, so it moves first; the rollback
+        // below is what makes a failed close observationally a no-op.
         self.identity.set_closed(true);
         // Flush everything flushable to the artifact root (no-op when
         // ephemeral — ephemeral means "not persisted", not "degraded").
-        self.flush()?;
-        self.write_manifest()
+        let result = self.flush().and_then(|()| self.write_manifest());
+        if result.is_err() {
+            self.identity.set_closed(false);
+            return result;
+        }
+        Ok(())
     }
 
     /// Flush accumulated in-memory run state to the artifact root: saved
@@ -596,8 +616,20 @@ impl RunContext {
         if let Some(j) = self.artifacts_store.journal() {
             let target = self.evidence.transactions.total();
             let reached = j.wait_for(target, std::time::Duration::from_secs(5));
-            if reached < target || j.is_unhealthy() {
+            let unhealthy = j.is_unhealthy();
+            if reached < target || unhealthy {
                 self.artifacts_store.mark_unhealthy();
+                // Audit P0 (beta stability): an incomplete drain or an
+                // unhealthy writer is a FLUSH FAILURE, not a silent
+                // degradation — a caller (close, resume, new's
+                // flush-before-replace) must learn the durable journal is
+                // short of the in-memory window, or a successful close
+                // would report evidence persisted that is not.
+                self.artifacts_store.set_ledger_flushed_upto(reached);
+                anyhow::bail!(
+                    "transaction journal incomplete: writer reached {reached} of {target} record(s){} — the ledger is {reached} records persisted, {target} in memory",
+                    if unhealthy { " and the writer is unhealthy" } else { "" }
+                );
             }
             self.artifacts_store.set_ledger_flushed_upto(reached);
         } else if self.evidence.transactions.total() > self.artifacts_store.ledger_flushed_upto() {
@@ -720,22 +752,26 @@ impl RunContext {
             let ledger_path = root.join("transactions.jsonl");
             // Finding 31: promotion CREATES the stream file — it carries
             // the format header before the records.
-            if let Ok(mut file) = std::fs::OpenOptions::new()
+            // Audit P0 (beta stability): the initial write is TRANSACTIONAL
+            // — every open/serialize/write failure propagates, and the
+            // flushed watermark moves only after the complete ledger is on
+            // disk. The old code swallowed all three failure classes and
+            // then marked the whole ledger flushed: evidence reported
+            // persisted that existed only in memory.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&ledger_path)
-            {
-                use std::io::Write as _;
-                let _ = file
-                    .write_all(StreamHeader::line(crate::run::formats::tags::LEDGER).as_bytes());
-                let _ = file.write_all(b"\n");
-                for tx in self.evidence.transactions.records() {
-                    if let Ok(line) = serde_json::to_string(tx) {
-                        let _ = file.write_all(line.as_bytes());
-                        let _ = file.write_all(b"\n");
-                    }
-                }
+                .open(&ledger_path)?;
+            file.write_all(StreamHeader::line(crate::run::formats::tags::LEDGER).as_bytes())?;
+            file.write_all(b"\n")?;
+            for tx in self.evidence.transactions.records() {
+                let line = serde_json::to_string(tx)?;
+                file.write_all(line.as_bytes())?;
+                file.write_all(b"\n")?;
             }
+            file.flush()?;
+            file.sync_all()?;
             self.artifacts_store
                 .set_ledger_flushed_upto(self.evidence.transactions.total());
         }
