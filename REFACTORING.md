@@ -270,7 +270,7 @@ the single canonical `pump()` untouched (invariant 4):
 | 9c70140 | `backend::raw_capture::RawCapture` | raw ring, declared head eviction, absolute stream total (+ `clear()` on `start()` as a documented correctness improvement: a new child stream restarts offsets) |
 | 62008e9 | `backend::input` | `encode_key` / `encode_key_kitty` / `encode_mouse_event` + their byte-level conformance fixtures (29 tests) |
 | 61b3d3a | `backend::event_clock::BackendEventClock` | five seq counters, wall+monotonic stamps, bounded per-change log, query-answer bookkeeping (+6 unit tests) |
-| (this)  | `backend::protocol` | `BackendCallbacks` (title/bells/OSC8/kitty/OSC133/query responder) + typed `QueryClass` enum |
+| 60a43a3 | `backend::protocol` | `BackendCallbacks` (title/bells/OSC8/kitty/OSC133/query responder) + typed `QueryClass` enum |
 
 The `QueryClass` enum replaces the plan-flagged stringly
 `Option<&'static str>` pending-class plumbing internally;
@@ -279,7 +279,17 @@ The `QueryClass` enum replaces the plan-flagged stringly
 event format is byte-identical (invariant 13) and the audit driver's
 `"dsr_cpr"` matching still holds. A unit test pins all eight strings.
 
-Remaining G2 slices: `emulator.rs` (Parser + normalization policy +
-scrollback state), `process.rs` (PtyProcess: master/child/writer/reader/
-chunk_rx/pid), `wait.rs` (WaitEvaluator), then optionally migrating
-line_cli.rs's duplicate raw ring onto the shared RawCapture.
+| Commit | Module | Moved |
+| --- | --- | --- |
+| 5da773a | `backend::emulator::TerminalEmulator` | vt100 Parser, normalization policy (item 48), scrollback cache + seen flag (item 53); refresh_scrollback's probe-then-page-walk lives with the emulator |
+| 420cb48 | `backend::process::PtyProcess` | master/child/writer, reader thread + chunk channel, child pid, clear-env flag (item 77); spawn + teardown ORDERING (terminate) + group signaling + process state live with the process |
+| 14f2f8f | `backend::wait::WaitEvaluator` | the per-condition evaluation match out of the polling loop: `evaluate(cond, tick, baselines, fingerprint)`, pure decision policy; the loop (pump→sync→snapshot→evaluate→sleep) stays on the backend. +10 unit tests |
+| 04312f3 | line_cli raw-ring migration | PtyLineBackend's duplicate ring/counter/local const replaced by the shared `RawCapture` — one bounds constant, one declared-eviction policy |
+
+**G2 COMPLETE**: `PortablePtyBackend` is down from 2296 lines to ~820 —
+a coordinator over five cohesive holders (raw capture, input encoders,
+event clock, protocol callbacks, emulator, process) plus its canonical
+`pump()`, `wait()` loop, and the TerminalBackend facade. One canonical
+byte-ingestion point preserved throughout (invariant 4); no new locks
+(invariant 15); the `QueryClass` serialization keeps on-disk event
+formats byte-identical (invariant 13).
