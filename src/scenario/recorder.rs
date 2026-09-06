@@ -34,6 +34,62 @@ impl ScenarioRecorder {
         };
     }
 
+    /// Record a first-class intent step (beta-audit P0-9): target + verb
+    /// as semantic facts. Replay re-resolves the target against the live
+    /// screen and runs the focus-secured plan engine, instead of
+    /// replaying frozen keys that a layout change breaks.
+    pub fn record_intent(&mut self, mut params: serde_json::Value) {
+        use serde_json::Value;
+        // Same sensitive policy as sensitive acts (re-review P0.3): a
+        // `type` verb's text payload is replaced with a `${NAME}`
+        // reference and the parameter is DECLARED — the value itself
+        // never lands in the scenario file.
+        if params.get("sensitive").and_then(|s| s.as_bool()) == Some(true) {
+            if let Some(text) = params
+                .get("verb")
+                .and_then(|v| v.get("text"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+            {
+                let param_name = format!("TEXT_{}", self.scenario.steps.len() + 1);
+                self.scenario
+                    .parameters
+                    .push(super::model::SensitiveParameter {
+                        name: param_name.clone(),
+                        kind: super::model::SensitiveKind::Secret,
+                        description: Some(format!(
+                            "sensitive payload recorded as redacted ({} bytes); \
+                             supply the value to replay this step",
+                            text.len()
+                        )),
+                    });
+                if let Some(verb) = params.get_mut("verb") {
+                    if let Some(vmap) = verb.as_object_mut() {
+                        vmap.insert(
+                            "text".to_string(),
+                            Value::String(format!("${{{param_name}}}")),
+                        );
+                    }
+                }
+                if let Some(map) = params.as_object_mut() {
+                    map.insert("payload_bytes".to_string(), Value::from(text.len() as u64));
+                }
+            }
+        }
+        self.scenario = Scenario {
+            steps: {
+                let mut steps = self.scenario.steps.clone();
+                steps.push(super::model::ScenarioStep {
+                    kind: super::model::StepKind::Intent,
+                    params,
+                    expect: None,
+                });
+                steps
+            },
+            ..self.scenario.clone()
+        };
+    }
+
     /// Record an act step WITH its mutation guard (re-review Wave-2): the
     /// captured before-frame's structure hash and resolved focus become the
     /// `expect` precondition the runner verifies before replaying this step.

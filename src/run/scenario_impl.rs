@@ -23,6 +23,23 @@ impl RunContext {
     /// Record an act step into every recording scoped to this exact session
     /// generation (re-review item 5: session A's recording never absorbs
     /// session B's traffic).
+    /// Beta-audit P0-9: record a first-class intent step (target + verb
+    /// as semantic facts) into every active scenario recording for the
+    /// session. Replay re-resolves the target and re-runs the
+    /// focus-secured plan.
+    pub fn record_scenario_intent(
+        &mut self,
+        session_id: &str,
+        generation: u32,
+        params: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
+        for r in self.scenarios.recorders_for(session_id, generation) {
+            r.record_intent(params.clone());
+        }
+        Ok(())
+    }
+
     pub fn record_scenario_act(
         &mut self,
         session_id: &str,

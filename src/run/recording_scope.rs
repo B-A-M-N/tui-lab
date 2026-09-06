@@ -65,6 +65,12 @@ impl ScenarioRecording {
     pub fn record_act(&mut self, params: serde_json::Value) {
         self.recorder.record_act(params);
     }
+    /// Record a first-class intent step (beta-audit P0-9): target + verb
+    /// as semantic facts; replay re-resolves the target and re-runs the
+    /// focus-secured plan.
+    pub fn record_intent(&mut self, params: serde_json::Value) {
+        self.recorder.record_intent(params);
+    }
     /// Record a sensitive act step (re-review P0.3): the payload field is
     /// replaced with a `${NAME}` reference and the parameter is declared on
     /// the scenario — the value itself never lands in the file.

@@ -6,7 +6,7 @@ use crate::mcp::helpers::{err, err_invalid_selector, err_with_details, ok};
 use crate::mcp::params::*;
 use rmcp::serde_json::json;
 
-use super::drive::{act_request_json, drive, DriveSpec, ScenarioCapture};
+use super::drive::{drive, DriveSpec, ScenarioCapture};
 
 /// Body of `tui_checkpoint` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
@@ -267,6 +267,9 @@ pub(crate) async fn tui_intent(
     let intent_id = format!("intent-{}", uuid::Uuid::new_v4().simple());
     let selector = p.id.clone();
     let target = p.target.clone();
+    // Beta-audit P0-9: the wire verb, kept for the recorded intent step
+    // (the scenario grammar round-trips this exact shape).
+    let intent_verb_json = serde_json::to_value(&p.verb).unwrap_or(serde_json::Value::Null);
     let run = s.run.clone();
     // Finding 3D: the plan store lives on the server; clone the Arc handle
     // into the closure instead of capturing `s` (whose borrow cannot cross
@@ -277,6 +280,16 @@ pub(crate) async fn tui_intent(
     // Planning is observation-only; it still gets the ticket so both arms
     // share one closure shape.
     s.with_sess_authorized(selector.as_deref(), move |sess, ticket| {
+        // Beta-audit P0-8: execute=true without a plan_id is a request-shape
+        // error — refused BEFORE any observation or target resolution, so
+        // the two-step contract is enforced with zero side effects.
+        if execute && p.plan_id.is_none() {
+            return err_with_details(
+                ErrorCategory::InvalidRequest,
+                "execute=true requires the plan_id returned by the preview (execute=false): pass the plan_id you inspected, or re-plan to get one",
+                json!({ "reason": "plan_id_required" }),
+            );
+        }
         // Planning reads the session's LAST fused frame (observe-before-act):
         // the semantic truth the agent would have seen from tui_observe.
         // Execution below re-observes fresh instead.
@@ -336,9 +349,12 @@ pub(crate) async fn tui_intent(
         };
         let plan_json = plan_to_json(&plan);
         if !execute {
-            // Finding 3D: the plan response carries a plan_id so execution
-            // can reference THIS previewed plan; the preview is stored
-            // server-side and consumed (revalidated) at execute time.
+            // Finding 3D + beta-audit P0-8: the plan response carries a
+            // plan_id so execution can reference THIS previewed plan. The
+            // ticket binds the FULL plan fingerprint — control, session,
+            // verb, risk, and the exact step shape — not just the control
+            // identity, so a caller cannot preview verb A and submit the
+            // plan_id for verb B against the same control.
             let plan_id = {
                 let mut plans = intent_plans.lock().unwrap();
                 let id = format!("plan-{}", uuid::Uuid::new_v4().simple());
@@ -346,6 +362,10 @@ pub(crate) async fn tui_intent(
                     id.clone(),
                     crate::mcp::ownership::IntentPlanTicket {
                         control_id: plan.control.id.clone(),
+                        session_id: sess.id.clone(),
+                        verb: plan.verb.name().to_string(),
+                        risk: plan.risk.name().to_string(),
+                        steps_hash: crate::mcp::ownership::plan_steps_hash(&plan_json["steps"]),
                         created: std::time::Instant::now(),
                     },
                 );
@@ -409,44 +429,66 @@ pub(crate) async fn tui_intent(
                 }
             }
         }
-        // 2. plan_id revalidation (finding 3D): the caller must be
-        // executing a plan it actually previewed. The store holds the
-        // previewed control identity per plan_id; execution re-resolves
-        // against the FRESH frame (the plan above) and the identities must
-        // still agree — a UI change that removed or renamed the previewed
-        // control refuses instead of acting on a lookalike. Unknown or
-        // expired plan_ids refuse too (plans are server-side state with a
-        // bounded lifetime).
-        if let Some(want) = p.plan_id.as_deref() {
-            match intent_plans.lock().unwrap().consume(want) {
-                Some(stored) => {
-                    let fresh_id = plan_json["control"]["id"].as_str().unwrap_or_default();
-                    if stored.control_id != fresh_id {
-                        return err_with_details(
-                            ErrorCategory::StaleState,
-                            format!(
-                                "the previewed plan's control '{old}' no longer resolves (fresh resolution: '{new}'); re-plan instead of executing a stale preview",
-                                old = stored.control_id,
-                                new = fresh_id
-                            ),
-                            json!({
-                                "reason": "stale_plan",
-                                "plan_id": want,
-                                "previewed_control": stored.control_id,
-                                "fresh_control": fresh_id,
-                            }),
-                        );
-                    }
-                }
-                None => {
+        // 2. plan_id revalidation (finding 3D + beta-audit P0-8): the
+        // caller must be executing the plan it ACTUALLY previewed —
+        // plan_id is REQUIRED for execution, not an optional nicety. The
+        // stored fingerprint (control, session, verb, risk, step shape)
+        // must match the fresh resolution in full; any drift (UI change,
+        // different verb, different session) refuses instead of acting on
+        // a lookalike.
+        // (plan_id's presence was enforced above — P0-8; here it is only
+        // unwrapped for the fingerprint check.)
+        let want = p.plan_id.as_deref().expect("plan_id enforced above");
+        match intent_plans.lock().unwrap().consume(want) {
+            Some(stored) => {
+                let fresh_id = plan_json["control"]["id"].as_str().unwrap_or_default();
+                let fresh_verb = plan.verb.name();
+                let fresh_risk = plan.risk.name();
+                let fresh_hash = crate::mcp::ownership::plan_steps_hash(&plan_json["steps"]);
+                if stored.session_id != sess.id {
                     return err_with_details(
                         ErrorCategory::InvalidRequest,
                         format!(
-                            "unknown or expired plan_id '{want}'; plans live server-side for a bounded number of intents — re-plan (execute=false) and execute the fresh plan_id"
+                            "plan_id '{want}' was previewed against session '{}', not '{}'; re-plan against the target session",
+                            stored.session_id,
+                            sess.id
                         ),
-                        json!({ "reason": "unknown_plan", "plan_id": want }),
+                        json!({
+                            "reason": "plan_session_mismatch",
+                            "plan_id": want,
+                            "previewed_session": stored.session_id,
+                        }),
                     );
                 }
+                if !stored.fingerprint(fresh_id, fresh_verb, fresh_risk, fresh_hash) {
+                    return err_with_details(
+                        ErrorCategory::StaleState,
+                        format!(
+                            "the executed request no longer matches the previewed plan '{want}' (previewed control '{}' / verb '{}' / risk '{}'; fresh resolution: '{fresh_id}' / '{fresh_verb}' / '{fresh_risk}'); re-plan instead of executing a lookalike",
+                            stored.control_id, stored.verb, stored.risk
+                        ),
+                        json!({
+                            "reason": "stale_plan",
+                            "plan_id": want,
+                            "previewed_control": stored.control_id,
+                            "previewed_verb": stored.verb,
+                            "previewed_risk": stored.risk,
+                            "fresh_control": fresh_id,
+                            "fresh_verb": fresh_verb,
+                            "fresh_risk": fresh_risk,
+                        }),
+                    );
+                }
+            }
+            None => {
+                return err_with_details(
+                    ErrorCategory::InvalidRequest,
+                    format!(
+                        "unknown, expired, or already-executed plan_id '{want}'; plans live server-side for {}s and execute at most once — re-plan (execute=false) and execute the fresh plan_id",
+                        crate::mcp::ownership::INTENT_PLAN_TTL.as_secs()
+                    ),
+                    json!({ "reason": "unknown_plan", "plan_id": want }),
+                );
             }
         }
         // A live human lease blocks execution (planning stays allowed — it
@@ -535,10 +577,14 @@ pub(crate) async fn tui_intent(
                             visibility,
                             completion: completion.clone(),
                             guard: guard.as_ref(),
-                            scenario: Some(ScenarioCapture {
-                                params: act_request_json(action),
-                                sensitive,
-                            }),
+                            // Beta-audit P0-9: the payload is recorded as
+                            // the FIRST-CLASS intent step below (target +
+                            // verb as semantic facts), NOT as a frozen act
+                            // step — a recorded key sequence would replay
+                            // against whatever control holds focus in a
+                            // fresh session, which is exactly the defect
+                            // the intent system exists to prevent.
+                            scenario: None,
                             origin: crate::execution::DriveOrigin::Intent,
                             ticket: Some(ticket.clone()),
                         },
@@ -565,7 +611,12 @@ pub(crate) async fn tui_intent(
         // transitions (observed before/after each hop) are recorded into
         // the run's FocusGraph below by the drive boundary — here we only
         // write the intent linkage record (audit P0-12): one ledger entry
-        // tying the plan's transactions together causally.
+        // tying the plan's transactions together causally. Beta-audit
+        // P0-9: scenario recordings also get the FIRST-CLASS intent step
+        // — target + verb as semantic facts, not frozen keys — so replay
+        // re-resolves the target and re-runs the focus-secured plan
+        // instead of replaying a key sequence that a layout change
+        // breaks.
         {
             let (sid, gen) = (sess.id.clone(), sess.generation);
             let mut run = run.lock().unwrap();
@@ -580,6 +631,15 @@ pub(crate) async fn tui_intent(
                     "steps": executed,
                 })
                 .to_string(),
+            );
+            let _ = run.record_scenario_intent(
+                &sid,
+                gen,
+                json!({
+                    "target": p.target,
+                    "verb": intent_verb_json,
+                    "sensitive": sensitive,
+                }),
             );
             let _ = run.record_scenario_wait(
                 &sid,

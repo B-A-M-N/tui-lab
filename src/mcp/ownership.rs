@@ -23,8 +23,57 @@
 #[derive(Clone)]
 pub(crate) struct IntentPlanTicket {
     pub(crate) control_id: String,
+    /// Beta-audit P0-8: the FULL plan binding. A plan_id authorizes the
+    /// plan the caller previewed — the session, verb, risk class, and the
+    /// step shape are all checked at execute time, so a caller cannot
+    /// preview verb A and submit the plan_id for verb B (the old ticket
+    /// bound only the control identity).
+    pub(crate) session_id: String,
+    pub(crate) verb: String,
+    pub(crate) risk: String,
+    /// Hash of the plan's serialized steps (the exact execution shape).
+    pub(crate) steps_hash: u64,
     /// Bounded store: creation order, oldest evicted first.
     pub(crate) created: std::time::Instant,
+}
+
+/// Beta-audit P0-8: a previewed plan expires. The stale_plan /
+/// expired-plan error semantics always claimed plans had a bounded
+/// lifetime; now one is enforced (generous — plans are previewed and
+/// executed back-to-back, not archived).
+pub(crate) const INTENT_PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl IntentPlanTicket {
+    /// Whether this ticket has expired (age beyond the TTL).
+    pub(crate) fn expired(&self) -> bool {
+        self.created.elapsed() > INTENT_PLAN_TTL
+    }
+
+    /// The plan fingerprint this ticket authorizes: control + verb + risk
+    /// + step shape. Execute-time resolution must produce the same
+    /// fingerprint or the ticket refuses.
+    pub(crate) fn fingerprint(
+        &self,
+        control_id: &str,
+        verb: &str,
+        risk: &str,
+        steps_hash: u64,
+    ) -> bool {
+        self.control_id == control_id
+            && self.verb == verb
+            && self.risk == risk
+            && self.steps_hash == steps_hash
+    }
+}
+
+/// Hash a plan's step list into the ticket's step fingerprint (P0-8).
+/// `DefaultHasher` is stable within one process lifetime, which is the
+/// ticket's whole life (plans are server-side state and never persisted).
+pub(crate) fn plan_steps_hash(steps_json: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    steps_json.to_string().hash(&mut h);
+    h.finish()
 }
 
 /// Bounded intent-plan store (finding 3D): at most this many previewed
@@ -110,9 +159,16 @@ impl IntentPlanStore {
     }
 
     /// Consume a plan by id: remove-and-return. A plan executes at most
-    /// once — a replayed plan_id finds the store empty.
+    /// once — a replayed plan_id finds the store empty. Beta-audit P0-8:
+    /// an expired ticket is dropped on read (the caller sees
+    /// `unknown_plan`, the honest answer for a preview that outlived its
+    /// window).
     pub(crate) fn consume(&mut self, plan_id: &str) -> Option<IntentPlanTicket> {
-        self.map.remove(plan_id)
+        match self.map.remove(plan_id) {
+            Some(t) if !t.expired() => Some(t),
+            Some(_) => None,
+            None => None,
+        }
     }
 
     /// How many plans are currently held (test introspection).
@@ -153,6 +209,10 @@ mod tests {
                 format!("p{i}"),
                 IntentPlanTicket {
                     control_id: "c".into(),
+                    session_id: "s".into(),
+                    verb: "activate".into(),
+                    risk: "mutating".into(),
+                    steps_hash: 0,
                     created: std::time::Instant::now(),
                 },
             );
@@ -163,6 +223,10 @@ mod tests {
             "late".to_string(),
             IntentPlanTicket {
                 control_id: "c".into(),
+                session_id: "s".into(),
+                verb: "activate".into(),
+                risk: "mutating".into(),
+                steps_hash: 0,
                 created: std::time::Instant::now(),
             },
         );
@@ -178,6 +242,10 @@ mod tests {
             "p".to_string(),
             IntentPlanTicket {
                 control_id: "c".into(),
+                session_id: "s".into(),
+                verb: "activate".into(),
+                risk: "mutating".into(),
+                steps_hash: 0,
                 created: std::time::Instant::now(),
             },
         );

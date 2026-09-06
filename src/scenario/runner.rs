@@ -368,6 +368,137 @@ impl ScenarioRunner {
                         Err(e) => (false, format!("unparseable wait step: {e}")),
                     }
                 }
+                StepKind::Intent => {
+                    // Beta-audit P0-9: a recorded semantic intent replays as
+                    // an INTENT, not as frozen keys. The target is
+                    // re-resolved against the LIVE screen and the same
+                    // focus-secured plan engine runs (move_focus →
+                    // assert_focus → act), so a recording survives layout
+                    // and focus changes that would break a replayed Tab
+                    // sequence. Sensitive `type` payloads keep their
+                    // visibility policy.
+                    match serde_json::from_value::<crate::intent::ActionTarget>(
+                        params.get("target").cloned().unwrap_or(serde_json::Value::Null),
+                    )
+                    .map_err(|e| format!("unparseable intent target: {e}"))
+                    .and_then(|target| {
+                        serde_json::from_value::<crate::mcp::params::IntentVerbParam>(
+                            params.get("verb").cloned().unwrap_or(serde_json::Value::Null),
+                        )
+                        .map_err(|e| format!("unparseable intent verb: {e}"))
+                        .and_then(|v| {
+                            v.parse().map_err(|e| format!("invalid intent verb: {e}"))
+                        })
+                        .map(|verb| (target, verb))
+                    }) {
+                        Ok((target, verb)) => {
+                            let sensitive = params
+                                .get("sensitive")
+                                .and_then(|s| s.as_bool())
+                                .unwrap_or(false);
+                            let vis = if sensitive {
+                                crate::execution::InputVisibility::Sensitive
+                            } else {
+                                crate::execution::InputVisibility::Normal
+                            };
+                            // Fresh observation: the plan resolves against
+                            // what the screen shows NOW (same audit-P0-13
+                            // rule the live path follows).
+                            let (step_passed, detail) = match session.observe_fused(40) {
+                                Err(e) => (false, format!("pre-intent observe failed: {e}")),
+                                Ok((_, sem, _, _)) => {
+                                    // The proven FocusGraph — intent steps
+                                    // replay under the SAME focus-route
+                                    // provenance rule the live path enforces.
+                                    let graph = match run {
+                                        Some(run) => run.lock().unwrap().graphs().focus_graph.clone(),
+                                        None => crate::semantic::focus_graph::FocusGraph::new(),
+                                    };
+                                    match crate::intent::plan_intent_with_graph(
+                                        &sem, &target, verb, &graph,
+                                    ) {
+                                        Err(e) => (
+                                            false,
+                                            format!("intent re-resolution failed: {}", e.message()),
+                                        ),
+                                        Ok(plan) => {
+                                            let mut ok = true;
+                                            let mut why = String::new();
+                                            for step in &plan.steps {
+                                                match step {
+                                                    crate::intent::PlannedStep::MoveFocus {
+                                                        key,
+                                                        ..
+                                                    } => {
+                                                        if let Err(e) = drive_intent_step(
+                                                            session, run, key, vis,
+                                                        ) {
+                                                            ok = false;
+                                                            why =
+                                                                format!("focus move failed: {e}");
+                                                            break;
+                                                        }
+                                                        // Refresh the session's
+                                                        // last frame so the
+                                                        // assert below reads the
+                                                        // post-move screen (same
+                                                        // rule as the live path).
+                                                        if let Err(e) = session.observe(0) {
+                                                            ok = false;
+                                                            why = format!(
+                                                                "post-focus observe failed: {e}"
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+                                                    crate::intent::PlannedStep::AssertFocus {
+                                                        target_id,
+                                                    } => {
+                                                        let live = session
+                                                            .analyze_last()
+                                                            .map(|a| a.semantic)
+                                                            .and_then(|s| s.focus.control_id);
+                                                        if live.as_deref()
+                                                            != Some(target_id.as_str())
+                                                        {
+                                                            ok = false;
+                                                            why = format!(
+                                                                "focus assertion failed: expected {target_id}, focus holds {live:?}"
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+                                                    crate::intent::PlannedStep::Act(action) => {
+                                                        if let Err(e) = drive_intent_step(
+                                                            session, run, action, vis,
+                                                        ) {
+                                                            ok = false;
+                                                            why = format!("payload act failed: {e}");
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if ok {
+                                                (
+                                                    true,
+                                                    format!(
+                                                        "intent replayed: {} step(s) focus-secured",
+                                                        plan.steps.len()
+                                                    ),
+                                                )
+                                            } else {
+                                                (false, why)
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            (step_passed, detail)
+                        }
+                        Err(msg) => (false, msg),
+                    }
+                }
                 StepKind::Assert => {
                     match session.observe(50) {
                         Ok(screen) => {
@@ -469,6 +600,44 @@ impl ScenarioRunner {
             steps_skipped: skipped,
             step_results: results,
         }
+    }
+}
+
+/// Beta-audit P0-9: one focus-secured intent step at replay time — the
+/// same driving pipeline the live intent path uses (frames, ledger,
+/// event fold under the run's ticket), so a recorded intent's replay is
+/// evidenced identically to its original execution.
+fn drive_intent_step(
+    session: &mut crate::session::state::Session,
+    run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+    action: &crate::execution::CanonicalAction,
+    vis: crate::execution::InputVisibility,
+) -> Result<crate::execution::InteractionTransaction, anyhow::Error> {
+    match run {
+        Some(run) => {
+            let ticket = crate::execution::RunTicket::capture(run);
+            let spec = crate::execution::CoreDriveSpec {
+                action,
+                quiet_ms: 150,
+                budget_ms: 1150,
+                no_wait: false,
+                visibility: vis,
+                completion: crate::capture::CompletionPolicy::StableScreen,
+                guard: None,
+                scenario: None,
+                origin: crate::execution::DriveOrigin::Scenario,
+                ticket,
+            };
+            crate::execution::drive_pipeline(session, run, spec).map(|o| o.tx)
+        }
+        None => crate::execution::execute_act_with_visibility(
+            session,
+            action,
+            150,
+            1150,
+            false,
+            vis,
+        ),
     }
 }
 

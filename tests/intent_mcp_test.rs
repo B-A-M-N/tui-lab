@@ -96,6 +96,25 @@ async fn observe(server: &TuiLabServer, id: &str) {
     );
 }
 
+/// Preview a Save-activation plan and return its plan_id. Beta-audit
+/// P0-8: execution requires the previewed plan_id — the two-step contract
+/// is now the only contract — so tests that execute start here.
+async fn plan_save(server: &TuiLabServer, id: &str) -> String {
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "id": id,
+        })))
+        .await;
+    let plan = unwrap_ok(&raw, "intent plan");
+    assert_eq!(plan["mode"], "planned", "{plan}");
+    plan["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .to_string()
+}
+
 #[tokio::test]
 async fn plan_names_steps_and_risk_without_sending_input() {
     let server = TuiLabServer::new();
@@ -195,6 +214,7 @@ async fn execute_runs_the_focus_secured_sequence() {
             "target": { "by": "text", "text": "Save" },
             "verb": "activate",
             "execute": true,
+            "plan_id": plan_save(&server, &id).await,
             "id": id,
         })))
         .await;
@@ -346,12 +366,15 @@ async fn risk_fence_requires_explicit_authorization() {
     }
 
     // A mutating plan (activate Save) with an explicit fence BELOW its
-    // risk must refuse.
+    // risk must refuse (fence checked BEFORE the plan_id is consumed, so
+    // the previewed plan survives a refused fence and can re-execute).
+    let plan_id = plan_save(&server, &id).await;
     let raw = server
         .tui_intent(params_typed(serde_json::json!({
             "target": { "by": "text", "text": "Save" },
             "verb": "activate",
             "execute": true,
+            "plan_id": plan_id,
             "max_risk": "safe",
             "id": id,
         })))
@@ -367,12 +390,14 @@ async fn risk_fence_requires_explicit_authorization() {
         "the refusal names the fence: {env}"
     );
 
-    // An explicit fence at/above the plan's risk authorizes execution.
+    // An explicit fence at/above the plan's risk authorizes execution —
+    // the SAME plan_id, proving a refused fence did not burn it.
     let raw = server
         .tui_intent(params_typed(serde_json::json!({
             "target": { "by": "text", "text": "Save" },
             "verb": "activate",
             "execute": true,
+            "plan_id": plan_id,
             "max_risk": "mutating",
             "id": id,
         })))
@@ -501,6 +526,7 @@ async fn execute_enters_run_evidence_and_scenario_recording() {
             "target": { "by": "text", "text": "Save" },
             "verb": "activate",
             "execute": true,
+            "plan_id": plan_save(&server, &id).await,
             "id": id,
         })))
         .await;
@@ -522,9 +548,10 @@ async fn execute_enters_run_evidence_and_scenario_recording() {
         "intent execution must commit frames: {before_frames} -> {after_frames}"
     );
 
-    // Stop the recording; the exported steps must contain an act step for
-    // the payload (replayable through the normal act grammar), not a
-    // shapeless blob. Step shape is flat: {kind, ...params}.
+    // Stop the recording; the exported steps must contain a first-class
+    // INTENT step for the payload (finding 9): target + verb as semantic
+    // facts that replay re-resolves against the live screen, not frozen
+    // keys. Step shape is flat: {kind, ...params}.
     let stop = unwrap_ok(
         &server
             .tui_scenario(params_typed(
@@ -537,12 +564,19 @@ async fn execute_enters_run_evidence_and_scenario_recording() {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let payload_step = steps
-        .iter()
-        .find(|s| s["kind"] == "act" && s["action"].is_string());
+    let payload_step = steps.iter().find(|s| {
+        s["kind"] == "intent"
+            && s["target"]["text"] == "Save"
+            && s["verb"] == "activate"
+    });
     assert!(
         payload_step.is_some(),
-        "the intent's payload action must be captured as a replayable act step: {steps:?}"
+        "the intent's payload must be captured as a re-resolvable intent step: {steps:?}"
+    );
+    assert!(
+        !steps.iter().any(|s| s["kind"] == "act"),
+        "the intent execution must NOT also leave a frozen key-level act \
+         step (that is the replay-fidelity bug this step type replaces): {steps:?}"
     );
 
     server
@@ -586,28 +620,23 @@ async fn lease_blocks_intent_execution_but_not_planning() {
     // Finding 4: the grant carries the release token.
     let lease_id = lease["lease_id"].as_str().expect("lease_id").to_string();
 
+    // Planning stays allowed under the lease (it sends nothing) — and it
+    // mints the plan_id the blocked execution attempt then presents.
+    let plan_id = plan_save(&server, &id).await;
+    assert!(!plan_id.is_empty(), "planning stays allowed: {plan_id}");
+
     // execute=true must be refused with control_leased.
     let raw = server
         .tui_intent(params_typed(serde_json::json!({
             "target": { "by": "text", "text": "Save" },
             "verb": "activate",
             "execute": true,
+            "plan_id": plan_id,
             "id": id,
         })))
         .await;
     let v = envelope(&raw, "intent under lease");
     assert_eq!(v["category"], "control_leased", "{v}");
-
-    // Planning stays allowed (it sends nothing).
-    let raw = server
-        .tui_intent(params_typed(serde_json::json!({
-            "target": { "by": "text", "text": "Save" },
-            "verb": "activate",
-            "id": id,
-        })))
-        .await;
-    let v = unwrap_ok(&raw, "intent plan under lease");
-    assert_eq!(v["mode"], "planned", "{v}");
 
     // And nothing was sent: the fixture prints "saved." on the first input.
     let scr = unwrap_ok(
@@ -659,6 +688,17 @@ async fn sensitive_type_stays_redacted_in_evidence() {
     observe(&server, &id).await;
 
     const SECRET: &str = "hunter2-secret-e2e";
+    // Preview the plan first (P0-8: execute requires a plan_id).
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Password" },
+            "verb": { "verb": "type", "text": SECRET },
+            "sensitive": true,
+            "id": id,
+        })))
+        .await;
+    let plan = unwrap_ok(&raw, "sensitive intent plan");
+    let plan_id = plan["plan_id"].as_str().expect("plan_id").to_string();
     // Record a scenario during the sensitive type so BOTH evidence sinks are
     // exercised: the run ledger and the scenario export.
     let rec = unwrap_ok(
@@ -679,6 +719,7 @@ async fn sensitive_type_stays_redacted_in_evidence() {
             "verb": { "verb": "type", "text": SECRET },
             "sensitive": true,
             "execute": true,
+            "plan_id": plan_id,
             "id": id,
         })))
         .await;
@@ -713,6 +754,218 @@ async fn sensitive_type_stays_redacted_in_evidence() {
     server
         .tui_session(params_typed(
             serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+}
+
+/// Beta-audit P0-8: the plan_id binds the FULL plan the caller previewed —
+/// preview verb A against a control, submit the plan_id asking for verb B
+/// → refused with a stale_plan naming both fingerprints. Also: a plan_id
+/// previewed against one session cannot execute against another, and an
+/// execute without any plan_id refuses up front (the two-step contract is
+/// the only contract).
+#[tokio::test]
+async fn plan_id_binds_the_whole_plan_not_just_the_control() {
+    let server = TuiLabServer::new();
+    let id = start_dialog(&server).await;
+    observe(&server, &id).await;
+
+    // Prove the Tab route so plans resolve (there and back).
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
+
+    // No plan_id at all: refuse before anything is resolved or sent.
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "execute": true,
+            "id": id,
+        })))
+        .await;
+    let env = envelope(&raw, "execute without plan_id");
+    assert!(
+        raw.is_error.unwrap_or(false),
+        "execute=true without a plan_id must refuse: {env}"
+    );
+    assert!(
+        serde_json::to_string(&env).unwrap_or_default().contains("plan_id_required"),
+        "the refusal names the missing plan_id: {env}"
+    );
+
+    // Preview an ACTIVATE plan, then submit its plan_id for a DIFFERENT
+    // control (Cancel instead of Save): the fingerprint binding must
+    // refuse — the plan_id authorizes the plan previewed, not whatever
+    // the caller asks for at execute time.
+    let plan_id = plan_save(&server, &id).await;
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Cancel" },
+            "verb": "activate",
+            "execute": true,
+            "plan_id": plan_id,
+            "max_risk": "mutating",
+            "id": id,
+        })))
+        .await;
+    let env = envelope(&raw, "verb swap");
+    assert!(
+        raw.is_error.unwrap_or(false),
+        "a plan_id does not authorize a different verb: {env}"
+    );
+    let detail = serde_json::to_string(&env).unwrap_or_default();
+    assert!(
+        detail.contains("stale_plan"),
+        "the refusal names the fingerprint mismatch: {env}"
+    );
+
+    // And nothing was sent by either refused attempt: the fixture prints
+    // "saved." on the first activation.
+    let scr = unwrap_ok(
+        &server
+            .tui_observe(params_typed(
+                serde_json::json!({ "mode": "summary", "id": id }),
+            ))
+            .await,
+        "post-refusal observe",
+    );
+    let text = serde_json::to_string(&scr).unwrap_or_default();
+    assert!(
+        !text.contains("saved."),
+        "refused executions must not have activated anything: {text}"
+    );
+
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+}
+
+/// Beta-audit P0-9: a recorded intent replays as an INTENT, not frozen
+/// keys. A scenario captured against one session (focus on Cancel, plan
+/// needed a Tab hop to Save) is replayed into a FRESH session whose focus
+/// state differs — the intent step re-resolves the target on the live
+/// screen and re-runs the focus-secured plan, so Save activates exactly
+/// once regardless of the starting focus.
+#[tokio::test]
+async fn recorded_intent_replays_re_resolved_not_as_frozen_keys() {
+    let server = TuiLabServer::new();
+    let dir = std::env::temp_dir().join(format!("intent-replay-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let act_log = dir.join("activations");
+    let env = serde_json::json!({ "INTENT_TUI_ACTIVATIONS": act_log.to_string_lossy() });
+
+    // Session 1: prove the Tab route, plan+execute the Save activation,
+    // with a scenario recording running.
+    let id = start_dialog_with_env(&server, env.clone()).await;
+    observe(&server, &id).await;
+    for _ in 0..2 {
+        let raw = server
+            .tui_act(params_typed(serde_json::json!({
+                "action": "key", "key": "tab", "id": id,
+            })))
+            .await;
+        unwrap_ok(&raw, "tab traversal");
+        let _ = observe(&server, &id).await;
+    }
+    let rec = unwrap_ok(
+        &server
+            .tui_scenario(params_typed(
+                serde_json::json!({ "action": "record_start", "name": "p0-9", "id": id }),
+            ))
+            .await,
+        "record start",
+    );
+    let rec_id = rec["recording_id"].as_str().expect("recording_id").to_string();
+    let raw = server
+        .tui_intent(params_typed(serde_json::json!({
+            "target": { "by": "text", "text": "Save" },
+            "verb": "activate",
+            "execute": true,
+            "plan_id": plan_save(&server, &id).await,
+            "id": id,
+        })))
+        .await;
+    unwrap_ok(&raw, "original execute");
+    let stop = unwrap_ok(
+        &server
+            .tui_scenario(params_typed(
+                serde_json::json!({ "action": "record_stop", "recording_id": rec_id }),
+            ))
+            .await,
+        "record stop",
+    );
+    let name = stop["name"].as_str().expect("scenario name").to_string();
+
+    // The recording must contain the FIRST-CLASS intent step (not a
+    // frozen key sequence).
+    let exported = unwrap_ok(
+        &server
+            .tui_scenario(params_typed(
+                serde_json::json!({ "action": "export", "name": name }),
+            ))
+            .await,
+        "export",
+    );
+    let text = serde_json::to_string(&exported).unwrap_or_default();
+    assert!(
+        text.contains("\"intent\""),
+        "the recording carries the semantic intent step: {text}"
+    );
+    assert!(
+        text.contains("\"Save\""),
+        "the intent step names its target as a semantic fact: {text}"
+    );
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+
+    // Session 2: a FRESH app instance, focus NEVER moved (starts on
+    // Cancel). The recorded intent must still activate Save exactly once —
+    // re-resolving the target and making its own focus hop.
+    let fresh = std::fs::read_to_string(&act_log).unwrap_or_default();
+    assert!(
+        fresh.contains("save-activated"),
+        "original execution activated Save: {fresh}"
+    );
+    let id2 = start_dialog_with_env(&server, env).await;
+    observe(&server, &id2).await;
+    let run = unwrap_ok(
+        &server
+            .tui_scenario(params_typed(
+                serde_json::json!({ "action": "run", "name": name, "id": id2 }),
+            ))
+            .await,
+        "replay",
+    );
+    let status = run["status"].as_str().unwrap_or_default().to_string();
+    assert_eq!(status, "completed", "replay completed: {run}");
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let ledger = std::fs::read_to_string(&act_log).unwrap_or_default();
+    let count = ledger
+        .lines()
+        .filter(|l| l.contains("save-activated"))
+        .count();
+    assert_eq!(
+        count, 2,
+        "the replay activated Save exactly once MORE (fresh session, different starting focus): {ledger:?} run={run}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id2 }),
         ))
         .await;
 }
