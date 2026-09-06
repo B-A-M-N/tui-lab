@@ -127,34 +127,6 @@ impl LaunchSpec {
     }
 }
 
-/// The reactive fused commit memo (re-review item 52): a computed fused
-/// triple plus the frame identity it is a function of. The identity
-/// covers every input the fused pipeline reads — structure (hash),
-/// interaction state (visual hash + cursor + process state), and the
-/// native channel's absorbed position (a fresh declare must invalidate).
-#[derive(Clone)]
-struct FusedMemo {
-    key: String,
-    sem: crate::semantic::SemanticScreen,
-    tree: crate::semantic::node::SemanticTree,
-    report: crate::semantic::native::NativeOverlayReport,
-}
-
-/// Frame identity key for the fused memo: structure hash (text/layout),
-/// visual hash + cursor + process state (interaction), and the count of
-/// native events absorbed so far (native overlay input). Two frames with
-/// the same key are, by construction, the same input to `fuse`.
-fn fused_key(screen: &crate::screen::ScreenState, native_seq: u64) -> String {
-    format!(
-        "{}/{}/{:?}/{:?}/{}",
-        screen.structure_hash,
-        screen.visual_hash,
-        (screen.cursor.x, screen.cursor.y, screen.cursor.visible),
-        screen.process.running,
-        native_seq,
-    )
-}
-
 /// The single-authority analysis of one terminal frame (re-review P0.4):
 /// the raw frame plus its FUSED semantic screen, semantic tree, native
 /// overlay report, and fused semantic identity. Produced only by a
@@ -270,23 +242,10 @@ pub struct Session {
     /// cursors, anchor counter, and the query/native watermarks — see
     /// [`super::event_state::SessionEventState`].
     event_state: super::event_state::SessionEventState,
-    /// Per-frame semantic cache (Wave G review): repeated `semantic::analyze`
-    /// on an unchanged frame (same `structure_hash`) is served from cache
-    /// instead of re-running all seven detectors. Interior-mutated by the
-    /// read-only `analyze_frame` path.
-    semantic_cache: std::cell::RefCell<crate::semantic::SemanticCache>,
-    /// Reactive fused commit (re-review item 52): the last frame's FULL
-    /// fused result (structure + interaction + native overlay), keyed on
-    /// the frame's complete identity — structure_hash + visual_hash +
-    /// cursor + native events absorbed. An unchanged frame identity
-    /// returns the memoized triple without re-running the interaction pass
-    /// or the overlay; any input (new structure, new visual state, fresh
-    /// native events) invalidates it. This is the "reactive" half: the
-    /// fused result is a function of the frame identity, computed when the
-    /// identity changes, not on every read.
-    fused_memo: std::cell::RefCell<Option<FusedMemo>>,
-    /// How many fused reads the memo served (evidence for the audit).
-    fused_memo_hits: std::cell::Cell<u64>,
+    /// Frame-analysis state (G4): the structural semantic cache, the
+    /// reactive fused memo (item 52), and its hit counter — see
+    /// [`super::semantic_state::SemanticState`].
+    semantic: super::semantic_state::SemanticState,
     /// Wave F items 58–63: the NativeSemanticProtocol side channel. The
     /// session creates it at start and injects `TUI_LAB_SEMANTIC` into the
     /// child's env; cooperative apps write their real semantic tree there
@@ -380,9 +339,7 @@ impl Session {
             pending_ingest: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             hook_recorder: std::sync::Arc::new(std::sync::Mutex::new(None)),
             event_state: super::event_state::SessionEventState::new(),
-            semantic_cache: std::cell::RefCell::new(crate::semantic::SemanticCache::new()),
-            fused_memo: std::cell::RefCell::new(None),
-            fused_memo_hits: std::cell::Cell::new(0),
+            semantic: super::semantic_state::SemanticState::new(),
             native: crate::semantic::native::NativeChannel::default(),
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
@@ -486,7 +443,7 @@ impl Session {
         // rest of the engine trusts, instead of leaving advertised
         // vocabulary nothing ordinary observation produces.
         {
-            let mut cache = self.semantic_cache.borrow_mut();
+            let mut cache = self.semantic.cache().borrow_mut();
             emit_semantic_frame_events(
                 self.event_state.queue_mut(),
                 &self.id,
