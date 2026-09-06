@@ -31,267 +31,13 @@ use crate::backend::{
 use crate::screen::{ProcessState, ScreenState};
 
 use super::input::{encode_key, encode_mouse_event};
+// vt100 callbacks that record host-observable terminal metadata — moved
+// to `super::protocol` (G2).
+use super::protocol::BackendCallbacks;
 
-/// vt100 callbacks that record host-observable terminal metadata.
-///
-/// Security boundary (spec section 75): these callbacks are *observations
-/// only*. We deliberately do NOT act on the host in response to terminal
-/// output — e.g. we never write the OSC 52 clipboard to the host clipboard.
-#[derive(Default)]
-struct BackendCallbacks {
-    title: Option<String>,
-    audible_bells: u64,
-    title_seq: u64,
-    /// OSC8 hyperlink currently open (`id=…` params + URI), if any.
-    open_link: Option<crate::screen::cell::Hyperlink>,
-    /// Links completed so far, in completion order.
-    links: Vec<crate::screen::cell::Hyperlink>,
-    /// Wave F item 52: kitty keyboard protocol flags pushed by the app
-    /// (`CSI > flags u` sets, `CSI < u` pops, `CSI = flags ; mode u` sets
-    /// the active portion). We track the *current* stack top honestly —
-    /// a full stack is only needed if apps interleave, which none do.
-    kitty_flags: u8,
-    /// Whether the app ever pushed kitty flags (capability promotion).
-    kitty_seen: bool,
-    /// Wave F item 56: bytes the terminal should send back to the
-    /// application in response to queries (DA1/DA2, DSR cursor position,
-    /// DECRQM mode reports, kitty `?u`, OSC color queries). Drained back
-    /// to the PTY by `pump()`.
-    query_responses: Vec<u8>,
-    /// Wave F item 54: shell-integration command edges (OSC 133).
-    command_seq: u64,
-    command_running: bool,
-    last_command_exit: Option<i32>,
-    command_phase: &'static str,
-    /// Item 22: query/answer bookkeeping. When the responder queues an
-    /// answer, it records the class here; `pump()` promotes the pending
-    /// class to `last_query` at the moment it actually writes the answer
-    /// bytes back to the PTY — that write is the measured "answer sent at".
-    /// Monotonic counters (one per answered query) let the session layer
-    /// diff "answers since last observe" into terminal events.
-    answered_seq: u64,
-    pending_class: Option<&'static str>,
-}
-
-impl BackendCallbacks {
-    fn queue_response(&mut self, bytes: &[u8]) {
-        self.query_responses.extend_from_slice(bytes);
-    }
-
-    /// Item 22: name the query class this answer belongs to and bump the
-    /// answer counter. Called by every responder arm right before (or right
-    /// after) queueing the reply bytes.
-    fn note_answer(&mut self, class: &'static str) {
-        self.answered_seq += 1;
-        self.pending_class = Some(class);
-    }
-}
-
-impl vt100::Callbacks for BackendCallbacks {
-    fn audible_bell(&mut self, _screen: &mut vt100::Screen) {
-        self.audible_bells += 1;
-    }
-    fn set_window_title(&mut self, _screen: &mut vt100::Screen, title: &[u8]) {
-        // Observation only: record the requested title. Never act on the host.
-        let s = String::from_utf8_lossy(title).into_owned();
-        self.title = Some(s);
-        self.title_seq += 1;
-    }
-
-    /// OSC8 hyperlinks (Wave C item 29): `\e]8;params;uri\e\\ … \e]8;;\e\\`.
-    /// The vt grid does not carry link state, so we record the span by
-    /// *cursor position at open/close time* — the same coordinates the grid
-    /// uses. Observation only: we never fetch the URI.
-    ///
-    /// Wave F item 54: OSC 133 shell-integration marks (A=prompt start,
-    /// B=command start of input echo, C=command output start, D[;exit]=
-    /// command end) are parsed from the same hook. Only edges are recorded —
-    /// never command payload text.
-    ///
-    /// Wave F item 56: OSC 10/11/… `?` color queries get an honest report
-    /// (we do not track palette state; we answer with the default colors we
-    /// actually render with rather than guessing the app's theme).
-    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
-        let (y, x) = screen.cursor_position();
-        match params.first().copied() {
-            Some(b"8") => {
-                // OSC8 with empty URI closes the current link.
-                let uri_at_2: Option<&[u8]> = params.get(2).map(|p| p.as_ref());
-                match uri_at_2 {
-                    Some(uri) if !uri.is_empty() => {
-                        let link_params =
-                            String::from_utf8_lossy(params.get(1).copied().unwrap_or(b""));
-                        let id = link_params
-                            .split(';')
-                            .find_map(|kv| kv.strip_prefix("id="))
-                            .map(|s| s.to_string());
-                        self.open_link = Some(crate::screen::cell::Hyperlink {
-                            id,
-                            uri: String::from_utf8_lossy(uri).into_owned(),
-                            start: (x, y),
-                            end: None,
-                        });
-                    }
-                    _ => {
-                        // Close: finish the span at the current cursor.
-                        if let Some(mut link) = self.open_link.take() {
-                            link.end = Some((x, y));
-                            self.links.push(link);
-                        }
-                    }
-                }
-            }
-            // ── OSC 133 shell integration (item 54) ──
-            Some(b"133") => match params.get(1).copied() {
-                Some(b"A") => {
-                    self.command_phase = "prompt";
-                }
-                Some(b"B") => {
-                    self.command_phase = "command";
-                }
-                Some(b"C") => {
-                    self.command_seq += 1;
-                    self.command_running = true;
-                    self.command_phase = "output";
-                }
-                Some(b"D") => {
-                    self.command_running = false;
-                    self.command_phase = "done";
-                    if let Some(exit) = params.get(2) {
-                        let s = String::from_utf8_lossy(exit);
-                        self.last_command_exit = s.trim().parse::<i32>().ok();
-                    }
-                }
-                _ => {}
-            },
-            // ── Terminal color queries (item 56) ──
-            // `OSC 10 ; ? BEL` (foreground), `OSC 11 ; ? BEL` (background),
-            // `OSC 4 ; idx ; ? BEL` (palette). We answer with the colors we
-            // actually render with — the harness displays default-color cells
-            // on a plain terminal, so that is the honest report.
-            Some(b"10") | Some(b"11") if params.get(2).copied() == Some(b"?".as_slice()) => {
-                let fg = matches!(params.first().copied(), Some(b"10"));
-                // xterm dynamic-color report: OSC <n> ; rgb:RRRR/GGGG/BBBB
-                let (r, g, b) = if fg {
-                    (0xC7u16, 0xC7, 0xC7)
-                } else {
-                    (0x00, 0x00, 0x00)
-                };
-                let which = if fg { 10 } else { 11 };
-                self.note_answer("osc_color");
-                self.queue_response(
-                    format!("\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x07", which, r, g, b).as_bytes(),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    /// Wave F items 52 + 56: CSI sequences vt100 does not implement carry
-    /// the kitty keyboard protocol stack ops and the terminal queries.
-    fn unhandled_csi(
-        &mut self,
-        _screen: &mut vt100::Screen,
-        i1: Option<u8>,
-        _i2: Option<u8>,
-        params: &[&[u16]],
-        c: char,
-    ) {
-        // ── Kitty keyboard protocol (item 52) ──
-        // `CSI > flags u`    push flags
-        // `CSI < number u`   pop `number` entries (default 1)
-        // `CSI = flags ; m u` set active flags (mode 1) / selected (mode 2)
-        // `CSI ? u`          query → `CSI ? flags u` response
-        if c == 'u' {
-            if i1 == Some(b'>') {
-                let flags = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-                self.kitty_flags = flags.min(u8::MAX as u16) as u8;
-                self.kitty_seen = true;
-                return;
-            }
-            if i1 == Some(b'<') {
-                let n = params
-                    .first()
-                    .and_then(|p| p.first())
-                    .copied()
-                    .unwrap_or(1)
-                    .max(1);
-                // A pop past the bottom of the stack disables the protocol
-                // (spec: the stack starts at depth 0 with flags 0).
-                self.kitty_flags = 0;
-                let _ = n; // single-depth stack: any pop clears
-                return;
-            }
-            if i1 == Some(b'=') {
-                let flags = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-                let mode = params.get(1).and_then(|p| p.first()).copied().unwrap_or(1);
-                match mode {
-                    1 => self.kitty_flags = flags.min(u8::MAX as u16) as u8,
-                    2 => self.kitty_flags |= flags.min(u8::MAX as u16) as u8,
-                    3 => self.kitty_flags &= !(flags.min(u8::MAX as u16) as u8),
-                    _ => {}
-                }
-                self.kitty_seen = true;
-                return;
-            }
-            if i1 == Some(b'?') {
-                // Query: report the currently active flags.
-                self.note_answer("kitty_flags");
-                self.queue_response(format!("\x1b[?{}u", self.kitty_flags).as_bytes());
-                return;
-            }
-        }
-
-        // ── Device queries (item 56) ──
-        match (i1, c) {
-            // DA1: `CSI c` or `CSI 0 c` → VT100 with AVO (`?1;2c`).
-            (None, 'c') | (Some(b'0'), 'c') => {
-                self.note_answer("da1");
-                self.queue_response(b"\x1b[?1;2c");
-            }
-            // Secondary DA: `CSI > c` → vt220, version 1, no ROM.
-            (Some(b'>'), 'c') => {
-                self.note_answer("da2");
-                self.queue_response(b"\x1b[>0;1;0c");
-            }
-            // Tertiary DA: `CSI = c` → unit id 0.
-            (Some(b'='), 'c') => {
-                self.note_answer("da3");
-                self.queue_response(b"\x1bP!|0000\x1b\\");
-            }
-            // DSR — cursor position: `CSI 6n` → `CSI row ; col R` (1-based).
-            (None, 'n') if params.first().and_then(|p| p.first()).copied() == Some(6) => {
-                let (row, col) = _screen.cursor_position();
-                self.note_answer("dsr_cpr");
-                self.queue_response(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
-            }
-            // DSR — operating status: `CSI 5n` → OK.
-            (None, 'n') if params.first().and_then(|p| p.first()).copied() == Some(5) => {
-                self.note_answer("dsr_status");
-                self.queue_response(b"\x1b[0n");
-            }
-            // DECRQM: `CSI ? Ps $ p` → DECSET report; `CSI Ps $ p` → ANSI report.
-            (Some(b'?'), 'p') => {
-                let mode = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-                let set = match mode {
-                    1 => _screen.application_cursor(),
-                    25 => !_screen.hide_cursor(),
-                    1000 | 1002 | 1003 => {
-                        _screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
-                    }
-                    1006 => _screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
-                    2004 => _screen.bracketed_paste(),
-                    1049 => _screen.alternate_screen(),
-                    _ => false,
-                };
-                self.note_answer("decrqm");
-                self.queue_response(format!("\x1b[?{};{}$y", mode, set as u8).as_bytes());
-            }
-            _ => {}
-        }
-    }
-}
-
+/// vt100 callbacks that record host-observable terminal metadata —
+/// moved to [`super::protocol`] (G2). Re-exported so `pump()` and the
+/// probe paths keep their names.
 pub struct PortablePtyBackend {
     cols: u16,
     rows: u16,
@@ -405,7 +151,8 @@ impl PortablePtyBackend {
             {
                 let cb = self.parser.callbacks_mut();
                 if let Some(class) = cb.pending_class.take() {
-                    self.events.note_query_answered(class, cb.answered_seq);
+                    self.events
+                        .note_query_answered(class.as_str(), cb.answered_seq);
                 }
             }
         }
@@ -569,7 +316,12 @@ impl PortablePtyBackend {
         // The callbacks queue the reply; drain WITHOUT writing it to the
         // PTY (this is a probe, not app traffic).
         let drained = std::mem::take(&mut self.parser.callbacks_mut().query_responses);
-        let class = self.parser.callbacks_mut().pending_class.take();
+        let class = self
+            .parser
+            .callbacks_mut()
+            .pending_class
+            .take()
+            .map(|c| c.as_str());
         // pending_class was set by the LAST answering arm in `query`; for a
         // single-query probe it is exactly the answer's class.
         (class, drained)
