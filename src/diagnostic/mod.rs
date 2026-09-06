@@ -83,6 +83,11 @@ pub struct ProbeResult {
     /// when the probe ran without a capture spec.
     pub transition_capture: Option<TransitionCapture>,
     pub timing_ms: u64,
+    /// Beta-audit P0-7: the probe stimulus's ACTUAL interaction
+    /// transaction — frames, settle, render provenance — when a stimulus
+    /// ran, so the run ledger can carry the causal record instead of a
+    /// generic counter bump. `None` for drift probes (no stimulus).
+    pub transaction: Option<crate::execution::InteractionTransaction>,
     /// Human-readable material changes (watched aspects that changed).
     /// A change is EVIDENCE of the stimulus's effect — it is an anomaly
     /// only when it deviates from a stated expectation, which this engine
@@ -441,6 +446,7 @@ pub fn run_probe_with_guard(
         after_focus,
         transition_capture: transition_capture_outcome,
         timing_ms: start.elapsed().as_millis() as u64,
+        transaction: tx,
         material_changes,
     })
 }

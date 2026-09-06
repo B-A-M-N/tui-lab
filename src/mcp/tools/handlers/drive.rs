@@ -52,6 +52,11 @@ pub(crate) struct DriveSpec<'a> {
     pub scenario: Option<ScenarioCapture>,
     /// Finding 2: typed provenance for the ledger row.
     pub origin: crate::execution::DriveOrigin,
+    /// Beta-audit P0-6: the ticket from the authorized dispatch
+    /// (with_sess_authorized hands it to the job). `None` falls back to
+    /// an in-job capture — still commit-verified, just a narrower
+    /// authorization window.
+    pub ticket: Option<crate::execution::RunTicket>,
 }
 
 /// The evidence one driven act produced.
@@ -84,6 +89,14 @@ pub(crate) fn drive(
     if let Some(refused) = lease_refused(sess) {
         return Err(refused);
     }
+    // Beta-audit P0-6: prefer the ticket captured at AUTHORIZATION
+    // (with_sess_authorized hands it to the job); fall back to an
+    // in-job capture only for callers not yet on the authorized entry —
+    // still verified at every commit.
+    let ticket = spec
+        .ticket
+        .clone()
+        .unwrap_or_else(|| crate::execution::RunTicket::capture(run));
     let core = crate::execution::CoreDriveSpec {
         action: spec.action,
         quiet_ms: spec.quiet_ms,
@@ -94,6 +107,7 @@ pub(crate) fn drive(
         guard: spec.guard,
         scenario: spec.scenario,
         origin: spec.origin,
+        ticket,
     };
     crate::execution::drive_pipeline(sess, run, core)
         .map(|o| DriveOutcome {

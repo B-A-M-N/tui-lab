@@ -249,6 +249,11 @@ impl ScenarioRunner {
                                     // envelope-sensitive visibility still rides.
                                     let outcome = match run {
                                         Some(run) => {
+                                            // Beta-audit P0-6: capture the run
+                                            // identity at replay dispatch; the
+                                            // pipeline verifies at commit.
+                                            let ticket =
+                                                crate::execution::RunTicket::capture(run);
                                             let spec = crate::execution::CoreDriveSpec {
                                                 action: &action,
                                                 quiet_ms: quiet,
@@ -259,6 +264,7 @@ impl ScenarioRunner {
                                                 guard: expect_guard.as_ref(),
                                                 scenario: None,
                                                 origin: crate::execution::DriveOrigin::Scenario,
+                                                ticket,
                                             };
                                             crate::execution::drive_pipeline(session, run, spec)
                                                 .map(|o| o.tx)

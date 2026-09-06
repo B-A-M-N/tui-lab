@@ -300,6 +300,7 @@ pub(crate) async fn tui_contract(
                         struct ScaffoldSession<'a> {
                             sess: &'a mut crate::session::Session,
                             run: &'a std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
+                            ticket: crate::execution::RunTicket,
                         }
                         impl crate::design::scaffold::ScaffoldIo for ScaffoldSession<'_> {
                             fn observe(
@@ -327,13 +328,18 @@ pub(crate) async fn tui_contract(
                                     guard: None,
                                     scenario: None,
                                     origin: crate::execution::DriveOrigin::Scaffold,
+                                    ticket: self.ticket.clone(),
                                 };
                                 crate::execution::drive_pipeline(self.sess, self.run, spec)
                                     .map(|_| ())
                                     .map_err(|e| anyhow::anyhow!("{name} failed: {e}"))
                             }
                         }
-                        let mut io = ScaffoldSession { sess, run: &run };
+                        let mut io = ScaffoldSession {
+                            sess,
+                            run: &run,
+                            ticket: crate::execution::RunTicket::capture(&run),
+                        };
                         let gathered = crate::design::scaffold::gather_states(
                             (screen, sem),
                             cols,

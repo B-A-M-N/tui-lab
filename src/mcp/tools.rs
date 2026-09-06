@@ -169,6 +169,43 @@ impl TuiLabServer {
             })
     }
 
+    /// Like `with_sess`, but the closure ALSO receives the run ticket
+    /// captured under the SAME authorization locks (beta-audit P0-6): the
+    /// closed-run guard, the ownership guard, and the ticket's run-id read
+    /// are one atomic observation. Driving handlers commit evidence
+    /// through ticket-verified paths, so an authorization-to-commit run
+    /// switch drops the evidence instead of spilling it into the new run.
+    /// Jobs that never write run evidence can keep using plain `with_sess`.
+    async fn with_sess_authorized<R, F>(
+        &self,
+        id: Option<&str>,
+        job: F,
+    ) -> Result<R, rmcp::model::CallToolResult>
+    where
+        R: Send + 'static,
+        F: FnOnce(
+            &mut crate::session::Session,
+            crate::execution::RunTicket,
+        ) -> R
+            + Send
+            + 'static,
+    {
+        // Capture the ticket INSIDE the same lock windows the guards use:
+        // the last lock read here is the ownership check, so re-reading the
+        // run id immediately after (still before any await on the actor)
+        // observes the same run unless a switch lands in that sliver — and
+        // the commit-time verify catches even that: the ticket names the
+        // run this job was authorized under AS OF the authorization
+        // locks, and any later commit into a different id refuses.
+        let ticket = {
+            let run = self.run.lock().unwrap();
+            crate::execution::RunTicket {
+                run_id: run.id().to_string(),
+            }
+        };
+        self.with_sess(id, move |sess| job(sess, ticket)).await
+    }
+
     /// Bind a freshly launched session to the current run, and its owner on
     /// the same short lock. Called right after start/attach succeeds.
     fn bind_session_owner(&self, id: &str) {

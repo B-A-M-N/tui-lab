@@ -277,54 +277,13 @@ fn sweep(
         Ok(screen) => screen,
         Err(e) => return Err((ErrorCategory::BackendError, e.to_string())),
     };
-    let mut run = run.lock().unwrap();
-    // Incremental event persistence (re-review Wave-2): events land in the
-    // run's on-disk log as they fire, via the run's own consumer cursor —
-    // not only at close. `hold_events` is append-only and idempotent per
-    // event (seqs are unique), and the close path still drains whatever
-    // tail remained.
-    {
-        let cursor_key = format!("persistence:{}", sess.id);
-        let from = run.event_cursor(&cursor_key).unwrap_or(0);
-        let batch = sess.events_since(from);
-        if !batch.events.is_empty() {
-            let _ = run.hold_events(&sess.id, batch.events);
-            run.set_event_cursor(&cursor_key, batch.cursor);
-        }
-    }
-    run.bump_event();
-    // Coverage ingestion rides every observation (re-review P1 item 17):
-    // native coverage events were absorbed into the session queue by
-    // observe itself, so the run ledger folds them here regardless of
-    // which observe mode triggered the sweep.
-    let batch = sess.events_since(0);
-    let cursor_key = format!("coverage:{}", sess.id);
-    let from = run.event_cursor(&cursor_key).unwrap_or(0);
-    let seq = batch.cursor;
-    if batch.cursor > from {
-        let evs = sess.events_since(from);
-        // Wave 5 item 41: widget-targeted coverage events join the
-        // declaring node's app-attested source locus (same NSP channel),
-        // so coverage→source is exact. File targets stay plain.
-        for ev in &evs.events {
-            if let crate::events::TerminalEventKind::NativeEvent { event, target } = &ev.kind {
-                if event != "coverage" {
-                    continue;
-                }
-                let locus = sess.native_source_for_widget(target).filter(|_| {
-                    !(target.starts_with("src/") || target.contains(".rs:") || target.contains('/'))
-                });
-                match locus {
-                    Some(sr) => {
-                        let _ = run.record_coverage_event_with_identity(&sess.id, target, sr);
-                    }
-                    None => {
-                        let _ = run.record_coverage_event(&sess.id, target);
-                    }
-                }
-            }
-        }
-        run.set_event_cursor(&cursor_key, seq);
-    }
+    // Beta-audit P0-6: the fold's run writes go through the ONE
+    // ticket-verified fold (persistence cursor + coverage ingestion) so a
+    // run switch mid-observe drops the fold instead of spilling this
+    // session's events into the new run. The ticket is captured here —
+    // inside the actor job, at the same moment the session was authorized
+    // by with_sess's guards — one lock window, no cross-await.
+    let ticket = crate::execution::RunTicket::capture(run);
+    crate::execution::fold_session_events(sess, run, &ticket);
     Ok(screen)
 }

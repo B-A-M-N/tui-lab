@@ -107,9 +107,19 @@ fn exercise_positive(b: &mut dyn TerminalBackend, caps: &Capabilities) {
             .expect("protocol_capture=true must read the raw ring");
     }
     if caps.scrollback {
-        let rows = b
-            .scrollback_lines()
-            .expect("scrollback=true must return rows");
+        // The child (python startup) may not have printed yet when we get
+        // here — poll briefly instead of racing its startup latency
+        // (de-flake: same class as the first-byte waits elsewhere).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows = b
+                .scrollback_lines()
+                .expect("scrollback=true must return rows");
+            if !rows.is_empty() || Instant::now() > deadline {
+                break rows;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
         assert!(
             !rows.is_empty(),
             "scrollback=true must report retained lines, got none"

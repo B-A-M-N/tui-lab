@@ -287,6 +287,9 @@ async fn drive_outcome_reports_evidence_health_not_fabricated_frames() {
         let action = tui_lab::execution::CanonicalAction::Key {
             key: tui_lab::backend::KeyEvent::new(tui_lab::backend::KeyCode::Char('x')),
         };
+        // Beta-audit P0-6: the spec carries the run identity captured at
+        // authorization; every commit below verifies it.
+        let run = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
         let make_spec = || tui_lab::execution::CoreDriveSpec {
             action: &action,
             quiet_ms: 120,
@@ -297,11 +300,11 @@ async fn drive_outcome_reports_evidence_health_not_fabricated_frames() {
             guard: None,
             scenario: None,
             origin: tui_lab::execution::DriveOrigin::Act,
+            ticket: tui_lab::execution::RunTicket::capture(&run),
         };
 
         // Open run: everything commits, outcome is healthy, frames carry
         // real ids.
-        let run = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
         let ok =
             tui_lab::execution::drive_pipeline(sess, &run, make_spec()).expect("drive on open run");
         assert!(
