@@ -57,8 +57,7 @@ impl Session {
     /// (re-review P1 fix 9). Every [`crate::execution::ObservationAnchor`]
     /// created against this session gets a distinct, increasing index.
     pub fn next_anchor(&mut self) -> u64 {
-        let n = self.next_anchor_seq;
-        self.next_anchor_seq += 1;
+        let n = self.event_state.next_anchor();
         n
     }
 

@@ -12,6 +12,7 @@
 //! single [`Session`] directly).
 
 pub mod actor;
+pub(crate) mod event_state;
 pub mod isolation;
 pub mod lease;
 pub mod locator;

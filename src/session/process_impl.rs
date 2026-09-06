@@ -104,7 +104,7 @@ impl Session {
         }
         // Native event absorption restarts with the channel (re-review P1:
         // counts stay aligned across generations).
-        self.native_events_absorbed_seq = 0;
+        self.event_state.set_native_absorbed_seq(0);
         let mut effective_env = effective_env; // native channel pair may append
         if let Some(pair) = self.native.env_pair() {
             if !crate::semantic::native::env_has_channel(&effective_env) {
