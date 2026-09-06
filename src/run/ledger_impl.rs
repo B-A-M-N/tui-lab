@@ -157,10 +157,15 @@ impl RunContext {
             "journal": journal,
             // Audit P1-46: restored runs report their damage — what the
             // restorer could not bring back. Absent on fresh runs (null).
+            // Audit P0 (beta stability, finding 2): the condition was
+            // INVERTED — a damaged run reported restore:null (its warnings
+            // hidden) and only a healthy run reported
+            // {degraded:false,...}. A damaged run must surface its
+            // warnings on every status surface.
             "restore": if self.artifacts_store.restore_degraded() {
-                serde_json::Value::Null
-            } else {
                 self.restore_health()
+            } else {
+                serde_json::Value::Null
             },
         })
     }

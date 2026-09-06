@@ -1644,14 +1644,14 @@ mod tests {
         {
             let mut run = RunContext::restore(&root).expect("restore");
             assert_eq!(run.status(Vec::new())["resume_epoch"], 0);
-            run.reopen();
+            run.reopen().expect("reopen");
             assert_eq!(run.status(Vec::new())["resume_epoch"], 1);
             // Persisted BEFORE reopen returns (a crash right after must
             // still name the epoch).
             let m = crate::run::manifest::load(&root).expect("manifest");
             assert_eq!(m.resume_epoch, 1, "manifest written by reopen itself");
             assert!(!m.closed, "reopen also reopens the manifest's view");
-            run.reopen();
+            run.reopen().expect("second reopen");
         }
         let again = RunContext::restore(&root).expect("restore once more");
         assert_eq!(again.status(Vec::new())["resume_epoch"], 2);
@@ -1746,6 +1746,154 @@ mod tests {
         assert!(msg.contains("closed"), ": {msg}");
         assert!(msg.contains("resume"), "names the remedy: {msg}");
     }
+    /// Audit P0 (beta stability, finding 2): the inversion regression —
+    /// a damaged restored run must surface its damage on the STATUS
+    /// surface (not just restore_health()), and a healthy run reports
+    /// restore:null there. The old code did the exact opposite.
+    #[test]
+    fn status_surfaces_restored_damage_not_null() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        // Corrupt one persisted artifact, then restore.
+        std::fs::write(root.join("findings.json"), b"{not json").expect("corrupt");
+        let restored = RunContext::restore(&root).expect("restore despite damage");
+        let status = restored.status(Vec::new());
+        assert_eq!(
+            status["restore"]["degraded"], serde_json::json!(true),
+            "damaged restore must be degraded in status, got: {}",
+            status["restore"]
+        );
+        let warnings = status["restore"]["warnings"]
+            .as_array()
+            .expect("warnings array present");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["artifact"] == serde_json::json!("findings.json")),
+            "the damaged artifact must be named in status.restore.warnings: {warnings:?}"
+        );
+        // Control: an undamaged restored run reports null on status (the
+        // damage block is absent, not a fake clean report).
+        let (_, clean_root) = persisted_fixture(base.path());
+        let clean = RunContext::restore(&clean_root).expect("clean restore");
+        assert_eq!(
+            clean.status(Vec::new())["restore"],
+            serde_json::Value::Null,
+            "healthy restored run carries no damage block"
+        );
+    }
+
+    /// Audit P0 (beta stability, finding 1): promote is transactional —
+    /// if the initial ledger write fails, the flushed watermark does NOT
+    /// move (the evidence stays memory-committed, unflushed), and promote
+    /// returns the error instead of reporting success over unwritten
+    /// records.
+    #[test]
+    fn promote_ledger_write_failure_does_not_mark_flushed() {
+        let base = tempfile::tempdir().expect("base");
+        let mut run = RunContext::ephemeral();
+        run.set_launch_spec(
+            "s",
+            crate::session::state::LaunchSpec::new("python3", 80, 24),
+        );
+        let _ = run.record_event("s", "wait");
+        // Force the ledger write to fail: pre-create `transactions.jsonl`
+        // as a DIRECTORY so OpenOptions::open on that path errors.
+        let id = run.id().to_string();
+        let target = base
+            .path()
+            .join(".tui-lab")
+            .join("runs")
+            .join(&id)
+            .join("transactions.jsonl");
+        std::fs::create_dir_all(&target).expect("blocker dir");
+        let err = run.promote(base.path()).expect_err("promote must fail");
+        assert!(
+            err.to_string().contains("transactions.jsonl")
+                || err.to_string().contains("Is a directory")
+                || err.to_string().to_lowercase().contains("os error"),
+            "error surfaces the filesystem failure: {err}"
+        );
+        // The watermark never moved: the transaction window is still
+        // memory-only evidence (unsaved_evidence still counts it as
+        // lost-if-dropped; promotion did not silently acknowledge it).
+        let loss = run.unsaved_evidence();
+        assert_eq!(
+            loss["lost_if_dropped"].as_u64(),
+            Some(run.transactions().len() as u64),
+            "the un-promoted ledger stays memory-only: {loss}"
+        );
+        assert!(
+            loss["evidence"]["transactions"].as_u64().unwrap_or(0) > 0,
+            "transactions counted as unsaved: {loss}"
+        );
+    }
+
+    /// Audit P0 (beta stability, finding 1): close is failure-atomic — a
+    /// flush failure rolls the closed flag back, so the run stays open
+    /// and re-closeable, and close() reports the error.
+    #[test]
+    fn close_failure_keeps_the_run_open() {
+        let base = tempfile::tempdir().expect("base");
+        let mut run = RunContext::ephemeral();
+        run.set_launch_spec(
+            "s",
+            crate::session::state::LaunchSpec::new("python3", 80, 24),
+        );
+        let _ = run.record_event("s", "wait");
+        let _ = run.promote(base.path()).expect("promote");
+        // Make every flush write fail: replace the run dir with a file
+        // is too invasive; instead make the scenarios dir unwritable by
+        // creating a FILE where flush needs a DIRECTORY.
+        let dir = run.run_dir().expect("dir").to_path_buf();
+        std::fs::remove_dir_all(dir.join("scenarios")).expect("rm scenarios dir");
+        std::fs::write(dir.join("scenarios"), b"not a dir").expect("blocker file");
+        assert!(run.close().is_err(), "flush failure must fail close");
+        assert!(
+            !run.is_closed(),
+            "a failed close must roll the closed flag back"
+        );
+        // Remove the blocker: the run can still flush and close for real.
+        std::fs::remove_file(dir.join("scenarios")).expect("unblock");
+        run.close().expect("close succeeds after unblocking");
+        assert!(run.is_closed());
+    }
+
+    /// Audit P0 (beta stability, finding 1): reopen is failure-atomic —
+    /// a failed manifest write leaves the run closed at its PREVIOUS
+    /// epoch (both in memory and on disk).
+    #[test]
+    fn failed_reopen_leaves_previous_epoch() {
+        let base = tempfile::tempdir().expect("base");
+        let (_, root) = persisted_fixture(base.path());
+        let mut run = RunContext::restore(&root).expect("restore");
+        // Block the manifest write: run.json becomes a DIRECTORY (the
+        // manifest's open-for-write then fails).
+        let manifest = root.join("run.json");
+        std::fs::remove_file(&manifest).expect("rm manifest");
+        std::fs::create_dir_all(&manifest).expect("blocker dir");
+        assert!(run.reopen().is_err(), "manifest failure must fail reopen");
+        assert!(
+            run.is_closed(),
+            "a failed reopen leaves the run closed in memory"
+        );
+        assert_eq!(
+            run.status(Vec::new())["resume_epoch"],
+            serde_json::json!(0),
+            "the epoch did NOT move"
+        );
+        // The on-disk manifest is untouched (still absent, still no new
+        // epoch anywhere).
+        assert!(manifest.is_dir(), "reopen never wrote through the blocker");
+        // Unblock and reopen for real.
+        std::fs::remove_dir(&manifest).expect("unblock");
+        run.reopen().expect("reopen after unblocking");
+        assert_eq!(
+            run.status(Vec::new())["resume_epoch"],
+            serde_json::json!(1)
+        );
+    }
+
 }
 
 // W2.10 unit checks for the coverage→SourceRef join.

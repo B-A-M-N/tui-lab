@@ -93,8 +93,16 @@ impl RunContext {
     ///
     /// Returns the citable id. Persistence is incremental (one append per
     /// committed frame) so a crash keeps every frame committed before it;
-    /// a write failure marks the run `persistence_unhealthy` and the frame
-    /// still gets its id (the run ledger always holds it in memory).
+    /// a write failure marks the run `persistence_unhealthy` and propagates
+    /// as `Err` after the frame is registered in memory.
+    ///
+    /// Audit P0 (beta stability): the error is visible on both channels —
+    /// the returned `Err` names the frame id and the durable append
+    /// failure, so callers can report `memory_committed` (the id exists,
+    /// the ring holds it) distinctly from `durably_committed` (frames.jsonl
+    /// holds it). The old code marked the store unhealthy but returned
+    /// `Ok(id)`, making a generated id indistinguishable from proof of
+    /// persistence.
     pub fn commit_frame(
         &mut self,
         frame: &mut crate::backend::CanonicalFrame,
@@ -165,7 +173,12 @@ impl RunContext {
                 .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
             {
                 Ok(()) => {}
-                Err(_) => self.artifacts_store.mark_unhealthy(),
+                Err(e) => {
+                    self.artifacts_store.mark_unhealthy();
+                    return Err(anyhow::anyhow!(e).context(format!(
+                        "durable frame append failed for frame {id} (committed in memory; run persistence is unhealthy)"
+                    )));
+                }
             }
         }
         Ok(id)
