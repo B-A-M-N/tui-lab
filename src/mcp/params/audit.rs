@@ -13,8 +13,11 @@ selector_enum!(
     /// `contract` (Wave E) folds conformance into findings. `unicode`,
     /// `controls`, `rendering`, `input_protocol`, `shell_cli`, `lifecycle`
     /// and `terminal_modes` (Wave 3) are frame-level subsystem audits over
-    /// the raw ring / one fused frame; `query_response` sends one device
-    /// query (CSI 6n) and verifies the CPR answer. `lifecycle_exit` runs a
+    /// the raw ring / one fused frame; `query_response` probes the
+    /// ENGINE-side device-query responder (a `CSI 6n` fed through the live
+    /// parser; the composed CPR answer is verified against the live
+    /// cursor) — nothing is written to the child's input, which is why it
+    /// stays lease-safe. `lifecycle_exit` runs a
     /// real teardown audit: it EXITS and relaunches the target, so it
     /// additionally requires `allow_process_restart=true` (never implied
     /// by `allow_mutation`) and is never part of `profile=full`.

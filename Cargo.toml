@@ -2,10 +2,19 @@
 name = "tui-lab"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.92" # verified: cargo +1.92 build (older trackers untested)
 description = "Agent-native TUI instrumentation, testing, exploration, and UX evaluation harness (MCP server)"
 license = "MIT"
+repository = "https://github.com/nousresearch/hermes-tui-lab"
+readme = "README.md"
+keywords = ["tui", "terminal", "testing", "mcp", "agent"]
+categories = ["development-tools::testing", "command-line-utilities"]
 
 [[bin]]
+# Installed under the `hermes-` prefix so the binary never shadows an
+# unrelated `tui-lab` executable on PATH; the crate/binary naming
+# relationship is deliberate (finding 17): `cargo install tui-lab`
+# provides `hermes-tui-lab`.
 name = "hermes-tui-lab"
 path = "src/main.rs"
 
@@ -41,10 +50,10 @@ serde_yaml = "0.9"
 
 [features]
 default = []
-# INTENT marker only (audit P1-53): no code is gated on this today — it does
-# NOT mean Microsoft tui-test is a supported backend. Remove or implement;
-# do not advertise.
-tui_test_backend = []
+# Removed (finding 17): `tui_test_backend` was an intent marker with no
+# code gated on it — advertising an unsupported backend name is worse
+# than not having the flag. If Microsoft tui-test stabilizes, reintroduce
+# the feature WITH its gated implementation.
 
 [dev-dependencies]
 tempfile = "3"

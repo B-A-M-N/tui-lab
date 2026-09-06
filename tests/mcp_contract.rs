@@ -1031,3 +1031,33 @@ fn tui_act_completion_field_resolves_to_policy() {
         Some(tui_lab::capture::CompletionPolicy::ProcessExit)
     ));
 }
+
+// Finding 16 (docs parity): the README's hand-written tool sections must
+// cover every tool the capability registry declares. The registry is the
+// contract; this test keeps the human documentation from drifting behind
+// it — a new registered tool without a README section fails here, with
+// the missing names in the message.
+#[test]
+fn readme_documents_every_registered_tool() {
+    let readme = match std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")) {
+        Ok(r) => r,
+        // README absent in an exotic checkout: nothing to keep in parity.
+        Err(_) => return,
+    };
+    let missing: Vec<&str> = tui_lab::mcp::registry::TOOLS
+        .iter()
+        .map(|t| t.name)
+        .filter(|name| {
+            // A `### <tool>` section header (also matched inline in the
+            // generated skill doc) is what "documented" means here.
+            !readme.contains(&format!("### {name}\n"))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "README tool sections drifted from the registry — no `### <tool>` \
+         section for: {missing:?}. Add prose sections (or regenerate from \
+         registry::TOOLS); the registry is the contract, the README must \
+         not underdescribe the product."
+    );
+}
