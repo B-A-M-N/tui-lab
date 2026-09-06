@@ -334,18 +334,9 @@ pub(crate) async fn tui_intent(
             let plan_id = {
                 let mut plans = intent_plans.lock().unwrap();
                 let id = format!("plan-{}", uuid::Uuid::new_v4().simple());
-                if plans.len() >= crate::mcp::tools::INTENT_PLAN_CAP {
-                    if let Some(oldest) = plans
-                        .iter()
-                        .min_by_key(|(_, t)| t.created)
-                        .map(|(k, _)| k.clone())
-                    {
-                        plans.remove(&oldest);
-                    }
-                }
-                plans.insert(
+                plans.store(
                     id.clone(),
-                    crate::mcp::tools::IntentPlanTicket {
+                    crate::mcp::ownership::IntentPlanTicket {
                         control_id: plan.control.id.clone(),
                         created: std::time::Instant::now(),
                     },
@@ -419,7 +410,7 @@ pub(crate) async fn tui_intent(
         // expired plan_ids refuse too (plans are server-side state with a
         // bounded lifetime).
         if let Some(want) = p.plan_id.as_deref() {
-            match intent_plans.lock().unwrap().remove(want) {
+            match intent_plans.lock().unwrap().consume(want) {
                 Some(stored) => {
                     let fresh_id = plan_json["control"]["id"].as_str().unwrap_or_default();
                     if stored.control_id != fresh_id {
