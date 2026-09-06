@@ -14,6 +14,7 @@
 use crate::screen::ScreenState;
 use std::time::Duration;
 
+pub mod input;
 pub mod line_cli;
 pub mod line_types;
 pub mod pipe;
