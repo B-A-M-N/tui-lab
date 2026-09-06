@@ -4,7 +4,7 @@
 //! (frames land, the declared tree merges over inference), not
 //! configuration (an env var was exported). The probe is shared library
 //! code (`diagnostic::native_cooperation_probe`), so these tests exercise
-//! exactly what `hermes-tui-lab doctor` runs:
+//! exactly what `tui-lab doctor` runs:
 //!
 //! * the happy path against the shipped cooperative fixture;
 //! * the honest-failure paths (a silent channel is NOT cooperation);
@@ -81,7 +81,7 @@ fn probe_distinguishes_silence_from_cooperation() {
 /// subsystems (now including native cooperation) are operational.
 #[test]
 fn doctor_binary_reports_native_cooperation_and_exits_zero() {
-    let bin = env!("CARGO_BIN_EXE_hermes-tui-lab");
+    let bin = env!("CARGO_BIN_EXE_tui-lab");
     let out = Command::new(bin)
         .arg("doctor")
         .output()
@@ -114,7 +114,7 @@ fn doctor_binary_reports_native_cooperation_and_exits_zero() {
 /// its own failure).
 #[test]
 fn doctor_without_python3_skips_the_tier_with_a_warn() {
-    let bin = env!("CARGO_BIN_EXE_hermes-tui-lab");
+    let bin = env!("CARGO_BIN_EXE_tui-lab");
     // A PATH that almost certainly lacks python3: an empty scratch dir.
     let scratch = tempfile::tempdir().expect("scratch");
     let out = Command::new(bin)

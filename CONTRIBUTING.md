@@ -1,10 +1,10 @@
-# Contributing to hermes-tui-lab
+# Contributing to tui-lab
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/nousresearch/hermes-tui-lab
-cd hermes-tui-lab
+git clone https://github.com/nousresearch/tui-lab
+cd tui-lab
 cargo build
 cargo test
 ```

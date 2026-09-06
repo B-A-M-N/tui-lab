@@ -5,17 +5,15 @@ edition = "2021"
 rust-version = "1.92" # verified: cargo +1.92 build (older trackers untested)
 description = "Agent-native TUI instrumentation, testing, exploration, and UX evaluation harness (MCP server)"
 license = "MIT"
-repository = "https://github.com/nousresearch/hermes-tui-lab"
+repository = "https://github.com/nousresearch/tui-lab"
 readme = "README.md"
 keywords = ["tui", "terminal", "testing", "mcp", "agent"]
 categories = ["development-tools::testing", "command-line-utilities"]
 
 [[bin]]
-# Installed under the `hermes-` prefix so the binary never shadows an
-# unrelated `tui-lab` executable on PATH; the crate/binary naming
-# relationship is deliberate (finding 17): `cargo install tui-lab`
-# provides `hermes-tui-lab`.
-name = "hermes-tui-lab"
+# Binary name matches the crate (user request): `cargo install tui-lab`
+# provides the `tui-lab` executable.
+name = "tui-lab"
 path = "src/main.rs"
 
 [dependencies]
