@@ -408,7 +408,7 @@ async fn verify_finding(
                 .clone()
                 .unwrap_or_else(|| finding_snapshot.id.clone());
             let result = s
-                .with_sess(p.id.as_deref(), move |sess| {
+                .with_sess_authorized(p.id.as_deref(), move |sess, _ticket| {
                     if let Some(refused) = lease_refused(sess) {
                         return Err(refused);
                     }

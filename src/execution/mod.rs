@@ -39,6 +39,6 @@ pub use guard::MutationGuard;
 pub mod drive;
 pub use drive::{
     act_request_json, drive as drive_pipeline, fold_session_events,
-    DriveOutcome as CoreDriveOutcome, DriveSpec as CoreDriveSpec, RunTicket,
+    DriveOutcome as CoreDriveOutcome, DriveSpec as CoreDriveSpec, RunEvidenceSink, RunTicket,
     ScenarioCapture as CoreScenarioCapture,
 };

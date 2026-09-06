@@ -19,12 +19,14 @@ pub(crate) async fn check_contract_against(
     let run = s.run.clone();
     let mode = mode_override;
     match s
-        .with_sess(selector.as_deref(), move |sess| {
+        .with_sess_authorized(selector.as_deref(), move |sess, _ticket| {
             // Conformance drives the app (declared keys, resizes,
             // Escape/Tab probes); the human control lease (item 76)
             // refuses it like any other driving path. The closure's
             // Result discriminates lease-refusal (left) from the
-            // engine result (right).
+            // engine result (right). Beta-audit P0-7: the installed
+            // evidence sink commits every conformance probe's
+            // transaction through the canonical pipeline.
             if let Some(refused) = lease_refused(sess) {
                 return Err(refused);
             }
@@ -67,7 +69,7 @@ pub(crate) async fn check_contract_inner(
     let selector = id.map(str::to_string);
     let mode = mode_override;
     match s
-        .with_sess(selector.as_deref(), move |sess| {
+        .with_sess_authorized(selector.as_deref(), move |sess, _ticket| {
             // Same lease rule as check_contract_against (item 76).
             if let Some(refused) = lease_refused(sess) {
                 return Err(refused);

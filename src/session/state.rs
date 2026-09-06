@@ -256,6 +256,14 @@ pub struct Session {
     /// Wave G item 77: what the current generation's launch actually got
     /// (profile, network isolation, env policy) — evidence, not a promise.
     isolation_evidence: Option<crate::session::isolation::IsolationEvidence>,
+    /// Beta-audit P0-7: the run evidence sink installed by authorized
+    /// dispatch (`with_sess_authorized`). When present, every transaction
+    /// the canonical executor produces commits through it — frames, run
+    /// ledger, event/coverage fold — so every driving path (act, intent,
+    /// scenario, exploration, audit drivers, repro, conformance, probe)
+    /// shares ONE commit pipeline instead of each remembering a subset.
+    /// Set/cleared per authorized job; never serialized.
+    evidence_sink: Option<std::sync::Arc<crate::execution::RunEvidenceSink>>,
 }
 
 /// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`]
@@ -343,6 +351,7 @@ impl Session {
             native: crate::semantic::native::NativeChannel::default(),
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
+            evidence_sink: None,
         };
         s.attach_session_hook();
         s

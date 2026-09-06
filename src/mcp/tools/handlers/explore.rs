@@ -83,7 +83,7 @@ pub(crate) async fn tui_explore(
     // only read state and stay allowed — they were filtered above (the
     // StateGraph early-return) and need no session at all.
     let lease_gates_driving = matches!(emode, EM::Random | EM::Semantic);
-    s.with_sess(selector.as_deref(), move |sess| {
+    s.with_sess_authorized(selector.as_deref(), move |sess, _ticket| {
         let p = explore;
         if lease_gates_driving {
             if let Some(refused) = lease_refused(sess) {
@@ -166,16 +166,20 @@ pub(crate) async fn tui_explore(
                         )
                     }
                 };
-                // Audit finding 22: the explorer's transactions enter the
-                // canonical run ledger — the graph summary below stays the
+                // Audit finding 22 + beta-audit P0-7: the explorer's
+                // transactions enter the canonical run ledger through the
+                // session's installed evidence sink — one commit per act,
+                // the run lock held briefly per commit, never across the
+                // exploration loop (the old run-guard-held-through-driving
+                // pattern self-deadlocked and blocked the run for every
+                // other reader). The graph summary below stays the
                 // exploration view, the ledger the evidence view.
-                let mut run_guard = run.lock().unwrap();
                 match crate::exploration::random::run_evidenced(
                     sess,
                     seed,
                     budget,
                     recording_path,
-                    Some(&mut run_guard),
+                    None,
                 ) {
                     Ok(report) => {
                         // The state graph records WHAT ACTUALLY HAPPENED
@@ -183,23 +187,17 @@ pub(crate) async fn tui_explore(
                         // ordered ExplorationStep records (before → after via
                         // the real action), not from post-hoc hash lists.
                         let graph_summary = {
+                            let mut run = run.lock().unwrap();
                             crate::exploration::random::record_steps(
-                                &mut run_guard.graphs_mut().state_graph,
+                                &mut run.graphs_mut().state_graph,
                                 &report.steps,
                             );
                             json!({
-                                "states": run_guard.graphs().state_graph.state_count(),
-                                "transitions": run_guard.graphs().state_graph.transition_count(),
-                                "dead_ends": run_guard.graphs().state_graph.find_dead_ends().len(),
+                                "states": run.graphs().state_graph.state_count(),
+                                "transitions": run.graphs().state_graph.transition_count(),
+                                "dead_ends": run.graphs().state_graph.find_dead_ends().len(),
                             })
                         };
-                        // RELEASE run_guard BEFORE taking the run lock again:
-                        // the persist block below re-locks `run`, and
-                        // minimize_crash_finding locks `self.run` internally.
-                        // Holding a std::sync::MutexGuard across either (both
-                        // non-reentrant) self-deadlocks the server — the map
-                        // is a value now; nothing below needs the guard.
-                        drop(run_guard);
                         // Persist the graph when the run is persistent.
                         let graph_path = {
                             let run = run.lock().unwrap();
@@ -258,14 +256,13 @@ pub(crate) async fn tui_explore(
                 };
                 let max_actions = p.actions.unwrap_or(20);
                 // Local graphs during the loop (session I/O must not hold
-                // the run lock); merged into the run after.
+                // the run lock); merged into the run after. The ledger side
+                // (audit finding 22 + beta-audit P0-7) rides the session's
+                // installed evidence sink — one ticket-verified commit per
+                // act, no run guard held across driving.
                 let mut local_graph =
                     crate::exploration::state_graph::StateGraph::new(graph_budget.clone());
                 let mut focus_graph = crate::semantic::focus_graph::FocusGraph::new();
-                // Audit finding 22: the run ledger rides INTO the explorer
-                // so each executed action's transaction lands in the
-                // canonical evidence store as it happens, not as a summary.
-                let mut run_guard = run.lock().unwrap();
                 let report = match crate::exploration::semantic::run_evidenced(
                     sess,
                     &mut local_graph,
@@ -274,15 +271,16 @@ pub(crate) async fn tui_explore(
                     max_actions,
                     max_risk,
                     contract.as_ref(),
-                    Some(&mut run_guard),
+                    None,
                 ) {
                     Ok(r) => r,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
                 // Merge what actually happened into the run's graphs.
                 {
-                    run_guard.graphs_mut().state_graph.merge(&local_graph);
-                    run_guard.graphs_mut().focus_graph.merge(&focus_graph);
+                    let mut run = run.lock().unwrap();
+                    run.graphs_mut().state_graph.merge(&local_graph);
+                    run.graphs_mut().focus_graph.merge(&focus_graph);
                 }
                 ok(json!({
                     "mode": "semantic",

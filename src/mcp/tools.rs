@@ -197,13 +197,20 @@ impl TuiLabServer {
         // the commit-time verify catches even that: the ticket names the
         // run this job was authorized under AS OF the authorization
         // locks, and any later commit into a different id refuses.
-        let ticket = {
-            let run = self.run.lock().unwrap();
-            crate::execution::RunTicket {
-                run_id: run.id().to_string(),
-            }
-        };
-        self.with_sess(id, move |sess| job(sess, ticket)).await
+        let sink = crate::execution::RunEvidenceSink::capture(&self.run);
+        let ticket = sink.ticket().clone();
+        // Beta-audit P0-7: the sink rides the SESSION for the job's whole
+        // actor turn, so every transaction the canonical executor produces
+        // inside it — including from paths that never see the run Arc
+        // (audit drivers, exploration, conformance, repro) — commits
+        // through the ONE ticket-verified pipeline.
+        self.with_sess(id, move |sess| {
+            sess.install_evidence_sink(sink);
+            let out = job(sess, ticket);
+            sess.take_evidence_sink();
+            out
+        })
+        .await
     }
 
     /// Bind a freshly launched session to the current run, and its owner on
