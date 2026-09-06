@@ -17,6 +17,7 @@ pub mod isolation;
 pub mod lease;
 pub mod locator;
 pub(crate) mod observation;
+pub(crate) mod recording_state;
 pub mod scratch;
 pub mod state;
 

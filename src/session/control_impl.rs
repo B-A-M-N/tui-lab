@@ -67,17 +67,9 @@ impl Session {
     /// synchronously on the calling thread inside `send_input`, so a guard
     /// flag set/cleared around the send is race-free.
     pub fn send_unrecorded(&mut self, input: crate::backend::Input) -> anyhow::Result<()> {
-        if let Some(rec) = &self.recorder {
-            if let Ok(mut r) = rec.lock() {
-                r.suppress_input();
-            }
-        }
+        self.recording.suppress_input_only();
         let result = self.backend.send_input(input);
-        if let Some(rec) = &self.recorder {
-            if let Ok(mut r) = rec.lock() {
-                r.resume_input();
-            }
-        }
+        self.recording.resume_input_only();
         result.map_err(anyhow::Error::from)
     }
 
