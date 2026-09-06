@@ -1,5 +1,7 @@
 //! tui_explore: random/semantic exploration and graphs.
 
+pub(crate) mod crash_finding;
+
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, lease_refused, ok};
 use crate::mcp::params::*;
@@ -220,7 +222,8 @@ pub(crate) async fn tui_explore(
                         // minimization pipeline — clean restart, delta-debug
                         // replay, saved Scenario, Finding with
                         // reproduction=scenario_id.
-                        let repro = server.minimize_crash_finding(sess, seed, &report);
+                        let repro =
+                            crash_finding::minimize_crash_finding(&server, sess, seed, &report);
                         ok(json!({
                             "seed": seed,
                             "report": report,
