@@ -293,3 +293,35 @@ event clock, protocol callbacks, emulator, process) plus its canonical
 byte-ingestion point preserved throughout (invariant 4); no new locks
 (invariant 15); the `QueryClass` serialization keeps on-disk event
 formats byte-identical (invariant 13).
+
+### G3 (2026-09-05) — typed TerminalBackend surfaces replace session downcasts
+
+Commit 90d7017: four typed optional trait methods with honest defaults —
+`last_query_answer()` → `(None, 0)`, `probe_query_response()` →
+`(None, empty)`, `screen_changes_since()` → empty, `separated_streams()`
+→ `(empty, empty)`. PortablePtyBackend overrides the first three; the
+pipe engine overrides `separated_streams` (the one engine with genuine
+stdout/stderr separation). The session layer's four downcasts to
+concrete engine types disappear; the pipe backend's
+`stdout_lines_pub`/`stderr_lines_pub` downcast-hook accessors are
+superseded and removed.
+
+### G4 progress (2026-09-05) — Session internal composition
+
+Same cadence. Session stays ONE actor-owned object (the plan's
+constraint); its flat state bucket becomes cohesive holders:
+
+| Commit | Holder | Fields moved |
+| --- | --- | --- |
+| fef3cbb | `observation::ObservationState` | last + previous; `advance()` makes the promote-then-install pairing atomic (the old double-take spurious-ProcessStarted bug class cannot recur) |
+| 011e485 | `event_state::SessionEventState` | event queue, per-consumer cursors, anchor counter, query-answer + native-absorption watermarks. The `Arc<Mutex<>>` ingest queue + recorder slot stay on Session (shared with the reader-thread hook at attach time) |
+| 56d69d3 | `recording_state::RecordingState` | recorder sink + record_input; suppression-gate policy (all/input-only) is holder policy. Hook slot + hook recorder interior stay on Session (swapping them would break the attached hook) |
+| ba53bae | `semantic_state::SemanticState` | semantic cache, fused memo (item 52), memo hits, FusedMemo + fused_key. RefCell/Cell interior mutability unchanged; fuse + native channel stay outside |
+
+Remaining Session fields are each deliberate: identity/command/generation
+(the actor-owned subject), the backend itself, the capabilities snapshot,
+the two hook-shared slots, the native side channel, the human lease
+(`LeaseState` was already a cohesive domain type), and the isolation
+evidence. No new locks anywhere (invariant 15) — every holder is plain
+state behind the actor's single-threaded ownership. observe() remains the
+compositional orchestrator.
