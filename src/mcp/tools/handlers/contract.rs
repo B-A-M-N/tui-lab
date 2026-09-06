@@ -1,6 +1,8 @@
 //! tui_contract: project-contract load/validate/compare/scaffold.
 
-use super::super::{contract_mode_override, diff_contract_reports};
+pub(crate) mod check;
+
+use check::{contract_mode_override, diff_contract_reports};
 use crate::audit::{Category, Severity};
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, ok};
@@ -140,7 +142,7 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
-            s.check_contract_against(p.id.as_deref(), contract, mode_override)
+            check::check_contract_against(s, p.id.as_deref(), contract, mode_override)
                 .await
         }
         // ── compare: run conformance now, diff against the baseline ──
@@ -161,9 +163,13 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
-            let current = match s
-                .check_contract_inner(p.id.as_deref(), contract.clone(), mode_override)
-                .await
+            let current = match check::check_contract_inner(
+                s,
+                p.id.as_deref(),
+                contract.clone(),
+                mode_override,
+            )
+            .await
             {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => return err(ErrorCategory::BackendError, e.to_string()),
@@ -428,9 +434,13 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
-            let report = match s
-                .check_contract_inner(p.id.as_deref(), contract, mode_override)
-                .await
+            let report = match check::check_contract_inner(
+                s,
+                p.id.as_deref(),
+                contract,
+                mode_override,
+            )
+            .await
             {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => return err(ErrorCategory::BackendError, e.to_string()),
