@@ -219,3 +219,43 @@ destructive replacement. 9. Session→run provenance unbypassable.
 12. Ephemeral→persistent promotion preserves state. 13. Serialization formats unchanged.
 14. Human lease check stays at the central driving boundary. 15. No new lock just because
 a struct became its own type.
+
+### G1 progress (2026-09-05) — COMPLETE
+
+Eight commits, one per holder, each keeping every public signature and
+caller compiling unchanged (the plan's acceptance condition):
+
+| Commit | Holder | Fields moved |
+| --- | --- | --- |
+| cc0c610 | `contract_state::ContractState` | contract, contract path, contract baselines |
+| 3213278 | `finding_store::FindingStore` | findings, finding baselines |
+| 77e8edc | `evidence_store::EvidenceStore` | transactions+count+dropped+first_seq, event count+held+flushed, frame ids+hot ring+evicted (internally: TransactionLedger / FrameLedger / EventLedger; event_cursors joined in 076e450) |
+| 076e450 | `coverage_state::CoverageState` | coverage ledger, coverage seq, delta cursor (cursor is coverage policy, not run bookkeeping) |
+| 4a8bd2a | `identity::{RunIdentity, RunSessionRegistry}` | id, started_at, closed, resume_epoch; session launch specs + primary |
+| ae7fd4b | `graph_state::RunGraphs` | focus_transitions, focus_graph, state_graph |
+| b57c2c4 | `scenario_store::ScenarioStore` | recorders, saved_scenarios, scenario_names (name-index invariant is store policy) |
+| a3c82e2 | `artifact_store::ArtifactStore` | artifacts registry, held recordings/captures, journal, ledger_flushed_upto, persistence_unhealthy, restore_warnings |
+
+`RunContext` is now a composition root over the plan's holders — a dozen
+fields, each a cohesive state domain — down from ~35 flat fields. The
+only plain field kept outside a holder is `run_dir` (the artifact-root
+PATH): promote/restore rewrite it directly and half the IO paths read
+it; everything it governs (journal, registry, media holds, health,
+damage) lives in the store.
+
+Deviations from the plan text, both deliberate:
+- event_cursors went to the evidence store's EventLedger (the plan's
+  "leave generic event cursors in the evidence/event store").
+- the plan's `RunArtifactStore` field list included run_dir; the path
+  itself stayed on the facade (see a3c82e2 rationale).
+
+Invariants re-checked at each commit: no new locks (each holder is plain
+state behind the existing one run mutex), on-disk formats byte-identical
+(run.json, transactions.jsonl, events/*.jsonl, frames.jsonl, coverage.json,
+findings.json, scenarios/*.json, state_graph.json, focus_graph*.json),
+eviction stays declared, scenario identity stays ID-based, close stays
+evidence-final, restore adopts through holder-level adopt/insert paths.
+
+Full suite green at every commit (33 suites; two known load-flaky PTY
+timing tests, documented at 77e8edc, fail only under full-matrix
+parallel load and pass in isolation).
