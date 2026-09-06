@@ -456,14 +456,9 @@ impl Session {
     /// the monotonic answered counter, so repeated calls between pumps are
     /// idempotent. `None` from engines without a responder changes nothing.
     fn absorb_query_answers(&mut self) {
-        // Downcast through the one engine shape that answers queries; other
-        // engines honestly never report answers.
-        let any = self.backend.as_any_mut();
-        let Some(port) = any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>()
-        else {
-            return;
-        };
-        let (class, answered_seq) = port.last_query_answer();
+        // G3: typed optional trait method; engines without a responder
+        // honestly never report answers.
+        let (class, answered_seq) = self.backend.last_query_answer();
         if let Some(class) = class {
             if answered_seq > self.last_query_answered_seq {
                 self.last_query_answered_seq = answered_seq;

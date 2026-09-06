@@ -158,11 +158,9 @@ impl Session {
     /// `(class, answered_counter)`; `(None, 0)` from engines without a
     /// responder. Measured at the `write_input` that delivered the bytes.
     pub fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
-        let any = self.backend.as_any_mut();
-        match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
-            Some(port) => port.last_query_answer(),
-            None => (None, 0),
-        }
+        // G3: typed optional trait method — engines without a responder
+        // return the honest `(None, 0)` default.
+        self.backend.last_query_answer()
     }
 
     /// Item 22: measured conformance probe — feed `query` through the same
@@ -171,37 +169,23 @@ impl Session {
     /// enters the output ring. `(None, empty)` from engines without a
     /// responder.
     pub fn probe_query_response(&mut self, query: &[u8]) -> (Option<&'static str>, Vec<u8>) {
-        let any = self.backend.as_any_mut();
-        match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
-            Some(port) => port.probe_query_response(query),
-            None => (None, Vec::new()),
-        }
+        self.backend.probe_query_response(query)
     }
 
     /// Item 26: `(screen_seq, unix_ms)` for every screen change at/after
     /// `after_seq`, oldest first — the measured evidence for an action's
     /// first-frame latency. Empty when no change was observed.
     pub fn screen_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
-        let any = self.backend.as_any_mut();
-        match any.downcast_mut::<crate::backend::portable_pty::PortablePtyBackend>() {
-            Some(port) => port.screen_changes_since(after_seq),
-            None => Vec::new(),
-        }
+        self.backend.screen_changes_since(after_seq)
     }
 
     /// Wave-2 (streams): the pipe engine's genuine stdout/stderr line
     /// separation. Returns `(stdout, stderr)`; `(empty, empty)` on engines
     /// that interleave by construction.
     pub fn pipe_streams(&mut self) -> (Vec<String>, Vec<String>) {
-        // Downcast through the known engine shape: the pipe backend is
-        // uniquely reachable here (BackendKind::Pipe gates the caller).
-        let any = self.backend.as_any_mut();
-        if let Some(pipe) = any.downcast_mut::<crate::backend::pipe::PipeBackend>() {
-            // Safe interior path: pump + clone the stores.
-            (pipe.stdout_lines_pub(), pipe.stderr_lines_pub())
-        } else {
-            (Vec::new(), Vec::new())
-        }
+        // G3: typed optional trait method — the pipe engine overrides it;
+        // interleaving engines return the honest `(empty, empty)` default.
+        self.backend.separated_streams()
     }
 
     /// Overlay the latest native snapshot onto an inferred semantic tree,
