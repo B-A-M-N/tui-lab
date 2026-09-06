@@ -309,30 +309,10 @@ pub struct PortablePtyBackend {
     // Wave G item 77: clear the inherited env before applying pairs at the
     // next start() (clean/strict isolation profiles).
     clear_env_on_start: bool,
-    // Event sequencing state (spec section 1).
-    output_seq: u64,
-    screen_seq: u64,
-    content_seq: u64,
-    bell_seq: u64,
-    title_seq: u64,
-    /// Item 22: the most recent responder answer that was actually written
-    /// back to the PTY (class + its monotonic answer counter). Read by the
-    /// session layer after a pump to fold measured query/answer events.
-    last_query_class: Option<&'static str>,
-    last_query_answered_seq: u64,
-    last_output_at_ms: u64,
-    last_screen_change_at_ms: u64,
-    /// Item 26: bounded log of `(screen_seq, unix_ms)` at each screen
-    /// change, so an action's FIRST frame instant is measurable even when
-    /// several changes followed it (the scalar `last_screen_change_at_ms`
-    /// only remembers the last). Capped; on overflow the head is dropped.
-    screen_change_log: Vec<(u64, u64)>,
-    // Monotonic Instants for fine-grained wait timing (monotonic clock,
-    // unlike SystemTime which can jump). These are updated in `pump()`
-    // whenever the corresponding event occurs.
+    // Event sequencing state (spec section 1): counters, stamps, the
+    // bounded per-change log, and query-answer bookkeeping (G2).
+    events: super::event_clock::BackendEventClock,
     child_pid: Option<u32>,
-    last_output_instant: Instant,
-    last_screen_change_instant: Instant,
     /// Item 48: the normalization policy applied when building structure
     /// hashes. Defaults to the built-in conservative classes; a loaded
     /// contract's `volatile_patterns` are merged in via
@@ -355,7 +335,6 @@ pub struct PortablePtyBackend {
 
 impl PortablePtyBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
-        let now = Instant::now();
         PortablePtyBackend {
             cols,
             rows,
@@ -368,19 +347,8 @@ impl PortablePtyBackend {
             recording_slot: new_recording_hook_slot(),
             reader_recording_hook: None,
             clear_env_on_start: false,
-            output_seq: 0,
-            screen_seq: 0,
-            content_seq: 0,
-            bell_seq: 0,
-            title_seq: 0,
-            last_query_class: None,
-            last_query_answered_seq: 0,
-            last_output_at_ms: 0,
-            last_screen_change_at_ms: 0,
-            screen_change_log: Vec::new(),
+            events: super::event_clock::BackendEventClock::new(),
             child_pid: None,
-            last_output_instant: now,
-            last_screen_change_instant: now,
             normalization_policy: std::sync::Arc::new(crate::screen::NormalizationPolicy::default()),
             scrollback_cache: Vec::new(),
             scrollback_seen: false,
@@ -420,9 +388,7 @@ impl PortablePtyBackend {
             // child's real bytes, before the parser interprets them.
             self.absorb_raw(chunk);
             self.parser.process(chunk);
-            self.output_seq += 1;
-            self.last_output_at_ms = now_ms();
-            self.last_output_instant = Instant::now();
+            self.events.on_output();
         }
         // Wave F item 56: write back any query responses the callbacks
         // produced (DA/DSR/DECRQM/kitty ?u/OSC color reports). A real
@@ -439,8 +405,7 @@ impl PortablePtyBackend {
             {
                 let cb = self.parser.callbacks_mut();
                 if let Some(class) = cb.pending_class.take() {
-                    self.last_query_class = Some(class);
-                    self.last_query_answered_seq = cb.answered_seq;
+                    self.events.note_query_answered(class, cb.answered_seq);
                 }
             }
         }
@@ -448,20 +413,13 @@ impl PortablePtyBackend {
         let after_fp = self.interaction_fingerprint();
         // content_seq bumps when text changed
         if before_contents != after_contents {
-            self.content_seq += 1;
+            self.events.bump_content();
         }
         // screen_seq bumps when the fingerprint changed (text or style)
         if before_fp != after_fp {
-            self.screen_seq += 1;
-            self.last_screen_change_at_ms = now_ms();
-            self.last_screen_change_instant = Instant::now();
+            self.events.bump_screen();
             // Item 26: record the change for per-action first-frame latency.
-            const SCREEN_CHANGE_LOG_CAP: usize = 256;
-            if self.screen_change_log.len() == SCREEN_CHANGE_LOG_CAP {
-                self.screen_change_log.remove(0);
-            }
-            self.screen_change_log
-                .push((self.screen_seq, self.last_screen_change_at_ms));
+            self.events.on_screen_change();
         }
         // Wave F item 53: materialize the parser's scrollback rows so
         // search/observe read plain strings without touching the parser's
@@ -588,7 +546,7 @@ impl PortablePtyBackend {
     /// bumps at the `write_input` that delivered the bytes.
     pub fn last_query_answer(&mut self) -> (Option<&'static str>, u64) {
         let _ = self.pump();
-        (self.last_query_class, self.last_query_answered_seq)
+        self.events.last_query_answer()
     }
 
     /// Item 26: `(screen_seq, unix_ms)` for every screen change at/after
@@ -597,11 +555,7 @@ impl PortablePtyBackend {
     /// `after_seq`.
     pub fn screen_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
         let _ = self.pump();
-        self.screen_change_log
-            .iter()
-            .filter(|(seq, _)| *seq > after_seq)
-            .copied()
-            .collect()
+        self.events.changes_since(after_seq)
     }
 
     /// Item 22: measured conformance probe. Feed `query` through the SAME
@@ -654,12 +608,7 @@ impl PortablePtyBackend {
     /// `state()`, `wait()` and `send_input`).
     fn sync_parser_counters(&mut self) {
         let cb = self.parser.callbacks();
-        if cb.audible_bells > self.bell_seq {
-            self.bell_seq = cb.audible_bells;
-        }
-        if cb.title_seq > self.title_seq {
-            self.title_seq = cb.title_seq;
-        }
+        self.events.sync_counters(cb.audible_bells, cb.title_seq);
     }
 
     fn current_modes(&self) -> InputModes {
@@ -702,7 +651,7 @@ impl PortablePtyBackend {
     /// compares against it so "any observable change" is a real superset of
     /// "screen change", including bell-only and title-only reactions.
     fn interaction_seq(&self) -> u64 {
-        self.screen_seq + self.bell_seq + self.title_seq
+        self.events.interaction_seq()
     }
 }
 
@@ -842,24 +791,13 @@ impl TerminalBackend for PortablePtyBackend {
         self.master = Some(pair.master);
         self.child = Some(child);
         self.writer = Some(writer);
-        self.output_seq = 0;
-        self.screen_seq = 0;
-        self.content_seq = 0;
-        self.bell_seq = 0;
-        self.title_seq = 0;
-        self.last_query_class = None;
-        self.last_query_answered_seq = 0;
-        self.last_output_at_ms = 0;
-        self.last_screen_change_at_ms = 0;
-        self.screen_change_log.clear();
-        // A new child stream is a new output stream: offsets restart.
+        // A new child stream is a new output stream: counters and offsets
+        // restart.
+        self.events.clear();
         self.raw.clear();
         self.scrollback_cache.clear();
         self.scrollback_seen = false;
         self.parser.callbacks_mut().query_responses.clear();
-        let now = Instant::now();
-        self.last_output_instant = now;
-        self.last_screen_change_instant = now;
         self.child_pid = self.child.as_ref().and_then(|c| c.process_id());
 
         // give the process a moment to emit initial frame
@@ -900,12 +838,7 @@ impl TerminalBackend for PortablePtyBackend {
         // Track bell/title sequence deltas from callbacks.
         {
             let cb = self.parser.callbacks();
-            if cb.audible_bells > self.bell_seq {
-                self.bell_seq = cb.audible_bells;
-            }
-            if cb.title_seq > self.title_seq {
-                self.title_seq = cb.title_seq;
-            }
+            self.events.sync_counters(cb.audible_bells, cb.title_seq);
         }
         let title = self.parser.callbacks().title.clone();
         let process = self.process();
@@ -1097,10 +1030,7 @@ impl TerminalBackend for PortablePtyBackend {
             WaitCond::Bell {
                 after_bell_seq: Some(seq),
             } => seq.saturating_sub(1),
-            WaitCond::Bell {
-                after_bell_seq: None,
-            } => self.bell_seq,
-            _ => self.bell_seq,
+            _ => self.events.bell_seq(),
         };
         let baseline_interaction_seq = self.interaction_seq();
 
@@ -1117,12 +1047,7 @@ impl TerminalBackend for PortablePtyBackend {
             // Track bell/title edges.
             {
                 let cb = self.parser.callbacks();
-                if cb.audible_bells > self.bell_seq {
-                    self.bell_seq = cb.audible_bells;
-                }
-                if cb.title_seq > self.title_seq {
-                    self.title_seq = cb.title_seq;
-                }
+                self.events.sync_counters(cb.audible_bells, cb.title_seq);
             }
 
             let process = self.process();
@@ -1169,10 +1094,10 @@ impl TerminalBackend for PortablePtyBackend {
                     // with sequence strictly greater than the captured baseline
                     // (wait_after / anchored_to).
                     let anchored_ok = match after_screen_seq {
-                        Some(seq) => self.screen_seq > *seq,
+                        Some(seq) => self.events.screen_seq() > *seq,
                         None => true,
                     };
-                    let quiet_ok = self.last_screen_change_instant.elapsed() >= *quiet_for;
+                    let quiet_ok = self.events.screen_quiet_for(*quiet_for);
                     (anchored_ok && quiet_ok, WaitReason::ScreenStable)
                 }
                 WaitCond::ProcessExit => (!screen.process.running, WaitReason::ProcessExit),
@@ -1180,7 +1105,9 @@ impl TerminalBackend for PortablePtyBackend {
                     screen.title.as_deref() == Some(t.as_str()),
                     WaitReason::Title,
                 ),
-                WaitCond::Bell { .. } => (self.bell_seq > baseline_bell_seq, WaitReason::Bell),
+                WaitCond::Bell { .. } => {
+                    (self.events.bell_seq() > baseline_bell_seq, WaitReason::Bell)
+                }
                 WaitCond::AnyActivity {
                     after_interaction_seq,
                 } => {
@@ -1202,10 +1129,10 @@ impl TerminalBackend for PortablePtyBackend {
                     // quiet interval suffices without an anchor; with an
                     // anchor, require output strictly newer than the baseline.
                     let anchored_ok = match after_output_seq {
-                        Some(seq) => self.output_seq > *seq,
+                        Some(seq) => self.events.output_seq() > *seq,
                         None => true,
                     };
-                    let quiet_ok = self.last_output_instant.elapsed() >= *quiet_for;
+                    let quiet_ok = self.events.output_quiet_for(*quiet_for);
                     (anchored_ok && quiet_ok, WaitReason::Idle)
                 }
                 WaitCond::CommandDone { after_command_seq } => {
@@ -1256,8 +1183,8 @@ impl TerminalBackend for PortablePtyBackend {
                     met: true,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     reason,
-                    screen_seq: self.screen_seq,
-                    output_seq: self.output_seq,
+                    screen_seq: self.events.screen_seq(),
+                    output_seq: self.events.output_seq(),
                     state: screen,
                 });
             }
@@ -1267,8 +1194,8 @@ impl TerminalBackend for PortablePtyBackend {
                     met: false,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     reason: WaitReason::Timeout,
-                    screen_seq: self.screen_seq,
-                    output_seq: self.output_seq,
+                    screen_seq: self.events.screen_seq(),
+                    output_seq: self.events.output_seq(),
                     state: screen,
                 });
             }
@@ -1281,7 +1208,7 @@ impl TerminalBackend for PortablePtyBackend {
         let mut caps = Capabilities::honest();
         // Promote optional capabilities only when we have observed the running
         // application negotiate them.
-        caps.title = self.title_seq > 0;
+        caps.title = self.events.title_seq() > 0;
         // Wave F item 53: promoted once real scrollback rows were captured.
         caps.scrollback = self.scrollback_seen;
         caps.mouse = self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None;
@@ -1369,20 +1296,7 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn event_state(&self) -> TerminalEventState {
-        TerminalEventState {
-            output_seq: self.output_seq,
-            screen_seq: self.screen_seq,
-            content_seq: self.content_seq,
-            visual_seq: self.screen_seq,
-            interaction_seq: self.screen_seq + self.bell_seq + self.title_seq,
-            bell_seq: self.bell_seq,
-            title_seq: self.title_seq,
-            last_output_at: self.last_output_at_ms,
-            last_screen_change_at: self.last_screen_change_at_ms,
-            // Wave F item 54: OSC 133 command edges participate in wait
-            // anchoring.
-            command_seq: self.parser.callbacks().command_seq,
-        }
+        self.events.event_state(self.parser.callbacks().command_seq)
     }
 
     /// Wave F item 53: the scrollback materialized at the last pump.
@@ -1459,13 +1373,6 @@ fn color_to_u32(c: vt100::Color) -> u32 {
             0x1000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
         }
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn exit_status_parts(status: portable_pty::ExitStatus) -> (i32, Option<String>) {
