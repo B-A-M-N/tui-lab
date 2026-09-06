@@ -14,6 +14,7 @@
 use crate::screen::ScreenState;
 use std::time::Duration;
 
+pub mod emulator;
 pub mod event_clock;
 pub mod input;
 pub mod line_cli;

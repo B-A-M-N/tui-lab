@@ -21,7 +21,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use vt100::Parser;
 
 use crate::backend::{
     new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
@@ -31,9 +30,6 @@ use crate::backend::{
 use crate::screen::{ProcessState, ScreenState};
 
 use super::input::{encode_key, encode_mouse_event};
-// vt100 callbacks that record host-observable terminal metadata — moved
-// to `super::protocol` (G2).
-use super::protocol::BackendCallbacks;
 
 /// vt100 callbacks that record host-observable terminal metadata —
 /// moved to [`super::protocol`] (G2). Re-exported so `pump()` and the
@@ -41,7 +37,9 @@ use super::protocol::BackendCallbacks;
 pub struct PortablePtyBackend {
     cols: u16,
     rows: u16,
-    parser: Parser<BackendCallbacks>,
+    /// Grid + normalization policy + scrollback (G2): see
+    /// [`super::emulator::TerminalEmulator`].
+    emulator: super::emulator::TerminalEmulator,
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     writer: Option<Box<dyn Write + Send>>,
@@ -59,18 +57,6 @@ pub struct PortablePtyBackend {
     // bounded per-change log, and query-answer bookkeeping (G2).
     events: super::event_clock::BackendEventClock,
     child_pid: Option<u32>,
-    /// Item 48: the normalization policy applied when building structure
-    /// hashes. Defaults to the built-in conservative classes; a loaded
-    /// contract's `volatile_patterns` are merged in via
-    /// [`Self::set_normalization_policy`].
-    normalization_policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
-    /// Wave F item 53: scrollback rows captured at the last `state()`.
-    /// The vt100 parser owns the buffer; we materialize rows eagerly so
-    /// consumers (search, observe mode=scrollback) read plain strings.
-    scrollback_cache: Vec<String>,
-    /// Wave F item 53: whether any scrollback row was ever captured —
-    /// `Capabilities.scrollback` is promoted only on this evidence.
-    scrollback_seen: bool,
     /// Wave-2 (protocol diagnostics): bounded raw-byte capture — the
     /// child's REAL output bytes (escape sequences, OSC, DCS and all) so
     /// the protocol decoder can reconstruct "what did this TUI actually
@@ -84,7 +70,7 @@ impl PortablePtyBackend {
         PortablePtyBackend {
             cols,
             rows,
-            parser: Parser::new_with_callbacks(rows, cols, 10_000, BackendCallbacks::default()),
+            emulator: super::emulator::TerminalEmulator::new(cols, rows),
             master: None,
             child: None,
             writer: None,
@@ -95,9 +81,6 @@ impl PortablePtyBackend {
             clear_env_on_start: false,
             events: super::event_clock::BackendEventClock::new(),
             child_pid: None,
-            normalization_policy: std::sync::Arc::new(crate::screen::NormalizationPolicy::default()),
-            scrollback_cache: Vec::new(),
-            scrollback_seen: false,
             raw: super::raw_capture::RawCapture::new(),
         }
     }
@@ -108,7 +91,7 @@ impl PortablePtyBackend {
         &mut self,
         policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
     ) {
-        self.normalization_policy = policy;
+        self.emulator.set_normalization_policy(policy);
     }
 
     /// Drain buffered PTY bytes, feed the parser, and bump `screen_seq` on
@@ -118,7 +101,7 @@ impl PortablePtyBackend {
     /// through which all terminal bytes and screen re-evaluation pass
     /// (audit items 1/2).
     fn pump(&mut self) -> BackendResult<(String, String)> {
-        let before_contents = self.parser.screen().contents();
+        let before_contents = self.emulator.screen().contents();
         let before_fp = self.interaction_fingerprint();
         // Drain into a local buffer first so `absorb_raw` can take `&mut self`
         // without holding the `chunk_rx` borrow across the mutation.
@@ -133,14 +116,14 @@ impl PortablePtyBackend {
             // Raw-output ring first (Wave-2 protocol diagnostics): the
             // child's real bytes, before the parser interprets them.
             self.absorb_raw(chunk);
-            self.parser.process(chunk);
+            self.emulator.feed(chunk);
             self.events.on_output();
         }
         // Wave F item 56: write back any query responses the callbacks
         // produced (DA/DSR/DECRQM/kitty ?u/OSC color reports). A real
         // terminal answers these; an app that asked and never got an answer
         // would hang waiting — silence would be a protocol lie.
-        let drained = std::mem::take(&mut self.parser.callbacks_mut().query_responses);
+        let drained = std::mem::take(&mut self.emulator.callbacks_mut().query_responses);
         if !drained.is_empty() {
             // write_input forwards to the PTY; fall back silently when no
             // session is attached (callbacks can fire during parser tests).
@@ -149,14 +132,14 @@ impl PortablePtyBackend {
             // the measurable "responded at". Promote the pending class so
             // the session layer can fold a measured query/answer event.
             {
-                let cb = self.parser.callbacks_mut();
+                let cb = self.emulator.callbacks_mut();
                 if let Some(class) = cb.pending_class.take() {
                     self.events
                         .note_query_answered(class.as_str(), cb.answered_seq);
                 }
             }
         }
-        let after_contents = self.parser.screen().contents();
+        let after_contents = self.emulator.screen().contents();
         let after_fp = self.interaction_fingerprint();
         // content_seq bumps when text changed
         if before_contents != after_contents {
@@ -172,54 +155,13 @@ impl PortablePtyBackend {
         // search/observe read plain strings without touching the parser's
         // scroll offset. Reading rows via `set_scrollback` would disturb the
         // live view; instead we page the offset, copy, and restore it.
-        self.refresh_scrollback();
+        self.emulator.refresh_scrollback(self.cols);
         Ok((before_fp, after_fp))
-    }
-
-    /// Wave F item 53: copy the parser's scrollback rows into
-    /// [`Self::scrollback_cache`]. The vt100 API exposes history only by
-    /// scrolling the view (`set_scrollback`); the offset is paged to each
-    /// position, the visible top row copied, and the original offset
-    /// restored — the live screen is untouched when this returns.
-    ///
-    /// History *length* is discovered by probing: `set_scrollback` clamps to
-    /// the buffer size, so a huge request returns the actual length in
-    /// `screen.scrollback()` (which is the *offset*, not the size, in the
-    /// normal view).
-    fn refresh_scrollback(&mut self) {
-        let saved = self.parser.screen().scrollback();
-        // Probe: the clamp tells us how much history actually exists.
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let total = self.parser.screen().scrollback();
-        if total == 0 {
-            self.parser.screen_mut().set_scrollback(saved);
-            // Nothing new since last refresh and cache already empty: skip
-            // the (cheap but nonzero) page walk.
-            if self.scrollback_cache.is_empty() {
-                return;
-            }
-        }
-        let mut rows = Vec::with_capacity(total);
-        for off in 1..=total {
-            self.parser.screen_mut().set_scrollback(off);
-            let row = self
-                .parser
-                .screen()
-                .rows(0, self.cols)
-                .next()
-                .unwrap_or_default();
-            rows.push(row);
-        }
-        self.parser.screen_mut().set_scrollback(saved);
-        self.scrollback_cache = rows;
-        if !self.scrollback_cache.is_empty() {
-            self.scrollback_seen = true;
-        }
     }
 
     /// Wave F item 54: pull the OSC 133 command state out of the callbacks.
     fn command_state_from_callbacks(&self) -> Option<super::CommandState> {
-        let cb = self.parser.callbacks();
+        let cb = self.emulator.callbacks();
         if cb.command_seq == 0 && !cb.command_running && cb.last_command_exit.is_none() {
             // No 133 edges ever seen: honest None so command waits report
             // "shell integration not present" instead of spinning. (Phase
@@ -312,12 +254,12 @@ impl PortablePtyBackend {
     /// enters the output ring — the probe measures the ENGINE's reply to a
     /// query class, which is precisely what conformance means here.
     pub fn probe_query_response(&mut self, query: &[u8]) -> (Option<&'static str>, Vec<u8>) {
-        self.parser.process(query);
+        self.emulator.feed(query);
         // The callbacks queue the reply; drain WITHOUT writing it to the
         // PTY (this is a probe, not app traffic).
-        let drained = std::mem::take(&mut self.parser.callbacks_mut().query_responses);
+        let drained = std::mem::take(&mut self.emulator.callbacks_mut().query_responses);
         let class = self
-            .parser
+            .emulator
             .callbacks_mut()
             .pending_class
             .take()
@@ -328,7 +270,7 @@ impl PortablePtyBackend {
     }
 
     fn interaction_fingerprint(&self) -> String {
-        let screen = self.parser.screen();
+        let screen = self.emulator.screen();
         let mut hasher = blake3::Hasher::new();
         let rows = screen.size().0;
         let cols = screen.size().1;
@@ -359,12 +301,12 @@ impl PortablePtyBackend {
     /// Pull bell/title counters out of the parser callbacks (shared by
     /// `state()`, `wait()` and `send_input`).
     fn sync_parser_counters(&mut self) {
-        let cb = self.parser.callbacks();
+        let cb = self.emulator.callbacks();
         self.events.sync_counters(cb.audible_bells, cb.title_seq);
     }
 
     fn current_modes(&self) -> InputModes {
-        let screen = self.parser.screen();
+        let screen = self.emulator.screen();
         InputModes {
             application_cursor: screen.application_cursor(),
             bracketed_paste: screen.bracketed_paste(),
@@ -373,7 +315,7 @@ impl PortablePtyBackend {
             cursor_visible: !screen.hide_cursor(),
             // Wave F item 52: kitty flags live in the callbacks (the vt100
             // grid has no notion of them).
-            kitty_flags: self.parser.callbacks().kitty_flags,
+            kitty_flags: self.emulator.callbacks().kitty_flags,
         }
     }
 
@@ -437,7 +379,7 @@ impl TerminalBackend for PortablePtyBackend {
     ) -> BackendResult<()> {
         self.cols = cols;
         self.rows = rows;
-        self.parser = Parser::new_with_callbacks(rows, cols, 10_000, BackendCallbacks::default());
+        self.emulator.reset(cols, rows);
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -547,9 +489,7 @@ impl TerminalBackend for PortablePtyBackend {
         // restart.
         self.events.clear();
         self.raw.clear();
-        self.scrollback_cache.clear();
-        self.scrollback_seen = false;
-        self.parser.callbacks_mut().query_responses.clear();
+        self.emulator.callbacks_mut().query_responses.clear();
         self.child_pid = self.child.as_ref().and_then(|c| c.process_id());
 
         // give the process a moment to emit initial frame
@@ -589,28 +529,28 @@ impl TerminalBackend for PortablePtyBackend {
         let _ = self.pump();
         // Track bell/title sequence deltas from callbacks.
         {
-            let cb = self.parser.callbacks();
+            let cb = self.emulator.callbacks();
             self.events.sync_counters(cb.audible_bells, cb.title_seq);
         }
-        let title = self.parser.callbacks().title.clone();
+        let title = self.emulator.callbacks().title.clone();
         let process = self.process();
         let links: Vec<crate::screen::cell::Hyperlink> = self
-            .parser
+            .emulator
             .callbacks()
             .links
             .iter()
             .cloned()
-            .chain(self.parser.callbacks().open_link.clone())
+            .chain(self.emulator.callbacks().open_link.clone())
             .collect();
         let mut state = crate::screen::from_vt_with_policy(
-            self.parser.screen(),
+            self.emulator.screen(),
             process,
             title,
             links,
-            &self.normalization_policy,
+            self.emulator.normalization_policy(),
         );
         // Wave F item 53: attach the real scrollback (oldest first).
-        state.scrollback = self.scrollback_cache.clone();
+        state.scrollback = self.emulator.scrollback_cache().to_vec();
         Ok(state)
     }
 
@@ -768,7 +708,7 @@ impl TerminalBackend for PortablePtyBackend {
         }
         // Resize the vt100 parser as well so our parsed screen matches the
         // child's notion of dimensions (spec section 3).
-        self.parser.screen_mut().set_size(rows, cols);
+        self.emulator.set_size(rows, cols);
         // Notify resize hook (audit item 24).
         self.notify(|hook| hook.on_resize(cols, rows));
         Ok(())
@@ -798,27 +738,27 @@ impl TerminalBackend for PortablePtyBackend {
             let _ = self.pump();
             // Track bell/title edges.
             {
-                let cb = self.parser.callbacks();
+                let cb = self.emulator.callbacks();
                 self.events.sync_counters(cb.audible_bells, cb.title_seq);
             }
 
             let process = self.process();
-            let title = self.parser.callbacks().title.clone();
+            let title = self.emulator.callbacks().title.clone();
             let mut links: Vec<crate::screen::cell::Hyperlink> =
-                self.parser.callbacks().links.clone();
-            if let Some(open) = &self.parser.callbacks().open_link {
+                self.emulator.callbacks().links.clone();
+            if let Some(open) = &self.emulator.callbacks().open_link {
                 links.push(open.clone());
             }
             let screen = crate::screen::from_vt_with_policy(
-                self.parser.screen(),
+                self.emulator.screen(),
                 process,
                 title,
                 links,
-                &self.normalization_policy,
+                self.emulator.normalization_policy(),
             );
             // Wave F item 53: command-output waits search scrollback too.
             let mut screen = screen;
-            screen.scrollback = self.scrollback_cache.clone();
+            screen.scrollback = self.emulator.scrollback_cache().to_vec();
             let screen = screen;
 
             let (met, reason) = match &cond {
@@ -890,7 +830,7 @@ impl TerminalBackend for PortablePtyBackend {
                 WaitCond::CommandDone { after_command_seq } => {
                     // Wave F item 54: a finish edge (133;D) with sequence
                     // strictly greater than the anchor resolved this wait.
-                    let cb = self.parser.callbacks();
+                    let cb = self.emulator.callbacks();
                     let anchored_ok = match after_command_seq {
                         Some(seq) => cb.command_seq > *seq,
                         None => cb.command_seq > 0 && !cb.command_running,
@@ -911,7 +851,7 @@ impl TerminalBackend for PortablePtyBackend {
                     // viewport only when the anchored command is the one
                     // currently running or the last finished one, so a token
                     // from an EARLIER command cannot satisfy this wait.
-                    let cb = self.parser.callbacks();
+                    let cb = self.emulator.callbacks();
                     let anchored_ok = match after_command_seq {
                         Some(seq) => cb.command_seq > *seq,
                         None => cb.command_seq > 0,
@@ -962,11 +902,11 @@ impl TerminalBackend for PortablePtyBackend {
         // application negotiate them.
         caps.title = self.events.title_seq() > 0;
         // Wave F item 53: promoted once real scrollback rows were captured.
-        caps.scrollback = self.scrollback_seen;
-        caps.mouse = self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None;
-        caps.bracketed_paste = self.parser.screen().bracketed_paste();
+        caps.scrollback = self.emulator.scrollback_seen();
+        caps.mouse = self.emulator.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+        caps.bracketed_paste = self.emulator.screen().bracketed_paste();
         // Wave F item 52: the app pushed kitty keyboard flags at some point.
-        caps.kitty_keyboard = self.parser.callbacks().kitty_seen;
+        caps.kitty_keyboard = self.emulator.callbacks().kitty_seen;
         // This engine retains the raw PTY byte ring (`recent_raw_output`),
         // so protocol capture is genuinely available.
         caps.protocol_capture = true;
@@ -1048,13 +988,14 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn event_state(&self) -> TerminalEventState {
-        self.events.event_state(self.parser.callbacks().command_seq)
+        self.events
+            .event_state(self.emulator.callbacks().command_seq)
     }
 
     /// Wave F item 53: the scrollback materialized at the last pump.
     fn scrollback_lines(&mut self) -> BackendResult<Vec<String>> {
         let _ = self.pump();
-        Ok(self.scrollback_cache.clone())
+        Ok(self.emulator.scrollback_cache().to_vec())
     }
 
     /// Wave F item 53: viewport + scrollback search through the shared
