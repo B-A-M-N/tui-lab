@@ -1,4 +1,4 @@
-# hermes-tui-lab
+# tui-lab
 
 Agent-native TUI instrumentation, testing, exploration, and UX evaluation harness.
 
@@ -24,19 +24,19 @@ cargo install --path .
 
 ```bash
 # Start MCP server over stdio
-hermes-tui-lab mcp
+tui-lab mcp
 
 # Check system readiness (every line is an executed probe)
-hermes-tui-lab doctor
+tui-lab doctor
 
 # Print version
-hermes-tui-lab version
+tui-lab version
 
 # Generate skill documentation
-hermes-tui-lab skill
+tui-lab skill
 
 # Render a persisted run's recorded history (transcript, not a re-drive)
-hermes-tui-lab replay <run_id> [--root <dir>] [--full]
+tui-lab replay <run_id> [--root <dir>] [--full]
 ```
 
 ## Run lifecycle
@@ -47,7 +47,7 @@ The run lifecycle tool — `status`, `persist`, `close`, `list`, `resume`,
 finding's context + regression diff), and `context` (the capability
 registry as JSON).
 
-Server startup is side-effect-free: `hermes-tui-lab mcp` opens an **ephemeral**
+Server startup is side-effect-free: `tui-lab mcp` opens an **ephemeral**
 run — no filesystem mutation. Every ephemeral run has a real `run_id`, event
 history, scenarios, checkpoints, and a state graph in memory; "ephemeral" means
 "not persisted", not "feature-degraded". When a session's work becomes worth
@@ -78,7 +78,7 @@ keeping, promote the SAME run to durable storage:
   Relaunch with `tui_session action=start` (the manifest records the specs) and
   new actions append to the same ledger.
 - Closed runs stay readable without resuming: the `tui://runs/<id>` resource
-  restores them read-only (`live: false`), and `hermes-tui-lab replay <run_id>`
+  restores them read-only (`live: false`), and `tui-lab replay <run_id>`
   renders the recorded history as a transcript. Replay is a *read* of what the
   run recorded, not a re-execution — replaying inputs against live children is
   what `tui_scenario action=run` is for.
@@ -409,7 +409,7 @@ serialize through the same mailbox.
 
 ## Testing
 
-The stdio E2E (`tests/mcp_stdio_e2e.rs`) spawns the real `hermes-tui-lab mcp`
+The stdio E2E (`tests/mcp_stdio_e2e.rs`) spawns the real `tui-lab mcp`
 binary and speaks JSON-RPC over its stdin/stdout, driving a full lifecycle
 against real python3 children. It is the integration bar: a feature is not
 integrated until the real MCP path can exercise it.
@@ -442,7 +442,7 @@ integrated until the real MCP path can exercise it.
 | Exploration | working (seeded, live transitions, budget-authoritative, contract-fed) |
 | Coverage | working (native NSP coverage events → run ledger with per-session correlation; optional tuicov executable invoked on demand, absent = honest Unsupported) |
 | Framework probes | working (detection + adapter snippets) |
-| Run replay CLI | working (`hermes-tui-lab replay <run_id>` renders the persisted ledger/findings/graphs — a read of what was recorded, not a re-drive) |
+| Run replay CLI | working (`tui-lab replay <run_id>` renders the persisted ledger/findings/graphs — a read of what was recorded, not a re-drive) |
 
 ## License
 

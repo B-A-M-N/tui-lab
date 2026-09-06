@@ -1,5 +1,5 @@
 //! MCP stdio transport E2E (audit: "the code path is identical" claim made
-//! real). Spawns the actual `hermes-tui-lab mcp` binary, speaks JSON-RPC over
+//! real). Spawns the actual `tui-lab mcp` binary, speaks JSON-RPC over
 //! its stdin/stdout, and drives a full lifecycle against a real python3 child:
 //! initialize → session start → observe → act (type+enter) → wait → assert →
 //! checkpoint save/compare → scenario record → record start/stop.
@@ -32,7 +32,7 @@ impl McpProc {
     }
 
     fn spawn_in(dir: &std::path::Path) -> Self {
-        let bin = env!("CARGO_BIN_EXE_hermes-tui-lab");
+        let bin = env!("CARGO_BIN_EXE_tui-lab");
         let mut child = Command::new(bin)
             .arg("mcp")
             .current_dir(dir)
@@ -40,7 +40,7 @@ impl McpProc {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn hermes-tui-lab mcp");
+            .expect("spawn tui-lab mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = Arc::new(Mutex::new(SharedStdout(BufReader::new(
             child.stdout.take().expect("stdout"),

@@ -185,7 +185,7 @@ fn mcp_detect_from_member_reports_member_context() {
     let ws = cargo_workspace();
     let member = ws.path().join("crates").join("tui-app");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hermes-tui-lab"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tui-lab"))
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

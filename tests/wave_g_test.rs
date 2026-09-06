@@ -1370,7 +1370,7 @@ fn replay_cli_renders_persisted_run() {
         run_id
     });
 
-    let bin = env!("CARGO_BIN_EXE_hermes-tui-lab");
+    let bin = env!("CARGO_BIN_EXE_tui-lab");
     let out = Command::new(bin)
         .args(["replay", &run_id, "--root", base.to_string_lossy().as_ref()])
         .output()

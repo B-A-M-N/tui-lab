@@ -1,4 +1,4 @@
-//! hermes-tui-lab — agent-native TUI instrumentation/testing/exploration/UX harness.
+//! tui-lab — agent-native TUI instrumentation/testing/exploration/UX harness.
 //!
 //! Binary entry point. Spawns the MCP server over stdio. All behavior lives in
 //! the `tui_lab` library crate; `main` only wires logging + transport.
@@ -9,7 +9,7 @@ use rmcp::ServiceExt;
 use tui_lab::mcp::TuiLabServer;
 
 #[derive(Parser)]
-#[command(name = "hermes-tui-lab", about, version, long_about = None)]
+#[command(name = "tui-lab", about, version, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
             doctor();
         }
         Commands::Version => {
-            println!("hermes-tui-lab {}", env!("CARGO_PKG_VERSION"));
+            println!("tui-lab {}", env!("CARGO_PKG_VERSION"));
         }
         Commands::Skill { write } => {
             if write {
@@ -158,7 +158,7 @@ fn replay(run_id: &str, root: Option<&str>, full: bool) -> anyhow::Result<()> {
         }
         let _ = writeln!(
             out,
-            "  (full ledger: hermes-tui-lab replay {} --full)",
+            "  (full ledger: tui-lab replay {} --full)",
             run.id(),
         );
     }
@@ -267,7 +267,7 @@ fn skill_write() -> anyhow::Result<()> {
 fn doctor() {
     use std::io::Write as _;
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "hermes-tui-lab doctor");
+    let _ = writeln!(out, "tui-lab doctor");
     let _ = writeln!(out, "======================");
     let _ = writeln!(out);
 

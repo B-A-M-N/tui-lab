@@ -1,4 +1,4 @@
-//! hermes-tui-lab — agent-native TUI instrumentation/testing/exploration/UX harness.
+//! tui-lab — agent-native TUI instrumentation/testing/exploration/UX harness.
 //!
 //! Library crate. The binary (`src/main.rs`) only wires logging + MCP transport.
 

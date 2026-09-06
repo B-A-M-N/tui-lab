@@ -1,11 +1,11 @@
 ---
 name: tui-lab
-description: Use when auditing, driving, exploring, or testing a terminal UI (TUI) through the hermes-tui-lab MCP server. Covers launching a TUI, semantic observation, automated interaction, UX audits, coverage-guided exploration, and regression scenarios — all WITHOUT a vision model.
+description: Use when auditing, driving, exploring, or testing a terminal UI (TUI) through the tui-lab MCP server. Covers launching a TUI, semantic observation, automated interaction, UX audits, coverage-guided exploration, and regression scenarios — all WITHOUT a vision model.
 ---
 
 # tui-lab — Agent-Native TUI Instrumentation & UX Harness
 
-`tui-lab` (binary `hermes-tui-lab`) is a local MCP server that gives Hermes a
+`tui-lab` (binary `tui-lab`) is a local MCP server that gives Hermes a
 Playwright-for-terminals: a stable session model over a real PTY, semantic
 inference from the cell grid, state-aware waits, assertions, UX audits,
 seeded exploration, and optional coverage via `tuicov`. It does NOT require a
@@ -132,7 +132,7 @@ attributes, cursor, title), not screenshots.
 ```yaml
 mcp_servers:
   tui_lab:
-    command: "/home/USER/.local/bin/hermes-tui-lab"
+    command: "/home/USER/.local/bin/tui-lab"
     args: ["mcp"]
     supports_parallel_tool_calls: false
     tools:
@@ -155,5 +155,5 @@ mcp_servers:
       enabled: false
 ```
 
-Install: build `cargo build --release` and copy `target/release/hermes-tui-lab`
+Install: build `cargo build --release` and copy `target/release/tui-lab`
 to `~/.local/bin/`.
