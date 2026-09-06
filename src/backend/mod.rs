@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod raw_capture;
 pub mod tmux;
 pub mod trait_def;
+pub mod wait;
 
 pub use line_cli::PtyLineBackend;
 pub use pipe::PipeBackend;

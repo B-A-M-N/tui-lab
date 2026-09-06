@@ -542,19 +542,21 @@ impl TerminalBackend for PortablePtyBackend {
         let start = Instant::now();
         // Review P0 (Bell race): an anchored Bell carries its own baseline;
         // only an unanchored Bell falls back to "captured at wait entry".
-        let baseline_bell_seq = match &cond {
-            WaitCond::Bell {
-                after_bell_seq: Some(seq),
-            } => seq.saturating_sub(1),
-            _ => self.events.bell_seq(),
-        };
-        let baseline_interaction_seq = self.interaction_seq();
-
-        // For screen-change we need the baseline *interaction fingerprint*
-        // now (style-only changes count as changes; audit item 3).
-        let baseline_hash = {
-            let _ = self.pump();
-            self.interaction_fingerprint()
+        let baselines = super::wait::WaitBaselines {
+            bell_seq: match &cond {
+                WaitCond::Bell {
+                    after_bell_seq: Some(seq),
+                } => seq.saturating_sub(1),
+                _ => self.events.bell_seq(),
+            },
+            interaction_seq: self.interaction_seq(),
+            // For screen-change: the baseline *interaction fingerprint*,
+            // captured after the entry pump (style-only changes count;
+            // audit item 3).
+            fingerprint: {
+                let _ = self.pump();
+                self.interaction_fingerprint()
+            },
         };
 
         loop {
@@ -585,114 +587,35 @@ impl TerminalBackend for PortablePtyBackend {
             screen.scrollback = self.emulator.scrollback_cache().to_vec();
             let screen = screen;
 
-            let (met, reason) = match &cond {
-                WaitCond::Text(t) => (
-                    screen.viewport_text.iter().any(|r| r.contains(t.as_str())),
-                    WaitReason::Text,
-                ),
-                WaitCond::TextAbsent(t) => (
-                    !screen.viewport_text.iter().any(|r| r.contains(t.as_str())),
-                    WaitReason::TextAbsent,
-                ),
-                WaitCond::ScreenChange => {
-                    let cur_fp = self.interaction_fingerprint();
-                    (cur_fp != baseline_hash, WaitReason::ScreenChange)
-                }
-                WaitCond::ScreenStable {
-                    quiet_for,
-                    after_screen_seq,
-                } => {
-                    // Generic stability: the screen has simply been quiet for
-                    // `quiet_for`. NO fresh mutation is required — a one-frame
-                    // reaction that arrived *before* wait() was entered must
-                    // still resolve (audit items 1/2/70).
-                    // Anchored stability: additionally require a screen change
-                    // with sequence strictly greater than the captured baseline
-                    // (wait_after / anchored_to).
-                    let anchored_ok = match after_screen_seq {
-                        Some(seq) => self.events.screen_seq() > *seq,
-                        None => true,
-                    };
-                    let quiet_ok = self.events.screen_quiet_for(*quiet_for);
-                    (anchored_ok && quiet_ok, WaitReason::ScreenStable)
-                }
-                WaitCond::ProcessExit => (!screen.process.running, WaitReason::ProcessExit),
-                WaitCond::Title(t) => (
-                    screen.title.as_deref() == Some(t.as_str()),
-                    WaitReason::Title,
-                ),
-                WaitCond::Bell { .. } => {
-                    (self.events.bell_seq() > baseline_bell_seq, WaitReason::Bell)
-                }
-                WaitCond::AnyActivity {
-                    after_interaction_seq,
-                } => {
-                    // Any observable edge — screen, bell, title, cursor — with
-                    // an interaction sequence strictly greater than the
-                    // anchor. Genuinely broader than ScreenChange: a bell-only
-                    // or title-only reaction resolves here.
-                    let anchored_ok = match after_interaction_seq {
-                        Some(seq) => self.interaction_seq() > *seq,
-                        None => self.interaction_seq() > baseline_interaction_seq,
-                    };
-                    (anchored_ok, WaitReason::ScreenChange)
-                }
-                WaitCond::Idle {
-                    quiet_for,
-                    after_output_seq,
-                } => {
-                    // Same shape as ScreenStable, keyed on PTY output chunks:
-                    // quiet interval suffices without an anchor; with an
-                    // anchor, require output strictly newer than the baseline.
-                    let anchored_ok = match after_output_seq {
-                        Some(seq) => self.events.output_seq() > *seq,
-                        None => true,
-                    };
-                    let quiet_ok = self.events.output_quiet_for(*quiet_for);
-                    (anchored_ok && quiet_ok, WaitReason::Idle)
-                }
-                WaitCond::CommandDone { after_command_seq } => {
-                    // Wave F item 54: a finish edge (133;D) with sequence
-                    // strictly greater than the anchor resolved this wait.
-                    let cb = self.emulator.callbacks();
-                    let anchored_ok = match after_command_seq {
-                        Some(seq) => cb.command_seq > *seq,
-                        None => cb.command_seq > 0 && !cb.command_running,
-                    };
-                    // `None` anchor semantics: the NEXT finish edge after
-                    // entering the wait — so the wait must have seen the
-                    // command both start and finish while it ran. With an
-                    // anchor, the finish simply has to be newer.
-                    let done_now = !cb.command_running;
-                    (anchored_ok && done_now, WaitReason::Idle)
-                }
-                WaitCond::CommandOutput {
-                    text,
-                    after_command_seq,
-                } => {
-                    // Wave F item 54: the text must appear in output captured
-                    // for the anchored command — checked against the live
-                    // viewport only when the anchored command is the one
-                    // currently running or the last finished one, so a token
-                    // from an EARLIER command cannot satisfy this wait.
-                    let cb = self.emulator.callbacks();
-                    let anchored_ok = match after_command_seq {
-                        Some(seq) => cb.command_seq > *seq,
-                        None => cb.command_seq > 0,
-                    };
-                    let in_window = cb.command_seq.saturating_sub(1)
-                        == after_command_seq.unwrap_or(0)
-                        || cb.command_seq == after_command_seq.unwrap_or(0).max(1);
-                    let found = anchored_ok
-                        && in_window
-                        && (screen
-                            .viewport_text
-                            .iter()
-                            .any(|r| r.contains(text.as_str()))
-                            || screen.scrollback.iter().any(|r| r.contains(text.as_str())));
-                    (found, WaitReason::Text)
-                }
+            // Monotonic quiet checks, pre-computed for the evaluator: the
+            // interval each condition kind asks for (None where quiet is
+            // irrelevant).
+            let (quiet_req, output_quiet_req) = match &cond {
+                WaitCond::ScreenStable { quiet_for, .. } => (Some(*quiet_for), None),
+                WaitCond::Idle { quiet_for, .. } => (None, Some(*quiet_for)),
+                _ => (None, None),
             };
+            let tick = super::wait::WaitTick {
+                screen: &screen,
+                screen_seq: self.events.screen_seq(),
+                output_seq: self.events.output_seq(),
+                bell_seq: self.events.bell_seq(),
+                interaction_seq: self.events.interaction_seq(),
+                screen_quiet: quiet_req
+                    .map(|q| self.events.screen_quiet_for(q))
+                    .unwrap_or(false),
+                output_quiet: output_quiet_req
+                    .map(|q| self.events.output_quiet_for(q))
+                    .unwrap_or(false),
+                command_seq: self.emulator.callbacks().command_seq,
+                command_running: self.emulator.callbacks().command_running,
+            };
+            let (met, reason) = super::wait::WaitEvaluator::evaluate(
+                &cond,
+                &tick,
+                &baselines,
+                &self.interaction_fingerprint(),
+            );
 
             if met {
                 return Ok(WaitOutcome {
