@@ -1,6 +1,6 @@
 //! tui_run: run lifecycle, persistence, diagnosis packets, registry context.
 
-use super::super::running_id;
+use crate::mcp::resources::running_id;
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, err_with_details, ok};
 use crate::mcp::params::*;
@@ -161,22 +161,14 @@ pub(crate) async fn tui_run(
             // alive after `tui_run new` (they are foreign); closing run B
             // must neither absorb their events nor kill them.
             let run_id = s.run.lock().unwrap().id().to_string();
-            let owned: Vec<String> = {
-                let owners = s.session_owners.lock().unwrap();
-                s.sessions
-                    .list()
-                    .into_iter()
-                    .filter(|sid| owners.get(sid).map(|o| o.as_str()) == Some(run_id.as_str()))
-                    .collect()
-            };
-            let foreign: Vec<String> = {
-                let owners = s.session_owners.lock().unwrap();
-                s.sessions
-                    .list()
-                    .into_iter()
-                    .filter(|sid| owners.get(sid).map(|o| o.as_str()) != Some(run_id.as_str()))
-                    .collect()
-            };
+            let live = s.sessions.list();
+            let owned: Vec<String> =
+                s.session_owners.lock().unwrap().sessions_of(&live, &run_id);
+            let foreign: Vec<String> = s
+                .session_owners
+                .lock()
+                .unwrap()
+                .foreign_sessions(&live, &run_id);
             // Drain terminal-event queues of OWNED sessions into the run
             // (Wave B item 14) before the flush so the event logs land in
             // the artifacts. Wave G item 73: each drain is one actor call
@@ -241,7 +233,7 @@ pub(crate) async fn tui_run(
                         continue;
                     }
                     if s.sessions.stop(sid).await.is_ok() {
-                        s.session_owners.lock().unwrap().remove(sid);
+                        s.session_owners.lock().unwrap().unbind(sid);
                         out.push(sid.clone());
                     }
                 }
@@ -386,20 +378,11 @@ pub(crate) async fn tui_run(
             // carry over (they already belong to the run being resumed).
             let target_run = running_id(&run_dir);
             let foreign: Vec<String> = {
-                let owners = s.session_owners.lock().unwrap();
-                s.sessions
-                    .list()
-                    .into_iter()
-                    .filter(|sid| {
-                        match owners.get(sid) {
-                            // Owned by the run we're resuming: fine.
-                            Some(o) => o != &target_run,
-                            // Unowned sessions: treat as foreign (must be
-                            // re-launched under the resumed run).
-                            None => true,
-                        }
-                    })
-                    .collect()
+                let live = s.sessions.list();
+                s.session_owners
+                    .lock()
+                    .unwrap()
+                    .foreign_sessions(&live, &target_run)
             };
             if !foreign.is_empty() && !p.detach_existing_sessions.unwrap_or(false) {
                 return err(
@@ -431,7 +414,7 @@ pub(crate) async fn tui_run(
             // safely persisted).
             for sid in &foreign {
                 let _ = s.sessions.stop(sid).await;
-                s.session_owners.lock().unwrap().remove(sid);
+                s.session_owners.lock().unwrap().unbind(sid);
             }
             // 4. ATOMIC swap under a short lock (never across an await).
             let manifest_like = {

@@ -32,54 +32,27 @@ use rmcp::handler::server::wrapper::Parameters;
 /// lock there blocks nothing async).
 #[derive(Clone)]
 pub struct TuiLabServer {
-    sessions: Arc<SessionPool>,
-    run: Arc<std::sync::Mutex<crate::run::RunContext>>,
-    /// Which run each live session belongs to (review P0.2): session id →
-    /// the run id that launched it. A session is only usable while it
-    /// belongs to the CURRENT run; resuming a different run must not let a
-    /// stale session drive it and spill foreign evidence in (run
-    /// provenance). Populated at launch/attach, dropped when the session
-    /// stops.
-    session_owners: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
-    /// Finding 3D (two-step intent): previewed execution plans by plan_id.
-    /// `plan` stores; `execute` consumes (revalidates + removes) — a plan
-    /// executes at most once, so a replayed plan_id cannot re-fire a
-    /// destructive payload.
-    intent_plans: Arc<std::sync::Mutex<std::collections::HashMap<String, IntentPlanTicket>>>,
+    pub(crate) sessions: Arc<SessionPool>,
+    pub(crate) run: Arc<std::sync::Mutex<crate::run::RunContext>>,
+    /// Which run each live session belongs to (review P0.2) and the
+    /// previewed intent plans (finding 3D) — both live in
+    /// [`crate::mcp::ownership`]; this struct keeps the Arc handles so
+    /// handler child modules can clone-share them across the actor await.
+    session_owners: Arc<std::sync::Mutex<crate::mcp::ownership::SessionOwnership>>,
+    intent_plans: Arc<std::sync::Mutex<crate::mcp::ownership::IntentPlanStore>>,
 }
-
-/// One previewed intent plan: the control identity it resolved against,
-/// kept between `tui_intent plan` and `tui_intent execute`. Risk is NOT
-/// stored here — the executor re-fences against the plan's LIVE risk at
-/// execute time, never a stale snapshot.
-#[derive(Clone)]
-pub(crate) struct IntentPlanTicket {
-    pub control_id: String,
-    /// Bounded store: creation order, oldest evicted first.
-    pub created: std::time::Instant,
-}
-
-/// Which named view of a session a `tui://sessions/<id>/<view>` resource
-/// resolves to. `TerminalProfile` is observationally pure — it never forces a
-/// screen settle, unlike the screen-backed views.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionView {
-    TerminalProfile,
-    Semantic,
-    Screen,
-}
-
-/// Bounded intent-plan store (finding 3D): at most this many previewed
-/// plans are held; the oldest is evicted first.
-pub(crate) const INTENT_PLAN_CAP: usize = 64;
 
 impl TuiLabServer {
     pub fn new() -> Self {
         TuiLabServer {
             sessions: Arc::new(SessionPool::new()),
             run: Arc::new(std::sync::Mutex::new(crate::run::RunContext::ephemeral())),
-            session_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            intent_plans: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_owners: Arc::new(std::sync::Mutex::new(
+                crate::mcp::ownership::SessionOwnership::new(),
+            )),
+            intent_plans: Arc::new(std::sync::Mutex::new(
+                crate::mcp::ownership::IntentPlanStore::new(),
+            )),
         }
     }
 
@@ -91,8 +64,12 @@ impl TuiLabServer {
         TuiLabServer {
             sessions: Arc::new(SessionPool::new()),
             run: Arc::new(std::sync::Mutex::new(run)),
-            session_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            intent_plans: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_owners: Arc::new(std::sync::Mutex::new(
+                crate::mcp::ownership::SessionOwnership::new(),
+            )),
+            intent_plans: Arc::new(std::sync::Mutex::new(
+                crate::mcp::ownership::IntentPlanStore::new(),
+            )),
         }
     }
 
@@ -101,241 +78,15 @@ impl TuiLabServer {
     /// await, so they take the Arc).
     pub(crate) fn plans_handle(
         &self,
-    ) -> Arc<std::sync::Mutex<std::collections::HashMap<String, IntentPlanTicket>>> {
+    ) -> Arc<std::sync::Mutex<crate::mcp::ownership::IntentPlanStore>> {
         self.intent_plans.clone()
     }
 
-    /// Resolve a `tui://` resource URI to its text content (Wave G item
-    /// 72). Unknown schemes/ids are honest `resource_not_found` errors that
-    /// name what WAS accepted, so a stale id can be self-corrected.
+    /// Resolve a `tui://` resource URI (Wave G item 72). The whole
+    /// resolver lives in [`crate::mcp::resources`]; this is the façade
+    /// hook the rmcp trait calls.
     async fn resolve_resource(&self, uri: &str) -> Result<String, rmcp::model::ErrorData> {
-        use crate::semantic;
-        let not_found = |msg: String| rmcp::model::ErrorData::resource_not_found(msg, None);
-        // Findings: the feed and (review P1: evidence-addressability) one
-        // finding by instance id, rendered like tui_explain — evidence
-        // refs joined to their sources, capabilities conditioning applied.
-        if uri == "tui://findings" {
-            let run = self.run.lock().unwrap();
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "run": run.id(),
-                "findings": run.findings(),
-                "count": run.findings().len(),
-            }))
-            .unwrap_or_default());
-        }
-        if let Some(fid) = uri.strip_prefix("tui://findings/") {
-            let fid = fid.trim_end_matches('/');
-            let run = self.run.lock().unwrap();
-            let finding = run.findings().iter().find(|f| f.id == fid).ok_or_else(|| {
-                not_found(format!(
-                    "no finding '{fid}' in run '{}' (tui://findings lists the {} available)",
-                    run.id(),
-                    run.findings().len()
-                ))
-            })?;
-            // Same explanation shape `tui_explain` renders, minus the live
-            // session conditioning (a resource read stays observationally
-            // pure — it never touches a session actor).
-            let joined = run.join_source_refs_if_known(finding);
-            let explanation = crate::terminal::explain::explain_finding(&joined, None, None);
-            return Ok(serde_json::to_string_pretty(&explanation).unwrap_or_default());
-        }
-        if let Some(rest) = uri.strip_prefix("tui://runs/") {
-            let rest = rest.trim_end_matches('/');
-            if rest.is_empty() {
-                return Err(not_found("empty run id".to_string()));
-            }
-            // Run-scoped evidence: scenarios and ledger transactions
-            // (review P1: citable evidence must be addressable, not just
-            // inlined into run status). Match these BEFORE the bare run
-            // id so `<run>/scenarios/<sid>` never falls through to it.
-            if let Some((run_id, sub)) = rest.split_once('/') {
-                let (kind, key) = match sub.split_once('/') {
-                    Some((k, key)) => (k, Some(key.trim_end_matches('/'))),
-                    None => (sub, None),
-                };
-                return self.resolve_run_scoped(run_id, kind, key, not_found);
-            }
-            // The live run first (it carries live session state)…
-            {
-                let run = self.run.lock().unwrap();
-                if rest == run.id() {
-                    let sessions = self.sessions.list();
-                    return Ok(run
-                        .status(
-                            sessions
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        )
-                        .to_string());
-                }
-            }
-            // …then any persisted run on disk (Wave G item 75: the browser
-            // reads closed runs without resuming them). Search roots: the
-            // base configured for the live run (its primary session cwd or
-            // durable root's parent), so `tui://runs/<old-id>` resolves
-            // against where runs actually live for this workspace.
-            let mut bases = self.run.lock().unwrap().browser_bases();
-            // The server's own working directory is the workspace anchor:
-            // the canonical browser workflow is a restarted server sitting
-            // in the same repo where runs were persisted.
-            if let Ok(cwd) = std::env::current_dir() {
-                if !bases.contains(&cwd) {
-                    bases.push(cwd);
-                }
-            }
-            for base in bases {
-                if let Some(dir) = crate::run::RunContext::resolve_run_dir(&base, rest) {
-                    let restored = crate::run::RunContext::restore(&dir)
-                        .map_err(|e| not_found(format!("run '{rest}' unreadable: {e}")))?;
-                    let mut summary = restored.status(Vec::new());
-                    summary["live"] = serde_json::Value::Bool(false);
-                    return Ok(summary.to_string());
-                }
-            }
-            let live_id = self.run.lock().unwrap().id().to_string();
-            return Err(not_found(format!(
-                "no run '{rest}' in this server or under its runs roots (this server's live run is '{live_id}'; use tui_run action=list to see persisted runs)"
-            )));
-        }
-        // tui://sessions/<id>/semantic | tui://sessions/<id>/screen
-        if let Some(rest) = uri.strip_prefix("tui://sessions/") {
-            let (sid, view) = match rest.split_once('/') {
-                Some((sid, view)) => (sid, view.trim_end_matches('/')),
-                None => (rest, ""),
-            };
-            let session_view = match view {
-                // TerminalProfile needs no screen: it reads the live backend
-                // capabilities without triggering an observation.
-                "terminal-profile" => SessionView::TerminalProfile,
-                "semantic" => SessionView::Semantic,
-                "screen" => SessionView::Screen,
-                other => {
-                    return Err(not_found(format!(
-                        "unknown session resource view '{other}' (expected \
-                         'terminal-profile', 'semantic', or 'screen')"
-                    )))
-                }
-            };
-            let selector = sid.to_string();
-            let in_job = selector.clone();
-            let snapshot = self
-                .sessions
-                .with_session(Some(&selector), move |s| {
-                    let selector = in_job;
-                    if let SessionView::TerminalProfile = session_view {
-                        // Evidence-backed capability report, no screen settle.
-                        let profile = s.terminal_profile();
-                        return Some(serde_json::to_string_pretty(&profile).unwrap_or_default());
-                    }
-                    // Passive resource read: consume the latest COMMITTED
-                    // frame without triggering a settle cycle and WITHOUT
-                    // advancing the session-global previous/current baseline.
-                    // The explicit `observe()` path (tui_observe) is the only
-                    // thing that should move a consumer's diff cursor; a peek
-                    // at the screen must be observationally pure. We only
-                    // settle once to establish a first frame if none exists
-                    // (a freshly-started session that was never observed).
-                    let screen = match s.last() {
-                        Some(f) => f.clone(),
-                        None => s.observe(40).ok()?,
-                    };
-                    if matches!(session_view, SessionView::Semantic) {
-                        // Fused truth: the resource serves the SAME analysis
-                        // observe modes see — cached detection + native
-                        // overlay — never an inference-only view.
-                        match s.fused_frame() {
-                            Some((sem, _tree, _report)) => {
-                                Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
-                            }
-                            None => {
-                                let sem = semantic::analyze(&screen);
-                                Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
-                            }
-                        }
-                    } else {
-                        Some(
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "session": selector,
-                                "cols": screen.cols,
-                                "rows": screen.rows,
-                                "title": screen.title,
-                                "cursor": screen.cursor,
-                                "viewport_text": screen.viewport_text,
-                                "structure_hash": screen.structure_hash,
-                                "visual_hash": screen.visual_hash,
-                                "process": screen.process,
-                            }))
-                            .unwrap_or_default(),
-                        )
-                    }
-                })
-                .await;
-            return match snapshot {
-                Ok(Some(text)) => Ok(text),
-                Ok(None) => Err(not_found(format!(
-                    "session '{sid}' could not be observed (stopped or exited)"
-                ))),
-                Err(e) => Err(not_found(e.to_string())),
-            };
-        }
-        Err(not_found(format!(
-            "unknown resource URI '{uri}' (templates: tui://runs/{{run_id}}, \
-             tui://runs/{{run_id}}/scenarios/{{scenario_id}}, \
-             tui://runs/{{run_id}}/transactions/{{seq}}, \
-             tui://sessions/{{session_id}}/semantic, tui://sessions/{{session_id}}/screen, \
-             tui://findings, tui://findings/{{finding_id}})"
-        )))
-    }
-
-    /// Run-scoped evidence read: `tui://runs/<id>/scenarios[/<key>]` and
-    /// `tui://runs/<id>/transactions[/<seq>]` (review P1: evidence-
-    /// addressability — citable evidence gets its own URI, live or
-    /// restored read-only from disk). `kind`/`key` are the path segments
-    /// after the run id.
-    fn resolve_run_scoped(
-        &self,
-        run_id: &str,
-        kind: &str,
-        key: Option<&str>,
-        not_found: impl Fn(String) -> rmcp::model::ErrorData,
-    ) -> Result<String, rmcp::model::ErrorData> {
-        // Resolve the run: live first (borrowed, short lock — this fn is
-        // sync and never awaits under it), then any persisted one restored
-        // read-only from disk.
-        let live_is_target = self.run.lock().unwrap().id() == run_id;
-        let rendered = if live_is_target {
-            let run = self.run.lock().unwrap();
-            run_scoped_payload(&run, run_id, kind, key)
-        } else {
-            let mut bases = self.run.lock().unwrap().browser_bases();
-            if let Ok(cwd) = std::env::current_dir() {
-                if !bases.contains(&cwd) {
-                    bases.push(cwd);
-                }
-            }
-            let mut restored: Option<crate::run::RunContext> = None;
-            for base in &bases {
-                if let Some(dir) = crate::run::RunContext::resolve_run_dir(base, run_id) {
-                    restored = Some(
-                        crate::run::RunContext::restore(&dir)
-                            .map_err(|e| not_found(format!("run '{run_id}' unreadable: {e}")))?,
-                    );
-                    break;
-                }
-            }
-            let run = restored.ok_or_else(|| {
-                not_found(format!(
-                    "no run '{run_id}' in this server or under its runs roots"
-                ))
-            })?;
-            run_scoped_payload(&run, run_id, kind, key)
-        };
-        match rendered {
-            Ok(text) => Ok(text),
-            Err(msg) => Err(not_found(msg)),
-        }
+        crate::mcp::resources::resolve::resource(self, uri).await
     }
 
     /// Run a closure against one session inside its actor, mapping actor
@@ -383,7 +134,7 @@ impl TuiLabServer {
                 .session_owners
                 .lock()
                 .ok()
-                .and_then(|m| m.get(&sid).cloned());
+                .and_then(|m| m.owner_of(&sid));
             if let Some(own) = bound {
                 if own != cur_run {
                     return Err(err(
@@ -417,7 +168,7 @@ impl TuiLabServer {
         self.session_owners
             .lock()
             .expect("session owner lock")
-            .insert(id.to_string(), run_id);
+            .bind(id, &run_id);
     }
 }
 
@@ -1002,85 +753,4 @@ impl ServerHandler for TuiLabServer {
         let contents = self.resolve_resource(&uri).await?;
         Ok(ReadResourceResult::new(vec![ResourceContents::text(contents, uri)]).into())
     }
-}
-
-/// The payload for a run-scoped evidence URI, rendered against whichever
-/// run context the caller resolved (live-borrowed or restored). `Err` is
-/// the honest not-found message naming what would have been accepted.
-fn run_scoped_payload(
-    run: &crate::run::RunContext,
-    run_id: &str,
-    kind: &str,
-    key: Option<&str>,
-) -> Result<String, String> {
-    match (kind, key) {
-        // The collection listing (no key): ids + shapes, so a client can
-        // address a specific one next.
-        ("scenarios", None) => {
-            let ids = run.list_saved_scenarios().map_err(|e| e.to_string())?;
-            let items: Vec<serde_json::Value> = ids
-                .iter()
-                .filter_map(|k| run.load_scenario(k).ok())
-                .map(|sc| {
-                    serde_json::json!({
-                        "id": sc.id, "name": sc.name,
-                        "steps": sc.steps.len(),
-                        "uri": format!("tui://runs/{run_id}/scenarios/{}", sc.id),
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "run": run_id, "scenarios": items, "count": items.len(),
-            }))
-            .unwrap_or_default())
-        }
-        // One scenario by id (or unambiguous name — load_scenario's own
-        // resolution order, shared with tui_scenario action=run).
-        ("scenarios", Some(key)) => {
-            let sc = run.load_scenario(key).map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&sc).unwrap_or_default())
-        }
-        // The ledger listing (no key): bounded to the retained window.
-        ("transactions", None) => {
-            let txs = run.transactions();
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "run": run_id,
-                "retained": txs.len(),
-                "lifetime": run.transaction_total(),
-                "note": "the ledger is a bounded window; the manifest names any evicted head (history_complete=false)",
-                "transactions": txs,
-            }))
-            .unwrap_or_default())
-        }
-        // One transaction by ledger seq.
-        ("transactions", Some(key)) => {
-            let seq: u64 = key.parse().map_err(|_| {
-                format!(
-                    "transaction key '{key}' is not a ledger seq (integer); tui://runs/{run_id}/transactions lists the retained window"
-                )
-            })?;
-            let tx = run.transactions().iter().find(|t| t.seq == seq).ok_or_else(
-                || {
-                    format!(
-                        "no transaction with seq {seq} in run '{run_id}' (retained window: {} records; the ledger may have evicted old records)",
-                        run.transactions().len()
-                    )
-                },
-            )?;
-            Ok(serde_json::to_string_pretty(tx).unwrap_or_default())
-        }
-        (other, _) => Err(format!(
-            "unknown run-scoped resource '{other}' under run '{run_id}' (expected 'scenarios' or 'transactions', each optionally followed by an id/seq)"
-        )),
-    }
-}
-
-/// Read the declared run id out of a persisted run directory (review P0.2).
-/// Used to decide which live sessions legitimately belong to the run being
-/// resumed. The manifest is authoritative; a directory without one cannot
-/// be a valid resume target.
-fn running_id(run_dir: &std::path::Path) -> String {
-    crate::run::manifest::load(run_dir)
-        .map(|m| m.run_id)
-        .unwrap_or_default()
 }

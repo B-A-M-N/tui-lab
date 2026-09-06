@@ -243,7 +243,7 @@ pub(crate) async fn tui_session(
                     .session_owners
                     .lock()
                     .ok()
-                    .and_then(|m| m.get(&id).cloned());
+                    .and_then(|m| m.owner_of(&id));
                 if let Some(own) = bound {
                     if own != cur_run {
                         return err(
@@ -312,7 +312,7 @@ pub(crate) async fn tui_session(
                     s.session_owners
                         .lock()
                         .expect("session owner lock")
-                        .remove(&id);
+                        .unbind(&id);
                     ok(json!({ "stopped": id }))
                 }
                 Err(e) => err(ErrorCategory::BackendError, e.to_string()),
