@@ -146,7 +146,7 @@ pub(crate) async fn tui_audit(
     let run = s.run.clone();
     let label = p.label.clone();
     let compare_to = p.compare_to.clone();
-    s.with_sess(selector.as_deref(), move |sess| {
+    s.with_sess_authorized(selector.as_deref(), move |sess, _ticket| {
             if profile_consumes_process && !allow_process_restart {
                 return err(
                     ErrorCategory::InvalidRequest,

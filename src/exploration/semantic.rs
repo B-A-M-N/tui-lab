@@ -189,12 +189,16 @@ pub fn run_evidenced(
         // Audit finding 23: the action's IDENTITY is the exact canonical
         // signature (`mouse:left:click@12,3`), not the generic kind name —
         // distinct keys/targets must not collapse in the graph, history,
-        // or novelty dimensions. Finding 22: when a run sink is present,
-        // the transaction enters the canonical ledger like every other
-        // driver, linked as exploration evidence.
+        // or novelty dimensions. Finding 22 + beta-audit P0-7: the
+        // transaction enters the canonical ledger through the session's
+        // installed evidence sink (committed inside execute_act_as above);
+        // the `run` reference stays only as the legacy route for callers
+        // without authorized dispatch (tests).
         let action_sig = action.signature();
-        if let Some(run) = run.as_deref_mut() {
-            let _ = run.record_interaction(&session.id, &tx);
+        if session.evidence_sink().is_none() {
+            if let Some(run) = run.as_deref_mut() {
+                let _ = run.record_interaction(&session.id, &tx);
+            }
         }
         let after = tx.after().clone();
         // Re-review P0.7: the after-state identity comes from the SAME

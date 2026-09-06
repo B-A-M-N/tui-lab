@@ -295,11 +295,16 @@ pub fn run_evidenced(
         // Audit finding 23: the step's identity is the exact canonical
         // signature, not the pool's generic kind name — `key` and `mouse_click`
         // collapse distinct actions; `mouse:left:click@12,3` does not.
-        // Finding 22: the transaction also enters the run ledger when a sink
-        // is present, linked as exploration evidence.
+        // Finding 22 + beta-audit P0-7: the transaction enters the run
+        // ledger through the session's installed evidence sink (committed
+        // inside execute_act_as above) — a `run_ctx` reference is now only
+        // the legacy route for callers that dispatch without authorized
+        // dispatch (tests); the MCP handler passes None.
         let action_sig = action.signature();
-        if let Some(run) = run_ctx.as_deref_mut() {
-            let _ = run.record_interaction(&session.id, &tx);
+        if session.evidence_sink().is_none() {
+            if let Some(run) = run_ctx.as_deref_mut() {
+                let _ = run.record_interaction(&session.id, &tx);
+            }
         }
 
         // Layered identity for both frames (re-review P0 fix 3): semantic

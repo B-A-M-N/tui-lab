@@ -112,9 +112,7 @@ pub struct EvidenceHealth {
     /// Whether the interaction transaction was recorded in the run
     /// ledger (the reconstructable record; sensitive payloads redacted).
     pub ledger_recorded: bool,
-}
-
-impl EvidenceHealth {
+}impl EvidenceHealth {
     /// True only when every evidence leg committed. A `false` here does
     /// not invalidate the act — the TUI still received the input (the
     /// execution itself succeeded) — it means the run's citable record
@@ -165,6 +163,115 @@ pub struct DriveOutcome {
     pub health: EvidenceHealth,
 }
 
+/// Beta-audit P0-7: the ONE evidence sink every driving path commits
+/// through. Authorized dispatch (`with_sess_authorized`, or an evidence
+/// -carrying driver entry) installs it on the session; the canonical
+/// executor's tail commits EVERY transaction it produces through
+/// [`Self::commit`] and folds the session's events through
+/// [`Self::fold`]. That makes `drive_pipeline`'s invariants — typed
+/// origin, citable frames, reconstructable ledger row, event/coverage
+/// fold, ticket-verified run identity — properties of the executor, not
+/// things each driver (exploration, audit drivers, repro, conformance,
+/// probe) has to remember.
+///
+/// The run Arc is locked BRIEFLY per commit, never held across driving —
+/// an exploration that used to hold the run mutex for its whole loop now
+/// only holds it for the per-act commit window.
+#[derive(Clone)]
+pub struct RunEvidenceSink {
+    run: std::sync::Arc<std::sync::Mutex<RunContext>>,
+    ticket: RunTicket,
+    /// Health of the most recent commit (finding 9): drivers that do not
+    /// return per-act outcomes (audit drivers, exploration) can still
+    /// report — and tests can assert — what actually committed.
+    last_health: std::sync::Arc<std::sync::Mutex<Option<EvidenceHealth>>>,
+}
+
+impl RunEvidenceSink {
+    /// Capture at authorization: the run identity is read under the same
+    /// lock window that decided the dispatch.
+    pub fn capture(run: &std::sync::Arc<std::sync::Mutex<RunContext>>) -> Self {
+        RunEvidenceSink {
+            run: run.clone(),
+            ticket: RunTicket::capture(run),
+            last_health: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// An explicit ticket over an existing Arc (tests, non-standard
+    /// authorization windows).
+    pub fn with_ticket(
+        run: std::sync::Arc<std::sync::Mutex<RunContext>>,
+        ticket: RunTicket,
+    ) -> Self {
+        RunEvidenceSink {
+            run,
+            ticket,
+            last_health: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn ticket(&self) -> &RunTicket {
+        &self.ticket
+    }
+
+    /// Finding 9: how healthy the most recent commit through this sink
+    /// was. `None` = nothing committed yet.
+    pub fn last_health(&self) -> Option<EvidenceHealth> {
+        self.last_health.lock().unwrap().clone()
+    }
+
+    /// Commit one interaction transaction: ticket verify → frames →
+    /// ledger. `Err` names a run-switch refusal (evidence DROPPED, never
+    /// committed to the wrong run). Frame/ledger failures are RECORDED
+    /// (finding 9), not fatal — the act already happened; health says
+    /// which legs stand behind it.
+    pub fn commit(
+        &self,
+        sid: &str,
+        gen: u32,
+        tx: &crate::execution::InteractionTransaction,
+    ) -> Result<EvidenceHealth, anyhow::Error> {
+        let mut run = self.run.lock().unwrap();
+        // Beta-audit P0-6: a run switch between authorization and commit
+        // aborts the whole evidence commit — the transaction belongs to
+        // the run that authorized it, and that run is gone.
+        self.ticket.verify(&run).map_err(anyhow::Error::msg)?;
+        // Frame commit pipeline (re-review item 40): both frames through
+        // the ONE commit path — id + provenance + incremental append.
+        let mut commit = |f: &crate::backend::CanonicalFrame| {
+            let mut f = f.clone();
+            f.session_id = Some(sid.to_string());
+            f.generation = Some(gen);
+            run.commit_frame(&mut f, Some(sid))
+                .map_err(|e| e.to_string())
+        };
+        let frame_commits = [commit(&tx.before_frame), commit(&tx.after_frame)];
+        // Run ledger (Wave-2 item 15): the reconstructable transaction
+        // record. Sensitive payloads are projected to Redacted(kind,
+        // byte_len) by the ledger itself.
+        let ledger_recorded = run.record_interaction(sid, tx).is_ok();
+        let health = EvidenceHealth {
+            frame_commits,
+            ledger_recorded,
+        };
+        *self.last_health.lock().unwrap() = Some(health.clone());
+        Ok(health)
+    }
+
+    /// Universal evidence fold (audit §28): the session's event queue
+    /// lands in the run (incremental persistence + native coverage). A
+    /// run switch between authorization and fold drops the fold — the
+    /// events stay queued for a later fold under the right run.
+    pub fn fold(&self, sess: &mut crate::session::Session) {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return; // run switched mid-operation; skip this fold
+        }
+        fold_into_run(sess, &mut run);
+    }
+}
+
 /// THE driving pipeline. Runs inside the session's actor (call it from a
 /// `with_sess` closure only): guarded execute → frames → ledger →
 /// scenario → event/coverage fold. Beta-audit P0-6: `ticket` is the run
@@ -187,88 +294,78 @@ pub fn drive(
         spec.completion,
         spec.guard,
     )?;
-    // Commit evidence under one short lock on the actor thread. Finding 9:
-    // commit results are RECORDED, not swallowed — a failed frame commit
-    // used to `.unwrap_or_default()` into frame id 0 and the outcome still
-    // cited "frame:0" as if it were evidence. The act itself already
-    // happened either way; health says which legs of the run's record
-    // stand behind it.
-    let (frames, health) = {
-        let (sid, gen) = (sess.id.clone(), sess.generation);
+    // Beta-audit P0-7: the commit + fold ride the ONE sink path. When the
+    // executor already committed through the session's installed sink
+    // (authorized dispatch — same run Arc, verified ticket), that commit
+    // IS the evidence; a second one would double-book the ledger row.
+    // Only a caller that dispatched without an installed sink commits
+    // here (tests, non-standard entry points — still verified).
+    let installed = sess.evidence_sink();
+    let already_committed = installed.as_ref().is_some_and(|s| {
+        std::sync::Arc::ptr_eq(&s.run, run) && s.ticket.run_id == spec.ticket.run_id
+    });
+    let sink = installed.unwrap_or_else(|| {
+        std::sync::Arc::new(RunEvidenceSink {
+            run: run.clone(),
+            ticket: spec.ticket.clone(),
+            last_health: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    });
+    let (sid, gen) = (sess.id.clone(), sess.generation);
+    let health = if already_committed {
+        sink.last_health()
+            .ok_or_else(|| anyhow::anyhow!("sink reported no commit health"))?
+    } else {
+        sink.commit(&sid, gen, &tx)?
+    };
+    // Scenario capture (re-review P0.3): sensitive text payloads are
+    // recorded as ${PARAM} references; sensitive non-text payloads as
+    // an opaque redacted step; everything else verbatim.
+    if let Some(cap) = &spec.scenario {
         let mut run = run.lock().unwrap();
-        // Beta-audit P0-6: a run switch between authorization and commit
-        // aborts the whole evidence commit — the transaction belongs to
-        // the run that authorized it, and that run is gone.
-        if let Err(mismatch) = spec.ticket.verify(&run) {
-            drop(run);
-            return Err(anyhow::anyhow!(mismatch));
-        }
-        // Frame commit pipeline (re-review item 40): both frames through
-        // the ONE commit path — id + provenance + incremental append.
-        let mut commit = |f: &crate::backend::CanonicalFrame| {
-            let mut f = f.clone();
-            f.session_id = Some(sid.clone());
-            f.generation = Some(gen);
-            run.commit_frame(&mut f, Some(&sid))
-                .map_err(|e| e.to_string())
+        let recorded = if cap.sensitive {
+            match spec.action {
+                CanonicalAction::Type { .. } => Some("text"),
+                CanonicalAction::Paste { .. } => Some("paste"),
+                _ => None,
+            }
+        } else {
+            None
         };
-        let frame_commits = [commit(&tx.before_frame), commit(&tx.after_frame)];
-        // Run ledger (Wave-2 item 15): the reconstructable transaction
-        // record. Sensitive payloads are projected to Redacted(kind,
-        // byte_len) by the ledger itself.
-        let ledger_recorded = run.record_interaction(&sid, &tx).is_ok();
-        // Scenario capture (re-review P0.3): sensitive text payloads are
-        // recorded as ${PARAM} references; sensitive non-text payloads as
-        // an opaque redacted step; everything else verbatim.
-        if let Some(cap) = &spec.scenario {
-            let recorded = if cap.sensitive {
-                match spec.action {
-                    CanonicalAction::Type { .. } => Some("text"),
-                    CanonicalAction::Paste { .. } => Some("paste"),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            match recorded {
-                Some(field) => {
-                    let _ = run.record_scenario_act_sensitive(
-                        &sid,
-                        gen,
-                        cap.params.clone(),
-                        field,
-                        crate::scenario::model::SensitiveKind::Secret,
-                        spec.action.payload_len(),
-                    );
-                }
-                None if cap.sensitive => {
-                    let _ = run.record_scenario_act(
-                        &sid,
-                        gen,
-                        json!({
-                            "action": spec.action.name(),
-                            "sensitive": true,
-                            "redacted": true,
-                            "payload_bytes": spec.action.payload_len(),
-                        }),
-                    );
-                }
-                None => {
-                    let _ = run.record_scenario_act(&sid, gen, cap.params.clone());
-                }
+        match recorded {
+            Some(field) => {
+                let _ = run.record_scenario_act_sensitive(
+                    &sid,
+                    gen,
+                    cap.params.clone(),
+                    field,
+                    crate::scenario::model::SensitiveKind::Secret,
+                    spec.action.payload_len(),
+                );
+            }
+            None if cap.sensitive => {
+                let _ = run.record_scenario_act(
+                    &sid,
+                    gen,
+                    json!({
+                        "action": spec.action.name(),
+                        "sensitive": true,
+                        "redacted": true,
+                        "payload_bytes": spec.action.payload_len(),
+                    }),
+                );
+            }
+            None => {
+                let _ = run.record_scenario_act(&sid, gen, cap.params.clone());
             }
         }
-        let health = EvidenceHealth {
-            frame_commits,
-            ledger_recorded,
-        };
-        let frames = health.frames_json();
-        (frames, health)
-    };
+    }
     // Universal evidence fold (audit §28): the session's event queue lands
     // in the run (incremental persistence + native coverage) after EVERY
-    // driven act, not only on observe sweeps.
-    fold_session_events(sess, run, &spec.ticket);
+    // driven act, not only on observe sweeps. Idempotent with the
+    // executor's own fold (consumer cursors).
+    sink.fold(sess);
+    let frames = health.frames_json();
     Ok(DriveOutcome { tx, frames, health })
 }
 
@@ -288,6 +385,13 @@ pub fn fold_session_events(
     if ticket.verify(&run).is_err() {
         return; // run switched mid-operation; skip this fold
     }
+    fold_into_run(sess, &mut run);
+}
+
+/// The fold body, shared by [`fold_session_events`] and
+/// [`RunEvidenceSink::fold`] — caller already holds the run lock and has
+/// verified the ticket.
+fn fold_into_run(sess: &mut crate::session::Session, run: &mut RunContext) {
     {
         let cursor_key = format!("persistence:{}", sess.id);
         let from = run.event_cursor(&cursor_key).unwrap_or(0);

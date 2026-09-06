@@ -504,7 +504,7 @@ fn execute_act_inner(
     // restores recording and relinquishes the session.
     window.commit();
 
-    Ok(InteractionTransaction {
+    let tx = InteractionTransaction {
         action: ActionEnvelope::new(action.clone(), visibility),
         anchor,
         before_frame,
@@ -520,7 +520,25 @@ fn execute_act_inner(
         render,
         transition_capture: transition_frames_evidence,
         origin: Some(origin),
-    })
+    };
+
+    // Beta-audit P0-7: when authorized dispatch installed the run evidence
+    // sink, EVERY transaction produced here — act, intent step, scenario
+    // step, exploration step, audit-driver probe, repro replay, conformance
+    // restore, probe stimulus — commits through the ONE pipeline
+    // (ticket-verified frames + run ledger), then folds the session's
+    // events into the run. The commit failures are RECORDED in the sink's
+    // health (finding 9), not swallowed: a caller that reads last_health()
+    // sees exactly which evidence legs stand behind the act. A run-switch
+    // refusal (P0-6) propagates — the evidence is dropped, never spilled.
+    if let Some(sink) = session.evidence_sink() {
+        let (sid, gen) = (session.id.clone(), session.generation);
+        sink.commit(&sid, gen, &tx)?;
+        // Idempotent with any outer fold (per-consumer cursors).
+        sink.fold(session);
+    }
+
+    Ok(tx)
 }
 
 /// Focus `(control_id, label)` from a frame via fused semantic analysis.

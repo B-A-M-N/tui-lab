@@ -48,6 +48,29 @@ impl Session {
         self.lease.active()
     }
 
+    /// Beta-audit P0-7: install the run evidence sink for the duration of
+    /// one authorized job. While installed, every transaction the
+    /// canonical executor produces commits through the ONE pipeline
+    /// (ticket-verified frames + run ledger + event/coverage fold) — the
+    /// invariants `drive_pipeline` enforces for `tui_act` become
+    /// properties of the executor for every driving path.
+    pub fn install_evidence_sink(&mut self, sink: crate::execution::RunEvidenceSink) {
+        self.evidence_sink = Some(std::sync::Arc::new(sink));
+    }
+
+    /// Clear the sink (end of the authorized job). Returns what was
+    /// installed, for the dispatcher's health reporting.
+    pub fn take_evidence_sink(
+        &mut self,
+    ) -> Option<std::sync::Arc<crate::execution::RunEvidenceSink>> {
+        self.evidence_sink.take()
+    }
+
+    /// The installed sink, if any (executor read path).
+    pub fn evidence_sink(&self) -> Option<std::sync::Arc<crate::execution::RunEvidenceSink>> {
+        self.evidence_sink.clone()
+    }
+
     /// Wave G item 77: what the current generation actually launched with.
     pub fn isolation_evidence(&self) -> Option<&crate::session::isolation::IsolationEvidence> {
         self.isolation_evidence.as_ref()
