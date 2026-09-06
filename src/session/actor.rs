@@ -134,6 +134,15 @@ impl SessionActor {
     /// error when it was already gone.
     ///
     /// The mailbox is bounded, so we do NOT rely on `try_send` landing the
+    /// Assert the closing gate without enqueuing Shutdown (beta-audit
+    /// P0-5): every handle clone shares the flag, so subsequent sends are
+    /// rejected atomically from this point.
+    fn begin_closing(&self) {
+        self.inner
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Shutdown mail (it can be dropped when full). Instead we set `closing`
     /// (which atomically rejects new work), enqueue Shutdown with a oneshot
     /// ack under `send(...).await` backpressure (which CANNOT fail while the
@@ -198,6 +207,28 @@ impl SessionActor {
         // Async backpressure (review item 13): a full mailbox suspends THIS
         // task until the actor drains, rather than blocking a runtime worker
         // thread as std::sync::mpsc::SyncSender::send would.
+        self.inner
+            .tx
+            .send(Mail::Job(job))
+            .await
+            .map_err(|_| ActorError::ActorGone(self.inner.id.clone()))?;
+        rrx.await
+            .map_err(|_| ActorError::ActorDropped(self.inner.id.clone()))
+    }
+
+    /// Internal control-path send: like `send` but EXEMPT from the closing
+    /// gate (beta-audit P0-5). Pool::stop asserts `closing` BEFORE mailing
+    /// the target-stop job so no racing handle can enqueue work — that same
+    /// mail must still get through. Only stop's own teardown uses this.
+    async fn send_control<R, F>(&self, job: F) -> Result<R, ActorError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Session) -> R + Send + 'static,
+    {
+        let (rtx, rrx) = tokio::sync::oneshot::channel::<R>();
+        let job: Job = Box::new(move |session: &mut Session| {
+            let _ = rtx.send(job(session));
+        });
         self.inner
             .tx
             .send(Mail::Job(job))
@@ -568,6 +599,14 @@ impl SessionPool {
 
     /// Stop a session and remove its actor. Idempotent: stopping an unknown
     /// id is success (the old manager's contract — "already gone").
+    ///
+    /// Beta-audit P0-5: the target-stop error is PRESERVED — actor teardown
+    /// succeeding says nothing about whether the child process actually
+    /// terminated, so `Err` here means the target refused to die (or the
+    /// backend stopped uncleanly), never "the actor is gone". And the
+    /// actor's `closing` gate is asserted BEFORE the target-stop mail is
+    /// sent: a handle cloned before the directory removal could otherwise
+    /// enqueue fresh work between removal and shutdown_ack's closing store.
     pub async fn stop(&self, id: &str) -> anyhow::Result<()> {
         // Remove from the directory BEFORE shutting down (finding 1): once
         // stop begins, `resolve` can no longer hand out handles that would
@@ -585,12 +624,36 @@ impl SessionPool {
             }
             actor
         };
-        // Stop synchronously inside the actor FIRST (flushes backend state),
-        // then shut the actor down (ack-awaited, so a full mailbox can never
-        // wedge us — review P0.3).
-        let _ = actor.send(|s: &mut Session| s.stop()).await;
-        actor.shutdown_ack().await?;
-        Ok(())
+        // Atomically close the mailbox FIRST (beta-audit P0-5): every
+        // handle clone shares the same closing flag, so any send that
+        // races this stop is rejected from here on — no work can be
+        // enqueued between the directory removal and shutdown.
+        actor.begin_closing();
+        // Target termination, with its real result. Best-effort actor
+        // cleanup below runs REGARDLESS, but the caller learns the truth
+        // about the process.
+        // send yields Result<Result<(), anyhow::Error>, ActorError>:
+        // transport error (left) or the in-actor stop's own failure.
+        let target: Result<(), String> = match actor.send_control(|s: &mut Session| s.stop()).await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(job_err)) => Err(format!("target termination failed: {job_err:#}")),
+            Err(actor_err) => Err(format!("target termination mail failed: {actor_err}")),
+        };
+        // Ack-awaited shutdown (review P0.3): a full mailbox can never
+        // wedge us. closing is already set, so this only drains + joins.
+        let teardown = actor.shutdown_ack().await;
+        // Teardown failure must not mask the target result — but both are
+        // reported when both fail.
+        match (target, teardown) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(target_msg), Ok(())) => Err(anyhow::anyhow!(target_msg)
+                .context("session actor stopped cleanly, but the target termination failed")),
+            (Err(target_msg), Err(teardown_err)) => Err(anyhow::anyhow!(teardown_err.to_string())
+                .context("actor teardown failed")
+                .context(target_msg)),
+            (Ok(()), Err(teardown_err)) => Err(anyhow::anyhow!(teardown_err.to_string())),
+        }
     }
 
     /// Stop every session and tear down the actors (run close
@@ -999,6 +1062,68 @@ mod tests {
             dropped.category(),
             crate::error::ErrorCategory::BackendError,
             "a dropped reply is a transport fault, not a missing session"
+        );
+    }
+
+    /// Beta-audit P0-5: a handle retained BEFORE the stop begins must not
+    /// be able to enqueue work during the teardown window, and a stop that
+    /// kills a live process reports success ONLY when the actor finished
+    /// draining. The old window: directory removal happened before
+    /// shutdown_ack's closing store, so this pre-held handle could send a
+    /// job into the actor mid-teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pre_stop_handle_cannot_enqueue_during_teardown() {
+        let pool = std::sync::Arc::new(SessionPool::new());
+        let id = pool
+            .start(
+                "python3",
+                &["-c".into(), "print('teardown-race'); input()".into()],
+                None,
+                &[],
+                80,
+                24,
+                "auto",
+                "local",
+            )
+            .await
+            .expect("start");
+        // Retain the handle BEFORE any stop machinery runs.
+        let handle = pool
+            .resolve(Some(&id))
+            .expect("handle resolves pre-stop");
+
+        // Concurrently: one task spams sends on the pre-held handle while
+        // stop runs. Every send must either land BEFORE closing was
+        // asserted (fine — the actor was still live) or be REJECTED with
+        // ActorGone/ActorBusy — never accepted-then-lost, and never a hang.
+        let spam = tokio::spawn(async move {
+            let mut accepted = 0u32;
+            let mut rejected = 0u32;
+            for _ in 0..200 {
+                match handle
+                    .send(|s: &mut Session| {
+                        let _ = &s.id;
+                    })
+                    .await
+                {
+                    Ok(()) => accepted += 1,
+                    Err(_) => rejected += 1,
+                }
+            }
+            (accepted, rejected)
+        });
+
+        let stop_res = pool.stop(&id).await;
+        stop_res.expect("stop of a healthy session succeeds (target + teardown)");
+        let (accepted, rejected) = spam.await.expect("spam task joins");
+        assert_eq!(
+            accepted + rejected,
+            200,
+            "every send resolves one way or the other ({accepted} accepted, {rejected} rejected)"
+        );
+        assert!(
+            pool.resolve(Some(&id)).is_none(),
+            "the actor is gone from the pool"
         );
     }
 }
