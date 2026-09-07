@@ -42,6 +42,23 @@ impl RunContext {
         self.findings.record_baseline(label, findings);
     }
 
+    /// Beta-audit P0.10: record a completed audit pass as THE current
+    /// snapshot (replaces any previous one — this is the newest pass,
+    /// not history).
+    pub fn record_audit_pass(&mut self, findings: Vec<crate::audit::Finding>) {
+        self.findings.record_pass(findings);
+    }
+
+    /// The latest completed audit pass's findings, when one has been
+    /// recorded in this run. Falls back to nothing — a run with no
+    /// completed pass has no "current set" to compare against, and
+    /// callers must say so rather than substitute the cumulative
+    /// ledger (whose stale copies turn fixed defects into persisting
+    /// ones).
+    pub fn latest_audit_pass(&self) -> Option<&[crate::audit::Finding]> {
+        self.findings.latest_pass()
+    }
+
     /// Fetch a labeled audit-finding baseline.
     pub fn finding_baseline(&self, label: &str) -> Option<&Vec<crate::audit::Finding>> {
         self.findings.baseline(label)

@@ -2024,6 +2024,96 @@ mod source_ref_tests {
         assert!(!coverage_target_matches_control("widget:#save", ""));
     }
 
+    fn compare_test_finding(id: &str, category: &str, target: &str) -> crate::audit::Finding {
+        Finding {
+            id: id.into(),
+            rule_id: None,
+            severity: crate::audit::Severity::Warn,
+            category: crate::audit::Category::parse(category),
+            summary: format!("{} in {}", id, category),
+            evidence: vec![crate::audit::EvidenceRef::point(
+                crate::audit::EvidenceKind::Other,
+                target,
+                "evidence",
+            )],
+            confidence: 0.9,
+            reproduction: None,
+            source_refs: Vec::new(),
+            occurrence_id: None,
+        }
+    }
+
+    /// Beta-audit P0.10: the latest audit pass is a first-class snapshot.
+    /// A defect that was in the baseline, was fixed (absent from the
+    /// newest pass), and still has stale copies in the cumulative ledger
+    /// must compare as FIXED — the ledger is history, not the current
+    /// set. This is the exact defect the old bundle had: comparing
+    /// against `findings()` kept a fixed defect "persisting" forever.
+    #[test]
+    fn latest_pass_snapshot_not_ledger_is_the_comparison_set() {
+        let mut run = RunContext::ephemeral();
+        let baseline_pass = vec![
+            compare_test_finding("KB-TRAP", "keyboard", "tab_trap"),
+            compare_test_finding("CLIP-001", "clipping", "region-a"),
+        ];
+        // Pass 1: both defects present. Baseline + snapshot recorded.
+        run.record_audit_pass(baseline_pass.clone());
+        run.record_finding_baseline("baseline", baseline_pass);
+
+        // Later activity adds unrelated findings to the LEDGER (the
+        // cumulative history every audit appends to).
+        let _ = run.extend_findings(vec![compare_test_finding("LATE-001", "focus", "unrelated")]);
+
+        // Pass 2 (the fix): KB-TRAP and CLIP-001 are GONE from the
+        // pass; only the unrelated late finding runs.
+        run.record_audit_pass(vec![compare_test_finding("LATE-001", "focus", "unrelated")]);
+
+        let base = run.finding_baseline("baseline").unwrap();
+        let resolved =
+            crate::audit::compare::Resolved(run.resolved_finding_fingerprints("baseline"));
+        let compared = crate::audit::compare::compare_with_resolved(
+            base,
+            run.latest_audit_pass().expect("a pass snapshot exists"),
+            &resolved,
+        );
+        let verdict_of = |id: &str| {
+            compared
+                .iter()
+                .find(|c| c.finding.id == id)
+                .map(|c| c.verdict)
+                .unwrap_or("absent-from-current")
+        };
+        assert_eq!(
+            verdict_of("KB-TRAP"),
+            "fixed",
+            "a defect absent from the newest pass is FIXED — a stale copy in the cumulative ledger must not resurrect it"
+        );
+        assert_eq!(verdict_of("CLIP-001"), "fixed");
+        assert_eq!(
+            verdict_of("LATE-001"),
+            "new",
+            "the unrelated late finding is new (not in the baseline)"
+        );
+
+        // The ledger still carries what was ever appended to it (history
+        // is kept — the point is it no longer decides the comparison).
+        let ledger_rules: Vec<&str> = run
+            .findings()
+            .iter()
+            .map(|f| f.rule_id.as_deref().unwrap_or(f.id.as_str()))
+            .collect();
+        assert!(ledger_rules.contains(&"LATE-001"));
+
+        // A run with NO completed pass has no comparison set at all —
+        // callers must report that honestly rather than substitute the
+        // ledger.
+        let fresh = RunContext::ephemeral();
+        assert!(
+            fresh.latest_audit_pass().is_none(),
+            "no completed pass ⇒ no current set"
+        );
+    }
+
     #[test]
     fn findings_get_app_declared_loci_when_control_is_covered() {
         let mut run = RunContext::ephemeral();

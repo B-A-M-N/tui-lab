@@ -169,7 +169,7 @@ async fn expired_lease_allows_stop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_run_unleased_cleanup_after_close_succeeds() {
     let server = tui_lab::mcp::tools::TuiLabServer::new();
-    let guard = PoolGuard::new(&server);
+    let _guard = PoolGuard::new(&server);
     let id = start_session(&server, "print('cu'); import sys; sys.stdin.read(1)").await;
     // Close WITHOUT kill_sessions: the owned session survives, still
     // owned by the (now closed) run.
