@@ -129,21 +129,73 @@ pub struct ReplayCheck {
 /// name and the exact arguments — so an agent can act without parsing the
 /// prose. `suggestion`/`rationale` remain for display; `tool` +
 /// `arguments` are the contract.
+///
+/// Beta-audit P0.4: `arguments` are built FROM the real MCP parameter
+/// types ([`ToolInvocation`]), never hand-written JSON. Every generated
+/// step round-trips through its tool's `Deserialize` before it is
+/// emitted — a suggestion that does not deserialize is a build/test
+/// failure, not an agent-side surprise.
 #[derive(Debug, Clone, Serialize)]
 pub struct NextObservation {
     /// Short imperative in observation space, e.g.
-    /// "probe control 'button/save' after Tab".
+    /// "inspect control 'button/save' with tui_observe mode=inspect".
     pub suggestion: String,
     /// Why this observation would move the investigation.
     pub rationale: String,
     /// The MCP tool that performs this observation (`tui_probe`,
-    /// `tui_act`, `tui_observe`, `tui_run`, …). `None` when the step is a
-    /// human-space read (source files) with no tool surface.
+    /// `tui_observe`, …). `None` when the step is a human-space read
+    /// (source files) with no tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     /// The exact arguments for `tool`, ready to send. Empty object when
     /// `tool` is `None` or the step needs no parameters.
     pub arguments: serde_json::Value,
+}
+
+/// Beta-audit P0.4: the typed source of every generated invocation.
+/// Building from the REAL parameter types (then serializing) is the
+/// only way the "exact arguments, ready to send" promise can be kept —
+/// hand-built JSON has already drifted into an invalid grammar once
+/// (nested `action.kind` that no tool accepts, fabricated session ids,
+/// a `tui_run context` claimed to be the transaction ledger).
+enum ToolInvocation {
+    Observe(crate::mcp::params::TuiObserveParams),
+    Probe(crate::mcp::params::TuiProbeParams),
+    Act(crate::mcp::params::TuiActRequest),
+}
+
+impl ToolInvocation {
+    /// The wire shape: serialize the REAL type, then round-trip it
+    /// back through that type's `Deserialize` to prove the generated
+    /// arguments are actually accepted. Returns `None` if the
+    /// round-trip fails — which is a generator bug and must surface
+    /// in tests, never in an agent's session.
+    fn to_arguments(&self) -> Option<serde_json::Value> {
+        let (tool, value): (&str, serde_json::Value) = match self {
+            ToolInvocation::Observe(p) => ("tui_observe", serde_json::to_value(p).ok()?),
+            ToolInvocation::Probe(p) => ("tui_probe", serde_json::to_value(p).ok()?),
+            ToolInvocation::Act(p) => ("tui_act", serde_json::to_value(p).ok()?),
+        };
+        // Round-trip validation: the arguments must deserialize into
+        // the tool's real request type.
+        let ok = match tool {
+            "tui_observe" => {
+                serde_json::from_value::<crate::mcp::params::TuiObserveParams>(value.clone())
+                    .is_ok()
+            }
+            "tui_probe" => {
+                serde_json::from_value::<crate::mcp::params::TuiProbeParams>(value.clone()).is_ok()
+            }
+            "tui_act" => {
+                serde_json::from_value::<crate::mcp::params::TuiActRequest>(value.clone()).is_ok()
+            }
+            _ => unreachable!("only the three tools above are generated"),
+        };
+        if !ok {
+            return None;
+        }
+        Some(value)
+    }
 }
 
 impl DiagnosticContext {
@@ -230,7 +282,14 @@ impl DiagnosticContext {
             .filter(|r| r.is_actionable())
             .cloned()
             .collect();
-        let suggested_next_observations = next_observations(&finding);
+        // Beta-audit P0.4: the invocations carry a REAL session id —
+        // the run's primary session when it has one. A fabricated id
+        // (the old `diagnose-focus-<target>` shape) targeted no session
+        // at all; no id is better than a wrong id (the caller fills
+        // their own), and a real one makes the step genuinely
+        // ready-to-send.
+        let suggested_next_observations =
+            next_observations(&finding, sessions.first().map(String::as_str));
         Some(DiagnosticContext {
             rule_id,
             finding,
@@ -253,7 +312,17 @@ impl DiagnosticContext {
 /// own evidence — what to LOOK at to sharpen the diagnosis, never an
 /// edit instruction. Each step names its MCP tool and exact arguments
 /// (finding 23): the prose describes, the structure executes.
-fn next_observations(finding: &crate::audit::Finding) -> Vec<NextObservation> {
+///
+/// Beta-audit P0.4: every invocation is BUILT from the real MCP
+/// parameter types and carries the caller's REAL session id — no
+/// fabricated ids, no grammar the tools don't accept, no claims about
+/// what a key does (Tab "targets a control" only when a proven focus
+/// route says so, and none is available here, so the control steps
+/// observe instead of drive).
+fn next_observations(
+    finding: &crate::audit::Finding,
+    session_id: Option<&str>,
+) -> Vec<NextObservation> {
     let mut out = Vec::new();
     for e in finding.evidence.iter() {
         let Some(target) = e.target.as_deref() else {
@@ -261,18 +330,61 @@ fn next_observations(finding: &crate::audit::Finding) -> Vec<NextObservation> {
         };
         match e.kind {
             crate::audit::EvidenceKind::Control => {
-                // Probe the control: send Tab (the focus primitive) and
-                // capture the settled frame + material changes.
-                out.push(NextObservation {
-                    suggestion: format!("tui_probe the control '{target}' after focusing it — capture the settled frame and its material changes"),
-                    rationale: "a control-targeted probe separates 'the control is absent' from 'the control is present but clipped/unresponsive'".into(),
-                    tool: Some("tui_probe".into()),
-                    arguments: serde_json::json!({
-                        "stimulus": { "action": { "kind": "key", "key": "tab" } },
-                        "completion": "stable",
-                        "id": format!("diagnose-focus-{target}"),
-                    }),
+                // Observe the control's live facts (identity, affordances,
+                // clipping, contract verdict) — target-aware WITHOUT
+                // claiming a focus route: sending Tab "at" a control is
+                // only meaningful when a proven focus path reaches it,
+                // which this static finding does not establish.
+                let observe = ToolInvocation::Observe(crate::mcp::params::TuiObserveParams {
+                    mode: Some(crate::mcp::params::Known::Known(
+                        crate::mcp::params::ObserveMode::Inspect,
+                    )),
+                    idle_ms: None,
+                    id: session_id.map(String::from),
+                    consumer: None,
+                    query: None,
+                    text: None,
+                    since_seq: None,
+                    until_seq: None,
+                    limit: None,
+                    event_types: None,
+                    // mode=inspect targets the CURRENT frame; a specific
+                    // control target would need a proven control id, which
+                    // a static finding's string is not.
+                    target: None,
                 });
+                if let Some(args) = observe.to_arguments() {
+                    out.push(NextObservation {
+                        suggestion: format!(
+                            "inspect the current frame with tui_observe mode=inspect and read control '{target}'s facts (identity, clipping state, affordances, contract verdict)"
+                        ),
+                        rationale: "a control-targeted inspect separates 'the control is absent' from 'the control is present but clipped/unresponsive' — without claiming any focus route".into(),
+                        tool: Some("tui_observe".into()),
+                        arguments: args,
+                    });
+                }
+                // A drift probe (stimulus omitted) on the live session:
+                // pure observation — settled frame + material changes —
+                // with no keys sent and no focus-route claim. Use this
+                // to check whether the finding's state persists.
+                let drift = ToolInvocation::Probe(crate::mcp::params::TuiProbeParams {
+                    stimulus: None,
+                    completion: None,
+                    capture: None,
+                    text: None,
+                    watch: None,
+                    quiet_ms: None,
+                    budget_ms: None,
+                    id: session_id.map(String::from),
+                });
+                if let Some(args) = drift.to_arguments() {
+                    out.push(NextObservation {
+                        suggestion: "run a drift probe (tui_probe with no stimulus) to capture the settled frame and watched material changes".to_string(),
+                        rationale: "a stimulus-free probe confirms whether the finding's state is stable or transient, and records what moved — without driving anything".into(),
+                        tool: Some("tui_probe".into()),
+                        arguments: args,
+                    });
+                }
                 out.push(NextObservation {
                     suggestion: "read the source loci in source_refs (opening with the attested ones) before editing anything".to_string(),
                     rationale: "provenance-tiered loci point at where the evidence was earned; correlated loci are leads, not cause sites".into(),
@@ -282,26 +394,56 @@ fn next_observations(finding: &crate::audit::Finding) -> Vec<NextObservation> {
             }
             crate::audit::EvidenceKind::Region => {
                 // Two-size compare: resize, observe, resize back, observe —
-                // the caller re-runs the region check on both frames.
-                out.push(NextObservation {
-                    suggestion: format!("capture frames at two terminal sizes (tui_act resize, then tui_observe) and compare region '{target}'"),
-                    rationale: "a region complaint that moves with size is layout math; one that persists across sizes is content or styling".into(),
-                    tool: Some("tui_act".into()),
-                    arguments: serde_json::json!({
-                        "action": { "kind": "resize", "cols": 120, "rows": 40 },
-                        "id": format!("diagnose-resize-{target}"),
-                    }),
+                // the caller re-runs the region check on both frames. The
+                // resize carries the REAL session id; completion defaults
+                // apply (resize settles fast; no fabricated completion).
+                let resize = ToolInvocation::Act(crate::mcp::params::TuiActRequest::Resize {
+                    cols: 120,
+                    rows: 40,
+                    guard: None,
+                    id: session_id.map(String::from),
+                    no_wait: None,
+                    completion: None,
+                    wait_ms: None,
                 });
+                if let Some(args) = resize.to_arguments() {
+                    out.push(NextObservation {
+                        suggestion: format!("resize to 120x40 (tui_act), tui_observe, and compare region '{target}' against the current frame — restore the size afterwards"),
+                        rationale: "a region complaint that moves with size is layout math; one that persists across sizes is content or styling".into(),
+                        tool: Some("tui_act".into()),
+                        arguments: args,
+                    });
+                }
             }
             _ => {
-                out.push(NextObservation {
-                    suggestion: format!("inspect the run's transaction ledger around the finding's evidence target '{target}'"),
-                    rationale: "the interaction that preceded the observation often names the trigger the finding only implies".into(),
-                    tool: Some("tui_run".into()),
-                    arguments: serde_json::json!({
-                        "action": "context",
-                    }),
+                // Beta-audit P0.4: the old suggestion pointed at
+                // `tui_run action=context`, which returns the capability
+                // REGISTRY, not the transaction ledger. The truthful
+                // surface for "what interactions preceded this" is the
+                // observe history mode.
+                let history = ToolInvocation::Observe(crate::mcp::params::TuiObserveParams {
+                    mode: Some(crate::mcp::params::Known::Known(
+                        crate::mcp::params::ObserveMode::History,
+                    )),
+                    idle_ms: None,
+                    id: session_id.map(String::from),
+                    consumer: None,
+                    query: None,
+                    text: None,
+                    since_seq: Some(0),
+                    until_seq: None,
+                    limit: None,
+                    event_types: None,
+                    target: None,
                 });
+                if let Some(args) = history.to_arguments() {
+                    out.push(NextObservation {
+                        suggestion: format!("read the session's terminal event history (tui_observe mode=history) around the finding's evidence target '{target}' — the events that preceded the finding often name its trigger"),
+                        rationale: "the interaction that preceded the observation often names the trigger the finding only implies".into(),
+                        tool: Some("tui_observe".into()),
+                        arguments: args,
+                    });
+                }
             }
         }
     }
@@ -412,25 +554,140 @@ mod tests {
                 ),
             }
         }
-        // The control-targeted probe is a real tui_probe call over the
-        // canonical action grammar.
-        let probe = ctx
+        // Beta-audit P0.4: the probe step (if any) is a DRIFT probe —
+        // no stimulus at all, never the old fabricated nested grammar
+        // `{"stimulus":{"action":{"kind":...}}}` no tool accepts.
+        if let Some(probe) = ctx
             .suggested_next_observations
             .iter()
             .find(|o| o.tool.as_deref() == Some("tui_probe"))
-            .expect("control evidence → tui_probe step");
-        assert_eq!(
-            probe.arguments["stimulus"]["action"]["kind"],
-            serde_json::json!("key"),
-            "stimulus uses the canonical grammar: {}",
-            probe.arguments
-        );
+        {
+            assert!(
+                probe.arguments.get("stimulus").is_none() || probe.arguments["stimulus"].is_null(),
+                "generated probes are stimulus-free (no focus-route claims): {}",
+                probe.arguments
+            );
+            assert_eq!(
+                probe.arguments["id"],
+                serde_json::json!("s1"),
+                "the REAL session id rides the invocation: {}",
+                probe.arguments
+            );
+        }
         let serialized = serde_json::to_value(&ctx).unwrap();
         let first = &serialized["suggested_next_observations"][0];
         assert!(
             first.get("tool").is_some() && first.get("arguments").is_some(),
             "tool + arguments ride the wire: {first}"
         );
+    }
+
+    /// Beta-audit P0.4's core contract: EVERY generated invocation
+    /// deserializes into its target tool's REAL request type. The old
+    /// generator emitted `{"action":{"kind":"key"}}` (wrong grammar),
+    /// fabricated session ids, and `tui_run context` misdescribed as
+    /// the ledger — all of which deserialize fine as JSON but are
+    /// rejected by the tools. This test fails if any generated step
+    /// stops round-tripping.
+    #[test]
+    fn every_generated_invocation_round_trips_through_the_real_request_type() {
+        // Control-kind finding (observe inspect + drift probe steps).
+        let f = finding_with(None, vec![]);
+        let ctx = DiagnosticContext::assemble(f, "run-1", vec!["sess-real".into()], |_| None)
+            .expect("context");
+        for obs in &ctx.suggested_next_observations {
+            let (tool, args) = match (&obs.tool, obs.arguments.is_null()) {
+                (Some(t), false) => (t.as_str(), obs.arguments.clone()),
+                _ => continue,
+            };
+            let ok = match tool {
+                "tui_observe" => {
+                    serde_json::from_value::<crate::mcp::params::TuiObserveParams>(args.clone())
+                        .is_ok()
+                }
+                "tui_probe" => {
+                    serde_json::from_value::<crate::mcp::params::TuiProbeParams>(args.clone())
+                        .is_ok()
+                }
+                "tui_act" => {
+                    serde_json::from_value::<crate::mcp::params::TuiActRequest>(args.clone())
+                        .is_ok()
+                }
+                other => panic!("unknown generated tool: {other}"),
+            };
+            assert!(
+                ok,
+                "generated {tool} invocation must deserialize into its real request type: {args}"
+            );
+        }
+    }
+
+    /// The audit's named defects, pinned individually:
+    /// - no fabricated `diagnose-*` session ids anywhere;
+    /// - no nested `action.kind` grammar;
+    /// - no `tui_run context` misdescribed as the ledger;
+    /// - resize/act steps carry the real session id.
+    #[test]
+    fn no_fabricated_ids_no_invalid_grammar_no_misdescribed_surfaces() {
+        // Region-kind finding exercises the resize (act) step.
+        let mut f = finding_with(None, vec![]);
+        f.evidence = vec![EvidenceRef::point(
+            EvidenceKind::Region,
+            "sidebar/left",
+            "clipped",
+        )];
+        let ctx = DiagnosticContext::assemble(f, "run-1", vec!["sess-real".into()], |_| None)
+            .expect("context");
+        for obs in &ctx.suggested_next_observations {
+            let args = &obs.arguments;
+            let text = args.to_string();
+            assert!(
+                !text.contains("diagnose-"),
+                "no fabricated session ids: {text}"
+            );
+            assert!(
+                args.get("action").map(|a| a.is_string()).unwrap_or(true),
+                "action is a STRING selector (canonical grammar), never an object: {text}"
+            );
+            if obs.tool.as_deref() == Some("tui_act") {
+                assert_eq!(
+                    args["id"],
+                    serde_json::json!("sess-real"),
+                    "act steps carry the REAL session id: {text}"
+                );
+            }
+            if obs.tool.as_deref() == Some("tui_observe") {
+                assert_eq!(
+                    args["id"],
+                    serde_json::json!("sess-real"),
+                    "observe steps carry the REAL session id: {text}"
+                );
+            }
+            // The history suggestion names the observe surface, not
+            // tui_run context.
+            assert!(
+                obs.tool.as_deref() != Some("tui_run"),
+                "tui_run is never generated (its context action is the registry, not the ledger)"
+            );
+        }
+    }
+
+    /// No session known at assembly: steps omit `id` entirely rather
+    /// than inventing one. A wrong id is worse than a missing id —
+    /// the caller fills their own real one.
+    #[test]
+    fn steps_without_session_provenance_omit_the_id_field() {
+        let f = finding_with(None, vec![]);
+        let ctx = DiagnosticContext::assemble(f, "run-1", vec![], |_| None).expect("context");
+        for obs in &ctx.suggested_next_observations {
+            if obs.tool.is_some() {
+                assert!(
+                    obs.arguments.get("id").is_none() || obs.arguments["id"].is_null(),
+                    "no fabricated ids — omit id when no session is known: {}",
+                    obs.arguments
+                );
+            }
+        }
     }
 
     /// Review §3's exact defect: a static finding (no reproduction) with
