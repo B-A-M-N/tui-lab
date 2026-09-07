@@ -271,6 +271,115 @@ impl RunEvidenceSink {
         }
         fold_into_run(sess, &mut run);
     }
+
+    // ── Beta-audit P0.3: typed ticket-verified bookkeeping ops ──────
+    //
+    // Handlers must NOT grab `Arc<Mutex<RunContext>>` for run-side
+    // bookkeeping: the sink owns ticket verification once, here, so no
+    // subsystem has to remember which calls need it. Every op verifies
+    // the ticket and returns `false` on a run switch (evidence dropped
+    // — the caller reports `run_switched`, never misattributes).
+
+    /// Record one event marker for `sid`.
+    pub fn record_event(&self, sid: &str, event: &str) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_event(sid, event).is_ok()
+    }
+
+    /// Record one scenario act step, generation-scoped.
+    pub fn record_scenario_act(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_act(sid, gen, params).is_ok()
+    }
+
+    /// Record one scenario act step with a redacted sensitive payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_scenario_act_sensitive(
+        &self,
+        sid: &str,
+        gen: u32,
+        params: serde_json::Value,
+        field: &str,
+        kind: crate::scenario::model::SensitiveKind,
+        payload_bytes: usize,
+    ) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_act_sensitive(sid, gen, params, field, kind, payload_bytes)
+            .is_ok()
+    }
+
+    /// Record one scenario assert step, generation-scoped.
+    pub fn record_scenario_assert(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_assert(sid, gen, params).is_ok()
+    }
+
+    /// Record one scenario wait step, generation-scoped.
+    pub fn record_scenario_wait(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_wait(sid, gen, params).is_ok()
+    }
+
+    /// Record one first-class scenario intent step, generation-scoped.
+    pub fn record_scenario_intent(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_intent(sid, gen, params).is_ok()
+    }
+
+    /// Merge a locally-accumulated exploration state graph into the
+    /// run's (idempotent merge; a run switch drops the merge).
+    pub fn merge_state_graph(&self, local: &crate::exploration::state_graph::StateGraph) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.graphs_mut().state_graph.merge(local);
+        true
+    }
+
+    /// Merge a locally-accumulated focus graph into the run's.
+    pub fn merge_focus_graph(&self, local: &crate::semantic::focus_graph::FocusGraph) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.graphs_mut().focus_graph.merge(local);
+        true
+    }
+
+    /// Run one read-or-write closure against the ticketed run. This is
+    /// the ESCAPE HATCH for bookkeeping families the typed ops don't
+    /// cover yet (checkpoints today) — it still funnels through the one
+    /// ticket verification, so a run switch makes the closure see
+    /// `None` and the caller reports dropped evidence instead of
+    /// writing into the wrong run. Prefer a typed op when one exists;
+    /// new bookkeeping families should extend the typed surface, not
+    /// reach for the raw `Arc<Mutex<RunContext>>` in handlers.
+    pub fn with_run<R>(&self, f: impl FnOnce(&mut RunContext) -> R) -> Option<R> {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return None;
+        }
+        Some(f(&mut run))
+    }
 }
 
 /// THE driving pipeline. Runs inside the session's actor (call it from a
@@ -322,8 +431,10 @@ pub fn drive(
     // Scenario capture (re-review P0.3): sensitive text payloads are
     // recorded as ${PARAM} references; sensitive non-text payloads as
     // an opaque redacted step; everything else verbatim.
+    // Beta-audit P0.3: through the sink's ticket-verified ops — the
+    // scenario step belongs to the run that authorized the drive, and
+    // a run switch drops it instead of misattributing it.
     if let Some(cap) = &spec.scenario {
-        let mut run = run.lock().unwrap();
         let recorded = if cap.sensitive {
             match spec.action {
                 CanonicalAction::Type { .. } => Some("text"),
@@ -335,7 +446,7 @@ pub fn drive(
         };
         match recorded {
             Some(field) => {
-                let _ = run.record_scenario_act_sensitive(
+                sink.record_scenario_act_sensitive(
                     &sid,
                     gen,
                     cap.params.clone(),
@@ -345,7 +456,7 @@ pub fn drive(
                 );
             }
             None if cap.sensitive => {
-                let _ = run.record_scenario_act(
+                sink.record_scenario_act(
                     &sid,
                     gen,
                     json!({
@@ -357,7 +468,7 @@ pub fn drive(
                 );
             }
             None => {
-                let _ = run.record_scenario_act(&sid, gen, cap.params.clone());
+                sink.record_scenario_act(&sid, gen, cap.params.clone());
             }
         }
     }
