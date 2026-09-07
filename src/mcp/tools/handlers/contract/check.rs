@@ -8,12 +8,15 @@ use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, lease_refused, ok};
 use rmcp::serde_json::json;
 
-/// Actor-backed conformance check with run-ledger recording.
+/// Actor-backed conformance check with run-ledger recording. `policy`
+/// states how much the engine may do (beta-audit P0.7): Passive reports
+/// driving groups Unverified, Driving executes them.
 pub(crate) async fn check_contract_against(
     s: &crate::mcp::tools::TuiLabServer,
     id: Option<&str>,
     contract: crate::design::ProjectContract,
     mode_override: Option<crate::design::ContractMode>,
+    policy: crate::design::conformance::ExecPolicy,
 ) -> rmcp::model::CallToolResult {
     let selector = id.map(str::to_string);
     let run = s.run.clone();
@@ -30,8 +33,8 @@ pub(crate) async fn check_contract_against(
             if let Some(refused) = lease_refused(sess) {
                 return Err(refused);
             }
-            Ok(crate::design::check_contract_with_mode(
-                sess, &contract, mode,
+            Ok(crate::design::check_contract_policy(
+                sess, &contract, mode, policy,
             ))
         })
         .await
@@ -48,6 +51,7 @@ pub(crate) async fn check_contract_against(
             let _ = run.extend_findings_with_source_refs(findings);
             ok(json!({
                 "verdict": report.verdict.as_str(),
+                "exec_policy": policy.as_str(),
                 "summary": summary,
                 "results": results,
             }))
@@ -65,6 +69,7 @@ pub(crate) async fn check_contract_inner(
     id: Option<&str>,
     contract: crate::design::ProjectContract,
     mode_override: Option<crate::design::ContractMode>,
+    policy: crate::design::conformance::ExecPolicy,
 ) -> Result<anyhow::Result<crate::design::ContractReport>, rmcp::model::CallToolResult> {
     let selector = id.map(str::to_string);
     let mode = mode_override;
@@ -74,8 +79,8 @@ pub(crate) async fn check_contract_inner(
             if let Some(refused) = lease_refused(sess) {
                 return Err(refused);
             }
-            Ok(crate::design::check_contract_with_mode(
-                sess, &contract, mode,
+            Ok(crate::design::check_contract_policy(
+                sess, &contract, mode, policy,
             ))
         })
         .await
