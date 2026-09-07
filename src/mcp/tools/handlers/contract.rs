@@ -67,10 +67,54 @@ pub(crate) async fn tui_contract(
                     )
                 }
             };
-            // Apply to EVERY live session (item 48 semantics): one actor
-            // job per session, none blocking another.
+            // Beta-audit P1.5: a run represents ONE TUI project. The
+            // contract's normalization policy applies ONLY to sessions
+            // whose launch cwd resolves to the same project root as the
+            // contract-bearing directory — a foreign-root session (a
+            // different application in the same run) is never silently
+            // normalized by another app's policy. Foreign sessions are
+            // listed, not hidden.
+            let contract_root = {
+                let run = s.run.lock().unwrap();
+                let anchor = p
+                    .id
+                    .as_deref()
+                    .and_then(|sid| run.launch_spec(sid))
+                    .and_then(|spec| spec.cwd.clone())
+                    .or_else(|| run.primary_session_cwd().map(str::to_string));
+                anchor.map(|cwd| {
+                    crate::session::ProjectLocator::locate(None, &cwd)
+                        .root()
+                        .to_string()
+                })
+            };
             let mut applied: Vec<String> = Vec::new();
+            let mut skipped_foreign: Vec<String> = Vec::new();
             for sid in s.sessions.list() {
+                // Same-project check: this session's launch cwd must
+                // resolve to the contract's project root.
+                let same_project = {
+                    let run = s.run.lock().unwrap();
+                    let session_root =
+                        run.launch_spec(&sid)
+                            .and_then(|spec| spec.cwd.clone())
+                            .map(|cwd| {
+                                crate::session::ProjectLocator::locate(None, &cwd)
+                                    .root()
+                                    .to_string()
+                            });
+                    match (&contract_root, session_root) {
+                        // No anchor at all: no scoping info — apply (the
+                        // legacy single-project behavior) and say so.
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(a), Some(b)) => a == &b,
+                    }
+                };
+                if !same_project {
+                    skipped_foreign.push(sid);
+                    continue;
+                }
                 let policy_for_session = policy.clone();
                 if let Ok(id) = s
                     .with_sess(Some(&sid), move |sess| {
@@ -95,6 +139,13 @@ pub(crate) async fn tui_contract(
                     "oracles": contract.oracles.len(),
                     "volatile_patterns": contract.volatile_patterns.len(),
                     "policy_applied_to_sessions": applied,
+                    "policy_skipped_foreign_sessions": skipped_foreign,
+                    "project_root_scope": contract_root,
+                    "scoping_note": if skipped_foreign.is_empty() {
+                        None
+                    } else {
+                        Some("foreign-root sessions were NOT normalized by this contract's policy — they belong to a different project".to_string())
+                    },
                 })
             };
             ok(json!({ "loaded": true, "path": path, "contract": summary }))
