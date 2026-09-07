@@ -114,60 +114,59 @@ pub(crate) fn bundle(
     let packet = contexts.into_iter().find(|c| c.finding.id == finding_id);
     // The before/after verdicts from the labeled baseline.
     let baseline = run.finding_baseline(&compare_label);
-    let (verdicts, before, regressions): (serde_json::Value, serde_json::Value, Vec<serde_json::Value>) =
-        match baseline {
-            None => (serde_json::Value::Null, serde_json::Value::Null, Vec::new()),
-            Some(base) => {
-                // REGRESSED reachable (review P1 item 12): a finding
-                // seen in an earlier pass but absent from this
-                // baseline is a regression when it reappears.
-                let resolved = crate::audit::compare::Resolved(
-                    run.resolved_finding_fingerprints(&compare_label),
-                );
-                let compared =
-                    crate::audit::compare::compare_with_resolved(base, run.findings(), &resolved);
-                let this = compared
-                    .iter()
-                    .find(|c| c.finding.id == finding_id)
-                    .map(|c| {
-                        json!({
-                            "fingerprint": c.fingerprint,
-                            "verdict": c.verdict,
-                        })
+    let (verdicts, before, regressions): (
+        serde_json::Value,
+        serde_json::Value,
+        Vec<serde_json::Value>,
+    ) = match baseline {
+        None => (serde_json::Value::Null, serde_json::Value::Null, Vec::new()),
+        Some(base) => {
+            // REGRESSED reachable (review P1 item 12): a finding
+            // seen in an earlier pass but absent from this
+            // baseline is a regression when it reappears.
+            let resolved =
+                crate::audit::compare::Resolved(run.resolved_finding_fingerprints(&compare_label));
+            let compared =
+                crate::audit::compare::compare_with_resolved(base, run.findings(), &resolved);
+            let this = compared
+                .iter()
+                .find(|c| c.finding.id == finding_id)
+                .map(|c| {
+                    json!({
+                        "fingerprint": c.fingerprint,
+                        "verdict": c.verdict,
                     })
-                    .unwrap_or(json!({
-                        "fingerprint": crate::audit::compare::fingerprint(finding),
-                        "verdict": "fixed",
-                        "note": "the bundled finding no longer appears in the current set",
-                    }));
-                // The regression guard: every OTHER finding whose
-                // verdict moved the wrong way between the passes.
-                let others: Vec<serde_json::Value> = compared
-                    .iter()
-                    .filter(|c| c.finding.id != finding_id)
-                    .filter(|c| c.verdict == "new" || c.verdict == "regressed")
-                    .map(|c| {
-                        json!({
-                            "id": c.finding.id,
-                            "category": c.finding.category,
-                            "summary": c.finding.summary,
-                            "verdict": c.verdict,
-                        })
+                })
+                .unwrap_or(json!({
+                    "fingerprint": crate::audit::compare::fingerprint(finding),
+                    "verdict": "fixed",
+                    "note": "the bundled finding no longer appears in the current set",
+                }));
+            // The regression guard: every OTHER finding whose
+            // verdict moved the wrong way between the passes.
+            let others: Vec<serde_json::Value> = compared
+                .iter()
+                .filter(|c| c.finding.id != finding_id)
+                .filter(|c| c.verdict == "new" || c.verdict == "regressed")
+                .map(|c| {
+                    json!({
+                        "id": c.finding.id,
+                        "category": c.finding.category,
+                        "summary": c.finding.summary,
+                        "verdict": c.verdict,
                     })
-                    .collect();
-                let before_f = base
-                    .iter()
-                    .find(|b| b.id == finding_id)
-                    .map(|b| {
-                        json!({
-                            "id": b.id,
-                            "summary": b.summary,
-                            "severity": b.severity,
-                        })
-                    });
-                (this, before_f.unwrap_or(serde_json::Value::Null), others)
-            }
-        };
+                })
+                .collect();
+            let before_f = base.iter().find(|b| b.id == finding_id).map(|b| {
+                json!({
+                    "id": b.id,
+                    "summary": b.summary,
+                    "severity": b.severity,
+                })
+            });
+            (this, before_f.unwrap_or(serde_json::Value::Null), others)
+        }
+    };
     ok(json!({
         "finding_id": finding_id,
         "rule_id": finding.rule_id,

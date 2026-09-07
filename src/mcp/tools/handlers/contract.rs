@@ -2,11 +2,11 @@
 
 pub(crate) mod check;
 
-use check::{contract_mode_override, diff_contract_reports};
 use crate::audit::{Category, Severity};
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, ok};
 use crate::mcp::params::*;
+use check::{contract_mode_override, diff_contract_reports};
 use rmcp::serde_json::json;
 
 /// Body of `tui_contract` (Phase 5 extraction): the #[tool] method in
@@ -142,8 +142,7 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
-            check::check_contract_against(s, p.id.as_deref(), contract, mode_override)
-                .await
+            check::check_contract_against(s, p.id.as_deref(), contract, mode_override).await
         }
         // ── compare: run conformance now, diff against the baseline ──
         CT::Compare => {

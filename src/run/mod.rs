@@ -1202,7 +1202,8 @@ mod tests {
         // reopen (the resume contract); coverage only folds while open.
         restored.reopen().expect("reopen");
         assert_eq!(
-            restored.coverage_seq(), pre_close_seq,
+            restored.coverage_seq(),
+            pre_close_seq,
             "restore reconstructs the sequence high-water from last_seq"
         );
         // New post-resume events continue STRICTLY ABOVE every persisted
@@ -1816,7 +1817,8 @@ mod tests {
         let restored = RunContext::restore(&root).expect("restore despite damage");
         let status = restored.status(Vec::new());
         assert_eq!(
-            status["restore"]["degraded"], serde_json::json!(true),
+            status["restore"]["degraded"],
+            serde_json::json!(true),
             "damaged restore must be degraded in status, got: {}",
             status["restore"]
         );
@@ -1945,12 +1947,8 @@ mod tests {
         // Unblock and reopen for real.
         std::fs::remove_dir(&manifest).expect("unblock");
         run.reopen().expect("reopen after unblocking");
-        assert_eq!(
-            run.status(Vec::new())["resume_epoch"],
-            serde_json::json!(1)
-        );
+        assert_eq!(run.status(Vec::new())["resume_epoch"], serde_json::json!(1));
     }
-
 }
 
 // W2.10 unit checks for the coverage→SourceRef join.

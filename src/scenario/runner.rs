@@ -252,8 +252,7 @@ impl ScenarioRunner {
                                             // Beta-audit P0-6: capture the run
                                             // identity at replay dispatch; the
                                             // pipeline verifies at commit.
-                                            let ticket =
-                                                crate::execution::RunTicket::capture(run);
+                                            let ticket = crate::execution::RunTicket::capture(run);
                                             let spec = crate::execution::CoreDriveSpec {
                                                 action: &action,
                                                 quiet_ms: quiet,
@@ -378,17 +377,21 @@ impl ScenarioRunner {
                     // sequence. Sensitive `type` payloads keep their
                     // visibility policy.
                     match serde_json::from_value::<crate::intent::ActionTarget>(
-                        params.get("target").cloned().unwrap_or(serde_json::Value::Null),
+                        params
+                            .get("target")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
                     )
                     .map_err(|e| format!("unparseable intent target: {e}"))
                     .and_then(|target| {
                         serde_json::from_value::<crate::mcp::params::IntentVerbParam>(
-                            params.get("verb").cloned().unwrap_or(serde_json::Value::Null),
+                            params
+                                .get("verb")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
                         )
                         .map_err(|e| format!("unparseable intent verb: {e}"))
-                        .and_then(|v| {
-                            v.parse().map_err(|e| format!("invalid intent verb: {e}"))
-                        })
+                        .and_then(|v| v.parse().map_err(|e| format!("invalid intent verb: {e}")))
                         .map(|verb| (target, verb))
                     }) {
                         Ok((target, verb)) => {
@@ -411,7 +414,9 @@ impl ScenarioRunner {
                                     // replay under the SAME focus-route
                                     // provenance rule the live path enforces.
                                     let graph = match run {
-                                        Some(run) => run.lock().unwrap().graphs().focus_graph.clone(),
+                                        Some(run) => {
+                                            run.lock().unwrap().graphs().focus_graph.clone()
+                                        }
                                         None => crate::semantic::focus_graph::FocusGraph::new(),
                                     };
                                     match crate::intent::plan_intent_with_graph(
@@ -434,8 +439,7 @@ impl ScenarioRunner {
                                                             session, run, key, vis,
                                                         ) {
                                                             ok = false;
-                                                            why =
-                                                                format!("focus move failed: {e}");
+                                                            why = format!("focus move failed: {e}");
                                                             break;
                                                         }
                                                         // Refresh the session's
@@ -473,7 +477,8 @@ impl ScenarioRunner {
                                                             session, run, action, vis,
                                                         ) {
                                                             ok = false;
-                                                            why = format!("payload act failed: {e}");
+                                                            why =
+                                                                format!("payload act failed: {e}");
                                                             break;
                                                         }
                                                     }
@@ -630,14 +635,9 @@ fn drive_intent_step(
             };
             crate::execution::drive_pipeline(session, run, spec).map(|o| o.tx)
         }
-        None => crate::execution::execute_act_with_visibility(
-            session,
-            action,
-            150,
-            1150,
-            false,
-            vis,
-        ),
+        None => {
+            crate::execution::execute_act_with_visibility(session, action, 150, 1150, false, vis)
+        }
     }
 }
 

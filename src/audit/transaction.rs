@@ -483,8 +483,8 @@ mod tests {
             // No change at all: run_verified would push nothing.
         }
         // run_verified applies the same policy end-to-end.
-        let (findings, _metrics) = run_verified(&mut s, "structure-probe", |_s| Vec::new())
-            .expect("run");
+        let (findings, _metrics) =
+            run_verified(&mut s, "structure-probe", |_s| Vec::new()).expect("run");
         for f in findings.iter().filter(|f| f.id == "AUDIT-RESIDUE") {
             assert!(
                 f.severity == Severity::Warn || f.severity == Severity::Info,

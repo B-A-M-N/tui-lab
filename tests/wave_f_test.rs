@@ -972,7 +972,11 @@ fn clean_audit_run_has_no_fake_metrics_finding() {
     // clean run are structure-only AUDIT-RESIDUE rows at INFO (contextual
     // evidence; this echo child shows the drivers' own control bytes).
     // Any WARN/ERROR AUDIT-* row on a clean run is a synthetic masquerade.
-    for f in report.findings.iter().filter(|f| f.id.starts_with("AUDIT-")) {
+    for f in report
+        .findings
+        .iter()
+        .filter(|f| f.id.starts_with("AUDIT-"))
+    {
         assert!(
             f.id == "AUDIT-RESIDUE" && f.severity == tui_lab::audit::Severity::Info,
             "timing must not masquerade as an audit finding, and only \
