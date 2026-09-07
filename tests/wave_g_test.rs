@@ -2037,8 +2037,20 @@ async fn workflow_inspect_diagnose_verify_construction_chain() {
         "workflow verify",
     );
     assert_eq!(verify["workflow"], "verify", "{verify}");
-    // recheck_profile selects the finding's category surface.
-    assert_eq!(verify["recheck_profile"], "discoverability", "{verify}");
+    // P1.2: the strategy names the surface explicitly (rule-prefix table,
+    // DISC → discoverability) and the fingerprint is citable.
+    assert_eq!(
+        verify["strategy"]["recheck_profile"], "discoverability",
+        "{verify}"
+    );
+    assert_eq!(
+        verify["strategy"]["matched_on"], "DISC (discoverability)",
+        "{verify}"
+    );
+    assert!(
+        verify["finding_fingerprint"].as_str().is_some(),
+        "verification is citable by fingerprint: {verify}"
+    );
     // The recheck leg actually ran (it is a live pass over the same frame).
     let recheck = verify["recheck"].as_object().expect("recheck ran");
     assert_eq!(recheck["profile"], "discoverability", "{recheck:?}");

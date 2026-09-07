@@ -28,6 +28,10 @@ pub(super) struct FindingStore {
     /// pass's copy sits in the ledger. The bundle surface compares
     /// against THIS instead.
     latest_pass: Option<Vec<crate::audit::Finding>>,
+    /// Beta-audit P1.2: verification records — one per
+    /// `tui_workflow action=verify` execution, so an agent can CITE a
+    /// verification later instead of re-deriving it.
+    verifications: Vec<crate::audit::verification::VerificationRecord>,
 }
 
 impl FindingStore {
@@ -37,6 +41,7 @@ impl FindingStore {
             findings: Vec::new(),
             baselines: HashMap::new(),
             latest_pass: None,
+            verifications: Vec::new(),
         }
     }
 
@@ -49,6 +54,7 @@ impl FindingStore {
             // A restored run has history but no live pass snapshot; the
             // first fresh audit after restore records one.
             latest_pass: None,
+            verifications: Vec::new(),
         }
     }
 
@@ -117,5 +123,25 @@ impl FindingStore {
             }
         }
         out
+    }
+
+    /// Beta-audit P1.2: persist one verification execution.
+    pub(super) fn record_verification(
+        &mut self,
+        rec: crate::audit::verification::VerificationRecord,
+    ) {
+        self.verifications.push(rec);
+    }
+
+    /// Verification records for one finding fingerprint, newest last.
+    pub(super) fn verifications_for(
+        &self,
+        finding_fingerprint: &str,
+    ) -> Vec<crate::audit::verification::VerificationRecord> {
+        self.verifications
+            .iter()
+            .filter(|r| r.finding_fingerprint == finding_fingerprint)
+            .cloned()
+            .collect()
     }
 }

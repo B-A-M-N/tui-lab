@@ -51,23 +51,28 @@ pub(crate) async fn tui_workflow(
 ///
 /// Audit P1 (finding 14): the root is derived from the RUN's recorded
 /// `LaunchSpec.cwd` — where the audited app actually lives — never from
-/// this server process's cwd. A finding generated against a TUI launched
-/// elsewhere must not be paired with framework detection from the
-/// server's own directory (that would join evidence from different
-/// projects while looking authoritative). An explicit `cwd` parameter is
-/// a conscious override and is reported as such.
+/// this server process's cwd. An explicit `cwd` parameter is a conscious
+/// override and is reported as such.
+///
+/// Beta-audit P1.3: with NO explicit cwd and NO recorded launch cwd,
+/// the answer is `unknown` with `requires: "cwd"` — never detection run
+/// over the server's own directory. Evidence from an unrelated tree (the
+/// server's own repository) joined into a target TUI investigation is
+/// worse than no evidence: an agent may act on it. There is no fallback.
 fn framework_context(recorded_cwd: Option<&str>, explicit_cwd: Option<&str>) -> serde_json::Value {
     let (root, provenance) = match explicit_cwd {
         Some(c) => (c.to_string(), "explicit_override".to_string()),
-        // The primary session's recorded launch cwd is the app's home;
-        // fall back to "." only when nothing recorded exists (e.g. no
-        // session ever launched), and say so.
+        // The primary session's recorded launch cwd is the app's home.
         None => match recorded_cwd {
             Some(c) => (c.to_string(), "recorded_launch_cwd".to_string()),
-            None => (
-                ".".to_string(),
-                "no_launch_cwd_recorded_fell_back_to_server_cwd".to_string(),
-            ),
+            None => {
+                return json!({
+                    "primary": serde_json::Value::Null,
+                    "root_provenance": "unknown",
+                    "requires": "cwd",
+                    "note": "no launch cwd recorded for this run and no explicit cwd given — framework detection refuses to guess (it would otherwise scan the server's own directory, an unrelated project). Pass cwd= to inspect a specific tree.",
+                });
+            }
         },
     };
     let project = crate::session::ProjectLocator::locate(None, &root);
@@ -143,48 +148,120 @@ fn contract_expectation(
     })
 }
 
-/// Component identity for the finding's evidence targets: semantic ids
-/// as-is, plus the native id + source loci the run can attest.
-fn component_identity(finding: &crate::audit::Finding) -> serde_json::Value {
+/// Component identity for the finding's evidence targets (beta-audit
+/// P1.4): a STRUCTURED join, not string containment. Semantic control
+/// ids (`button/save`), native framework ids (`#save`), and source
+/// locations (`src/ui.rs:184`) are different namespaces — one string
+/// happening to contain another proves nothing. The join key is the one
+/// the run actually established: the coverage ledger's
+/// control↔coverage-target match (the same matcher the provenance join
+/// used to attach the loci), so each identity block names the semantic
+/// id, the native id, and the source loci THAT identity is known to
+/// have — and loci that cannot be pinned to one target ride at
+/// `provenance_scope: "finding"` instead of being dropped or guessed.
+fn component_identity(
+    run: &crate::run::RunContext,
+    finding: &crate::audit::Finding,
+) -> serde_json::Value {
     let targets: Vec<String> = finding
         .evidence
         .iter()
         .filter_map(|e| e.target.clone())
         .collect();
+    let sr_json = |sr: &crate::semantic::source_ref::SourceRef| {
+        json!({
+            "location": sr.location(),
+            "symbol": sr.symbol,
+            "framework_id": sr.framework_id,
+            "confidence": sr.confidence,
+            "source": sr.source,
+            "provenance": sr.provenance.name(),
+            "actionable": sr.is_actionable(),
+        })
+    };
     let mut identities = Vec::new();
+    let mut joined_targets: std::collections::BTreeSet<String> = Default::default();
     for t in &targets {
-        // The finding's own loci for this target (already joined with the
-        // coverage ledger's app-attested chain by the caller's
-        // `join_source_refs_if_known`), tiered by the actionable fence.
+        // The identity's source loci: only what the run's own provenance
+        // machinery attached for THIS control — i.e. loci already on the
+        // finding (attested for this finding) whose native id or coverage
+        // target matches this control through the ledger's identity
+        // match, never a free-text containment between namespaces.
+        let native_id = run
+            .coverage_ledger()
+            .iter()
+            .find_map(|(cov_target, entry)| {
+                crate::run::coverage_target_matches_control(cov_target, t).then(|| {
+                    entry
+                        .source_refs
+                        .first()
+                        .and_then(|sr| sr.framework_id.clone())
+                })
+            })
+            .flatten();
         let loci: Vec<_> = finding
             .source_refs
             .iter()
-            .filter(|sr| {
-                sr.location().contains(t.as_str())
-                    || sr
-                        .framework_id
-                        .as_deref()
-                        .map(|f| t.contains(f))
-                        .unwrap_or(false)
-                    || t.contains(&sr.location())
+            .filter(|sr| match &sr.framework_id {
+                // A locus joins this target when its native framework id
+                // is the one the ledger bound to this control.
+                Some(fid) => native_id.as_deref() == Some(fid.as_str()),
+                // No native id on the locus: it can still join when the
+                // run attested the locus FOR a coverage target that IS
+                // this control (the attested chain carries no separate
+                // native id — the locus came from the same ledger entry).
+                None => run.coverage_ledger().iter().any(|(cov_target, entry)| {
+                    !entry.source_refs.is_empty()
+                        && entry
+                            .source_refs
+                            .iter()
+                            .any(|e_sr| e_sr.location() == sr.location())
+                        && crate::run::coverage_target_matches_control(cov_target, t)
+                }),
             })
-            .cloned()
+            .map(sr_json)
             .collect();
+        if !loci.is_empty() {
+            joined_targets.insert(t.clone());
+        }
         identities.push(json!({
             "semantic_target": t,
-            "source_refs": loci.iter().map(|sr| json!({
-                "location": sr.location(),
-                "symbol": sr.symbol,
-                "framework_id": sr.framework_id,
-                "confidence": sr.confidence,
-                "source": sr.source,
-                "provenance": sr.provenance.name(),
-                "actionable": sr.is_actionable(),
-            })).collect::<Vec<_>>(),
+            "native_id": native_id,
+            "source_refs": loci,
             "loci_known": !loci.is_empty(),
+            "provenance_scope": "target",
         }));
     }
-    json!({ "identities": identities })
+    // Finding-scoped provenance: loci the finding carries that could NOT
+    // be pinned to one evidence target. They are real provenance (kept),
+    // labeled honestly as finding-level rather than silently dropped.
+    let finding_scoped: Vec<_> = finding
+        .source_refs
+        .iter()
+        .filter(|sr| {
+            // Not already surfaced under some target above.
+            !identities.iter().any(|id| {
+                id["source_refs"]
+                    .as_array()
+                    .map(|arr| arr.iter().any(|j| j["location"] == json!(sr.location())))
+                    .unwrap_or(false)
+            })
+        })
+        .map(|sr| {
+            let mut j = sr_json(sr);
+            j["provenance_scope"] = json!("finding");
+            j
+        })
+        .collect();
+    json!({
+        "identities": identities,
+        "finding_scoped_source_refs": finding_scoped,
+        "join": if finding_scoped.is_empty() {
+            json!("all loci pinned to a semantic target")
+        } else {
+            json!("some loci are finding-scoped only — no evidence target pins them")
+        },
+    })
 }
 
 /// One finding's full chain (finding 38's diagram, realized).
@@ -200,7 +277,7 @@ fn workflow_chain(
         .collect();
     // Component identity (loci joined late, like tui_explain does).
     let joined = run.join_source_refs_if_known(finding);
-    let identity = component_identity(&joined);
+    let identity = component_identity(run, &joined);
     // Contract expectation.
     let expectation = contract_expectation(run.contract(), &targets);
     // Minimal reproduction (as recorded; verify replays it).
@@ -322,10 +399,30 @@ async fn diagnose_all(
     }))
 }
 
-/// verify: run the finding's verification plan LIVE — replay the
-/// reproduction scenario when present, then the targeted re-checks
-/// (re-run the cheapest audit surface over the finding's target) — and
-/// report whether the finding still reproduces. Lease-gated.
+/// verify: run the finding's verification strategy LIVE and RECORD it.
+///
+/// Beta-audit P1.2 rewrite. The old version had four stacked defects:
+/// a category→profile fallback that degraded unknown categories to an
+/// unrelated `full` audit; no mutation authorization (SafeOnly always,
+/// so invasive surfaces were permanently gated with the only remedy
+/// being "leave the workflow"); rule matching by raw string (fresh
+/// findings are not normalized the same way as stored ones); and replay
+/// leg wording that implied replay itself verified the finding.
+///
+/// Now:
+/// - strategy: `VerificationStrategy::for_finding` — rule-prefix table,
+///   category only when it names an actual profile, never a broad
+///   fallback; no engine surface ⇒ honest `no_surface` (replay +
+///   targeted observation only).
+/// - authorization: `allow_mutation=true` mirrors tui_audit through the
+///   SAME centralized policy (`run_profile_checked` +
+///   `SafetyPolicy::AllowMutation`); default false reports `gated`.
+/// - matching: canonical `compare::fingerprint` (occurrence identity)
+///   both ways — the fresh pass is normalized before the match.
+/// - replay: reported as `reproduction_setup` — setup for the verdict,
+///   never proof.
+/// - persistence: a `VerificationRecord` lands in the run, citable
+///   later.
 async fn verify_finding(
     s: &crate::mcp::tools::TuiLabServer,
     p: &TuiWorkflowParams,
@@ -336,12 +433,11 @@ async fn verify_finding(
             "verify requires 'finding_id'",
         );
     };
-    // Resolve the finding snapshot, plan, and the re-check surface BEFORE
-    // driving (pure reads). The surface is the audit profile named by the
-    // finding's own category slug when one exists, else the `full`
-    // composite (which under safe-only runs its observational members and
-    // names the withheld ones).
-    let (finding_snapshot, scenario_id, plan, recheck_profile) = {
+    let allow_mutation = p.allow_mutation.unwrap_or(false);
+
+    // Resolve the finding snapshot and its strategy BEFORE driving
+    // (pure reads).
+    let (finding_snapshot, scenario_id, strategy) = {
         let run = s.run.lock().unwrap();
         let Some(finding) = run.findings().iter().find(|f| f.id == finding_id) else {
             return err(
@@ -349,100 +445,101 @@ async fn verify_finding(
                 format!("unknown finding id '{finding_id}' in run '{}'", run.id()),
             );
         };
-        let (contexts, _) = run.diagnostic_contexts();
-        let plan = contexts
-            .into_iter()
-            .find(|c| c.finding.id == finding_id)
-            .map(|c| c.verification);
-        let category_slug = finding.category.as_str().to_string();
-        let profile = crate::audit::orchestrator::AuditProfile::parse(&category_slug)
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|_| "full".to_string());
-        (finding.clone(), finding.reproduction.clone(), plan, profile)
+        (
+            finding.clone(),
+            finding.reproduction.clone(),
+            crate::audit::verification::VerificationStrategy::for_finding(finding),
+        )
     };
-    if plan.is_none() && scenario_id.is_none() {
+    let fingerprint = crate::audit::compare::fingerprint(&finding_snapshot);
+    let has_replay_leg = scenario_id.is_some() && strategy.needs_reproduction;
+    let recheck_profile = strategy
+        .audit_profile
+        .as_ref()
+        .map(|ap| ap.name().to_string());
+    if !has_replay_leg && recheck_profile.is_none() {
         return err(
             ErrorCategory::InvalidRequest,
             format!(
-                "finding '{finding_id}' has no verification plan (no evidence targets) and no recorded reproduction — nothing to verify against"
+                "finding '{finding_id}' has no verification surface: its rule has no re-check profile and it records no reproduction scenario. Verify it by direct observation of its evidence targets instead."
             ),
         );
-    };
+    }
 
-    // The replay leg (when the finding has a reproduction): lease-gated,
-    // through the standard scenario runner inside the run context.
-    let replay_result: Option<serde_json::Value> = match &scenario_id {
-        None => None,
-        Some(scen_id) => {
-            let scenario = {
-                let run = s.run.lock().unwrap();
-                match run.load_scenario(scen_id) {
-                    Ok(sc) => Some(sc),
-                    Err(e) => {
-                        return err(
-                            ErrorCategory::InvalidRequest,
-                            format!("reproduction scenario '{scen_id}' cannot load: {e}"),
-                        )
-                    }
+    // ── Leg 1: reproduction replay (SETUP, not proof) ────────────────
+    let replay_result: Option<serde_json::Value> = if has_replay_leg {
+        let scen_id = scenario_id.clone().expect("checked above");
+        let scenario = {
+            let run = s.run.lock().unwrap();
+            match run.load_scenario(&scen_id) {
+                Ok(sc) => Some(sc),
+                Err(e) => {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        format!("reproduction scenario '{scen_id}' cannot load: {e}"),
+                    )
                 }
-            };
-            let scenario = scenario.expect("checked above");
-            let run = s.run.clone();
-            let selector = p.id.clone();
-            let scen = scenario.clone();
-            let result = s
-                .with_sess(selector.as_deref(), move |sess| {
-                    if let Some(refused) = lease_refused(sess) {
-                        return Err(refused);
-                    }
-                    let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
-                        &scen,
-                        sess,
-                        &[],
-                        Some(&run),
-                        None,
-                    );
-                    Ok(json!({
-                        "status": report.status,
-                        "steps_total": report.steps_total,
-                        "steps_passed": report.steps_passed,
-                        "steps_failed": report.steps_failed,
-                        "steps_skipped": report.steps_skipped,
-                    }))
-                })
-                .await
-                .and_then(|inner| inner);
-            match result {
-                Ok(v) => Some(v),
-                Err(e) => return e,
             }
+        };
+        let scenario = scenario.expect("checked above");
+        let run = s.run.clone();
+        let selector = p.id.clone();
+        let scen = scenario.clone();
+        let result = s
+            .with_sess(selector.as_deref(), move |sess| {
+                if let Some(refused) = lease_refused(sess) {
+                    return Err(refused);
+                }
+                let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
+                    &scen,
+                    sess,
+                    &[],
+                    Some(&run),
+                    None,
+                );
+                Ok(json!({
+                    "scenario_id": scen.id,
+                    "status": report.status,
+                    "steps_total": report.steps_total,
+                    "steps_passed": report.steps_passed,
+                    "steps_failed": report.steps_failed,
+                    "steps_skipped": report.steps_skipped,
+                }))
+            })
+            .await
+            .and_then(|inner| inner);
+        match result {
+            Ok(v) => Some(v),
+            Err(e) => return e,
         }
+    } else {
+        None
     };
 
-    // The targeted leg: re-run the finding's audit surface LIVE (one
-    // observation pass — the same engine entry point the original audit
-    // used) and match its fresh findings against this finding by rule
-    // identity. Lease-gated: a driving profile touches the app; under the
-    // safe-only default an invasive surface is WITHHELD by the engine (an
-    // ORCH-GATED row), which the match reports as `not_rechecked` — never
-    // as a pass.
-    let recheck: Option<serde_json::Value> = match &plan {
-        Some(_) => {
+    // ── Leg 2: the strategy's re-check surface ───────────────────────
+    // `executed` is Some only when the surface actually ran; `gated`
+    // when the caller withheld authorization. Under the human lease the
+    // same audit-descriptor rule applies as on tui_audit: observational
+    // surfaces stay available, exclusive-control ones refuse.
+    let recheck: Option<serde_json::Value> = match &recheck_profile {
+        None => None,
+        Some(profile_name) => {
             let run = s.run.clone();
-            let profile = recheck_profile.clone();
+            let profile_name = profile_name.clone();
             let rule_key = finding_snapshot
                 .rule_id
                 .clone()
                 .unwrap_or_else(|| finding_snapshot.id.clone());
-            // Audit P1 (finding 14): the lease gate follows the audit
-            // descriptor's OWN classification, not a blanket refusal —
-            // an observational re-check surface (color, rendering,
-            // terminal_modes, …) stays available during a human lease,
-            // exactly as it does on tui_audit itself; only a surface
-            // that sends input/resizes/consumes the process waits.
-            let exclusive = crate::audit::orchestrator::AuditProfile::parse(&profile)
+            let expect_occurrence = finding_snapshot.occurrence_id.clone();
+            let fingerprint = fingerprint.clone();
+            let exclusive = crate::audit::orchestrator::AuditProfile::parse(&profile_name)
                 .map(|ap| ap.requires_exclusive_control())
                 .unwrap_or(true);
+            let policy = if allow_mutation {
+                crate::audit::orchestrator::SafetyPolicy::AllowMutation
+            } else {
+                crate::audit::orchestrator::SafetyPolicy::SafeOnly
+            };
             let result = s
                 .with_sess_authorized(p.id.as_deref(), move |sess, _ticket| {
                     if exclusive {
@@ -453,25 +550,44 @@ async fn verify_finding(
                     let contract = run.lock().unwrap().contract().cloned();
                     match crate::audit::orchestrator::run_profile_checked(
                         sess,
-                        &profile,
+                        &profile_name,
                         contract.as_ref(),
-                        crate::audit::orchestrator::SafetyPolicy::SafeOnly,
+                        policy,
                     ) {
                         Ok(report) => {
+                            // A withheld surface is named by the engine
+                            // as ORCH-GATED; that is `gated`, never a
+                            // pass and never a refutation.
                             let gated = report
                                 .findings
                                 .iter()
                                 .any(|f| f.id == "ORCH-GATED" && f.summary.contains("was not run"));
-                            let refired = report.findings.iter().any(|f| {
-                                f.rule_id.as_deref() == Some(rule_key.as_str())
-                                    || f.occurrence_id == finding_snapshot.occurrence_id
-                            });
+                            // Canonical identity match: normalize the
+                            // fresh findings to fingerprints and compare
+                            // against THIS finding's fingerprint — and
+                            // the rule-level fallback (a rule refiring
+                            // on a DIFFERENT occurrence is still this
+                            // defect's rule firing).
+                            let fresh: Vec<String> = report
+                                .findings
+                                .iter()
+                                .map(crate::audit::compare::fingerprint)
+                                .collect();
+                            let rule_refired = !gated
+                                && (fresh.iter().any(|fp| fp == &fingerprint)
+                                    || report.findings.iter().any(|f| {
+                                        f.rule_id.as_deref() == Some(rule_key.as_str())
+                                            || f.id == rule_key
+                                            || f.occurrence_id == expect_occurrence
+                                    }));
                             Ok(json!({
                                 "profile": report.profile.name(),
-                                "mode": report.mode,
-                                "engine_gated": gated,
-                                "rule_refired": if gated { serde_json::Value::Null } else { json!(refired) },
+                                "risk": report.profile.risk().name(),
+                                "executed": !gated,
+                                "gated": gated,
+                                "rule_refired": if gated { serde_json::Value::Null } else { json!(rule_refired) },
                                 "fresh_finding_count": report.findings.len(),
+                                "generation": sess.generation,
                             }))
                         }
                         Err(msg) => Err(err(ErrorCategory::InvalidRequest, msg)),
@@ -484,64 +600,135 @@ async fn verify_finding(
                 Err(e) => return e,
             }
         }
-        None => None,
     };
 
-    // The still-reproduces verdict. Two evidence legs, honestly weighted:
-    //   replay    — did the reproduction scenario fail again?
-    //   recheck   — did the finding's rule fire again on a fresh audit pass?
-    // Each leg answers only when it RAN; a gated/withheld recheck is
-    // `null` with the reason, never a pass.
+    // ── The verdict, honestly weighted ───────────────────────────────
     let replay_verdict = match &replay_result {
-        None => serde_json::Value::Null,
+        None => json!({
+            "leg": "reproduction_setup",
+            "ran": false,
+            "note": "no reproduction scenario recorded (or the strategy does not need it)",
+        }),
         Some(replay) => {
             let failed = replay["steps_failed"].as_u64().unwrap_or(0);
             let skipped = replay["steps_skipped"].as_u64().unwrap_or(0);
             if failed > 0 || skipped > 0 {
                 json!({
-                    "still_reproduces": null,
-                    "reason": "the replay itself did not complete cleanly (failed/skipped steps) — it proves nothing either way; fix the replay path first",
+                    "leg": "reproduction_setup",
+                    "ran": true,
+                    "clean": false,
+                    "note": "the replay did not complete cleanly (failed/skipped steps) — it proves nothing either way; fix the replay path first",
                 })
             } else {
                 json!({
-                    "still_reproduces": null,
-                    "reason": "the replay completed cleanly but step-level success does not re-evaluate the finding's rule — the targeted recheck is the rule-level leg",
+                    "leg": "reproduction_setup",
+                    "ran": true,
+                    "clean": true,
+                    "note": "replay completed cleanly — reproduction SETUP for the re-check, not proof: step-level success does not re-evaluate the finding's rule",
                 })
             }
         }
     };
-    let recheck_verdict = match &recheck {
-        None => json!({
-            "still_reproduces": null,
-            "reason": "no targeted recheck ran (the finding has no evidence targets) — only the replay leg ran",
-        }),
-        Some(r) if r["engine_gated"].as_bool() == Some(true) => json!({
-            "still_reproduces": null,
-            "reason": format!(
-                "profile '{}' was withheld by the safe-only gate — pass allow_mutation=true via tui_audit to recheck an invasive surface",
-                recheck_profile
+    let (recheck_state, still_reproduces, recheck_reason) = match &recheck {
+        None => (
+            "no_surface",
+            serde_json::Value::Null,
+            "the finding's rule has no audit surface to re-check — verify by targeted observation of its evidence targets".to_string(),
+        ),
+        Some(r) if r["gated"].as_bool() == Some(true) => (
+            "gated",
+            serde_json::Value::Null,
+            format!(
+                "profile '{}' is beyond observational and allow_mutation was not set — re-send tui_workflow action=verify with allow_mutation=true to run the re-check",
+                recheck_profile.clone().unwrap_or_default()
             ),
-        }),
-        Some(r) => json!({
-            "still_reproduces": r["rule_refired"].clone(),
-            "reason": if r["rule_refired"].as_bool() == Some(true) {
-                "the finding's rule fired again on a fresh pass of its audit surface".to_string()
-            } else {
-                format!("a fresh pass of profile '{}' produced no instance of this finding's rule", recheck_profile)
-            },
-        }),
+        ),
+        Some(r) => {
+            let refired = r["rule_refired"].as_bool();
+            match refired {
+                Some(true) => (
+                    "refired",
+                    json!(true),
+                    "the finding's rule fired again on a fresh pass of its audit surface".to_string(),
+                ),
+                Some(false) => (
+                    "clean",
+                    json!(false),
+                    format!(
+                        "a fresh pass of profile '{}' produced no instance of this finding (no fingerprint or rule match)",
+                        recheck_profile.clone().unwrap_or_default()
+                    ),
+                ),
+                None => (
+                    "indeterminate",
+                    serde_json::Value::Null,
+                    "the re-check ran but produced no rule-level answer".to_string(),
+                ),
+            }
+        }
     };
+
+    // Persist the verification record so a later caller can cite it.
+    let record = crate::audit::verification::VerificationRecord {
+        finding_fingerprint: fingerprint.clone(),
+        finding_id: finding_id.clone(),
+        session: p.id.clone().unwrap_or_else(|| "primary".to_string()),
+        generation: recheck
+            .as_ref()
+            .and_then(|r| r["generation"].as_u64())
+            .unwrap_or(0) as u32,
+        strategy: strategy.matched_on.to_string(),
+        replay: match &replay_result {
+            None => "skipped".to_string(),
+            Some(r) if r["steps_failed"].as_u64().unwrap_or(0) > 0 => "ran".to_string(),
+            Some(_) => "ran".to_string(),
+        },
+        recheck: recheck_state.to_string(),
+        verdict: match &still_reproduces {
+            serde_json::Value::Bool(true) => "still_reproduces".to_string(),
+            serde_json::Value::Bool(false) => "no_longer_reproduces".to_string(),
+            _ => "undetermined".to_string(),
+        },
+        evidence_refs: {
+            let mut refs = Vec::new();
+            if let Some(r) = &replay_result {
+                if let Some(id) = r["scenario_id"].as_str() {
+                    refs.push(format!("scenario:{id}"));
+                }
+            }
+            if let Some(name) = &recheck_profile {
+                refs.push(format!("audit_pass:{}", name));
+            }
+            refs
+        },
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    {
+        let mut run = s.run.lock().unwrap();
+        run.record_verification(record);
+    }
 
     ok(json!({
         "workflow": "verify",
         "finding_id": finding_id,
-        "recheck_profile": recheck_profile,
-        "replay": replay_result,
+        "finding_fingerprint": fingerprint,
+        "strategy": {
+            "matched_on": strategy.matched_on,
+            "recheck_profile": recheck_profile,
+            "needs_reproduction": strategy.needs_reproduction,
+            "allow_mutation": allow_mutation,
+        },
+        "reproduction_setup": replay_result,
         "recheck": recheck,
         "verdict": {
+            "still_reproduces": still_reproduces,
+            "recheck_state": recheck_state,
+            "reason": recheck_reason,
             "replay": replay_verdict,
-            "recheck": recheck_verdict,
         },
-        "plan_summary": plan.map(|pl| json!({"summary": pl.summary, "replay": pl.replay})),
+        "note": "this verification is recorded in the run's evidence — cite it via the finding's fingerprint",
     }))
 }
