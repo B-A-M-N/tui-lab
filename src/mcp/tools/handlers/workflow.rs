@@ -38,6 +38,7 @@ pub(crate) async fn tui_workflow(
         unreachable!()
     };
     match action {
+        WA::Construct => construct_view(s, &p).await,
         WA::Inspect => inspect_finding(s, &p).await,
         WA::Verify => verify_finding(s, &p).await,
         WA::Diagnose => diagnose_all(s, &p).await,
@@ -325,6 +326,180 @@ fn workflow_chain(
         "run_id": run.id(),
         "sessions": sessions,
     })
+}
+
+/// construct (beta-audit P1.1): the greenfield/understanding entry
+/// point. One SAFE call that joins what the agent would otherwise
+/// chain six tools for — live session capabilities, the observation
+/// inspection (the SAME view `tui_observe mode=inspect` serves),
+/// project/framework identity, native adapter status, the loaded
+/// contract, observation-derived contract candidates (status
+/// `unverified` — never promoted to declared facts), and the exact
+/// next invocations. It never drives the app and never edits source.
+async fn construct_view(
+    s: &crate::mcp::tools::TuiLabServer,
+    p: &TuiWorkflowParams,
+) -> rmcp::model::CallToolResult {
+    // Framework identity first (pure run read; no session).
+    let framework = {
+        let run = s.run.lock().unwrap();
+        framework_context(run.primary_session_cwd(), p.cwd.as_deref())
+    };
+    // The session live view: capabilities + the shared inspection view.
+    // When no session is selected AND the run has none, construct still
+    // answers — the run-level joins stand alone, with the session leg
+    // reported honestly absent (a bare run is a valid construct call).
+    let has_target = p.id.is_some() || s.run.lock().unwrap().primary_launch_spec().is_some();
+    let session_view = if !has_target {
+        serde_json::Value::Null
+    } else {
+        let selector = p.id.clone();
+        let run_handle = s.run.clone();
+        let session_live = s
+            .with_sess(selector.as_deref(), move |sess| {
+                let caps = sess.capabilities();
+                let adapter = sess.adapter_status();
+                // The same inspection `tui_observe mode=inspect` serves — one
+                // settle cycle, then the extracted view body.
+                let sink = crate::execution::RunEvidenceSink::capture(&run_handle);
+                let screen = match super::observe::sweep(sess, &sink, 80) {
+                    Ok(sc) => sc,
+                    Err((c, m)) => {
+                        return crate::mcp::helpers::err(c, m);
+                    }
+                };
+                let observe_params = TuiObserveParams {
+                    mode: Some(crate::mcp::params::Known::Known(
+                        crate::mcp::params::ObserveMode::Inspect,
+                    )),
+                    idle_ms: None,
+                    id: None,
+                    consumer: None,
+                    query: None,
+                    text: None,
+                    since_seq: None,
+                    until_seq: None,
+                    limit: None,
+                    event_types: None,
+                    target: None,
+                };
+                let inspect =
+                    super::observe_modes::inspect_view(sess, &observe_params, screen, &run_handle);
+                let inspect_envelope: serde_json::Value = serde_json::from_str(
+                    &inspect
+                        .content
+                        .first()
+                        .map(|c| match c {
+                            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+                            _ => String::new(),
+                        })
+                        .unwrap_or_default(),
+                )
+                .unwrap_or(serde_json::Value::Null);
+                let inspect_json = inspect_envelope
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let session_json = json!({
+                    "session": sess.id,
+                    "generation": sess.generation,
+                    "backend": sess.backend_kind.display(),
+                    "capabilities": {
+                        "mouse": caps.mouse,
+                        "kitty_keyboard": caps.kitty_keyboard,
+                        "colors": caps.colors,
+                        "cell_attributes": caps.cell_attributes,
+                        "title": caps.title,
+                        "scrollback": caps.scrollback,
+                        "bracketed_paste": caps.bracketed_paste,
+                        "signals": caps.signals,
+                    },
+                    "native_adapter": {
+                        "adapter_available": adapter.adapter_available,
+                        "channel_active": adapter.native_channel_active,
+                        "frames_accepted": adapter.frames_received,
+                        "frames_invalid": adapter.frames_invalid,
+                    },
+                    "inspection": inspect_json,
+                });
+                crate::mcp::helpers::ok(session_json)
+            })
+            .await;
+        match session_live {
+            Ok(v) => {
+                let text = v
+                    .content
+                    .first()
+                    .map(|c| match c {
+                        rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                let v: serde_json::Value =
+                    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                // Unwrap the inner tool envelope: construct's packet is ONE
+                // object, not an envelope inside an envelope.
+                v.get("data").cloned().unwrap_or(serde_json::Value::Null)
+            }
+            Err(e) => return e,
+        }
+    };
+    // Run-held material: loaded contract, candidate invariants from what
+    // the observation shows, untested design properties, next calls.
+    let (contract_block, candidates, next_invocations) = {
+        let run = s.run.lock().unwrap();
+        let contract = run.contract();
+        let contract_block = match contract {
+            Some(c) => json!({
+                "loaded": true,
+                "name": c.schema.name,
+                "version": c.schema.version,
+                "mode": c.schema.mode.as_str(),
+                "components": c.components.len(),
+                "oracles": c.oracles.len(),
+            }),
+            None => json!({
+                "loaded": false,
+                "starter": "tui_contract action=scaffold generates an observation-derived starter contract from the inspection above",
+            }),
+        };
+        // Candidates from what the observation-derived scaffold pass
+        // would propose — all `unverified` until a conformance run
+        // proves them (P0.5's rule: unverified is never promoted).
+        let candidates = json!([
+            crate::design::ProjectContract::scaffold_candidate(
+                "reverse_tab_required",
+                "unverified",
+                "drive Shift+Tab after a Tab walk and compare focus order against the reverse of the walk (tui_audit profile=contract allow_mutation=true)",
+            ),
+            crate::design::ProjectContract::scaffold_candidate(
+                "escape_closes_modal",
+                "unverified",
+                "open a modal, press Escape, observe whether the dialog region closes (tui_intent or tui_audit profile=contract allow_mutation=true)",
+            ),
+            crate::design::ProjectContract::scaffold_candidate(
+                "destructive_require_confirmation",
+                "unverified",
+                "trigger a destructive action and observe whether a confirmation dialog appears (requires explicit authorization)",
+            ),
+        ]);
+        let next = json!([
+            { "call": "tui_observe", "args": { "mode": "inspect" }, "why": "re-inspect after any change" },
+            { "call": "tui_contract", "args": { "action": "scaffold" }, "why": "produce the observation-derived starter contract" },
+            { "call": "tui_audit", "args": { "profile": "discoverability" }, "why": "passive first audit (no driving)" },
+            { "call": "tui_workflow", "args": { "action": "diagnose" }, "why": "once findings exist, per-finding construction chains" },
+        ]);
+        (contract_block, candidates, next)
+    };
+    ok(json!({
+        "workflow": "construct",
+        "note": "one safe join: nothing here drove the app; candidates are UNVERIFIED until a conformance run proves them",
+        "session": session_view,
+        "framework": framework,
+        "contract": contract_block,
+        "candidate_invariants": candidates,
+        "next_invocations": next_invocations,
+    }))
 }
 
 /// inspect: one finding's chain (no driving).
