@@ -82,6 +82,21 @@ impl RunContext {
         self.findings.resolved_fingerprints(compare_label)
     }
 
+    /// Beta-audit P1.2: persist one `tui_workflow action=verify`
+    /// execution, keyed by the finding's fingerprint, so a later caller
+    /// can cite the verification instead of re-deriving it.
+    pub fn record_verification(&mut self, rec: crate::audit::verification::VerificationRecord) {
+        self.findings.record_verification(rec);
+    }
+
+    /// Verification records for one finding fingerprint, newest last.
+    pub fn verifications_for(
+        &self,
+        finding_fingerprint: &str,
+    ) -> Vec<crate::audit::verification::VerificationRecord> {
+        self.findings.verifications_for(finding_fingerprint)
+    }
+
     pub fn record_contract_baseline(
         &mut self,
         label: &str,

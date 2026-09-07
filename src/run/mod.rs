@@ -560,7 +560,7 @@ fn source_ref_from_target(t: &str) -> Option<crate::semantic::source_ref::Source
 /// control a finding's evidence points at. Matching is by the control id's
 /// last path segment (the stable label slug): `widget:#save.activate` and
 /// `button/save` both reduce to something containing "save".
-fn coverage_target_matches_control(coverage_target: &str, control_id: &str) -> bool {
+pub(crate) fn coverage_target_matches_control(coverage_target: &str, control_id: &str) -> bool {
     if control_id.is_empty() {
         return false;
     }

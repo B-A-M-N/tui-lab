@@ -35,7 +35,15 @@ pub struct TuiWorkflowParams {
     #[serde(default)]
     pub id: Option<String>,
     /// inspect/diagnose: project directory for framework detection
-    /// (defaults to the primary session's cwd, then ".").
+    /// (defaults to the primary session's cwd).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// verify: authorize the INVASIVE parts of the verification (a
+    /// re-check surface classified beyond observational). Default
+    /// false: an invasive re-check is withheld and reported `gated`
+    /// with this flag named — never silently downgraded and never a
+    /// silent refusal to verify. True mirrors tui_audit's
+    /// allow_mutation through the same centralized policy.
+    #[serde(default)]
+    pub allow_mutation: Option<bool>,
 }

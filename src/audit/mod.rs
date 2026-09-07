@@ -12,6 +12,7 @@ pub mod driver;
 pub mod orchestrator;
 pub mod repair;
 pub mod transaction;
+pub mod verification;
 pub use driver::*;
 
 /// What kind of artifact an [`EvidenceRef`] points at.
