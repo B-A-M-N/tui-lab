@@ -208,6 +208,16 @@ impl Session {
         self.observation.previous()
     }
 
+    /// Test-only observation seeding: install a screen as the session's
+    /// last settled observation without a backend round-trip, so unit
+    /// tests can exercise consumers of `last()` (frame provenance,
+    /// diffing) against a known screen. `#[cfg(test)]` — production code
+    /// must go through `observe()`.
+    #[cfg(test)]
+    pub(crate) fn seed_last_observation(&mut self, screen: ScreenState) {
+        let _ = self.observation.advance(screen);
+    }
+
     /// Semantic analysis of the last settled frame, served from the per-session
     /// [`crate::semantic::SemanticCache`]. Returns `None` when no observation
     /// has happened yet. The cache is keyed on `ScreenState::structure_hash`, so

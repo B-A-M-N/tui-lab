@@ -2587,3 +2587,115 @@ async fn workflow_framework_root_follows_recorded_launch_cwd() {
         .await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Beta-audit P0.11: inspect's frame citation is a PROVENANCE citation —
+/// session-scoped and latest-wins — not a hash match. Two sessions run
+/// the SAME program (identical structure hashes); each session's inspect
+/// must cite its OWN frame. Then one session navigates A→B→A: its next
+/// inspect cites the second A (the higher frame id), never the first.
+#[tokio::test]
+async fn inspect_frame_citation_is_provenance_scoped() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let script = r#"print("== SAME =="); print("[ Save ]  [ Quit ]"); input()"#;
+
+    let a = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", script], "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start a",
+    );
+    let sid_a = a["session"].as_str().unwrap().to_string();
+    let b = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", script], "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start b",
+    );
+    let sid_b = b["session"].as_str().unwrap().to_string();
+
+    // One committed frame per session, from the identical screens.
+    for sid in [&sid_a, &sid_b] {
+        unwrap_ok(
+            &server
+                .tui_act(params_typed(
+                    serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+                ))
+                .await,
+            "seed act",
+        );
+    }
+
+    let inspect = |sid: String| {
+        params_typed::<tui_lab::mcp::params::TuiObserveParams>(serde_json::json!({
+            "mode": "inspect", "id": sid,
+        }))
+    };
+    let frame_a = unwrap_ok(
+        &server.tui_observe(inspect(sid_a.clone())).await,
+        "inspect a",
+    )["frame"]
+        .clone();
+    let frame_b = unwrap_ok(
+        &server.tui_observe(inspect(sid_b.clone())).await,
+        "inspect b",
+    )["frame"]
+        .clone();
+    assert_eq!(
+        frame_a["session"], sid_a,
+        "session A cites ITS frame, not the identical-hash frame of B: {frame_a}"
+    );
+    assert_eq!(
+        frame_b["session"], sid_b,
+        "session B cites ITS frame: {frame_b}"
+    );
+    assert_ne!(
+        frame_a["ref"], frame_b["ref"],
+        "identical screens still hold distinct frame ids"
+    );
+
+    // A→B→A on session A: tab twice more (each act commits a frame; the
+    // final screen structurally matches the first). The citation must
+    // move to the LATEST commit.
+    for _ in 0..2 {
+        unwrap_ok(
+            &server
+                .tui_act(params_typed(
+                    serde_json::json!({ "action": "key", "key": "tab", "id": sid_a }),
+                ))
+                .await,
+            "nav act",
+        );
+    }
+    let frame_a2 = unwrap_ok(
+        &server.tui_observe(inspect(sid_a.clone())).await,
+        "inspect a again",
+    )["frame"]
+        .clone();
+    assert_eq!(
+        frame_a2["session"], sid_a,
+        "the A-return still cites session A: {frame_a2}"
+    );
+    let older = frame_a["ref"].as_str().unwrap().to_string();
+    let newer = frame_a2["ref"].as_str().unwrap().to_string();
+    assert_ne!(
+        older, newer,
+        "latest-wins: the second A cites the newer commit ({older} vs {newer})"
+    );
+
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid_a }),
+        ))
+        .await;
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid_b }),
+        ))
+        .await;
+}

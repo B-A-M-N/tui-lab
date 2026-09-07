@@ -594,6 +594,15 @@ pub(crate) fn observe_mode_arm(
 /// run has one (finding 36: the inspect view cites the frame id, not just
 /// hashes). `None` = no committed frame (the run evicted it or the frame
 /// was never committed) — the view still carries both hashes.
+///
+/// Beta-audit P0.11: the match is a PROVENANCE match, not a hash match
+/// alone. Structure hashes collide across sessions (two sessions running
+/// the same program) and across time (a screen returned to a prior
+/// layout), so the candidate must come from THIS session; and among the
+/// matching records the LATEST wins (highest frame id) — an app that
+/// navigated A→B→A is looking at the second A, not the first. The
+/// emitted citation carries session/generation so the consuming agent
+/// can see whose frame it cites.
 fn run_frame_of(
     sess: &crate::session::Session,
     run: &std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
@@ -603,10 +612,14 @@ fn run_frame_of(
     let run = run.lock().unwrap();
     let hit = run
         .frame_hot_records()
-        .find(|r| &r.structure_hash == structure)
+        .filter(|r| r.session.as_deref() == Some(&sess.id))
+        .filter(|r| &r.structure_hash == structure)
+        .max_by_key(|r| r.frame_id)
         .map(|r| {
             json!({
                 "ref": format!("frame:{}", r.frame_id),
+                "session": r.session,
+                "generation": r.generation,
                 "semantic_identity": r.semantic_identity,
                 "screen_seq": r.screen_seq,
                 "committed_at": r.committed_at,
@@ -625,4 +638,72 @@ fn role_matches_contract(want: &str, node: &crate::semantic::SemanticNode) -> bo
         return true;
     }
     node.children.iter().any(|c| role_matches_contract(want, c))
+}
+
+#[cfg(test)]
+mod frame_provenance_tests {
+    use super::*;
+
+    /// Beta-audit P0.11: `run_frame_of` cites by PROVENANCE, not hash
+    /// alone. Three guarantees, over one committed ring:
+    ///
+    /// 1. a frame from a DIFFERENT session is never cited, even with an
+    ///    identical structure hash (two sessions running the same
+    ///    program);
+    /// 2. when the same screen structure was committed more than once
+    ///    (A→B→A navigation), the LATEST frame wins;
+    /// 3. no match in this run ⇒ `None` (the view falls back to bare
+    ///    hashes — honest absence).
+    #[test]
+    fn frame_citation_is_session_scoped_and_latest_wins() {
+        let run = std::sync::Arc::new(std::sync::Mutex::new(crate::run::RunContext::ephemeral()));
+        let screen_with = |hash: &str| {
+            let mut s = crate::screen::ScreenState::new(80, 24);
+            s.structure_hash = hash.to_string();
+            s
+        };
+        let frame = |hash: &str, session: Option<&str>| {
+            let mut f = crate::backend::CanonicalFrame::new(screen_with(hash), 0, 0);
+            f.session_id = session.map(str::to_string);
+            f
+        };
+
+        // Two sessions ran the SAME program: identical structure hash,
+        // committed from sess-b then sess-a. Then sess-a navigated
+        // A→B→A: a second commit of the same hash from sess-a.
+        const SAME: &str = "structure:v1:same";
+        let mut g = run.lock().unwrap();
+        g.commit_frame(&mut frame(SAME, Some("sess-b")), Some("sess-b"))
+            .expect("commit b");
+        g.commit_frame(&mut frame(SAME, Some("sess-a")), Some("sess-a"))
+            .expect("commit a1");
+        g.commit_frame(&mut frame(SAME, Some("sess-a")), Some("sess-a"))
+            .expect("commit a2");
+        drop(g);
+
+        // sess-a, back on the shared screen: its LAST observation is the
+        // A-return. Seeded through the test-only observation helper.
+        let mut sess_a =
+            crate::session::state::Session::new("sess-a".to_string(), "python3".to_string());
+        sess_a.seed_last_observation(screen_with(SAME));
+        // And a twin session whose run committed nothing.
+        let mut sess_c =
+            crate::session::state::Session::new("sess-c".to_string(), "python3".to_string());
+        sess_c.seed_last_observation(screen_with(SAME));
+
+        // (1) sess-a cites its LATEST matching frame — never sess-b's
+        // identical-hash frame, and never its own older copy.
+        let cited = run_frame_of(&sess_a, &run).expect("sess-a cites a frame");
+        assert_eq!(cited["ref"], "frame:3", "{cited}");
+        assert_eq!(cited["session"], "sess-a", "{cited}");
+        // (2) sess-b still cites its own frame, not sess-a's:
+        let mut sess_b =
+            crate::session::state::Session::new("sess-b".to_string(), "python3".to_string());
+        sess_b.seed_last_observation(screen_with(SAME));
+        let cited_b = run_frame_of(&sess_b, &run).expect("sess-b cites a frame");
+        assert_eq!(cited_b["ref"], "frame:1", "{cited_b}");
+        // (3) an unprovenanced session on the same screen gets NO
+        // citation — honest absence, not a hash-only hit:
+        assert!(run_frame_of(&sess_c, &run).is_none());
+    }
 }
