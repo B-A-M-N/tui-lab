@@ -24,37 +24,45 @@ pub(crate) async fn tui_checkpoint(
             <CA as crate::mcp::params::EnumVariants>::VARIANTS,
         );
     };
-    let run = s.run.clone();
+    // Beta-audit P0.3: checkpoint bookkeeping runs against the
+    // ticketed run through the sink's verified escape hatch — a run
+    // switch between admission and the checkpoint write reports the
+    // operation as refused (run_switched) instead of storing the
+    // checkpoint into the new run.
+    let sink = crate::execution::RunEvidenceSink::capture(&s.run);
     // The actor closure owns the session side (observe) and does the
     // checkpoint work against the run under a short lock.
     s.with_sess(p.id.as_deref(), move |sess| {
         let session_id = sess.id.clone();
         let generation = sess.generation;
         match ckpt_action {
-            CA::List => {
-                let run = run.lock().unwrap();
-                ok(json!({ "checkpoints": run.checkpoints.list(&session_id) }))
-            }
+            CA::List => match sink.with_run(|run| run.checkpoints.list(&session_id)) {
+                Some(checkpoints) => ok(json!({ "checkpoints": checkpoints })),
+                None => run_switched(),
+            },
             CA::Save => {
                 let (screen, sem, _, _) = match sess.observe_fused(40) {
                     Ok(t) => t,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
-                let mut run = run.lock().unwrap();
-                let name = run.checkpoints.save(
-                    &session_id,
-                    generation,
-                    p.name.clone(),
-                    &screen,
-                    Some(&sem),
-                );
-                ok(json!({
-                    "name": name,
-                    "structure_hash": screen.structure_hash,
-                    "visual_hash": screen.visual_hash,
-                    "focus": sem.focus.control,
-                    "controls": sem.controls.len(),
-                }))
+                match sink.with_run(|run| {
+                    run.checkpoints.save(
+                        &session_id,
+                        generation,
+                        p.name.clone(),
+                        &screen,
+                        Some(&sem),
+                    )
+                }) {
+                    Some(name) => ok(json!({
+                        "name": name,
+                        "structure_hash": screen.structure_hash,
+                        "visual_hash": screen.visual_hash,
+                        "focus": sem.focus.control,
+                        "controls": sem.controls.len(),
+                    })),
+                    None => run_switched(),
+                }
             }
             CA::Compare => {
                 let name = match &p.name {
@@ -65,16 +73,16 @@ pub(crate) async fn tui_checkpoint(
                     Ok(t) => t,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
-                let run = run.lock().unwrap();
-                match run
-                    .checkpoints
-                    .compare(&session_id, &name, &screen, Some(&sem))
-                {
-                    Ok(json_out) => crate::mcp::helpers::ok_from_json(&json_out),
-                    Err(ErrorCategory::InvalidRequest) => {
+                match sink.with_run(|run| {
+                    run.checkpoints
+                        .compare(&session_id, &name, &screen, Some(&sem))
+                }) {
+                    Some(Ok(json_out)) => crate::mcp::helpers::ok_from_json(&json_out),
+                    Some(Err(ErrorCategory::InvalidRequest)) => {
                         err(ErrorCategory::InvalidRequest, "no such checkpoint")
                     }
-                    Err(c) => err(c, "checkpoint comparison failed"),
+                    Some(Err(c)) => err(c, "checkpoint comparison failed"),
+                    None => run_switched(),
                 }
             }
             CA::Delete => {
@@ -82,14 +90,26 @@ pub(crate) async fn tui_checkpoint(
                     Some(n) => n.clone(),
                     None => return err(ErrorCategory::InvalidRequest, "delete requires 'name'"),
                 };
-                let mut run = run.lock().unwrap();
-                let removed = run.checkpoints.delete(&session_id, &name);
-                ok(json!({ "name": name, "deleted": removed }))
+                match sink.with_run(|run| run.checkpoints.delete(&session_id, &name)) {
+                    Some(removed) => ok(json!({ "name": name, "deleted": removed })),
+                    None => run_switched(),
+                }
             }
         }
     })
     .await
     .unwrap_or_else(|e| e)
+}
+
+/// The refusal for a bookkeeping operation whose run era ended between
+/// admission and the run-side write (beta-audit P0.3): the operation is
+/// rejected, never misattributed. Mirrors the ticket's own commit
+/// language so callers see one consistent story.
+fn run_switched() -> rmcp::model::CallToolResult {
+    err(
+        ErrorCategory::RunClosed,
+        "run switched under an in-flight operation: the checkpoint bookkeeping was REFUSED (not committed to the wrong run); resume or re-issue against the current run",
+    )
 }
 
 /// Body of `tui_act` (Phase 5 extraction): the #[tool] method in
@@ -618,9 +638,14 @@ pub(crate) async fn tui_intent(
         // instead of replaying a key sequence that a layout change
         // breaks.
         {
+            // Beta-audit P0.3: intent linkage rides the ticket-verified
+            // sink — the record belongs to the run that authorized the
+            // execution, never to whichever run happens to be current.
+            let sink = sess
+                .evidence_sink()
+                .expect("authorized dispatch installs the evidence sink");
             let (sid, gen) = (sess.id.clone(), sess.generation);
-            let mut run = run.lock().unwrap();
-            let _ = run.record_event(
+            sink.record_event(
                 &sid,
                 &json!({
                     "intent": intent_id,
@@ -632,7 +657,7 @@ pub(crate) async fn tui_intent(
                 })
                 .to_string(),
             );
-            let _ = run.record_scenario_intent(
+            sink.record_scenario_intent(
                 &sid,
                 gen,
                 json!({
@@ -641,7 +666,7 @@ pub(crate) async fn tui_intent(
                     "sensitive": sensitive,
                 }),
             );
-            let _ = run.record_scenario_wait(
+            sink.record_scenario_wait(
                 &sid,
                 gen,
                 json!({ "condition": "screen_stable", "note": format!("intent {intent_id} completed") }),

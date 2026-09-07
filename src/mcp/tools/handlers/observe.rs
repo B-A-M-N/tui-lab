@@ -26,7 +26,10 @@ pub(crate) async fn tui_assert(
         );
     }
     let selector = p.id.clone();
-    let run = s.run.clone();
+    // Beta-audit P0.3: run-side bookkeeping through a ticket-verified
+    // sink, not the raw current-run Arc — the records cannot land in
+    // a run other than the one that authorized this observe.
+    let sink = crate::execution::RunEvidenceSink::capture(&s.run);
     s.with_sess(selector.as_deref(), move |sess| {
         let screen = match sess.observe(40) {
             Ok(s) => s,
@@ -46,8 +49,7 @@ pub(crate) async fn tui_assert(
             {
                 // Scoped to the resolved session generation (item 5).
                 let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = run.lock().unwrap();
-                let _ = run.record_scenario_assert(
+                sink.record_scenario_assert(
                     &sid,
                     gen,
                     serde_json::json!({ "assertion": "oracle", "text": expr }),
@@ -76,8 +78,7 @@ pub(crate) async fn tui_assert(
             {
                 // Scoped to the resolved session generation (item 5).
                 let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = run.lock().unwrap();
-                let _ = run.record_scenario_assert(
+                sink.record_scenario_assert(
                     &sid,
                     gen,
                     serde_json::to_value(&p).unwrap_or_default(),
@@ -151,7 +152,9 @@ pub(crate) async fn tui_wait(
         None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),
     };
     let selector = p.id.clone();
-    let run = s.run.clone();
+    // Beta-audit P0.3: ticket-verified sink for the wait's event +
+    // scenario records (same rule as tui_assert above).
+    let sink = crate::execution::RunEvidenceSink::capture(&s.run);
     // Go through the canonical wait executor (re-review P0), inside the
     // session actor.
     s.with_sess(selector.as_deref(), move |sess| {
@@ -160,9 +163,8 @@ pub(crate) async fn tui_wait(
                 // Scoped to the resolved session generation (item 5).
                 {
                     let (sid, gen) = (sess.id.clone(), sess.generation);
-                    let mut run = run.lock().unwrap();
-                    let _ = run.record_event(&sid, "wait");
-                    let _ = run.record_scenario_wait(
+                    sink.record_event(&sid, "wait");
+                    sink.record_scenario_wait(
                         &sid,
                         gen,
                         serde_json::to_value(&p).unwrap_or_default(),
@@ -224,7 +226,14 @@ pub(crate) async fn tui_observe(
     }
     let mode = mode.known().copied().unwrap();
     let selector = p.id.clone();
+    // Beta-audit P0.3: the observe fold goes through a ticket-verified
+    // sink instead of the raw current-run Arc (sweep() below uses it;
+    // same fold body, same verification every other driving path uses).
+    // The plain Arc stays for observe_mode_arm's READS (contract
+    // lookup, committed-frame citation) — reads are not evidence
+    // commits and need no ticket.
     let run = s.run.clone();
+    let sink = crate::execution::RunEvidenceSink::capture(&s.run);
     s.with_sess(selector.as_deref(), move |sess| {
         // Lazy screen capture (re-review item 5): only the modes that
         // render a screen need to pay a settle cycle and advance the
@@ -233,7 +242,7 @@ pub(crate) async fn tui_observe(
         // cost no PTY round-trip and do NOT move `previous` — a passive
         // read must not re-anchor someone's diff baseline.
         let screen = if mode_needs_sweep(mode) {
-            match sweep(sess, &run, p.idle_ms.unwrap_or(80)) {
+            match sweep(sess, &sink, p.idle_ms.unwrap_or(80)) {
                 Ok(screen) => Some(screen),
                 Err((c, m)) => return err(c, m),
             }
@@ -270,20 +279,19 @@ fn mode_needs_sweep(mode: crate::mcp::params::ObserveMode) -> bool {
 /// which mode triggered it.
 fn sweep(
     sess: &mut crate::session::Session,
-    run: &std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
+    sink: &crate::execution::RunEvidenceSink,
     idle: u64,
 ) -> Result<crate::screen::ScreenState, (ErrorCategory, String)> {
     let screen = match sess.observe(idle) {
         Ok(screen) => screen,
         Err(e) => return Err((ErrorCategory::BackendError, e.to_string())),
     };
-    // Beta-audit P0-6: the fold's run writes go through the ONE
-    // ticket-verified fold (persistence cursor + coverage ingestion) so a
-    // run switch mid-observe drops the fold instead of spilling this
-    // session's events into the new run. The ticket is captured here —
-    // inside the actor job, at the same moment the session was authorized
-    // by with_sess's guards — one lock window, no cross-await.
-    let ticket = crate::execution::RunTicket::capture(run);
-    crate::execution::fold_session_events(sess, run, &ticket);
+    // Beta-audit P0-6/P0.3: the fold's run writes go through the ONE
+    // ticket-verified fold (persistence cursor + coverage ingestion) so
+    // a run switch mid-observe drops the fold instead of spilling this
+    // session's events into the new run. The sink was captured at the
+    // handler boundary — the same authorization moment that admitted
+    // this actor job.
+    sink.fold(sess);
     Ok(screen)
 }

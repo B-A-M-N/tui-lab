@@ -212,3 +212,77 @@ async fn run_switch_drops_the_fold_without_losing_events() {
     .await
     .expect("fold race job");
 }
+
+// ── Beta-audit P0.3: the typed sink ops refuse cross-run bookkeeping ──
+//
+// The sink is now the one place handlers get run-side bookkeeping.
+// Every typed op must verify the ticket like `commit` does: a record
+// authorized under run A never lands in run B (dropped, reported as
+// `false`), and the same op under the RIGHT run succeeds.
+
+mod sink_bookkeeping {
+    use std::sync::{Arc, Mutex};
+    use tui_lab::execution::RunEvidenceSink;
+    use tui_lab::run::RunContext;
+
+    /// A run Arc swapped out from under a sink: the sink's ticket names
+    /// run A; the Arc now holds run B.
+    fn swapped() -> (Arc<Mutex<RunContext>>, RunEvidenceSink) {
+        let run_a = Arc::new(Mutex::new(RunContext::ephemeral()));
+        let sink = RunEvidenceSink::capture(&run_a);
+        // The same deliberate-loss swap `tui_run new discard=true`
+        // performs.
+        *run_a.lock().unwrap() = RunContext::ephemeral();
+        (run_a, sink)
+    }
+
+    #[tokio::test]
+    async fn every_typed_op_refuses_after_a_run_switch() {
+        let (_run, sink) = swapped();
+        assert!(
+            !sink.record_event("sess-x", "probe"),
+            "record_event must refuse"
+        );
+        assert!(!sink.record_scenario_act("sess-x", 0, serde_json::json!({})));
+        assert!(!sink.record_scenario_act_sensitive(
+            "sess-x",
+            0,
+            serde_json::json!({}),
+            "text",
+            tui_lab::scenario::model::SensitiveKind::Secret,
+            4
+        ));
+        assert!(!sink.record_scenario_assert("sess-x", 0, serde_json::json!({})));
+        assert!(!sink.record_scenario_wait("sess-x", 0, serde_json::json!({})));
+        assert!(!sink.record_scenario_intent("sess-x", 0, serde_json::json!({})));
+        let local_graph = tui_lab::exploration::state_graph::StateGraph::new(Default::default());
+        assert!(!sink.merge_state_graph(&local_graph));
+        let local_focus = tui_lab::semantic::focus_graph::FocusGraph::new();
+        assert!(!sink.merge_focus_graph(&local_focus));
+        assert!(sink.with_run(|_run| 0u8).is_none(), "with_run must refuse");
+    }
+
+    #[tokio::test]
+    async fn typed_ops_succeed_under_the_live_run() {
+        let run = Arc::new(Mutex::new(RunContext::ephemeral()));
+        let sink = RunEvidenceSink::capture(&run);
+        assert!(sink.record_event("sess-x", "probe"));
+        // Graph merges land in the run's graphs — observable through
+        // the same verified hatch via status counts.
+        let local = tui_lab::exploration::state_graph::StateGraph::new(Default::default());
+        let mut focus = tui_lab::semantic::focus_graph::FocusGraph::new();
+        // A focus transition (from -> to via Tab) is one observable
+        // edge.
+        focus.record_edge("ctrl-a", "ctrl-b", "tab", None);
+        sink.merge_focus_graph(&focus);
+        sink.merge_state_graph(&local);
+        let edges = sink
+            .with_run(|r| r.graphs().focus_graph.summary()["edges"].clone())
+            .expect("live run");
+        assert_eq!(
+            edges,
+            serde_json::json!(1),
+            "the merged focus edge is in the ticketed run's graph"
+        );
+    }
+}
