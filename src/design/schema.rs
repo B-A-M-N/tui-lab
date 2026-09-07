@@ -340,23 +340,71 @@ impl ProjectContract {
             });
         }
 
-        // Focus behavior defaults stay ON (they are the app-independent
-        // invariants the audit engine already proves): Escape closes a
-        // modal when one is open, Shift+Tab reverses Tab.
-        contract.escape_closes_modal = true;
-        contract.reverse_tab_required = true;
+        // Beta-audit P0.5: focus behavior is NOT declared here. A
+        // scaffold pass never proves `escape_closes_modal` (sending
+        // Escape from a state with no modal proves nothing about modal
+        // states) or `reverse_tab_required` (a Tab walk proves nothing
+        // about Shift+Tab). Both land in `candidate_invariants` as
+        // unverified with a how-to-verify recipe; promotion into real
+        // contract flags is the author's deliberate act — ideally after
+        // `tui_contract action=check` proves them.
+        let ext = contract
+            .schema
+            .extensions
+            .get_mut("scaffold.inferred")
+            .expect("inserted above");
+        ext["candidate_invariants"] = serde_json::Value::Array(vec![
+            Self::scaffold_candidate(
+                "reverse_tab_required",
+                "unverified",
+                "run tui_contract action=check with a contract that declares reverse_tab_required: true — the behavior check sweeps Tab then Shift+Tab and proves the inverse",
+            ),
+            Self::scaffold_candidate(
+                "escape_closes_modal",
+                "unverified",
+                "run tui_contract action=check with an interaction whose expect declares modal_open() — the behavior check opens a modal and proves Escape dismisses it",
+            ),
+        ]);
 
         contract
     }
 }
 
-impl Default for ProjectContract {
-    fn default() -> Self {
+impl ProjectContract {
+    /// The neutral document: byte-for-byte what serde produces when
+    /// every optional field is omitted. No viewports, no invariant
+    /// flags, no normalization opinions. Scaffolds start here so a
+    /// generated contract asserts ONLY what was observed.
+    ///
+    /// Beta-audit P0.5: `Default` is exactly this — `Default` and serde
+    /// omission must mean the same document, or
+    /// `..ProjectContract::default()` and a sparse YAML load disagree
+    /// silently.
+    pub fn blank() -> Self {
         ProjectContract {
             schema: default_schema(),
             launch: None,
-            // NOTE: `mode` and `extensions` live inside `schema`; the
-            // default schema carries their defaults.
+            viewports: Vec::new(),
+            keybindings: Vec::new(),
+            escape_closes_modal: false,
+            reverse_tab_required: false,
+            destructive_require_confirmation: false,
+            volatile_patterns: Vec::new(),
+            components: Vec::new(),
+            interactions: Vec::new(),
+            layout: Vec::new(),
+            oracles: Vec::new(),
+        }
+    }
+
+    /// The recommended starting POLICY — a human-chosen opinionated
+    /// baseline (canonical viewports, the app-independent focus
+    /// invariants, the conservative volatile classes), kept under an
+    /// explicit name so nobody gets it by accident via `Default` or a
+    /// sparse deserialize. This is a claim to be PROVEN by conformance
+    /// runs, not an observation; scaffolds never start from it.
+    pub fn recommended_policy() -> Self {
+        ProjectContract {
             viewports: vec![
                 ViewportReq { cols: 80, rows: 24 },
                 ViewportReq {
@@ -368,15 +416,81 @@ impl Default for ProjectContract {
                     rows: 40,
                 },
             ],
-            keybindings: Vec::new(),
             escape_closes_modal: true,
             reverse_tab_required: true,
             destructive_require_confirmation: true,
             volatile_patterns: vec![r"\bCPU \d+%".to_string(), r"\b\d\d:\d\d:\d\d\b".to_string()],
-            components: Vec::new(),
-            interactions: Vec::new(),
-            layout: Vec::new(),
-            oracles: Vec::new(),
+            ..ProjectContract::blank()
         }
+    }
+
+    /// One candidate invariant observed-but-not-proven: names the
+    /// property, its evidence status, and how a later conformance run
+    /// can promote it. Stable shape — rides the `scaffold.inferred`
+    /// extension and reports.
+    pub fn scaffold_candidate(
+        property: &str,
+        status: &str,
+        how_to_verify: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "property": property,
+            "status": status,
+            "how_to_verify": how_to_verify,
+        })
+    }
+}
+
+impl Default for ProjectContract {
+    /// Exactly [`ProjectContract::blank`] — serde omission semantics.
+    /// The opinionated baseline lives behind
+    /// [`ProjectContract::recommended_policy`].
+    fn default() -> Self {
+        ProjectContract::blank()
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    /// Beta-audit P0.5's core parity contract: `Default` and "every
+    /// field omitted" must deserialize to the SAME document. A sparse
+    /// YAML load and a `..ProjectContract::default()` fill must never
+    /// disagree.
+    #[test]
+    fn default_equals_serde_omission() {
+        let via_serde: ProjectContract = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            ProjectContract::default(),
+            via_serde,
+            "Default must be serde-omission-identical"
+        );
+        // And through the author-facing YAML path.
+        let via_yaml: ProjectContract = serde_yaml::from_str("# empty document\n").unwrap();
+        assert_eq!(ProjectContract::default(), via_yaml);
+    }
+
+    #[test]
+    fn blank_is_neutral() {
+        let b = ProjectContract::blank();
+        assert!(!b.escape_closes_modal);
+        assert!(!b.reverse_tab_required);
+        assert!(!b.destructive_require_confirmation);
+        assert!(b.viewports.is_empty());
+        assert!(b.volatile_patterns.is_empty());
+        assert_eq!(b.schema.name, "unnamed");
+    }
+
+    #[test]
+    fn recommended_policy_carries_the_old_defaults() {
+        let r = ProjectContract::recommended_policy();
+        assert!(r.escape_closes_modal);
+        assert!(r.reverse_tab_required);
+        assert!(r.destructive_require_confirmation);
+        assert_eq!(r.viewports.len(), 3);
+        assert_eq!(r.volatile_patterns.len(), 2);
+        // ...and it stays distinct from Default by construction.
+        assert_ne!(r, ProjectContract::default());
     }
 }

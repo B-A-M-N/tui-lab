@@ -3,10 +3,16 @@
 //! [`ProjectContract::scaffold_from`] builds a starter contract from ONE
 //! observed frame — honest, but insufficient to derive a TUI
 //! specification. This module gathers states the way the finding asks:
-//! a bounded, explicitly-SAFE pass over the live app (initial screen,
-//! focus order, common viewport sizes, dialogs opened only through
-//! safe-classified interaction), every distinct state recorded, and the
-//! scaffold built from the UNION.
+//! a bounded, non-mutating-by-intent pass over the live app (initial
+//! screen, focus order, viewport sizes), every distinct state recorded,
+//! and the scaffold built from the UNION.
+//!
+//! Beta-audit P0.6 honesty note: this pass is *bounded exploratory*,
+//! not provably side-effect-free. Tab is usually inert but app-defined;
+//! Escape is NOT sent at all (it can dismiss dialogs, cancel workflows,
+//! or exit the app — there is no general inverse). Viewport resizes ARE
+//! restored. What the pass guarantees is boundedness and full
+//! reporting — not state restoration.
 //!
 //! Every inferred requirement stays NON-required (`required: false`) and
 //! the contract's `scaffold.inferred` extension names exactly which states
@@ -34,6 +40,11 @@ pub struct ScaffoldState {
     pub regions: Vec<String>,
     /// Screen-level components detected (table/tree/scrollbar).
     pub components: Vec<String>,
+    /// Region ids observed CLIPPED at this state's viewport (beta-audit
+    /// P0.5: the `no_clipping` layout candidate must be derived from
+    /// actual clipping evidence, not merely from having probed the
+    /// size).
+    pub clipped_regions: Vec<String>,
 }
 
 /// What the gather pass saw, before scaffolding.
@@ -100,10 +111,16 @@ struct Observed {
     identity: String,
 }
 
-/// Gather states from a live session through SAFE interactions only:
-/// observation, Tab (focus movement), Escape (dismiss), and resizes
-/// (restored afterwards). No Enter, no clicks, no typing — a scaffold
-/// pass must never mutate the app to describe it.
+/// Gather states from a live session through a BOUNDED, non-mutating-
+/// by-intent interaction set: observation, Tab (focus movement), and
+/// resizes (restored afterwards). No Enter, no clicks, no typing, and —
+/// beta-audit P0.6 — NO Escape: Escape is not state-preserving in
+/// general (it dismisses dialogs, cancels workflows, and in some TUIs
+/// exits the app); there is no inverse to send. Tab itself is
+/// app-defined, so "safe" here means bounded and fully reported, never
+/// provably side-effect-free. Callers wanting a strong restoration
+/// guarantee should restart the session from its LaunchSpec after the
+/// pass and diff the initial frame.
 ///
 /// `io` bundles the two session touches the pass needs — `observe` takes
 /// one fused observation, `act` runs one canonical action (the caller
@@ -172,6 +189,13 @@ where
                     crate::semantic::Component::Tree(_) => "tree".to_string(),
                     crate::semantic::Component::Scrollbar(_) => "scrollbar".to_string(),
                 })
+                .collect(),
+            clipped_regions: o
+                .sem
+                .regions
+                .iter()
+                .filter(|r| !matches!(r.clipping_state, crate::semantic::ClippingState::None))
+                .map(|r| r.id.clone())
                 .collect(),
         });
     };
@@ -298,17 +322,12 @@ where
     }
     out.focus_order = focus_order;
 
-    // ── 3. Escape: dismiss whatever is open (safe, restores state) ──
-    let _ = io.act(
-        "escape",
-        CanonicalAction::Key {
-            key: crate::backend::KeyEvent::new(KeyCode::Escape),
-        },
-    );
-    let next_index = out.states.len();
-    let _ = observe_now(io, &mut out, &mut seen_identities, next_index, "escape");
-
-    // ── 4. viewport probes: narrow + wide, restored to the launch size ──
+    // ── 3. viewport probes: narrow + wide, restored to the launch size ──
+    // (Beta-audit P0.6: no Escape step. Escape was previously sent here
+    // on the theory that it "restores state"; it does nothing of the
+    // sort in general — it can dismiss dialogs, cancel workflows, or
+    // exit the app, and no inverse exists. Bounded exploration means
+    // bounded keys, not unverifiable restoration claims.)
     let probes: [(u16, u16); 2] = [(120, 40), (60, 20)];
     let mut probed = 0usize;
     for (c, r) in probes {
@@ -352,7 +371,10 @@ where
 /// states they were seen in, the focus walk becomes declared
 /// interactions' expect material, and every probed viewport is declared.
 pub fn scaffold_multi_state(gathered: &GatheredStates, launch: (u16, u16)) -> ProjectContract {
-    let mut contract = ProjectContract::default();
+    // Beta-audit P0.5: start from the NEUTRAL document. The old
+    // `ProjectContract::default()` base injected three viewports, three
+    // invariant flags, and volatile regexes nothing here observed.
+    let mut contract = ProjectContract::blank();
     contract.schema.name = format!("scaffold-{}state", gathered.distinct());
     contract.schema.extensions.insert(
         "scaffold.inferred".to_string(),
@@ -361,7 +383,7 @@ pub fn scaffold_multi_state(gathered: &GatheredStates, launch: (u16, u16)) -> Pr
             "mode": "explore",
             "states": gathered.states,
             "launch_viewport": { "cols": launch.0, "rows": launch.1 },
-            "note": "generated by tui_contract action=scaffold mode=explore from a SAFE multi-state pass (initial screen, Tab focus walk, Escape, viewport probes); everything declared was SEEN — promote required=true deliberately",
+            "note": "generated by tui_contract action=scaffold mode=explore from a bounded exploratory pass (initial screen, Tab focus walk, viewport probes); everything declared was SEEN — promote required=true deliberately",
         }),
     );
 
@@ -450,25 +472,173 @@ pub fn scaffold_multi_state(gathered: &GatheredStates, launch: (u16, u16)) -> Pr
             });
     }
 
-    // Viewport probes that produced clipped regions at the narrow size
-    // are exactly the layout constraints worth declaring.
-    let narrow = gathered
+    // Beta-audit P0.5: `no_clipping` is DERIVED from clipping evidence,
+    // not from having probed the size. A 60×20 probe that showed no
+    // clipped region proves nothing about clipping; one that DID clip
+    // is a layout candidate worth declaring.
+    let clipped_at_narrow: Vec<&str> = gathered
         .states
         .iter()
         .filter(|s| s.via.starts_with("resize:60x"))
-        .count();
-    if narrow > 0 {
+        .flat_map(|s| s.clipped_regions.iter().map(String::as_str))
+        .collect();
+    if !clipped_at_narrow.is_empty() {
         contract.layout.push(super::schema::LayoutConstraint {
             name: Some("narrow-viewport-probed".to_string()),
             min_cols: Some(60),
             min_rows: Some(20),
             no_clipping: true,
         });
+        let scaffold_ext = contract
+            .schema
+            .extensions
+            .get_mut("scaffold.inferred")
+            .expect("just inserted");
+        scaffold_ext["clipping_evidence"] = serde_json::json!({
+            "at": "60x20",
+            "clipped_regions": clipped_at_narrow,
+        });
     }
 
-    // App-independent focus invariants, same as the single-frame scaffold.
-    contract.escape_closes_modal = true;
-    contract.reverse_tab_required = true;
+    // Beta-audit P0.5: the focus invariants the old scaffold asserted
+    // outright were never proven by this pass (a Tab walk says nothing
+    // about Shift+Tab; Escape was never sent at all). They surface as
+    // UNVERIFIED candidates with a verification recipe; the author
+    // promotes them after `tui_contract action=check` proves them.
+    let candidates = vec![
+        ProjectContract::scaffold_candidate(
+            "reverse_tab_required",
+            "unverified",
+            "run tui_contract action=check with a contract that declares reverse_tab_required: true — the behavior check sweeps Tab then Shift+Tab and proves the inverse",
+        ),
+        ProjectContract::scaffold_candidate(
+            "escape_closes_modal",
+            "unverified",
+            "run tui_contract action=check with an interaction whose expect declares modal_open() — the behavior check opens a modal and proves Escape dismisses it",
+        ),
+        ProjectContract::scaffold_candidate(
+            "destructive_require_confirmation",
+            "unverified",
+            "declare the destructive interactions explicitly, each expecting a confirmation step; there is no general static detector",
+        ),
+    ];
+    let scaffold_ext = contract
+        .schema
+        .extensions
+        .get_mut("scaffold.inferred")
+        .expect("just inserted");
+    scaffold_ext["candidate_invariants"] = serde_json::Value::Array(
+        candidates
+            .into_iter()
+            .map(|c| serde_json::to_value(c).expect("scaffold candidates are JSON literals"))
+            .collect(),
+    );
 
     contract
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gathered_with(clipped_at_narrow: &[&str]) -> GatheredStates {
+        let mut g = GatheredStates::default();
+        g.viewports = vec![(80, 24), (60, 20)];
+        g.states.push(ScaffoldState {
+            index: 0,
+            via: "initial".into(),
+            identity: "i0".into(),
+            controls: vec!["#button/save".into()],
+            regions: vec!["panel".into()],
+            components: vec![],
+            clipped_regions: vec![],
+        });
+        g.states.push(ScaffoldState {
+            index: 1,
+            via: "resize:60x20".into(),
+            identity: "i1".into(),
+            controls: vec!["#button/save".into()],
+            regions: vec!["panel".into()],
+            components: vec![],
+            clipped_regions: clipped_at_narrow.iter().map(|s| s.to_string()).collect(),
+        });
+        g.focus_order = vec!["#button/save".into(), "#button/cancel".into()];
+        g.controls_seen
+            .insert("#button/save".into(), "button".into());
+        g.regions_seen = vec!["panel".into()];
+        g
+    }
+
+    /// Beta-audit P0.5: the scaffold starts from the NEUTRAL document —
+    /// no invariant flags, no inherited viewports, no volatile regexes.
+    /// Everything declared was seen; everything else is a candidate.
+    #[test]
+    fn scaffold_starts_neutral_and_never_asserts_unproven_invariants() {
+        let c = scaffold_multi_state(&gathered_with(&[]), (80, 24));
+        assert!(
+            !c.escape_closes_modal,
+            "escape_closes_modal was never proven"
+        );
+        assert!(
+            !c.reverse_tab_required,
+            "a Tab walk proves nothing about Shift+Tab"
+        );
+        assert!(
+            !c.destructive_require_confirmation,
+            "no destructive action was observed"
+        );
+        assert!(
+            c.volatile_patterns.is_empty(),
+            "no normalization opinions from observation"
+        );
+        // The only declared viewport is the one actually probed.
+        let probed: Vec<_> = c.viewports.iter().map(|v| (v.cols, v.rows)).collect();
+        assert_eq!(probed, vec![(80, 24), (60, 20)]);
+        // All components are optional (observed once ≠ guaranteed).
+        assert!(c.components.iter().all(|x| !x.required));
+    }
+
+    /// The unproven focus invariants surface as candidates with a
+    /// verification recipe — unverified never silently becomes true.
+    #[test]
+    fn focus_invariants_surface_as_unverified_candidates() {
+        let c = scaffold_multi_state(&gathered_with(&[]), (80, 24));
+        let ext = c.schema.extensions.get("scaffold.inferred").unwrap();
+        let cands = ext["candidate_invariants"].as_array().unwrap();
+        let props: Vec<&str> = cands
+            .iter()
+            .map(|x| x["property"].as_str().unwrap())
+            .collect();
+        assert!(props.contains(&"reverse_tab_required"), "{props:?}");
+        assert!(props.contains(&"escape_closes_modal"), "{props:?}");
+        for cand in cands {
+            assert_eq!(cand["status"], "unverified");
+            assert!(
+                cand["how_to_verify"].as_str().unwrap().len() > 10,
+                "each candidate names how to verify it: {cand}"
+            );
+        }
+    }
+
+    /// `no_clipping` at the narrow probe is derived from ACTUAL
+    /// clipping evidence. Without clipping observed: no layout
+    /// constraint. With clipping observed: constraint + the evidence
+    /// rides the extension.
+    #[test]
+    fn no_clipping_requires_observed_clipping() {
+        let without = scaffold_multi_state(&gathered_with(&[]), (80, 24));
+        assert!(
+            without.layout.is_empty(),
+            "a clean narrow probe declares no clipping constraint"
+        );
+
+        let with = scaffold_multi_state(&gathered_with(&["#panel/sidebar"]), (80, 24));
+        assert_eq!(with.layout.len(), 1);
+        assert!(with.layout[0].no_clipping);
+        let ext = with.schema.extensions.get("scaffold.inferred").unwrap();
+        assert_eq!(
+            ext["clipping_evidence"]["clipped_regions"][0], "#panel/sidebar",
+            "the evidence for the constraint is named: {ext}"
+        );
+    }
 }
