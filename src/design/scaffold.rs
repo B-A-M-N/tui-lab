@@ -542,8 +542,10 @@ mod tests {
     use super::*;
 
     fn gathered_with(clipped_at_narrow: &[&str]) -> GatheredStates {
-        let mut g = GatheredStates::default();
-        g.viewports = vec![(80, 24), (60, 20)];
+        let mut g = GatheredStates {
+            viewports: vec![(80, 24), (60, 20)],
+            ..Default::default()
+        };
         g.states.push(ScaffoldState {
             index: 0,
             via: "initial".into(),
