@@ -21,6 +21,13 @@ pub(super) struct FindingStore {
     /// X; `tui_audit compare_to=X` diffs the fresh pass against the stored
     /// one via finding fingerprints.
     baselines: HashMap<String, Vec<crate::audit::Finding>>,
+    /// Beta-audit P0.10: the most recent COMPLETED audit pass, as a
+    /// first-class snapshot. The cumulative `findings` ledger is arrival-
+    /// ordered history; a regression comparison against it would keep
+    /// reporting a fixed defect as persisting for as long as an older
+    /// pass's copy sits in the ledger. The bundle surface compares
+    /// against THIS instead.
+    latest_pass: Option<Vec<crate::audit::Finding>>,
 }
 
 impl FindingStore {
@@ -29,6 +36,7 @@ impl FindingStore {
         FindingStore {
             findings: Vec::new(),
             baselines: HashMap::new(),
+            latest_pass: None,
         }
     }
 
@@ -38,6 +46,9 @@ impl FindingStore {
         FindingStore {
             findings,
             baselines: HashMap::new(),
+            // A restored run has history but no live pass snapshot; the
+            // first fresh audit after restore records one.
+            latest_pass: None,
         }
     }
 
@@ -55,6 +66,19 @@ impl FindingStore {
     /// Evidence count for status/ledger summaries.
     pub(super) fn len(&self) -> usize {
         self.findings.len()
+    }
+
+    /// Beta-audit P0.10: record a completed audit pass as THE current
+    /// snapshot. Called once per completed audit run with that pass's
+    /// findings (not accumulated).
+    pub(super) fn record_pass(&mut self, findings: Vec<crate::audit::Finding>) {
+        self.latest_pass = Some(findings);
+    }
+
+    /// The latest completed pass's findings, when one has been recorded
+    /// in this run.
+    pub(super) fn latest_pass(&self) -> Option<&[crate::audit::Finding]> {
+        self.latest_pass.as_deref()
     }
 
     /// Store (or overwrite) a labeled audit-finding baseline (item 67).

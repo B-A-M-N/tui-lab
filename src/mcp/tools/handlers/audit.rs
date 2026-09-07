@@ -202,6 +202,11 @@ pub(crate) async fn tui_audit(
                 // W2.10: attach app-declared source loci where coverage
                 // evidence can name the finding's control.
                 let _ = run.extend_findings_with_source_refs(report.findings.clone());
+                // Beta-audit P0.10: the completed pass becomes THE current
+                // snapshot, so regression comparisons ask "fixed or
+                // persisting in the newest audit" — never "still somewhere
+                // in the cumulative ledger".
+                run.record_audit_pass(report.findings.clone());
                 if let Some(cmp_label) = compare_to.as_deref() {
                     match run.finding_baseline(cmp_label) {
                         Some(baseline) => {

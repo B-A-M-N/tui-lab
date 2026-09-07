@@ -97,6 +97,32 @@ pub(crate) fn bundle(
     };
     let compare_label = p.compare_to.clone().unwrap_or_else(|| "baseline".into());
     let run = s.run.lock().unwrap();
+    // Beta-audit P0.10: the "current set" for a did-the-fix-hold
+    // comparison is the LATEST COMPLETED AUDIT PASS — a first-class
+    // snapshot — never the cumulative finding ledger. The ledger keeps
+    // every finding ever recorded in the run, so a defect that was in
+    // the baseline, was fixed, and is absent from the newest pass would
+    // still match a stale copy there and read `persisting` forever.
+    //
+    // The comparable gate comes FIRST: with no completed pass in this
+    // run, nothing is comparable — whatever the finding id. (The id may
+    // belong to a PREVIOUS run's ledger; refusing on it before the gate
+    // would hide the real answer behind an unrelated error.)
+    let current_set: Vec<crate::audit::Finding> = match run.latest_audit_pass() {
+        Some(pass) => pass.to_vec(),
+        None => {
+            let finding = run.findings().iter().find(|f| f.id == finding_id);
+            return ok(json!({
+                "finding_id": finding_id,
+                "rule_id": finding.map(|f| f.rule_id.clone()),
+                "summary": finding.map(|f| f.summary.clone()),
+                "baseline": compare_label,
+                "baseline_available": run.finding_baseline(&compare_label).is_some(),
+                "comparable": false,
+                "note": "no completed audit pass recorded in this run yet — run tui_audit action=run (label=baseline before the change; compare_to=baseline after). The finding ledger is cumulative history and is deliberately NOT used as the current set.",
+            }));
+        }
+    };
     let Some(finding) = run.findings().iter().find(|f| f.id == finding_id) else {
         let labels = run.finding_baseline_labels();
         return err(
@@ -127,7 +153,7 @@ pub(crate) fn bundle(
             let resolved =
                 crate::audit::compare::Resolved(run.resolved_finding_fingerprints(&compare_label));
             let compared =
-                crate::audit::compare::compare_with_resolved(base, run.findings(), &resolved);
+                crate::audit::compare::compare_with_resolved(base, &current_set, &resolved);
             let this = compared
                 .iter()
                 .find(|c| c.finding.id == finding_id)
@@ -176,6 +202,8 @@ pub(crate) fn bundle(
         "after": verdicts,
         "baseline": compare_label,
         "baseline_available": baseline.is_some(),
+        "comparable": true,
+        "current_set": "latest_audit_pass",
         "side_effects": {
             "new_or_regressed_elsewhere": regressions,
             "count": regressions.len(),
