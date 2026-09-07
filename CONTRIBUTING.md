@@ -3,7 +3,7 @@
 ## Development Setup
 
 ```bash
-git clone https://github.com/nousresearch/tui-lab
+git clone https://github.com/B-A-M-N/tui-lab
 cd tui-lab
 cargo build
 cargo test

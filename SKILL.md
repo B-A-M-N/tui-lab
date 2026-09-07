@@ -1,4 +1,4 @@
-# hermes-tui-lab skill
+# tui-lab skill
 
 MCP server for agent-native TUI instrumentation, testing, exploration, and UX evaluation.
 
@@ -56,7 +56,7 @@ persisted run as the live run (the ledger, findings, checkpoints, scenarios,
 graphs, and coverage come back; sessions do not — relaunch them with
 `tui_session action=start`; the launch specs are recorded in the run
 manifest). Read closed runs without resuming them via the `tui://runs/<id>`
-resource or `hermes-tui-lab replay <run_id>` — a transcript render, not a
+resource or `tui-lab replay <run_id>` — a transcript render, not a
 re-drive.
 
 ## Human control lease
