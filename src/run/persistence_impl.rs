@@ -520,7 +520,9 @@ impl RunContext {
             // Roll back: the run was never observably reopened.
             self.identity.set_resume_epoch(new_epoch - 1);
             self.identity.set_closed(true);
-            return Err(e.context("reopen: manifest write failed; the run remains closed at its previous epoch"));
+            return Err(e.context(
+                "reopen: manifest write failed; the run remains closed at its previous epoch",
+            ));
         }
         Ok(())
     }

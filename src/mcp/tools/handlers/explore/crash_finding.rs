@@ -142,4 +142,3 @@ pub(crate) fn minimize_crash_finding(
         "attempts": pipeline.attempts,
     })
 }
-

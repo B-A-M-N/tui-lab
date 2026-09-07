@@ -9,17 +9,66 @@
 
 use std::sync::Arc;
 
-
 use rmcp::tool;
 use rmcp::tool_router;
 use rmcp::ServerHandler;
-
 
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::err;
 use crate::mcp::params::*;
 use crate::session::SessionPool;
 use rmcp::handler::server::wrapper::Parameters;
+
+/// Beta-audit P0.2: why a lifecycle mutation (stop/restart/detach) was
+/// refused at preflight. Typed so aggregate callers (resume detach) can
+/// name every blocked session in one structured response.
+#[derive(Debug, Clone)]
+pub(crate) enum PreflightRefusal {
+    /// A live human control lease blocks killing the process.
+    Leased {
+        session: String,
+        holder: String,
+        remaining_ms: u64,
+    },
+    /// The session belongs to a different run; this run has no
+    /// authority over its lifecycle.
+    ForeignRun {
+        session: String,
+        bound_to: String,
+        current: String,
+        operation: String,
+    },
+}
+
+impl PreflightRefusal {
+    /// The wire shape for aggregate preflight reports (resume detach).
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        match self {
+            PreflightRefusal::Leased {
+                session,
+                holder,
+                remaining_ms,
+            } => serde_json::json!({
+                "session": session,
+                "reason": "human_lease_live",
+                "holder": holder,
+                "retry_after_ms": remaining_ms,
+            }),
+            PreflightRefusal::ForeignRun {
+                session,
+                bound_to,
+                current,
+                operation,
+            } => serde_json::json!({
+                "session": session,
+                "reason": "bound_to_foreign_run",
+                "bound_to": bound_to,
+                "current_run": current,
+                "operation": operation,
+            }),
+        }
+    }
+}
 
 /// Shared MCP state: the session pool (Wave G item 73 — per-session actors;
 /// no global blocking lock) plus the run context (composition root for
@@ -40,6 +89,11 @@ pub struct TuiLabServer {
     /// handler child modules can clone-share them across the actor await.
     session_owners: Arc<std::sync::Mutex<crate::mcp::ownership::SessionOwnership>>,
     intent_plans: Arc<std::sync::Mutex<crate::mcp::ownership::IntentPlanStore>>,
+    /// Beta-audit P0.1: the run lifecycle admission gate. Ordinary
+    /// operations take a shared lease inside `with_sess`; `tui_run
+    /// new`/`resume`/`close` take the exclusive lease, so a run swap can
+    /// only land where no other operation is mid-flight.
+    pub(crate) lifecycle: crate::mcp::lifecycle::RunLifecycleCoordinator,
 }
 
 impl TuiLabServer {
@@ -53,6 +107,7 @@ impl TuiLabServer {
             intent_plans: Arc::new(std::sync::Mutex::new(
                 crate::mcp::ownership::IntentPlanStore::new(),
             )),
+            lifecycle: crate::mcp::lifecycle::RunLifecycleCoordinator::new(),
         }
     }
 
@@ -70,6 +125,7 @@ impl TuiLabServer {
             intent_plans: Arc::new(std::sync::Mutex::new(
                 crate::mcp::ownership::IntentPlanStore::new(),
             )),
+            lifecycle: crate::mcp::lifecycle::RunLifecycleCoordinator::new(),
         }
     }
 
@@ -108,6 +164,15 @@ impl TuiLabServer {
     /// current run is closed, and the agent is told to resume or start a
     /// fresh run. Read-only run surfaces (`tui_run status/list`, explain,
     /// replay) do not go through this path and stay available.
+    ///
+    /// Beta-audit P0.1: this is ALSO the lifecycle admission boundary.
+    /// The shared lifecycle lease is taken BEFORE the closed-run and
+    /// ownership guards read the run, and held across the whole actor
+    /// await, so a `tui_run new`/`resume`/`close` transition cannot
+    /// land between a job's authorization and its evidence commit —
+    /// the swap waits for the lease, the operation never sees a run
+    /// change mid-flight. (`RunTicket` still verifies at commit: belt
+    /// and suspenders, for paths that bypass admission.)
     async fn with_sess<R, F>(
         &self,
         id: Option<&str>,
@@ -117,6 +182,51 @@ impl TuiLabServer {
         R: Send + 'static,
         F: FnOnce(&mut crate::session::Session) -> R + Send + 'static,
     {
+        // Admission first: the shared lease makes this operation part
+        // of the current lifecycle era. A pending exclusive transition
+        // holds new admissions out until it completes.
+        let lease = self.lifecycle.shared("with_sess").await;
+        let out = self.with_sess_leased(id, job, &lease).await;
+        drop(lease);
+        out
+    }
+
+    /// Dispatch under an ALREADY-HELD lease. Used by multi-stage
+    /// operations that hold one lease across several actor calls
+    /// (session start/attach: launch → bind → readback) — acquiring a
+    /// second shared lease inside the first could deadlock against a
+    /// queued exclusive transition (tokio's RwLock is write-preferring
+    /// and not read-reentrant). The passed lease is the caller's
+    /// admission witness; this only performs the authorization read.
+    async fn with_sess_leased<R, F>(
+        &self,
+        id: Option<&str>,
+        job: F,
+        _lease: &crate::mcp::lifecycle::Lease,
+    ) -> Result<R, rmcp::model::CallToolResult>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::session::Session) -> R + Send + 'static,
+    {
+        self.admit_under_lease(id)?;
+        self.sessions
+            .with_session(id, job)
+            .await
+            .map_err(|e| match e.details() {
+                // Finding 12: a busy refusal carries the retry window
+                // structurally — the agent reads `retry_after_ms` instead of
+                // regex-matching the prose.
+                Some(details) => {
+                    crate::mcp::helpers::err_with_details(e.category(), e.to_string(), details)
+                }
+                None => err(e.category(), e.to_string()),
+            })
+    }
+
+    /// The authorization observation `with_sess` performs under the
+    /// lifecycle lease: closed-run guard + session ownership guard, one
+    /// atomic read of the run world. `Some(err)` = refuse admission.
+    fn admit_under_lease(&self, id: Option<&str>) -> Result<(), rmcp::model::CallToolResult> {
         if self.run.lock().unwrap().is_closed() {
             let run_id = self.run.lock().unwrap().id().to_string();
             return Err(err(
@@ -155,18 +265,7 @@ impl TuiLabServer {
                 }
             }
         }
-        self.sessions
-            .with_session(id, job)
-            .await
-            .map_err(|e| match e.details() {
-                // Finding 12: a busy refusal carries the retry window
-                // structurally — the agent reads `retry_after_ms` instead of
-                // regex-matching the prose.
-                Some(details) => {
-                    crate::mcp::helpers::err_with_details(e.category(), e.to_string(), details)
-                }
-                None => err(e.category(), e.to_string()),
-            })
+        Ok(())
     }
 
     /// Like `with_sess`, but the closure ALSO receives the run ticket
@@ -183,12 +282,7 @@ impl TuiLabServer {
     ) -> Result<R, rmcp::model::CallToolResult>
     where
         R: Send + 'static,
-        F: FnOnce(
-            &mut crate::session::Session,
-            crate::execution::RunTicket,
-        ) -> R
-            + Send
-            + 'static,
+        F: FnOnce(&mut crate::session::Session, crate::execution::RunTicket) -> R + Send + 'static,
     {
         // Capture the ticket INSIDE the same lock windows the guards use:
         // the last lock read here is the ownership check, so re-reading the
@@ -436,11 +530,7 @@ impl TuiLabServer {
         // (Unbound sessions carry no objection here, matching the
         // driving gate's adoption rule.)
         let cur_run = self.run.lock().unwrap().id().to_string();
-        let owner = self
-            .session_owners
-            .lock()
-            .ok()
-            .and_then(|m| m.owner_of(id));
+        let owner = self.session_owners.lock().ok().and_then(|m| m.owner_of(id));
         if let Some(own) = owner {
             if own != cur_run {
                 return Err(err(
@@ -449,6 +539,45 @@ impl TuiLabServer {
                         "session '{id}' is bound to run {own}, not the current run {cur_run}; {operation} is refused — resume run {own} to manage its sessions",
                     ),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Beta-audit P0.2: the TYPED lifecycle preflight — the same checks
+    /// [`Self::authorize_lifecycle`] performs, but reporting WHY a
+    /// mutation is impossible instead of a rendered envelope, so callers
+    /// that aggregate refusals (resume detach preflight) can name the
+    /// sessions and reasons structurally. `Ok` = the mutation may
+    /// proceed.
+    pub(crate) async fn preflight_lifecycle(
+        &self,
+        id: &str,
+        operation: &str,
+    ) -> Result<(), PreflightRefusal> {
+        if !self.sessions.list().iter().any(|s| s == id) {
+            return Ok(()); // already gone — idempotent, same as authorize_lifecycle
+        }
+        let lease = self
+            .sessions
+            .with_session(Some(id), |sess| sess.driving_blocked())
+            .await;
+        if let Ok(Some(lease)) = lease {
+            return Err(PreflightRefusal::Leased {
+                session: id.to_string(),
+                holder: lease.holder.clone(),
+                remaining_ms: lease.remaining_ms(),
+            });
+        }
+        let cur_run = self.run.lock().unwrap().id().to_string();
+        if let Some(own) = self.session_owners.lock().ok().and_then(|m| m.owner_of(id)) {
+            if own != cur_run {
+                return Err(PreflightRefusal::ForeignRun {
+                    session: id.to_string(),
+                    bound_to: own,
+                    current: cur_run,
+                    operation: operation.to_string(),
+                });
             }
         }
         Ok(())
@@ -525,7 +654,6 @@ impl TuiLabServer {
     ) -> rmcp::model::CallToolResult {
         crate::mcp::tools::handlers::contract::tui_contract(self, p).await
     }
-
 }
 
 // Generate `call_tool`/`list_tools`/`get_info` from the tool router above.

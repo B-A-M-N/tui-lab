@@ -56,10 +56,7 @@ pub(crate) async fn tui_workflow(
 /// server's own directory (that would join evidence from different
 /// projects while looking authoritative). An explicit `cwd` parameter is
 /// a conscious override and is reported as such.
-fn framework_context(
-    recorded_cwd: Option<&str>,
-    explicit_cwd: Option<&str>,
-) -> serde_json::Value {
+fn framework_context(recorded_cwd: Option<&str>, explicit_cwd: Option<&str>) -> serde_json::Value {
     let (root, provenance) = match explicit_cwd {
         Some(c) => (c.to_string(), "explicit_override".to_string()),
         // The primary session's recorded launch cwd is the app's home;
@@ -67,7 +64,10 @@ fn framework_context(
         // session ever launched), and say so.
         None => match recorded_cwd {
             Some(c) => (c.to_string(), "recorded_launch_cwd".to_string()),
-            None => (".".to_string(), "no_launch_cwd_recorded_fell_back_to_server_cwd".to_string()),
+            None => (
+                ".".to_string(),
+                "no_launch_cwd_recorded_fell_back_to_server_cwd".to_string(),
+            ),
         },
     };
     let project = crate::session::ProjectLocator::locate(None, &root);

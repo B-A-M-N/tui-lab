@@ -112,7 +112,8 @@ pub struct EvidenceHealth {
     /// Whether the interaction transaction was recorded in the run
     /// ledger (the reconstructable record; sensitive payloads redacted).
     pub ledger_recorded: bool,
-}impl EvidenceHealth {
+}
+impl EvidenceHealth {
     /// True only when every evidence leg committed. A `false` here does
     /// not invalidate the act — the TUI still received the input (the
     /// execution itself succeeded) — it means the run's citable record

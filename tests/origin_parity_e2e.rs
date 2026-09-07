@@ -15,9 +15,7 @@ use tui_lab::session::SessionPool;
 fn raw_ready_args(marker: &str) -> Vec<String> {
     vec![
         "-c".into(),
-        format!(
-            "import sys,tty; tty.setraw(0); print('{marker}'); sys.stdin.buffer.read(1)"
-        ),
+        format!("import sys,tty; tty.setraw(0); print('{marker}'); sys.stdin.buffer.read(1)"),
     ]
 }
 

@@ -156,11 +156,7 @@ fn replay(run_id: &str, root: Option<&str>, full: bool) -> anyhow::Result<()> {
         for (action, (total, settled)) in by_action {
             let _ = writeln!(out, "  {:<24} {:>4} (settled {})", action, total, settled);
         }
-        let _ = writeln!(
-            out,
-            "  (full ledger: tui-lab replay {} --full)",
-            run.id(),
-        );
+        let _ = writeln!(out, "  (full ledger: tui-lab replay {} --full)", run.id(),);
     }
 
     // Findings summary.

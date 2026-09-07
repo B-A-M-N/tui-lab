@@ -29,6 +29,13 @@ pub(crate) async fn tui_session(
     };
     match action {
         A::Start => {
+            // Beta-audit P0.1: the shared lifecycle lease spans the
+            // WHOLE launch — actor start, owner binding, fact readback,
+            // launch-spec attach. The old shape bound ownership AFTER
+            // the async launch completed, so a run switch landing in
+            // that window bound the session to whichever run was
+            // current at completion, not the one that authorized it.
+            let _lease = s.lifecycle.shared("session-start").await;
             let cols = p.cols.unwrap_or(80);
             let rows = p.rows.unwrap_or(24);
             let command = match &p.command {
@@ -98,16 +105,23 @@ pub(crate) async fn tui_session(
             s.bind_session_owner(&id);
             // Read back the launch facts inside the actor (the session
             // never crosses the boundary — only this summary does).
+            // Dispatched under the SAME lease the launch holds (a
+            // second shared acquire could deadlock against a queued
+            // lifecycle transition).
             let facts = s
-                .with_sess(Some(&id), |s| {
-                    let caps = s.capabilities();
-                    let launch = s.launch().cloned();
-                    let version = s.backend_version();
-                    let kind = s.backend_kind;
-                    let generation = s.generation;
-                    let iso_evidence = s.isolation_evidence().cloned();
-                    (caps, launch, version, kind, generation, iso_evidence)
-                })
+                .with_sess_leased(
+                    Some(&id),
+                    |s| {
+                        let caps = s.capabilities();
+                        let launch = s.launch().cloned();
+                        let version = s.backend_version();
+                        let kind = s.backend_kind;
+                        let generation = s.generation;
+                        let iso_evidence = s.isolation_evidence().cloned();
+                        (caps, launch, version, kind, generation, iso_evidence)
+                    },
+                    &_lease,
+                )
                 .await;
             let (caps, launch, version, kind, generation, iso_evidence) = match facts {
                 Ok(f) => f,
@@ -137,6 +151,9 @@ pub(crate) async fn tui_session(
         // process predates TUI-Lab and belongs to the user. TUI-Lab
         // never kills the pane on detach.
         A::Attach => {
+            // Beta-audit P0.1: same whole-operation lease as Start —
+            // an attach authorized under run A binds to run A.
+            let _lease = s.lifecycle.shared("session-attach").await;
             let target = match p.target.as_deref() {
                 Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                 _ => {
@@ -153,22 +170,27 @@ pub(crate) async fn tui_session(
                 Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
             };
             s.bind_session_owner(&id);
+            // Readback under the attach's own lease (no nested acquire).
             let facts = s
-                .with_sess(Some(&id), |s| {
-                    let caps = s.capabilities();
-                    let version = s.backend_version();
-                    let kind = s.backend_kind;
-                    let generation = s.generation;
-                    let process = s.process();
-                    (caps, version, kind, generation, process)
-                })
+                .with_sess_leased(
+                    Some(&id),
+                    |s| {
+                        let caps = s.capabilities();
+                        let version = s.backend_version();
+                        let kind = s.backend_kind;
+                        let generation = s.generation;
+                        let process = s.process();
+                        (caps, version, kind, generation, process)
+                    },
+                    &_lease,
+                )
                 .await;
             let (caps, version, kind, generation, process) = match facts {
                 Ok(f) => f,
                 Err(e) => return e,
             };
             if let Some(spec) = s
-                .with_sess(Some(&id), |s| s.launch().cloned())
+                .with_sess_leased(Some(&id), |s| s.launch().cloned(), &_lease)
                 .await
                 .ok()
                 .flatten()

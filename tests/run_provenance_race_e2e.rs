@@ -16,9 +16,7 @@ use tui_lab::session::SessionPool;
 fn raw_ready_args(marker: &str) -> Vec<String> {
     vec![
         "-c".into(),
-        format!(
-            "import sys,tty; tty.setraw(0); print('{marker}'); sys.stdin.buffer.read(1)"
-        ),
+        format!("import sys,tty; tty.setraw(0); print('{marker}'); sys.stdin.buffer.read(1)"),
     ]
 }
 
@@ -68,9 +66,8 @@ async fn run_switch_between_authorization_and_commit_drops_evidence() {
         .expect("start");
 
     pool.with_session(Some(&id), move |sess| {
-        let run_a = std::sync::Arc::new(std::sync::Mutex::new(
-            tui_lab::run::RunContext::ephemeral(),
-        ));
+        let run_a =
+            std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
         // "Authorization": capture the ticket under A (what with_sess's
         // guard window would do).
         let ticket = tui_lab::execution::RunTicket::capture(&run_a);
@@ -131,9 +128,7 @@ async fn matching_ticket_commits_normally() {
         .expect("start");
 
     pool.with_session(Some(&id), move |sess| {
-        let run = std::sync::Arc::new(std::sync::Mutex::new(
-            tui_lab::run::RunContext::ephemeral(),
-        ));
+        let run = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
         let ticket = tui_lab::execution::RunTicket::capture(&run);
         let action = key_x();
         let outcome = tui_lab::execution::drive_pipeline(sess, &run, key_spec(&action, ticket))
@@ -174,9 +169,8 @@ async fn run_switch_drops_the_fold_without_losing_events() {
         .expect("start");
 
     pool.with_session(Some(&id.clone()), move |sess| {
-        let run_a = std::sync::Arc::new(std::sync::Mutex::new(
-            tui_lab::run::RunContext::ephemeral(),
-        ));
+        let run_a =
+            std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
         let ticket = tui_lab::execution::RunTicket::capture(&run_a);
         // Swap to B, then drive with A's ticket: the commit refuses (as in
         // the headline test) BEFORE the fold, so the act's events remain in
@@ -184,7 +178,9 @@ async fn run_switch_drops_the_fold_without_losing_events() {
         *run_a.lock().unwrap() = tui_lab::run::RunContext::ephemeral();
         let action = key_x();
         let persist_key = format!("persistence:{id}");
-        assert!(tui_lab::execution::drive_pipeline(sess, &run_a, key_spec(&action, ticket)).is_err());
+        assert!(
+            tui_lab::execution::drive_pipeline(sess, &run_a, key_spec(&action, ticket)).is_err()
+        );
 
         // A stale-ticket fold is a no-op: B's persistence cursor does not
         // move. The stale ticket names A — captured against a context that

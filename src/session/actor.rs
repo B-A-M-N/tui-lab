@@ -1088,9 +1088,7 @@ mod tests {
             .await
             .expect("start");
         // Retain the handle BEFORE any stop machinery runs.
-        let handle = pool
-            .resolve(Some(&id))
-            .expect("handle resolves pre-stop");
+        let handle = pool.resolve(Some(&id)).expect("handle resolves pre-stop");
 
         // Concurrently: one task spams sends on the pre-held handle while
         // stop runs. Every send must either land BEFORE closing was

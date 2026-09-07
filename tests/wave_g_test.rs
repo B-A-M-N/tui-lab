@@ -419,10 +419,7 @@ async fn full_audit_leaves_no_state_residue() {
         assert!(
             genuine.is_empty(),
             "full audit must restore the state it is responsible for: {:?}",
-            genuine
-                .iter()
-                .map(|f| &f.summary)
-                .collect::<Vec<_>>()
+            genuine.iter().map(|f| &f.summary).collect::<Vec<_>>()
         );
         for f in report.findings.iter().filter(|f| f.id == "AUDIT-RESIDUE") {
             assert_eq!(
@@ -2407,10 +2404,7 @@ async fn close_and_persist_responses_report_fresh_final_state() {
     );
     assert_eq!(close["closed"], true, "{close}");
     let final_close = &close["final"];
-    assert!(
-        final_close.is_object(),
-        "final is present: {close}"
-    );
+    assert!(final_close.is_object(), "final is present: {close}");
     assert_eq!(
         final_close["closed"], true,
         "the final summary describes the run AFTER the close, not the \
@@ -2421,10 +2415,7 @@ async fn close_and_persist_responses_report_fresh_final_state() {
         Some(tx_at_persist),
         "final counts are the settled totals, not pre-flush values: {close}"
     );
-    assert_eq!(
-        final_close["run_id"], again["run_id"],
-        "{close}"
-    );
+    assert_eq!(final_close["run_id"], again["run_id"], "{close}");
 
     // Cross-check against a fresh status call: identical totals.
     let after = unwrap_ok(
@@ -2507,7 +2498,9 @@ async fn restart_between_mutations_requires_explicit_mutation_consent() {
     );
 
     server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
         .await;
 }
 
@@ -2567,7 +2560,8 @@ async fn workflow_framework_root_follows_recorded_launch_cwd() {
         "root comes from the recorded launch cwd, not the server cwd: {fw}"
     );
     assert_eq!(
-        fw["project_root"], base.to_string_lossy().as_ref(),
+        fw["project_root"],
+        base.to_string_lossy().as_ref(),
         "detection resolved against the app's own directory: {fw}"
     );
 
@@ -2587,7 +2581,9 @@ async fn workflow_framework_root_follows_recorded_launch_cwd() {
     );
 
     server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": sid })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid }),
+        ))
         .await;
     let _ = std::fs::remove_dir_all(&base);
 }
