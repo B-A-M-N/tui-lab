@@ -278,9 +278,11 @@ pub(crate) async fn tui_contract(
             let selector = p.id.clone();
             let run = s.run.clone();
             if scaffold_mode == SM::Explore {
-                // The multi-state pass DRIVES the app (Tab / Escape /
-                // resize), so the human control lease gates it exactly
-                // like every other driver.
+                // The multi-state pass DRIVES the app (Tab / resize),
+                // so the human control lease gates it exactly like
+                // every other driver. (Beta-audit P0.6: Escape is no
+                // longer in the pass — it is not state-preserving in
+                // general.)
                 let scaffolded = s
                     .with_sess(selector.as_deref(), move |sess| {
                         if let Some(refused) = crate::mcp::helpers::lease_refused(sess) {
@@ -382,7 +384,9 @@ pub(crate) async fn tui_contract(
                     "viewports": contract.viewports.iter().map(|v| json!({"cols": v.cols, "rows": v.rows})).collect::<Vec<_>>(),
                     "states": ext["states"],
                     "focus_order": ext["states"].as_array().map(|_| ()),
-                    "note": "scaffolded from a SAFE multi-state pass (initial screen, Tab focus walk, Escape, viewport probes) — everything declared was SEEN, nothing is yet required. Edit required=true / mode=validation as you fix intent, then tui_contract action=validate.",
+                    "candidate_invariants": ext["candidate_invariants"],
+                    "clipping_evidence": ext["clipping_evidence"],
+                    "note": "scaffolded from a bounded exploratory pass (initial screen, Tab focus walk, viewport probes; NO Escape — it is not state-preserving in general). Everything declared was SEEN, nothing is yet required, and the focus invariants are UNVERIFIED candidates — see candidate_invariants. Promote deliberately (required=true / mode=validation), then tui_contract action=check to prove the candidates.",
                     "yaml": yaml,
                 }))
             } else {
