@@ -327,6 +327,177 @@ mod tests {
         assert_eq!(declared, served, "registry TOOLS != router tools/list set");
     }
 
+    /// Beta-audit P0.9: the ADVERTISED schema and the ACCEPTED wire shape
+    /// must agree per field. The old hand-maintained schema mirror drifted
+    /// within weeks (resize/signal lacked the guard field the parser
+    /// accepts), so this walks the tui_act oneOf and asserts, per action
+    /// variant, that every property the schema names deserializes and —
+    /// the drift that actually shipped — every field the PARSER accepts
+    /// on a payload is advertised.
+    #[test]
+    fn act_schema_advertises_every_field_the_parser_accepts() {
+        let router = crate::mcp::TuiLabServer::tool_router();
+        let tool = router.get("tui_act").unwrap();
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let one_of = schema
+            .get("oneOf")
+            .and_then(|v| v.as_array())
+            .expect("tui_act root is a wrapped oneOf");
+        assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
+
+        // Tag -> advertised property set.
+        let mut advertised: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for v in one_of {
+            let action = v["properties"]["action"]["const"]
+                .as_str()
+                .unwrap_or_else(|| panic!("variant missing action const: {v}"))
+                .to_string();
+            let props: Vec<String> = v["properties"]
+                .as_object()
+                .expect("variant properties")
+                .keys()
+                .cloned()
+                .collect();
+            advertised.insert(action, props);
+        }
+        let expected_actions: &[&str] = &[
+            "key",
+            "keys",
+            "type",
+            "paste",
+            "raw",
+            "mouse_click",
+            "mouse_press",
+            "mouse_release",
+            "mouse_move",
+            "mouse_drag",
+            "mouse_scroll",
+            "resize",
+            "signal",
+        ];
+        assert_eq!(advertised.len(), expected_actions.len(), "{advertised:?}");
+
+        // Every action accepts the shared transport fields; the schema
+        // must advertise them (guard included — the historical drift).
+        for action in expected_actions {
+            let props = &advertised[*action];
+            for shared in ["id", "no_wait", "completion", "wait_ms", "guard"] {
+                assert!(
+                    props.contains(&shared.to_string()),
+                    "{action}: schema must advertise '{shared}' (the mirror dropped guard from resize/signal): {props:?}"
+                );
+            }
+        }
+
+        // And the reverse direction: serialize a maxed request per action
+        // (every field set) and check the schema's properties cover every
+        // KEY it emits.
+        let full = |tag: &str, extra: serde_json::Value| {
+            serde_json::json!({
+                "action": tag,
+                "no_wait": false,
+                "completion": "stable_screen",
+                "wait_ms": 10,
+                "id": "s1",
+                "guard": {},
+            })
+            .as_object()
+            .unwrap()
+            .iter()
+            .chain(extra.as_object().unwrap())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        let samples = [
+            full("key", serde_json::json!({ "key": "tab" })),
+            full("keys", serde_json::json!({ "keys": ["tab"] })),
+            full(
+                "type",
+                serde_json::json!({ "text": "hi", "sensitive": false }),
+            ),
+            full(
+                "paste",
+                serde_json::json!({ "paste": "hi", "sensitive": false }),
+            ),
+            full("raw", serde_json::json!({ "raw": [1] })),
+            full(
+                "mouse_click",
+                serde_json::json!({ "x": 1, "y": 2, "button": "left" }),
+            ),
+            full("mouse_press", serde_json::json!({ "x": 1, "y": 2 })),
+            full("mouse_release", serde_json::json!({ "x": 1, "y": 2 })),
+            full("mouse_move", serde_json::json!({ "x": 1, "y": 2 })),
+            full("mouse_drag", serde_json::json!({ "x": 1, "y": 2 })),
+            full(
+                "mouse_scroll",
+                serde_json::json!({ "x": 1, "y": 2, "direction": "down" }),
+            ),
+            full("resize", serde_json::json!({ "cols": 80, "rows": 24 })),
+            full("signal", serde_json::json!({ "signal": 15 })),
+        ];
+        for s in samples {
+            // 1. The PARSER accepts it (schema-valid ⇒ wire-valid).
+            let req: crate::mcp::params::TuiActRequest =
+                serde_json::from_value(serde_json::Value::Object(s.clone()))
+                    .unwrap_or_else(|e| panic!("parser rejects its own maxed shape: {e}: {s:?}"));
+            // 2. The SCHEMA advertises every key it carries.
+            let action = s["action"].as_str().unwrap();
+            let props = &advertised[action];
+            for k in s.keys() {
+                assert!(
+                    props.contains(k),
+                    "{action}: parser accepts '{k}' but the schema omits it: {props:?}"
+                );
+            }
+            let _ = req;
+        }
+    }
+
+    /// Wire compatibility: the historical flat tagged shape still
+    /// deserializes identically after the payload-struct refactor — a
+    /// recorded scenario from before the refactor must replay.
+    #[test]
+    fn act_wire_shape_is_backward_compatible() {
+        let flat = serde_json::json!({
+            "action": "type", "text": "hello", "sensitive": true,
+            "no_wait": true, "id": "s9", "wait_ms": 25,
+            "completion": { "type": "text_appears", "text": "Saved" },
+            "guard": { "structure_hash": "abc", "focus_control_id": "#b/ok" },
+        });
+        let req: crate::mcp::params::TuiActRequest = serde_json::from_value(flat).unwrap();
+        match &req {
+            crate::mcp::params::TuiActRequest::Type(p) => {
+                assert_eq!(p.text, "hello");
+                assert_eq!(p.sensitive, Some(true));
+                assert_eq!(p.common.id.as_deref(), Some("s9"));
+                assert_eq!(p.common.wait_ms, Some(25));
+                assert_eq!(p.common.no_wait, Some(true));
+                let guard = p.common.guard.as_ref().expect("guard survives");
+                assert_eq!(guard.structure_hash.as_deref(), Some("abc"));
+                let completion = p.common.completion.as_ref().expect("completion survives");
+                assert!(
+                    matches!(
+                        completion.to_policy(),
+                        crate::capture::CompletionPolicy::TextAppears(ref t)
+                            if t == "Saved"
+                    ),
+                    "completion carries its payload through: {completion:?}"
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // And it round-trips back to the same flat shape.
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["action"], "type");
+        assert_eq!(back["text"], "hello");
+        assert_eq!(back["guard"]["structure_hash"], "abc");
+        // Accessors read through the payloads.
+        assert!(req.sensitive());
+        assert_eq!(req.id(), Some("s9"));
+        assert!(req.guard().is_some());
+        assert!(req.no_wait());
+    }
+
     #[test]
     fn registry_selectors_match_the_wire_schema() {
         // Audit P1-50: names parity was never behavior parity. For every

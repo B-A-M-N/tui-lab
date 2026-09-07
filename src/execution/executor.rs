@@ -1188,16 +1188,18 @@ mod tests {
     #[test]
     fn canonical_action_from_request() {
         use crate::mcp::params::TuiActRequest;
-        let req = TuiActRequest::MouseClick {
+        let req = TuiActRequest::MouseClick(crate::mcp::params::MouseClickPayload {
             x: 3,
             y: 4,
             button: None,
-            no_wait: Some(true),
-            completion: None,
-            wait_ms: Some(500),
-            id: Some("s1".into()),
-            guard: None,
-        };
+            common: crate::mcp::params::ActCommon {
+                no_wait: Some(true),
+                completion: None,
+                wait_ms: Some(500),
+                id: Some("s1".into()),
+                guard: None,
+            },
+        });
         let a = CanonicalAction::from_request(&req).expect("click");
         assert_eq!(a.name(), "mouse_click");
         match a {
@@ -1208,27 +1210,19 @@ mod tests {
             _ => panic!("wrong variant"),
         }
 
-        let bad = TuiActRequest::Keys {
+        let bad = TuiActRequest::Keys(crate::mcp::params::KeysPayload {
             keys: vec![],
-            no_wait: None,
-            completion: None,
-            wait_ms: None,
-            id: None,
-            guard: None,
-        };
+            common: crate::mcp::params::ActCommon::none(),
+        });
         assert!(
             CanonicalAction::from_request(&bad).is_err(),
             "empty keys rejected"
         );
 
-        let raw = TuiActRequest::Raw {
+        let raw = TuiActRequest::Raw(crate::mcp::params::RawPayload {
             raw: vec![],
-            no_wait: None,
-            completion: None,
-            wait_ms: None,
-            id: None,
-            guard: None,
-        };
+            common: crate::mcp::params::ActCommon::none(),
+        });
         assert!(
             CanonicalAction::from_request(&raw).is_err(),
             "empty raw rejected"

@@ -397,15 +397,19 @@ fn next_observations(
                 // the caller re-runs the region check on both frames. The
                 // resize carries the REAL session id; completion defaults
                 // apply (resize settles fast; no fabricated completion).
-                let resize = ToolInvocation::Act(crate::mcp::params::TuiActRequest::Resize {
-                    cols: 120,
-                    rows: 40,
-                    guard: None,
-                    id: session_id.map(String::from),
-                    no_wait: None,
-                    completion: None,
-                    wait_ms: None,
-                });
+                let resize = ToolInvocation::Act(crate::mcp::params::TuiActRequest::Resize(
+                    crate::mcp::params::ResizePayload {
+                        cols: 120,
+                        rows: 40,
+                        common: crate::mcp::params::ActCommon {
+                            no_wait: None,
+                            completion: None,
+                            wait_ms: None,
+                            id: session_id.map(String::from),
+                            guard: None,
+                        },
+                    },
+                ));
                 if let Some(args) = resize.to_arguments() {
                     out.push(NextObservation {
                         suggestion: format!("resize to 120x40 (tui_act), tui_observe, and compare region '{target}' against the current frame — restore the size afterwards"),
