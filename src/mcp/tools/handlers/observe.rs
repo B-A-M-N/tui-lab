@@ -277,7 +277,7 @@ fn mode_needs_sweep(mode: crate::mcp::params::ObserveMode) -> bool {
 /// incremental event persistence (re-review Wave-2) and native coverage
 /// ingestion (re-review P1 item 17) ride EVERY observation, regardless of
 /// which mode triggered it.
-fn sweep(
+pub(crate) fn sweep(
     sess: &mut crate::session::Session,
     sink: &crate::execution::RunEvidenceSink,
     idle: u64,

@@ -36,7 +36,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
   - action: load, validate, status, compare, scaffold, baseline
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
 - `tui_workflow` — Construction workflow per finding (one object, no autonomy): inspect assembles finding → component identity → source loci → framework context → contract expectation → minimal reproduction → targeted validation; verify runs that verification plan live (replay + re-checks; lease-gated) and reports whether the finding still reproduces; diagnose lists every finding's chain.
-  - action: inspect, verify, diagnose
+  - action: construct, inspect, verify, diagnose
 ## Core principle: OBSERVE BEFORE ACTING, DIFF AFTER
 
 - Prefer `tui_observe` modes `summary` and `semantic` over `screen`. Never ask
