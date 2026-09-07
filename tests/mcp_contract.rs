@@ -121,14 +121,10 @@ fn contract_unknown_assertion_is_invalid_request_not_failure() {
 
 #[test]
 fn contract_keys_action_sends_full_sequence() {
-    let p = TuiActRequest::Keys {
-        keys: vec!["tab".into(), "tab".into(), "enter".into()],
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+    let p = TuiActRequest::Keys(tui_lab::mcp::params::KeysPayload {
+        keys: vec!["tab".into(), "x".into(), "y".into()],
+        common: tui_lab::mcp::params::ActCommon::none(),
+    });
     let input = CanonicalAction::from_request(&p)
         .expect("build keys input")
         .to_input();
@@ -292,14 +288,16 @@ async fn contract_launch_spec_preserved_across_restart() {
 
 #[test]
 fn contract_ctrl_key_encodes_typed_representation() {
-    let p = TuiActRequest::Key {
+    let p = TuiActRequest::Key(tui_lab::mcp::params::KeyPayload {
         key: "ctrl+c".into(),
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+        common: tui_lab::mcp::params::ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            id: None,
+            guard: None,
+        },
+    });
     let input = CanonicalAction::from_request(&p)
         .expect("build key input")
         .to_input();
@@ -552,14 +550,16 @@ fn contract_structure_assertion_is_snapshot_alias() {
 
 #[test]
 fn contract_key_a_preserves_case() {
-    let p = TuiActRequest::Key {
+    let p = TuiActRequest::Key(tui_lab::mcp::params::KeyPayload {
         key: "A".into(),
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+        common: tui_lab::mcp::params::ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            id: None,
+            guard: None,
+        },
+    });
     let input = CanonicalAction::from_request(&p)
         .expect("build key A")
         .to_input();
@@ -574,14 +574,16 @@ fn contract_key_a_preserves_case() {
 
 #[test]
 fn contract_key_shift_a_yields_uppercase() {
-    let p = TuiActRequest::Key {
+    let p = TuiActRequest::Key(tui_lab::mcp::params::KeyPayload {
         key: "shift+a".into(),
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+        common: tui_lab::mcp::params::ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            id: None,
+            guard: None,
+        },
+    });
     let input = CanonicalAction::from_request(&p)
         .expect("build shift+a")
         .to_input();
@@ -596,14 +598,16 @@ fn contract_key_shift_a_yields_uppercase() {
 
 #[test]
 fn contract_key_ctrl_c() {
-    let p = TuiActRequest::Key {
+    let p = TuiActRequest::Key(tui_lab::mcp::params::KeyPayload {
         key: "ctrl+c".into(),
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+        common: tui_lab::mcp::params::ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            id: None,
+            guard: None,
+        },
+    });
     let input = CanonicalAction::from_request(&p)
         .expect("build ctrl+c")
         .to_input();
@@ -618,28 +622,32 @@ fn contract_key_ctrl_c() {
 
 #[test]
 fn contract_key_bogus_modifier_errors() {
-    let p = TuiActRequest::Key {
+    let p = TuiActRequest::Key(tui_lab::mcp::params::KeyPayload {
         key: "bogus+key".into(),
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+        common: tui_lab::mcp::params::ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            id: None,
+            guard: None,
+        },
+    });
     let result = CanonicalAction::from_request(&p);
     assert!(result.is_err());
 }
 
 #[test]
 fn contract_key_f1_function() {
-    let p = TuiActRequest::Key {
+    let p = TuiActRequest::Key(tui_lab::mcp::params::KeyPayload {
         key: "F1".into(),
-        no_wait: None,
-        completion: None,
-        wait_ms: None,
-        id: None,
-        guard: None,
-    };
+        common: tui_lab::mcp::params::ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            id: None,
+            guard: None,
+        },
+    });
     let input = CanonicalAction::from_request(&p)
         .expect("build F1")
         .to_input();

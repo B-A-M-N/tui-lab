@@ -256,10 +256,11 @@ impl CanonicalAction {
         let btn =
             |b: &Option<crate::mcp::params::MouseButtonParam>| b.map(MB::from).unwrap_or(MB::Left);
         match req {
-            R::Key { key, .. } => Ok(CanonicalAction::Key {
-                key: crate::mcp::helpers::parse_key_public(key)?,
+            R::Key(p) => Ok(CanonicalAction::Key {
+                key: crate::mcp::helpers::parse_key_public(&p.key)?,
             }),
-            R::Keys { keys, .. } => {
+            R::Keys(p) => {
+                let keys = &p.keys;
                 if keys.is_empty() {
                     return Err("empty keys".into());
                 }
@@ -269,49 +270,50 @@ impl CanonicalAction {
                 }
                 Ok(CanonicalAction::Keys { keys: out })
             }
-            R::Type { text, .. } => Ok(CanonicalAction::Type { text: text.clone() }),
-            R::Paste { paste, .. } => Ok(CanonicalAction::Paste {
-                text: paste.clone(),
+            R::Type(p) => Ok(CanonicalAction::Type {
+                text: p.text.clone(),
             }),
-            R::Raw { raw, .. } => {
+            R::Paste(p) => Ok(CanonicalAction::Paste {
+                text: p.paste.clone(),
+            }),
+            R::Raw(p) => {
+                let raw = &p.raw;
                 if raw.is_empty() {
                     return Err("empty raw payload".into());
                 }
                 Ok(CanonicalAction::Raw { bytes: raw.clone() })
             }
-            R::MouseClick { x, y, button, .. } => Ok(CanonicalAction::MouseClick {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MouseClick(p) => Ok(CanonicalAction::MouseClick {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MousePress { x, y, button, .. } => Ok(CanonicalAction::MousePress {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MousePress(p) => Ok(CanonicalAction::MousePress {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MouseRelease { x, y, button, .. } => Ok(CanonicalAction::MouseRelease {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MouseRelease(p) => Ok(CanonicalAction::MouseRelease {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MouseMove { x, y, .. } => Ok(CanonicalAction::MouseMove { x: *x, y: *y }),
-            R::MouseDrag { x, y, button, .. } => Ok(CanonicalAction::MouseDrag {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MouseMove(p) => Ok(CanonicalAction::MouseMove { x: p.x, y: p.y }),
+            R::MouseDrag(p) => Ok(CanonicalAction::MouseDrag {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MouseScroll {
-                x, y, direction, ..
-            } => Ok(CanonicalAction::MouseScroll {
-                direction: direction.map(SD::from).unwrap_or(SD::Down),
-                x: *x,
-                y: *y,
+            R::MouseScroll(p) => Ok(CanonicalAction::MouseScroll {
+                direction: p.direction.map(SD::from).unwrap_or(SD::Down),
+                x: p.x,
+                y: p.y,
             }),
-            R::Resize { cols, rows, .. } => Ok(CanonicalAction::Resize {
-                cols: *cols,
-                rows: *rows,
+            R::Resize(p) => Ok(CanonicalAction::Resize {
+                cols: p.cols,
+                rows: p.rows,
             }),
-            R::Signal { signal, .. } => Ok(CanonicalAction::Signal { signal: *signal }),
+            R::Signal(p) => Ok(CanonicalAction::Signal { signal: p.signal }),
         }
     }
 }
