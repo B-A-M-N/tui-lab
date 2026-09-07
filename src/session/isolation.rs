@@ -11,8 +11,10 @@
 //!   `HOME`/`TMPDIR`, terminal-critical vars kept. Reproduces "fresh shell"
 //!   behavior.
 //! - [`Isolation::Strict`] — [`Isolation::Clean`] plus a network-isolated
-//!   namespace via `unshare -n` when available. Unavailable platforms
-//!   report `network_isolated: false` instead of pretending.
+//!   namespace via `unshare -n`. Beta-audit P0.8: strict FAILS CLOSED —
+//!   if the network namespace cannot be proven (no `unshare`, or the
+//!   net-ns operation is not permitted), the launch is REFUSED, not run
+//!   networked. An option called strict never silently degrades.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +27,9 @@ pub enum Isolation {
     /// Minimal environment: temp HOME/TMPDIR, essential PATH, no inherited
     /// credentials or user config.
     Clean,
-    /// Clean PLUS network isolation (unshare -n) when the platform provides
-    /// it; honestly reported as not network-isolated when it does not.
+    /// Clean PLUS a PROVEN network-isolated namespace (`unshare --net`).
+    /// If isolation cannot be proven at launch, the launch fails — it is
+    /// never downgraded to clean-but-networked.
     Strict,
 }
 
@@ -82,40 +85,42 @@ impl Isolation {
         matches!(self, Isolation::Strict)
     }
 
-    /// Apply the profile to a launch command. Returns the rewritten
-    /// `(command, args)`, whether the `unshare` wrapper is present on PATH,
-    /// and the honest network-isolation verdict.
+    /// Apply the profile to a launch command. On success returns the
+    /// rewritten `(command, args)`, whether the `unshare` wrapper is in
+    /// use, and the network-isolation verdict.
     ///
-    /// Strict runs `<child>` as `unshare --net -- <child>` ONLY when `unshare`
-    /// is present AND an actual net namespace can be created. Merely checking
-    /// that the `unshare` executable exists is not evidence of isolation —
-    /// a host may have `unshare` installed while `unshare --net` fails with
-    /// `Operation not permitted` (containers, hardened kernels, seccomp). So
-    /// we preflight the exact namespace operation (`unshare --net true`):
+    /// Strict runs `<child>` as `unshare --net -- <child>` ONLY when
+    /// `unshare` is present AND an actual net namespace can be created —
+    /// and, since beta-audit P0.8, REFUSES the launch otherwise. Merely
+    /// checking that the `unshare` executable exists is not evidence of
+    /// isolation — a host may have `unshare` installed while
+    /// `unshare --net` fails with `Operation not permitted` (containers,
+    /// hardened kernels, seccomp). So we preflight the exact namespace
+    /// operation (`unshare --net true`):
     ///
-    /// - executable absent → `wrapper_available=false`, `NotApplied`; launch
-    ///   proceeds clean-but-networked and says so.
-    /// - executable present, probe succeeds → `wrapper_available=true`,
-    ///   `Verified`; the child is wrapped.
-    /// - executable present, probe fails (e.g. not permitted) →
-    ///   `wrapper_available=true`, `Failed`; the launch CANNOT be isolated,
-    ///   so we do NOT wrap (a failed wrapper would just abort the child) and
-    ///   we report `Failed` honestly rather than claiming isolation.
+    /// - executable absent → `Err` (fail closed; no unshare means no way
+    ///   to prove isolation).
+    /// - executable present, probe succeeds → `Verified`; the child is
+    ///   wrapped.
+    /// - executable present, probe fails (e.g. not permitted) → `Err`
+    ///   (fail closed; the old behavior launched the child networked and
+    ///   reported `Failed` afterward — observability is not enforcement).
     ///
-    /// This is a pre-launch verdict; whether the wrapped child actually
-    /// started is captured separately (`IsolationEvidence.launch_succeeded`).
+    /// Callers that want best-effort behavior on such hosts should ask
+    /// for `clean` explicitly — a visible, deliberate downgrade, never a
+    /// silent one.
     pub fn apply_to_command(
         &self,
         command: &str,
         args: &[String],
-    ) -> (String, Vec<String>, bool, VerifiedState) {
+    ) -> anyhow::Result<(String, Vec<String>, bool, VerifiedState)> {
         if !self.wants_network_ns() {
-            return (
+            return Ok((
                 command.to_string(),
                 args.to_vec(),
                 false,
                 VerifiedState::NotApplied,
-            );
+            ));
         }
         // Presence of the executable: a cheap upper bound. Not proof.
         let present = std::process::Command::new("unshare")
@@ -126,15 +131,15 @@ impl Isolation {
             .map(|s| s.success())
             .unwrap_or(false);
         if !present {
-            return (
-                command.to_string(),
-                args.to_vec(),
-                false,
-                VerifiedState::NotApplied,
-            );
+            return Err(anyhow::anyhow!(
+                "isolation=strict cannot be proven: no 'unshare' executable on PATH, \
+                 so a network namespace cannot be created. The launch is REFUSED \
+                 (strict never runs networked). Use isolation=clean for an \
+                 env-scrubbed launch without network isolation."
+            ));
         }
         // Preflight the exact operation. If it cannot run (not permitted),
-        // isolation is Failed — do not wrap, do not claim success.
+        // isolation is impossible — refuse rather than launch networked.
         let probe_ok = std::process::Command::new("unshare")
             .arg("--net")
             .arg("true")
@@ -144,22 +149,22 @@ impl Isolation {
             .map(|s| s.success())
             .unwrap_or(false);
         if !probe_ok {
-            return (
-                command.to_string(),
-                args.to_vec(),
-                true,
-                VerifiedState::Failed,
-            );
+            return Err(anyhow::anyhow!(
+                "isolation=strict cannot be proven: 'unshare --net' is not permitted \
+                 on this host (container/hardened kernel/seccomp). The launch is \
+                 REFUSED (strict never runs networked). Use isolation=clean for an \
+                 env-scrubbed launch without network isolation."
+            ));
         }
         let mut wrapped = vec!["--net".to_string(), "--".to_string()];
         wrapped.push(command.to_string());
         wrapped.extend(args.iter().cloned());
-        (
+        Ok((
             "unshare".to_string(),
             wrapped,
             true,
             VerifiedState::Verified,
-        )
+        ))
     }
 }
 
@@ -260,41 +265,60 @@ mod tests {
         assert!(eff.iter().any(|(k, _)| k == "PATH"));
     }
 
+    /// Beta-audit P0.8: strict FAILS CLOSED. Depending on the host, the
+    /// preflight either proves the net namespace (wrapped launch) or the
+    /// launch is REFUSED with an error that names the clean downgrade.
+    /// There is no outcome in which strict launches the child networked.
     #[test]
-    fn strict_preflights_net_ns_and_never_wraps_an_unproven_wrapper() {
-        let (cmd, args, wrapper_available, state) =
-            Isolation::Strict.apply_to_command("python3", &["-c".into()]);
-        match state {
-            VerifiedState::Verified => {
+    fn strict_fails_closed_never_launches_networked() {
+        match Isolation::Strict.apply_to_command("python3", &["-c".into()]) {
+            Ok((cmd, args, wrapper_available, state)) => {
                 // The probe actually created a net namespace, so we wrapped.
                 assert!(wrapper_available);
+                assert_eq!(state, VerifiedState::Verified);
                 assert_eq!(cmd, "unshare");
                 assert_eq!(args.first().map(String::as_str), Some("--net"));
                 assert_eq!(args.get(2).map(String::as_str), Some("python3"));
             }
-            VerifiedState::Failed => {
-                // unshare present but the net-ns could not be created
-                // (e.g. operation not permitted). We must NOT wrap — a broken
-                // wrapper would just abort the child — and must say so.
-                assert!(wrapper_available);
-                assert_eq!(cmd, "python3");
-                assert!(!args.contains(&String::from("unshare")));
-            }
-            VerifiedState::NotApplied => {
-                // No unshare on this host: honest, command unchanged.
-                assert!(!wrapper_available);
-                assert_eq!(cmd, "python3");
-            }
-            VerifiedState::Unverified => {
-                // Unverified is not produced by the preflight path.
-                panic!("preflight should never be Unverified")
+            Err(e) => {
+                // Refusal: the message names the proof failure AND the
+                // explicit clean downgrade.
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("cannot be proven") && msg.contains("REFUSED"),
+                    "refusal names the failure: {msg}"
+                );
+                assert!(
+                    msg.contains("isolation=clean"),
+                    "refusal names the explicit downgrade: {msg}"
+                );
             }
         }
     }
 
+    /// The refusal branches are exhaustive over the failure modes; pin
+    /// the verified wrap for local/clean (unchanged) and that Failed /
+    /// NotApplied can no longer reach a strict launch.
+    #[test]
+    fn local_and_clean_are_unchanged_by_fail_closed() {
+        let (cmd, args, wrapped, state) = Isolation::Clean
+            .apply_to_command("sh", &["-c".into()])
+            .unwrap();
+        assert_eq!(cmd, "sh");
+        assert_eq!(args, vec!["-c".to_string()]);
+        assert!(!wrapped);
+        assert_eq!(state, VerifiedState::NotApplied);
+        let (cmd, args, wrapped, state) = Isolation::Local.apply_to_command("sh", &[]).unwrap();
+        assert_eq!(cmd, "sh");
+        assert!(args.is_empty());
+        assert!(!wrapped);
+        assert_eq!(state, VerifiedState::NotApplied);
+    }
+
     #[test]
     fn local_never_wraps() {
-        let (cmd, args, wrapper_available, state) = Isolation::Local.apply_to_command("sh", &[]);
+        let (cmd, args, wrapper_available, state) =
+            Isolation::Local.apply_to_command("sh", &[]).unwrap();
         assert_eq!(cmd, "sh");
         assert!(args.is_empty());
         assert!(!wrapper_available);

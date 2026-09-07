@@ -96,9 +96,13 @@ there is no check-then-race window.
 ### Isolation profiles
 
 `tui_session action=start isolation=local|clean|strict` — `local` (default)
-runs the child as-is; `clean` scrubs the environment; `strict` wraps the child
-in `unshare --net` (no network). Every start reports `IsolationEvidence` —
-what was actually applied, not what was requested.
+runs the child as-is; `clean` scrubs the environment; `strict` is `clean`
+PLUS a proven network namespace (`unshare --net`): the namespace operation
+is preflighted at launch, and if it cannot be proven (no `unshare`, or not
+permitted on this host) the launch is REFUSED — strict never runs networked
+on the promise of isolation it could not verify. Use `clean` for an
+env-scrubbed launch without network isolation. Every start reports
+`IsolationEvidence` — what was actually applied, not what was requested.
 
 ### MCP resources (tui://)
 
