@@ -242,6 +242,34 @@ pub struct ObservedBehavior {
     pub reverse_tab_is_inverse: Option<bool>,
 }
 
+/// How much of the conformance engine may run (beta-audit P0.7): one
+/// mutation-authorization model shared by EVERY conformance entry point.
+/// The audit surface derives this from its SafetyPolicy; the contract
+/// tool defaults to Passive and requires explicit consent to drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecPolicy {
+    /// No driving at all: document validation, component checks, and
+    /// static oracles run against the CURRENT frame; every driving group
+    /// (interactions, layout resizes, behavior probes, active oracles)
+    /// is reported Unverified with how to allow it. An operation named
+    /// `status` must never mutate the app by default.
+    Passive,
+    /// Full conformance: declared keys are sent, resizes run, Escape/Tab
+    /// probes drive. Requires the caller's explicit mutation consent
+    /// (the MCP layer's allow_mutation, or the audit surface's
+    /// SafetyPolicy).
+    Driving,
+}
+
+impl ExecPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecPolicy::Passive => "passive",
+            ExecPolicy::Driving => "driving",
+        }
+    }
+}
+
 /// Run the full conformance check against a live session.
 pub fn check_contract(
     session: &mut Session,
@@ -259,11 +287,104 @@ pub fn check_contract_with_mode(
     contract: &ProjectContract,
     mode_override: Option<crate::design::schema::ContractMode>,
 ) -> anyhow::Result<ContractReport> {
+    check_contract_policy(session, contract, mode_override, ExecPolicy::Driving)
+}
+
+/// [`check_contract_with_mode`] with an explicit execution policy
+/// (beta-audit P0.7). This is THE single conformance entry point — every
+/// caller states how much the engine may do, and the engine applies it.
+pub fn check_contract_policy(
+    session: &mut Session,
+    contract: &ProjectContract,
+    mode_override: Option<crate::design::schema::ContractMode>,
+    policy: ExecPolicy,
+) -> anyhow::Result<ContractReport> {
     let mut results = Vec::new();
     let mut driven = 0u32;
 
     // 1. Document validation (static).
     results.extend(validate_document(contract));
+
+    if policy == ExecPolicy::Passive {
+        // No driving: interactions, layout resizes, behavior probes, and
+        // active oracles are ALL Unverified — an honest absence, not a
+        // failure (item 32). The detail names the consent that lifts it.
+        let unverified = |group: &'static str, name: String, what: &str| CheckResult {
+            group,
+            name,
+            verdict: Verdict::Unverified,
+            detail: format!(
+                "{what} requires driving the app; this check ran passive \
+                 (no mutations). Re-run with allow_mutation=true to execute it."
+            ),
+            required: false,
+        };
+        for i in &contract.interactions {
+            results.push(unverified(
+                "interaction",
+                i.name.clone(),
+                &format!("interaction [{}]", i.keys.join(",")),
+            ));
+        }
+        for lc in &contract.layout {
+            let name = lc.name.clone().unwrap_or_else(|| "layout".to_string());
+            results.push(unverified("layout", name, "layout/resize survival"));
+        }
+        for v in &contract.viewports {
+            results.push(unverified(
+                "layout",
+                format!("viewport {}x{}", v.cols, v.rows),
+                "viewport clipping",
+            ));
+        }
+        if contract.escape_closes_modal {
+            results.push(unverified(
+                "behavior",
+                "escape_closes_modal".to_string(),
+                "the Escape-dismissal property",
+            ));
+        }
+        if contract.reverse_tab_required {
+            results.push(unverified(
+                "behavior",
+                "reverse_tab_required".to_string(),
+                "the Shift+Tab-reverses-Tab property",
+            ));
+        }
+        // Components + static top-level oracles against the current
+        // frame only.
+        results.extend(check_components(session, contract));
+        results.extend(check_top_level_oracles(
+            session,
+            contract,
+            &crate::design::conformance::ObservedBehavior::default(),
+        ));
+        let mode = mode_override.unwrap_or(contract.schema.mode);
+        let verdict = results.iter().fold(Verdict::Pass, |acc, r| {
+            let v = match r.verdict {
+                Verdict::Fail => {
+                    if r.required || mode.optional_failure_is_fatal() {
+                        Verdict::Fail
+                    } else {
+                        Verdict::Warn
+                    }
+                }
+                Verdict::Unverified if mode.unverified_is_fatal() => Verdict::Fail,
+                other => other,
+            };
+            acc.merge(v)
+        });
+        return Ok(ContractReport {
+            contract: contract.schema.name.clone(),
+            version: contract.schema.version.clone(),
+            verdict,
+            mode,
+            results,
+            driven_actions: 0,
+            session_mutated: false,
+            residue: Vec::new(),
+        });
+    }
 
     // Restore point: audits must leave the terminal as they found it.
     let (orig_cols, orig_rows) = (session.cols(), session.rows());

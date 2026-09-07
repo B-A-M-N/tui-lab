@@ -36,9 +36,9 @@ pub struct TuiContractParams {
     /// load | validate | status | compare | scaffold
     pub action: Known<ContractAction>,
     /// scaffold (finding 37): current = one observed frame (the original
-    /// behavior); explore = a bounded SAFE multi-state pass (initial
-    /// screen, Tab focus walk, Escape, viewport probes) and the scaffold
-    /// cites every state it saw. Defaults to current.
+    /// behavior); explore = a bounded exploratory multi-state pass
+    /// (initial screen, Tab focus walk, viewport probes) and the
+    /// scaffold cites every state it saw. Defaults to current.
     #[serde(default)]
     pub scaffold_mode: Option<Known<ScaffoldMode>>,
     /// Path to the contract document (YAML or JSON).
@@ -59,4 +59,13 @@ pub struct TuiContractParams {
     /// both Validation (dev) and Strict (gate) without editing it.
     #[serde(default)]
     pub mode: Option<Known<ContractModeParam>>,
+    /// Beta-audit P0.7: status/baseline/compare run PASSIVE by default —
+    /// document checks, component checks, and static oracles only; the
+    /// driving groups (declared interactions, resizes, Escape/Tab
+    /// probes) are reported Unverified, never executed. Pass true to
+    /// authorize the full driving check, which sends declared keys and
+    /// resizes the terminal. One mutation-authorization model with
+    /// tui_audit's allow_mutation.
+    #[serde(default)]
+    pub allow_mutation: Option<bool>,
 }

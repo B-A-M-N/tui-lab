@@ -16,8 +16,8 @@ pub mod scaffold;
 pub mod schema;
 
 pub use conformance::{
-    check_contract, check_contract_with_mode, validate_document, CheckResult, ContractReport,
-    ObservedBehavior, Verdict,
+    check_contract, check_contract_policy, check_contract_with_mode, validate_document,
+    CheckResult, ContractReport, ExecPolicy, ObservedBehavior, Verdict,
 };
 pub use loader::{default_contract, load_design_contract, parse_json, parse_yaml, to_yaml};
 pub use oracle::{

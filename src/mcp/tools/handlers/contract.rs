@@ -9,6 +9,18 @@ use crate::mcp::params::*;
 use check::{contract_mode_override, diff_contract_reports};
 use rmcp::serde_json::json;
 
+/// Beta-audit P0.7: ONE mutation-authorization rule for every
+/// conformance-running contract action — passive unless the caller
+/// explicitly passes allow_mutation=true. `tui_audit profile=contract`
+/// derives its policy from the same knob via SafetyPolicy.
+fn exec_policy(p: &TuiContractParams) -> crate::design::conformance::ExecPolicy {
+    if p.allow_mutation.unwrap_or(false) {
+        crate::design::conformance::ExecPolicy::Driving
+    } else {
+        crate::design::conformance::ExecPolicy::Passive
+    }
+}
+
 /// Body of `tui_contract` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
 /// whose private fields this child module can see unchanged.
@@ -142,7 +154,10 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
-            check::check_contract_against(s, p.id.as_deref(), contract, mode_override).await
+            // Beta-audit P0.7: passive by default — a status check never
+            // drives the app unless the caller explicitly consents.
+            let policy = exec_policy(&p);
+            check::check_contract_against(s, p.id.as_deref(), contract, mode_override, policy).await
         }
         // ── compare: run conformance now, diff against the baseline ──
         CT::Compare => {
@@ -162,11 +177,13 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
+            let policy = exec_policy(&p);
             let current = match check::check_contract_inner(
                 s,
                 p.id.as_deref(),
                 contract.clone(),
                 mode_override,
+                policy,
             )
             .await
             {
@@ -443,11 +460,13 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
+            let policy = exec_policy(&p);
             let report = match check::check_contract_inner(
                 s,
                 p.id.as_deref(),
                 contract,
                 mode_override,
+                policy,
             )
             .await
             {
