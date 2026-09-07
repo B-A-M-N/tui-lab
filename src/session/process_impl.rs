@@ -79,8 +79,12 @@ impl Session {
             .map_err(|e| anyhow::anyhow!(e))?;
         // Session-unique scratch HOME/TMPDIR keyed by (id, generation).
         let effective_env = isolation.effective_env(&self.id, self.generation, &spec.env);
+        // Beta-audit P0.8: strict fails CLOSED — if the net namespace
+        // cannot be proven, the launch is refused here (the error names
+        // the clean downgrade for callers that want it), never silently
+        // run networked.
         let (command, args, wrapper_available, network_isolated) =
-            isolation.apply_to_command(&spec.command, &spec.args);
+            isolation.apply_to_command(&spec.command, &spec.args)?;
         let requested_network_ns =
             matches!(isolation, crate::session::isolation::Isolation::Strict);
         self.backend.set_clear_env(!matches!(
