@@ -506,25 +506,23 @@ impl TuiLabServer {
             .sessions
             .with_session(Some(id), |sess| sess.driving_blocked())
             .await;
-        match lease {
-            Ok(Some(lease)) => {
-                return Err(crate::mcp::helpers::err_with_details(
-                    ErrorCategory::ControlLeased,
-                    format!(
-                        "session '{id}' is leased to '{}' ({}ms remaining); {operation} would kill the process they are driving",
-                        lease.holder,
-                        lease.remaining_ms()
-                    ),
-                    serde_json::json!({
-                        "session": id,
-                        "holder": lease.holder,
-                        "retry_after_ms": lease.remaining_ms(),
-                    }),
-                ));
-            }
-            // Lease expired or absent: fall through to the ownership check.
-            _ => {}
+        if let Ok(Some(lease)) = lease {
+            return Err(crate::mcp::helpers::err_with_details(
+                ErrorCategory::ControlLeased,
+                format!(
+                    "session '{id}' is leased to '{}' ({}ms remaining); {operation} would kill the process they are driving",
+                    lease.holder,
+                    lease.remaining_ms()
+                ),
+                serde_json::json!({
+                    "session": id,
+                    "holder": lease.holder,
+                    "retry_after_ms": lease.remaining_ms(),
+                }),
+            ));
         }
+        // Lease expired or absent (the remaining Ok/Err shapes): fall
+        // through to the ownership check.
         // 2. Ownership: a session bound to a DIFFERENT run is not this
         // run's to stop/restart — its lifecycle belongs to that run.
         // (Unbound sessions carry no objection here, matching the

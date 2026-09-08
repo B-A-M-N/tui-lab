@@ -222,7 +222,7 @@ impl RunContext {
             };
             let ctx = crate::audit::repair::DiagnosticContext::assemble(
                 joined.clone(),
-                &self.id(),
+                self.id(),
                 sessions.clone(),
                 loader,
             );
