@@ -3,7 +3,7 @@
 //!
 //! The subsystem probes (PTY, semantic model, recorder…) answer whether
 //! the pieces work; these answer whether the PRODUCT works — real MCP
-//! tool calls against a real [`TuiLabServer`], real python3 children,
+//! tool calls against a real `TuiLabServer`, real python3 children,
 //! real disk for the persistence roundtrip. Each probe returns a
 //! [`ProductProbe`] with a tier: failure of a CORE probe fails the
 //! doctor; degraded capability is a warn. Nothing here is a hardcoded

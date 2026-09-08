@@ -142,7 +142,7 @@ impl CompletionName {
         }
     }
 
-    /// The runtime [`CompletionPolicy`] this name stands for.
+    /// The runtime `CompletionPolicy` this name stands for.
     pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
         use crate::capture::CompletionPolicy as P;
         match self {
@@ -188,7 +188,7 @@ pub enum CompletionSpec {
 }
 
 impl CompletionSpec {
-    /// The runtime [`CompletionPolicy`] this spec stands for. The text
+    /// The runtime `CompletionPolicy` this spec stands for. The text
     /// variants carry their payload through; `StableScreen` maps to the
     /// ordinary settle policy (its optional `quiet_ms` reaches the executor
     /// through [`CompletionSpec::quiet_ms`], since the runtime policy keeps
@@ -212,7 +212,7 @@ impl CompletionSpec {
 }
 
 impl TuiCompletionParam {
-    /// The runtime [`CompletionPolicy`] this wire value stands for.
+    /// The runtime `CompletionPolicy` this wire value stands for.
     pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
         match self {
             TuiCompletionParam::Name(n) => n.to_policy(),

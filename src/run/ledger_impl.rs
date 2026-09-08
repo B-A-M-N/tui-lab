@@ -101,7 +101,7 @@ impl RunContext {
         Ok(())
     }
 
-    /// The transaction ledger (bounded; see [`Self::record_transaction`]).
+    /// The transaction ledger (bounded; see `Self::record_transaction`).
     pub fn transactions(&self) -> &[TransactionRecord] {
         self.evidence.transactions.records()
     }

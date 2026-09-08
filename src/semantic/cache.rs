@@ -60,7 +60,7 @@ pub struct CacheResult {
     pub key: String,
 }
 
-/// A bounded per-frame semantic cache. Holds at most [`Self::MAX_ENTRIES`]
+/// A bounded per-frame semantic cache. Holds at most `Self::MAX_ENTRIES`
 /// keys (a small working set of recent frames), evicting oldest on overflow
 /// while keeping the *last* analyzed hash so an alternating two-frame repaint
 /// stays cached.

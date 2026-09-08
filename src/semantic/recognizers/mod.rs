@@ -28,7 +28,7 @@ pub struct Candidate {
 }
 
 /// Detect tab-like controls: "Tab 1 | Tab 2 | Tab 3" or "[Tab 1] [Tab 2]"
-/// Accepts >= 2 segments. Selects one if a bracketed marker like "[Tab]" is
+/// Accepts >= 2 segments. Selects one if a bracketed marker like "\[Tab\]" is
 /// detected. If no selected marker is present, emit all with selected=false.
 pub fn detect_tabs(line: &str, y: u16) -> Vec<Candidate> {
     let mut out = Vec::new();

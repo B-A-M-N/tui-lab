@@ -1,6 +1,6 @@
 //! Live reproduction minimization (Wave D item 38).
 //!
-//! The [`ReproMinimizer`] was fully built and connected to nothing: it
+//! The `ReproMinimizer` was fully built and connected to nothing: it
 //! needed a caller willing to (a) capture the trace that failed, (b) restart
 //! the app clean before every candidate replay, (c) re-execute the candidate
 //! through the one canonical executor, and (d) declare failure honestly.

@@ -343,7 +343,7 @@ impl Finding {
     ///
     /// Finding 21: this is also where the typed `occurrence_id` is
     /// assigned — the canonical, versioned occurrence identity (sorted
-    /// key material, see [`occurrence_id`]) that baselines compare on.
+    /// key material, see `occurrence_id`) that baselines compare on.
     pub fn instance(mut self) -> Self {
         let rule = self.rule_id.clone().unwrap_or_else(|| self.id.clone());
         // Discriminator: the first evidence target (region/control id,

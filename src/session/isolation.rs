@@ -62,7 +62,7 @@ impl Isolation {
     /// parallel sessions / restarted generations never collide (review P0:
     /// session-unique scratch; the old per-process scratch leaked between
     /// them). `inherited` is the server's captured environment. The effective
-    /// policy is spelled out in [`EnvironmentPolicy`] and applies here:
+    /// policy is spelled out in `EnvironmentPolicy` and applies here:
     /// Local inherits, Clean/Strict run under `Hermetic` (fresh scratch + a
     /// derived minimal PATH — honest, not a hardcoded list).
     pub fn effective_env(

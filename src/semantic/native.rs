@@ -479,7 +479,7 @@ impl NativeChannel {
     }
 
     /// Fused merge (re-review Wave-4): resolve each native node ONCE and
-    /// write it into both shapes — the [`SemanticTree`] (nodes mode) and the
+    /// write it into both shapes — the `SemanticTree` (nodes mode) and the
     /// flat [`crate::semantic::SemanticScreen`] (semantic/summary/tree modes)
     /// — so every observe mode reports the same truth. A native node that
     /// matches a tree node derived from a `Control` also fixes up that

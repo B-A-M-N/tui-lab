@@ -12,8 +12,8 @@
 //! screen actually settled (re-review items 8/9).
 //!
 //! Split into family files (review §15 god-object residue): the action
-//! vocabulary in [`record`], the transaction record in [`transaction`], the
-//! executor + its tests in [`executor`], waits/asserts in [`wait`].
+//! vocabulary in `record`, the transaction record in `transaction`, the
+//! executor + its tests in `executor`, waits/asserts in `wait`.
 
 mod executor;
 mod record;

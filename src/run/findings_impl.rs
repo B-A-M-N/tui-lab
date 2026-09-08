@@ -96,7 +96,7 @@ impl RunContext {
     }
 
     /// Findings accumulated in this run. Round-2 (G1): delegates to
-    /// [`super::finding_store::FindingStore`].
+    /// `super::finding_store::FindingStore`.
     pub fn findings(&self) -> &[crate::audit::Finding] {
         self.findings.all()
     }

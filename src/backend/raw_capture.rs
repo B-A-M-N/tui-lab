@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 /// How many raw bytes the engine retains for the protocol decoder. 256 KiB
 /// covers generous terminal traffic (a full-screen redraw is typically
 /// well under 8 KiB) at a small fixed cost; a firehose beyond it degrades
-/// by dropping the head, which [`Self::stats`] declares.
+/// by dropping the head, which `Self::stats` declares.
 pub const RAW_RING_CAPACITY: usize = 256 * 1024;
 
 /// The bounded raw-output ring + declared eviction + absolute total.

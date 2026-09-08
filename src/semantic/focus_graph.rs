@@ -12,7 +12,7 @@
 //! * Edges are `{from, to, via, count}` — `via` is the key that produced the
 //!   transition, so Tab order A→B→C is *proven*, not suggested.
 //! * [`FocusGraph::tab_cycle`] detects an actual cycle in the Tab subgraph
-//!   (A→B→C→A), and [`FocusGraph::reverse_tab_consistent`] proves Shift+Tab
+//!   (A→B→C→A), and `FocusGraph::reverse_tab_consistent` proves Shift+Tab
 //!   is the true inverse (each forward edge has the matching reverse edge)
 //!   rather than "some keys were sent and nothing crashed".
 
