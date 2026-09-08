@@ -4,7 +4,7 @@
 //! this small experiment and tell me EVERYTHING materially different."* That
 //! is a probe, distinct from `observe`/`act`/`wait`/`assert`/`scenario`/
 //! `audit`/`explore` because it *composes* a baseline capture, a stimulus, a
-//! generalized [`CaptureStrategy`], and a before/after diff into one result.
+//! generalized `CaptureStrategy`, and a before/after diff into one result.
 //!
 //! It never requires classification first (Raw-mode friendly) and never
 //! mandates a stable screen (the strategy decides "done"). It reports what
@@ -135,12 +135,12 @@ impl ProbeResult {
 /// Run one probe against a live session.
 ///
 /// Re-review Wave-2 (canonical diagnostics): the stimulus goes through the
-/// ONE canonical executor — [`execute_act_with_completion`] — so a probe
+/// ONE canonical executor — `execute_act_with_completion` — so a probe
 /// inherits everything an act gets: the pre-action causal anchor
-/// ([`TerminalEventState`]), completion compiled and evaluated by the one
+/// (`TerminalEventState`), completion compiled and evaluated by the one
 /// compiler/interpreter, event-queue events scoped to the probe window via a
 /// per-probe cursor (the old post-hoc `drain_events()` stole every other
-/// consumer's events), and a real [`InteractionTransaction`] carrying the
+/// consumer's events), and a real `InteractionTransaction` carrying the
 /// settled after-frame. A `None` stimulus still runs an observe-only drift
 /// probe (baseline → settle → diff), which is its own diagnostic.
 ///

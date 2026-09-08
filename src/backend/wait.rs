@@ -2,7 +2,7 @@
 //! round 2, G2).
 //!
 //! The giant `match &cond` inside the backend's polling `wait()` loop
-//! moves here as [`WaitEvaluator`]: given one condition, one snapshot of
+//! moves here as `WaitEvaluator`: given one condition, one snapshot of
 //! what the loop observed this tick, and the baselines captured at wait
 //! entry, decide whether the condition is met and which reason to
 //! report. The polling loop itself (pump → sync counters → snapshot →

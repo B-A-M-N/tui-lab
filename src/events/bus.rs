@@ -7,7 +7,7 @@
 //!   screen changes, cursor, bell, title, resize, process edges).
 //! * **Shell command** — OSC 133 shell-integration boundaries (prompt / output
 //!   / done) that a cooperative shell reports, surfaced by the backend's
-//!   [`CommandState`](crate::backend::CommandState).
+//!   `CommandState`.
 //! * **Native** — structural/UX signals a framework adapter already decoded
 //!   (focus moves, affordance changes) — the `native` half of the semantic
 //!   model, not re-inferred.

@@ -11,7 +11,7 @@ use super::*;
 impl RunContext {
     /// The loaded project contract, if any. Feeds exploration candidates
     /// (item 49) and `tui_contract status/compare`. Round-2 (G1): delegates
-    /// to the cohesive [`super::contract_state::ContractState`].
+    /// to the cohesive `super::contract_state::ContractState`.
     pub fn contract(&self) -> Option<&crate::design::ProjectContract> {
         self.contract.contract()
     }
@@ -37,7 +37,7 @@ impl RunContext {
     }
 
     /// Store (or overwrite) a labeled audit-finding baseline (item 67).
-    /// Round-2 (G1): delegates to [`super::finding_store::FindingStore`].
+    /// Round-2 (G1): delegates to `super::finding_store::FindingStore`.
     pub fn record_finding_baseline(&mut self, label: &str, findings: Vec<crate::audit::Finding>) {
         self.findings.record_baseline(label, findings);
     }

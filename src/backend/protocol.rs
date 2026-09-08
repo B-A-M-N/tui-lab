@@ -1,7 +1,7 @@
 //! Terminal protocol observation + device-query responder state
 //! (god-object round 2, G2).
 //!
-//! [`BackendCallbacks`] — the vt100 parser callbacks that record
+//! `BackendCallbacks` — the vt100 parser callbacks that record
 //! host-observable terminal metadata (title, bells, OSC8 hyperlinks,
 //! kitty keyboard flags, OSC 133 shell-integration edges) and compose
 //! the device-query answers (DA1/DA2/DA3, DSR, DECRQM, kitty `?u`, OSC

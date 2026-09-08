@@ -92,7 +92,7 @@ impl RunContext {
 
     /// The coverage ledger (target → entry), for readers that fold over
     /// all entries. Round-2 (G1): delegates to
-    /// [`coverage_state::CoverageState`].
+    /// `coverage_state::CoverageState`.
     pub fn coverage_ledger(&self) -> &std::collections::BTreeMap<String, CoverageEntry> {
         self.coverage.entries()
     }

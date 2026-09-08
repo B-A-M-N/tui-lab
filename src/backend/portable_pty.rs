@@ -9,7 +9,7 @@
 //!   * `ScreenChange` resolves on the first post-baseline screen mutation;
 //!   * `resize()` resizes both the OS PTY and the `vt100` parser;
 //!   * paste / mouse / cursor-key encoding is mode-aware (reads negotiated state);
-//!   * Ctrl/Alt/Shift/Function keys are parsed into typed [`KeyEvent`]s;
+//!   * Ctrl/Alt/Shift/Function keys are parsed into typed `KeyEvent`s;
 //!   * signals are delivered to the child process group (Unix), not silently
 //!     mapped to `kill`;
 //!   * title and bell are tracked via parser callbacks;

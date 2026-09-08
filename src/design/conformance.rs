@@ -234,7 +234,7 @@ impl ContractReport {
 }
 
 /// Which behavior properties were actually observed by driving the app.
-/// Filled by [`check_behavior`]; active oracles read from it instead of
+/// Filled by `check_behavior`; active oracles read from it instead of
 /// guessing.
 #[derive(Debug, Default, Clone)]
 pub struct ObservedBehavior {

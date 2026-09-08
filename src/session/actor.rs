@@ -452,7 +452,7 @@ impl SessionPool {
     }
 
     /// Typed-engine launch (re-review P0): the engine arrives as
-    /// [`BackendKind`], not a string the launch layer re-interprets. The
+    /// `BackendKind`, not a string the launch layer re-interprets. The
     /// engine name recorded in the spec is derived from the kind — one
     /// source of truth, no parse drift between MCP param and engine.
     #[allow(clippy::too_many_arguments)]

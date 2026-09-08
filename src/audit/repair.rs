@@ -1,6 +1,6 @@
 //! DiagnosticContext (review §2/§3; formerly `RepairPacket`).
 //!
-//! A [`Finding`] says *what* is wrong. Investigating it then costs the
+//! A `Finding` says *what* is wrong. Investigating it then costs the
 //! agent 5–8 more calls: re-derive the reproduction, find the source
 //! loci, get the before/after frames, figure out how to verify a change.
 //! The context joins everything the run already holds into one citable
@@ -52,7 +52,7 @@ pub struct DiagnosticContext {
     /// known — never a guess.
     pub source_refs: Vec<crate::semantic::source_ref::SourceRef>,
     /// The loci an agent may open first: the attested, above-the-fence
-    /// subset ([`SourceRef::is_actionable()`]). A correlated or inferred
+    /// subset (`SourceRef::is_actionable()`). A correlated or inferred
     /// locus stays in `source_refs` as investigative evidence.
     pub actionable_refs: Vec<crate::semantic::source_ref::SourceRef>,
     /// How a future change can be verified (review §3: decoupled from
@@ -131,7 +131,7 @@ pub struct ReplayCheck {
 /// `arguments` are the contract.
 ///
 /// Beta-audit P0.4: `arguments` are built FROM the real MCP parameter
-/// types ([`ToolInvocation`]), never hand-written JSON. Every generated
+/// types (`ToolInvocation`), never hand-written JSON. Every generated
 /// step round-trips through its tool's `Deserialize` before it is
 /// emitted — a suggestion that does not deserialize is a build/test
 /// failure, not an agent-side surprise.

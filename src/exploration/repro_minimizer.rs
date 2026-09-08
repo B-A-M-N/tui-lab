@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 /// A single action in a reproduction trace.
 ///
-/// Carries the full [`CanonicalAction`] (re-review: `{index, name}` could
+/// Carries the full `CanonicalAction` (re-review: `{index, name}` could
 /// count an action but never replay it — coordinates, typed text, and
 /// modifiers were all lost). `index` preserves the position in the original
 /// trace so minimized reports still point at real steps; `name` is derived
-/// from the action via [`CanonicalAction::name`].
+/// from the action via `CanonicalAction::name`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReproAction {
     pub index: u32,

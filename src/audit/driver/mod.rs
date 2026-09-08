@@ -3,7 +3,7 @@
 //!
 //! Formerly one 3,669-line `driver.rs` (review §15 follow-up, god-object
 //! residue): the families now live in sibling files, one per family, with
-//! the shared evidence/decode helpers in [`shared`]. This module keeps the
+//! the shared evidence/decode helpers in `shared`. This module keeps the
 //! `crate::audit::driver::*` paths the orchestrator's descriptor table
 //! uses — every family's `pub` entry point is re-exported at this level —
 //! so the table reads exactly as before.

@@ -9,7 +9,7 @@
 //! ignore.
 //!
 //! The backend keeps its single canonical `pump()`; it calls
-//! [`TerminalEmulator::feed`] at the one ingestion point and reads
+//! `TerminalEmulator::feed` at the one ingestion point and reads
 //! snapshots/modes through the emulator's accessors. Protocol state
 //! (callbacks' fields) stays in [`super::protocol`]; the emulator holds
 //! the parser that carries it and hands out callbacks access.

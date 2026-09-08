@@ -6,7 +6,7 @@
 //!     ordered [`ExplorationStep`] (seq, action, before/after identity,
 //!     transaction outcome) while the action runs — no post-hoc hash
 //!     reconstruction.
-//!   * [`ExplorationBudget`] is the authority: every iteration checks all
+//!   * `ExplorationBudget` is the authority: every iteration checks all
 //!     applicable limits and the report names the real completion reason
 //!     ([`ExplorationCompletionReason`]), never a generic "completed".
 //!   * Relaunch goes through `session.restart()` so generation increments and
@@ -39,7 +39,7 @@ pub enum ExplorationCompletionReason {
 /// One executed exploration step, recorded while it happened (item 12).
 ///
 /// Identity-bearing (re-review P0 fix 3): before/after are full
-/// [`StateIdentity`] values, not bare structure hashes, so the graph
+/// `StateIdentity` values, not bare structure hashes, so the graph
 /// distinguishes states that differ only in interaction state (same text,
 /// focus on "Save" vs focus on "Cancel"). Semantic analysis runs per step —
 /// the same `analyze` the MCP observe path uses.

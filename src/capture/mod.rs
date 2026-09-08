@@ -25,7 +25,7 @@
 //! `completion_wait_cond`. Two interpreters of one vocabulary is how semantic
 //! drift starts; both are gone. Every consumer compiles a policy through
 //! [`compile_completion`] into a [`CompletionPlan`] and evaluates it with the
-//! one evaluator — [`evaluate_completion_plan`] — against a [`Session`].
+//! one evaluator — `evaluate_completion_plan` — against a `Session`.
 
 use crate::backend::trait_def::TerminalBackend;
 use crate::backend::{BackendResult, CaptureOutcome, WaitCond};
@@ -165,7 +165,7 @@ pub struct CaptureSequenceOutcome {
 /// interpreter for `CompletionPolicy`).
 ///
 /// `BackendWait` variants are proven by the backend's event-sequenced wait;
-/// everything else is evaluated by [`evaluate_completion_plan`] above the
+/// everything else is evaluated by `evaluate_completion_plan` above the
 /// backend layer, where the session's event queue, semantic state, and
 /// before-frames live.
 #[derive(Debug, Clone)]

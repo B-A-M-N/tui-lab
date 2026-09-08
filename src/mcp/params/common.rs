@@ -1,4 +1,4 @@
-//! Shared selector machinery: Known<T>, EnumVariants, and the selector_enum! macro.
+//! Shared selector machinery: `Known<T>`, EnumVariants, and the selector_enum! macro.
 //!
 //! Split from the former monolithic `params.rs` (review §15). Every
 //! public item is re-exported from `mcp::params`, so external paths

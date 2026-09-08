@@ -40,7 +40,7 @@ pub struct TuiSessionParams {
     #[serde(default)]
     pub backend: Option<Known<BackendParam>>,
     /// Isolation profile (Wave G item 77): `local` | `clean` | `strict`.
-    /// Typed as Known<IsolationParam> so an unknown name still reaches the
+    /// Typed as `Known<IsolationParam>` so an unknown name still reaches the
     /// envelope as invalid_request with the accepted list.
     #[serde(default)]
     pub isolation: Option<Known<IsolationParam>>,

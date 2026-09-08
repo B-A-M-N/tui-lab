@@ -11,9 +11,9 @@
 //!   as `Unsupported` with an honest "not observed" reason, so the agent
 //!   doesn't assume mouse or kitty or title just because it *might* exist.
 //!
-//! * **[`FindingExplanation`]** — the "Explain" surface: ties one audit
+//! * **`FindingExplanation`** — the "Explain" surface: ties one audit
 //!   [`Finding`](crate::audit::Finding) to the probe and source that produced
-//!   it. A finding carries typed [`EvidenceRef`]s but no story; the explainer
+//!   it. A finding carries typed `EvidenceRef`s but no story; the explainer
 //!   walks each ref, resolves it against the runtime probe/transition data
 //!   available, and emits a path-shaped explanation ("this finding came from
 //!   probe `P`, whose before→after transition added 3 controls; the source is

@@ -398,7 +398,7 @@ fn flow_regression_test_tui() -> serde_json::Value {
 }
 
 /// The canonical flows, in stable order. Each is built from typed
-/// request builders — see [`flow_debug_existing_tui`].
+/// request builders — see `flow_debug_existing_tui`.
 pub fn flows() -> serde_json::Value {
     json!({
         "debug_existing_tui": flow_debug_existing_tui(),

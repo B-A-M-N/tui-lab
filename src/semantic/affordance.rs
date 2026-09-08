@@ -40,7 +40,7 @@ pub enum Invocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
-    /// The key/hint is printed on the screen (e.g. "[F1] Help", "q quit").
+    /// The key/hint is printed on the screen (e.g. "\[F1\] Help", "q quit").
     Labeled,
     /// No on-screen cue; the binding exists only by convention or source.
     Hidden,
@@ -71,7 +71,7 @@ pub struct Affordance {
 ///   1. Control-declared shortcuts (`&File`, "(F)ile" → "F") and
 ///      focusable/clickable controls themselves;
 ///   2. Hint footer patterns: `key action` pairs like "q quit", "^X exit",
-///      "[F1] Help", "ctrl+s save" anywhere on screen.
+///      "\[F1\] Help", "ctrl+s save" anywhere on screen.
 pub fn infer_affordances(screen: &ScreenState, controls: &[Control]) -> Vec<Affordance> {
     let mut out = Vec::new();
 
