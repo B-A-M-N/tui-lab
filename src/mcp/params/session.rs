@@ -198,4 +198,43 @@ mod backend_param_parity_tests {
         }
         assert!("nonsense".parse::<BackendParam>().is_err());
     }
+
+    /// P2 (reduce schema mirror duplication): `IsolationParam` is the
+    /// other hand-written VARIANTS list in this module. Its advertised
+    /// set must equal its serde wire names — a variant added to the enum
+    /// without updating VARIANTS (or vice versa) breaks the schema's
+    /// promise. (BackendParam needs the FromStr legs above because it
+    /// hand-parses; IsolationParam only round-trips through serde.)
+    #[test]
+    fn isolation_param_variants_match_serde_wire_names() {
+        let wire: Vec<String> = [
+            IsolationParam::Local,
+            IsolationParam::Clean,
+            IsolationParam::Strict,
+        ]
+        .iter()
+        .map(|v| {
+            serde_json::to_value(v)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+        let mut advertised: Vec<String> = IsolationParam::VARIANTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut sorted_wire = wire.clone();
+        advertised.sort();
+        sorted_wire.sort();
+        assert_eq!(advertised, sorted_wire, "VARIANTS == serde wire names");
+        // And every advertised name deserializes.
+        for name in IsolationParam::VARIANTS {
+            let v: IsolationParam =
+                serde_json::from_value(serde_json::Value::String(name.to_string()))
+                    .unwrap_or_else(|e| panic!("{name} must deserialize: {e}"));
+            assert_eq!(v.as_str(), *name);
+        }
+    }
 }

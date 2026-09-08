@@ -25,12 +25,20 @@ enum Commands {
     Version,
     /// Generate skill documentation.
     Skill {
-        /// Splice the generated Tools and Resources sections into SKILL.md
-        /// on disk (between their headings, preserving all other prose)
-        /// instead of printing. This is the fix loop for the drift the
-        /// registry parity test catches.
+        /// Splice the generated Tools and Resources sections into a
+        /// SKILL.md on disk (between their headings, preserving all
+        /// other prose) instead of printing. This is the fix loop for
+        /// the drift the registry parity test catches.
         #[arg(long)]
         write: bool,
+        /// skill --write: explicit output path. `CARGO_MANIFEST_DIR` is
+        /// a developer-tree concept — after `cargo install`, rewriting
+        /// the crate's manifest directory is not a sensible public
+        /// runtime behavior. With `--path` the file is read and written
+        /// where the caller says; without it, --write falls back to the
+        /// manifest-dir SKILL.md (the developer/build loop, unchanged).
+        #[arg(long)]
+        path: Option<String>,
     },
     /// Print a persisted run's history from disk (item 74): manifest,
     /// declared-replay ledger, findings summary, graphs. Read-only —
@@ -61,9 +69,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Version => {
             println!("tui-lab {}", env!("CARGO_PKG_VERSION"));
         }
-        Commands::Skill { write } => {
+        Commands::Skill { write, path } => {
             if write {
-                skill_write()?;
+                skill_write(path)?;
             } else {
                 println!("{}", tui_lab::SKILL_DOC);
             }
@@ -243,20 +251,28 @@ async fn start_mcp() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `skill --write`: regenerate the generated sections into SKILL.md on
-/// disk. The SKILL.md path resolves relative to the crate root via
-/// CARGO_MANIFEST_DIR so the command works from any working directory.
-fn skill_write() -> anyhow::Result<()> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("SKILL.md");
+/// `skill --write`: regenerate the generated sections into a SKILL.md on
+/// disk. P2: an explicit `--path` is the public contract — the default
+/// (CARGO_MANIFEST_DIR/SKILL.md) is the developer/build loop, available
+/// only when the manifest directory actually exists as such.
+fn skill_write(path: Option<String>) -> anyhow::Result<()> {
+    let path = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("SKILL.md"),
+    };
     let doc = std::fs::read_to_string(&path)?;
-    let spliced = tui_lab::mcp::registry::splice_skill_sections(&doc)
-        .ok_or_else(|| anyhow::anyhow!("SKILL.md is missing a generated section heading"))?;
+    let spliced = tui_lab::mcp::registry::splice_skill_sections(&doc).ok_or_else(|| {
+        anyhow::anyhow!("{} is missing a generated section heading", path.display())
+    })?;
     if spliced == doc {
-        eprintln!("SKILL.md already current — nothing to write.");
+        eprintln!("{} already current — nothing to write.", path.display());
         return Ok(());
     }
     std::fs::write(&path, spliced)?;
-    eprintln!("SKILL.md updated: Tools and Resources sections regenerated from the registry.");
+    eprintln!(
+        "{} updated: Tools and Resources sections regenerated from the registry.",
+        path.display()
+    );
     Ok(())
 }
 

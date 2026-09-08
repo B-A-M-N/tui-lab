@@ -542,42 +542,43 @@ pub(crate) fn inspect_view(
     // design?" without touching the app. Driving checks
     // (interactions/layout/behavior) are NOT run here.
     let loaded_contract = run.lock().unwrap().contract().cloned();
+    // P2 (contract inspect duplicates conformance logic): the presence
+    // rule is `design::conformance::component_role_present` — THE one
+    // predicate, shared with the conformance engine (which gains the
+    // confidence gate here that the local copy lacked). Screen-level
+    // component detection runs ONCE per frame, not once per contract
+    // component.
     let contract_violations: Vec<serde_json::Value> = match loaded_contract {
-        Some(ref contract) if !contract.components.is_empty() => contract
-            .components
-            .iter()
-            .filter_map(|comp| {
-                let want = comp.role.trim().to_lowercase();
-                let component_hit =
-                    crate::semantic::detect_components(&screen)
-                        .iter()
-                        .any(|c| match c {
-                            crate::semantic::Component::Table(_) => want == "table",
-                            crate::semantic::Component::Tree(_) => want == "tree",
-                            crate::semantic::Component::Scrollbar(_) => want == "scrollbar",
-                        });
-                let region_hit = sem
-                    .regions
-                    .iter()
-                    .any(|r| format!("{:?}", r.kind).to_lowercase() == want);
-                let node_hit = role_matches_contract(want.as_str(), &tree.root);
-                let found = component_hit || region_hit || node_hit;
-                if found {
-                    None
-                } else {
-                    Some(json!({
-                        "component": comp.name,
-                        "role": comp.role,
-                        "required": comp.required,
-                        "severity": if comp.required { "error" } else { "warn" },
-                        "detail": format!(
-                            "component role '{}' declared in contract but not found on this frame",
-                            comp.role
-                        ),
-                    }))
-                }
-            })
-            .collect(),
+        Some(ref contract) if !contract.components.is_empty() => {
+            let screen_components = crate::semantic::detect_components(&screen);
+            contract
+                .components
+                .iter()
+                .filter_map(|comp| {
+                    let want = comp.role.trim().to_lowercase();
+                    let found = crate::design::conformance::component_role_present(
+                        want.as_str(),
+                        &sem,
+                        &screen_components,
+                        &tree.root,
+                    );
+                    if found {
+                        None
+                    } else {
+                        Some(json!({
+                            "component": comp.name,
+                            "role": comp.role,
+                            "required": comp.required,
+                            "severity": if comp.required { "error" } else { "warn" },
+                            "detail": format!(
+                                "component role '{}' declared in contract but not found on this frame",
+                                comp.role
+                            ),
+                        }))
+                    }
+                })
+                .collect()
+        }
         _ => Vec::new(),
     };
     ok(json!({
@@ -659,17 +660,6 @@ fn run_frame_of(
         });
     drop(run);
     hit
-}
-
-/// The contract component-presence role match (conformance's own
-/// `role_matches`, re-exported here so the inspect view judges the frame
-/// with the SAME rule the contract checker uses — never a diverging
-/// reimplementation).
-fn role_matches_contract(want: &str, node: &crate::semantic::SemanticNode) -> bool {
-    if node.role.slug() == want && node.confidence.score >= 0.6 {
-        return true;
-    }
-    node.children.iter().any(|c| role_matches_contract(want, c))
 }
 
 #[cfg(test)]
