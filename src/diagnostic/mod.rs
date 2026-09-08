@@ -613,6 +613,8 @@ pub fn stable_or(_quiet_ms: u64) -> CompletionPolicy {
 /// Re-export the pieces a probe consumer needs to not reach into internals.
 pub use crate::screen::diff::{ScreenDiff, SemanticDiff};
 
+pub mod product_probes;
+
 #[cfg(test)]
 mod tests {
     use super::*;

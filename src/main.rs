@@ -20,7 +20,12 @@ enum Commands {
     /// Start the MCP server over stdio.
     Mcp,
     /// Check system readiness.
-    Doctor,
+    Doctor {
+        /// Emit the readiness matrix as JSON (P1.10): machine-consumable,
+        /// same probes, stable field names.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print version information.
     Version,
     /// Generate skill documentation.
@@ -69,8 +74,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mcp => {
             start_mcp().await?;
         }
-        Commands::Doctor => {
-            doctor();
+        Commands::Doctor { json } => {
+            doctor(json).await?;
         }
         Commands::Version => {
             println!("tui-lab {}", env!("CARGO_PKG_VERSION"));
@@ -316,17 +321,17 @@ fn readme_write(path: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn doctor() {
-    use std::io::Write as _;
-    let mut out = std::io::stdout();
-    let _ = writeln!(out, "tui-lab doctor");
-    let _ = writeln!(out, "======================");
-    let _ = writeln!(out);
+async fn doctor(json_out: bool) -> anyhow::Result<()> {
+    // P1.10: probe data first, render second — the same matrix feeds the
+    // human text and `--json`. Subsystem probes answer "do the pieces
+    // work"; product probes answer "can an agent actually USE this
+    // end-to-end on this machine".
+    use tui_lab::diagnostic::product_probes as pp;
+    let mut entries: Vec<ProbeEntry> = Vec::new();
 
-    // Every line below is a real probe, not a hardcoded claim. The doctor
-    // must fail visibly when a subsystem is broken (audit: honest readiness).
+    // ── subsystem probes ──
 
-    // 1. PTY spawn + observe: actually run a child through the backend.
+    // PTY spawn + observe: actually run a child through the backend.
     let pty = std::panic::catch_unwind(|| {
         use tui_lab::backend::TerminalBackend as _;
         let mut backend = tui_lab::backend::PortablePtyBackend::new(80, 24);
@@ -349,45 +354,25 @@ fn doctor() {
             }
     })
     .unwrap_or(false);
-    report(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Terminal PTY",
-        pty,
+        Tier::from_ok(pty),
         "spawn python3 + parse screen",
-    );
+    ));
 
-    // 2. Screen parsing / semantic model: analyze a synthetic frame.
+    // Screen parsing / semantic model: analyze a synthetic frame.
     let semantic = std::panic::catch_unwind(|| {
-        let screen = tui_lab::screen::ScreenState {
-            cols: 40,
-            rows: 5,
-            cursor: tui_lab::screen::CursorState {
-                x: 1,
-                y: 1,
-                visible: true,
-            },
-            title: None,
-            cells: Vec::new(),
-            viewport_text: vec![
-                "[ Save ]".to_string(),
-                "Host: localhost".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "".to_string(),
-            ],
-            scrollback: Vec::new(),
-            hyperlinks: Vec::new(),
-            raw_hash: String::new(),
-            visual_hash: String::new(),
-            structure_hash: String::new(),
-            process: tui_lab::screen::ProcessState {
-                running: true,
-                exit_code: None,
-                exit_signal: None,
-                cwd: None,
-                pid: None,
-            },
-        };
+        let screen = probe_screen();
+        let mut screen = screen;
+        screen.cols = 40;
+        screen.rows = 5;
+        screen.viewport_text = vec![
+            "[ Save ]".to_string(),
+            "Host: localhost".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
         let sem = tui_lab::semantic::analyze(&screen);
         sem.controls.iter().any(|c| c.label == "Save")
             && sem
@@ -396,28 +381,26 @@ fn doctor() {
                 .any(|c| c.kind == tui_lab::semantic::ControlKind::Field)
     })
     .unwrap_or(false);
-    report(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Semantic model",
-        semantic,
+        Tier::from_ok(semantic),
         "control inference on synthetic frame",
-    );
+    ));
 
-    // 3. Recording: construct a recorder and produce NDJSON.
+    // Recording: construct a recorder and produce NDJSON.
     let recording = std::panic::catch_unwind(|| {
         let mut r = tui_lab::recording::AsciicastRecorder::new(80, 24, false);
         r.record_output(b"probe");
         r.event_count() > 0
     })
     .unwrap_or(false);
-    report(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Recording (asciicast)",
-        recording,
+        Tier::from_ok(recording),
         "recorder produces events",
-    );
+    ));
 
-    // 4. Checkpoints: save + compare in a temp dir.
+    // Checkpoints: save + compare in a temp dir.
     let checkpoints = std::panic::catch_unwind(|| {
         let dir = std::env::temp_dir().join(format!("tui-lab-doctor-{}", std::process::id()));
         let mut store =
@@ -429,23 +412,26 @@ fn doctor() {
         ok
     })
     .unwrap_or(false);
-    report(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Checkpoints",
-        checkpoints,
+        Tier::from_ok(checkpoints),
         "save + persist round-trip",
-    );
+    ));
 
-    // 5. Scenario model: build + validate.
+    // Scenario model: build + validate.
     let scenarios = std::panic::catch_unwind(|| {
         use tui_lab::scenario::model::Scenario;
         let s = Scenario::new("doctor").act(serde_json::json!({"action":"key","key":"enter"}));
         s.is_valid() && s.step_count() == 1
     })
     .unwrap_or(false);
-    report(&mut out, "Scenarios", scenarios, "model build + validate");
+    entries.push(ProbeEntry::tier(
+        "Scenarios (model)",
+        Tier::from_ok(scenarios),
+        "model build + validate",
+    ));
 
-    // 6. Exploration: state graph bookkeeping (identity-keyed, P0 fix 3).
+    // Exploration: state graph bookkeeping (identity-keyed, P0 fix 3).
     let exploration = std::panic::catch_unwind(|| {
         use tui_lab::exploration::state_graph::StateIdentity;
         let mut g = tui_lab::exploration::StateGraph::new(
@@ -459,19 +445,17 @@ fn doctor() {
         g.state_count() == 2 && g.transition_count() == 1
     })
     .unwrap_or(false);
-    report(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Exploration (state graph)",
-        exploration,
+        Tier::from_ok(exploration),
         "identity graph record + count",
-    );
+    ));
 
-    // 7. Coverage: honest probe for the optional tuicov executable. Absent
+    // Coverage: honest probe for the optional tuicov executable. Absent
     // is a warn, not a fail — the lab works without it, only the optional
     // coverage correlation degrades.
     let coverage = tui_lab::coverage::tuicov::is_available();
-    tier(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Coverage (tuicov)",
         if coverage { Tier::Ok } else { Tier::Warn },
         if coverage {
@@ -479,9 +463,9 @@ fn doctor() {
         } else {
             "optional executable not on PATH — coverage correlation unavailable"
         },
-    );
+    ));
 
-    // 8. Framework probes: parse a synthetic ratatui manifest (this crate
+    // Framework probes: parse a synthetic ratatui manifest (this crate
     // itself legitimately has no TUI framework dependency — it IS the harness).
     let framework = std::panic::catch_unwind(|| {
         let dir = std::env::temp_dir().join(format!("tui-lab-doctor-fw-{}", std::process::id()));
@@ -493,14 +477,13 @@ fn doctor() {
         det.primary.as_ref().map(|c| c.name.as_str()) == Some("ratatui")
     })
     .unwrap_or(false);
-    tier(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Framework detection",
         Tier::from_ok(framework),
         "ratatui manifest parse",
-    );
+    ));
 
-    // 9. python3 presence (fixtures + many audits depend on it). Missing
+    // python3 presence (fixtures + many audits depend on it). Missing
     // python3 degrades audits that drive python fixtures — a warn, since
     // the core PTY/semantic/recording paths run against any child.
     let python3 = std::process::Command::new("python3")
@@ -510,8 +493,7 @@ fn doctor() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    tier(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "python3 (fixture runtime)",
         if python3 { Tier::Ok } else { Tier::Warn },
         if python3 {
@@ -519,15 +501,10 @@ fn doctor() {
         } else {
             "python3 not on PATH — python-fixture audits unavailable"
         },
-    );
+    ));
 
-    // 10. Native cooperation, end-to-end (doctor item 38): launch the
-    // shipped cooperative fixture and prove the whole side-channel path —
-    // env injection → NDJSON frames → fused overlay — not just the env-var
-    // plumbing the launch path guarantees. Without python3 the probe cannot
-    // run; that is degraded capability (warn), like every other fixture
-    // probe. With python3 present, a silent or broken channel is a FAIL:
-    // cooperation is a core, advertised capability.
+    // Native cooperation, end-to-end (doctor item 38): launch the shipped
+    // cooperative fixture and prove the whole side-channel path.
     let native_probe = if python3 {
         std::panic::catch_unwind(tui_lab::diagnostic::native_cooperation_probe).unwrap_or_else(
             |_| tui_lab::diagnostic::NativeCooperationReport {
@@ -541,7 +518,6 @@ fn doctor() {
         )
     } else {
         tui_lab::diagnostic::NativeCooperationReport {
-            // Skipped, not failed: degradation is honest (warn tier).
             ran: true,
             frames_received: 1,
             frames_invalid: 0,
@@ -555,8 +531,7 @@ fn doctor() {
         && native_probe.frames_invalid == 0
         && native_probe.native_control_resolved
         && native_probe.native_focus_applied;
-    tier(
-        &mut out,
+    entries.push(ProbeEntry::tier(
         "Native cooperation (TUI_LAB_SEMANTIC)",
         if python3 {
             Tier::from_ok(native_ok)
@@ -564,27 +539,73 @@ fn doctor() {
             Tier::Warn
         },
         &native_probe.detail,
-    );
+    ));
 
-    let _ = writeln!(out);
-    let core = pty && semantic && recording && checkpoints && scenarios && exploration && native_ok;
-    if core {
-        let _ = writeln!(out, "Core subsystems operational.");
+    // ── product probes (P1.10): the end-to-end matrix ──
+    let p = pp::mcp_stdio_roundtrip().await;
+    entries.push(ProbeEntry::raw(&p));
+    let p = pp::pty_inspect_act_diff().await;
+    entries.push(ProbeEntry::raw(&p));
+    let p = pp::scenario_record_replay().await;
+    entries.push(ProbeEntry::raw(&p));
+    let p = pp::contract_static_check().await;
+    entries.push(ProbeEntry::raw(&p));
+    let p = pp::workflow_diagnostic().await;
+    entries.push(ProbeEntry::raw(&p));
+    let p = pp::persistence_roundtrip().await;
+    entries.push(ProbeEntry::raw(&p));
+    entries.push(ProbeEntry::raw(&pp::tmux_available()));
+    entries.push(ProbeEntry::raw(&pp::strict_isolation()));
+
+    // ── render ──
+    if json_out {
+        let matrix = serde_json::json!({
+            "tool": "tui-lab",
+            "command": "doctor",
+            "ok": entries.iter().all(|e| e.tier != "FAIL"),
+            "probes": entries.iter().map(|e| serde_json::json!({
+                "name": e.name,
+                "tier": e.tier.to_lowercase(),
+                "detail": e.detail,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&matrix)?);
     } else {
-        let _ = writeln!(out, "CORE SUBSYSTEM FAILURES — see [FAIL] lines above.");
-        std::process::exit(1);
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "tui-lab doctor");
+        let _ = writeln!(out, "======================");
+        let _ = writeln!(out);
+        for e in &entries {
+            let t = match e.tier {
+                "ok" => Tier::Ok,
+                "warn" => Tier::Warn,
+                _ => Tier::Fail,
+            };
+            tier(&mut out, &e.name, t, &e.detail);
+        }
+        let _ = writeln!(out);
+        let core_failed = entries.iter().any(|e| e.tier == "FAIL");
+        if core_failed {
+            let _ = writeln!(out, "CORE SUBSYSTEM FAILURES — see [FAIL] lines above.");
+            std::process::exit(1);
+        }
+        let degraded = entries.iter().filter(|e| e.tier == "warn").count();
+        if degraded > 0 {
+            let _ = writeln!(
+                out,
+                "Operational ({degraded} degraded capability — see [warn] lines)."
+            );
+        } else {
+            let _ = writeln!(out, "Fully operational.");
+        }
     }
+    Ok(())
 }
 
-fn report(out: &mut impl std::io::Write, name: &str, ok: bool, detail: &str) {
-    tier(out, name, Tier::from_ok(ok), detail);
-}
-
-/// Readiness tier for a doctor probe: only [`Tier::Fail`] (a core subsystem
-/// is actually broken) affects the exit code; [`Tier::Warn`] is degraded
-/// capability and [`Tier::Skip`] is an optional integration that isn't
-/// present. The old single ok/FAIL bit conflated "broken" with "absent" —
-/// an optional executable missing from PATH is not a failure of the lab.
+/// Readiness tier for a doctor probe: only Fail (a core subsystem is
+/// actually broken) affects the exit code; Warn is degraded capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
     Ok,
     /// Degraded but functional (or an optional integration absent).
@@ -613,11 +634,51 @@ impl Tier {
 fn tier(out: &mut impl std::io::Write, name: &str, t: Tier, detail: &str) {
     let _ = writeln!(
         out,
-        "{:<28} {}  ({})",
+        "{:<42} {}  ({})",
         format!("{}:", name),
         t.label(),
         detail
     );
+}
+
+/// One row of the readiness matrix (P1.10): tier as data so `--json` and
+/// the text render share one source.
+struct ProbeEntry {
+    name: String,
+    /// "ok" | "warn" | "FAIL"
+    tier: &'static str,
+    detail: String,
+}
+
+impl ProbeEntry {
+    fn tier(name: &str, t: Tier, detail: &str) -> Self {
+        ProbeEntry {
+            name: name.to_string(),
+            tier: t.as_tier_str(),
+            detail: detail.to_string(),
+        }
+    }
+    fn raw(p: &tui_lab::diagnostic::product_probes::ProductProbe) -> Self {
+        ProbeEntry {
+            name: p.name.to_string(),
+            tier: match p.tier {
+                "ok" => "ok",
+                "warn" => "warn",
+                _ => "FAIL",
+            },
+            detail: p.detail.clone(),
+        }
+    }
+}
+
+impl Tier {
+    fn as_tier_str(&self) -> &'static str {
+        match self {
+            Tier::Ok => "ok",
+            Tier::Warn => "warn",
+            Tier::Fail => "FAIL",
+        }
+    }
 }
 
 /// Minimal synthetic screen for doctor probes.
