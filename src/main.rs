@@ -39,6 +39,12 @@ enum Commands {
         /// manifest-dir SKILL.md (the developer/build loop, unchanged).
         #[arg(long)]
         path: Option<String>,
+        /// Splice the generated per-tool selector vocabulary into
+        /// README.md (P1.9) instead of the SKILL.md sections — the
+        /// README's `**Actions:**`-style tables, regenerated from the
+        /// same registry. Honors `--path` the same way.
+        #[arg(long)]
+        write_readme: bool,
     },
     /// Print a persisted run's history from disk (item 74): manifest,
     /// declared-replay ledger, findings summary, graphs. Read-only —
@@ -69,8 +75,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Version => {
             println!("tui-lab {}", env!("CARGO_PKG_VERSION"));
         }
-        Commands::Skill { write, path } => {
-            if write {
+        Commands::Skill {
+            write,
+            path,
+            write_readme,
+        } => {
+            if write_readme {
+                readme_write(path)?;
+            } else if write {
                 skill_write(path)?;
             } else {
                 println!("{}", tui_lab::SKILL_DOC);
@@ -271,6 +283,34 @@ fn skill_write(path: Option<String>) -> anyhow::Result<()> {
     std::fs::write(&path, spliced)?;
     eprintln!(
         "{} updated: Tools and Resources sections regenerated from the registry.",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `skill --write-readme` (P1.9): regenerate the README's per-tool
+/// selector vocabulary from the registry. Same `--path` contract as
+/// `skill --write`.
+fn readme_write(path: Option<String>) -> anyhow::Result<()> {
+    let path = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+    };
+    let doc = std::fs::read_to_string(&path)?;
+    let spliced = tui_lab::mcp::registry::splice_readme_selectors(&doc).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is missing the generated-selector markers — add the \
+             <!-- BEGIN/END GENERATED SELECTORS --> block first",
+            path.display()
+        )
+    })?;
+    if spliced == doc {
+        eprintln!("{} already current — nothing to write.", path.display());
+        return Ok(());
+    }
+    std::fs::write(&path, spliced)?;
+    eprintln!(
+        "{} updated: selector vocabulary regenerated from the registry.",
         path.display()
     );
     Ok(())

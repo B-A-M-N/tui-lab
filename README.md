@@ -121,11 +121,74 @@ wire router. This prose is not the contract). The authoritative selector
 lists live in the capability registry and the generated skill doc —
 this section is prose, the registry is the contract.
 
+<!-- BEGIN GENERATED SELECTORS (registry.rs) — regenerate: cargo run -- skill --write-readme -->
+
+### tui_session
+
+**Action:** start, restart, stop, list, status, lease, release, attach
+
+### tui_observe
+
+**Mode:** summary, screen, cells, semantic, tree, nodes, diff, changes, scrollback, search, command_state, history, protocol, streams, terminal_modes, inspect
+
+### tui_wait
+
+**Condition:** text, text_absent, screen_change, screen_stable, process_exit, title, bell, idle, command_done, command_output, event
+
+### tui_probe
+
+**Completion:** stable, first_change, any_change, text_appears, text_disappears, process_exit, semantic_change, may_be_silent
+
+### tui_assert
+
+**Assertion:** text, text_absent, position, focus, not_clipped, dimensions, exit_code, region, snapshot, structure, control_exists, focused_not, oracle
+
+### tui_checkpoint
+
+**Action:** save, compare, list, delete
+
+### tui_scenario
+
+**Action:** list, record_start, record_stop, save, export, run, regression_asset
+
+### tui_record
+
+**Format:** start, stop, cast, svg, png
+
+### tui_explore
+
+**Mode:** random, guided_candidates, semantic, state_graph
+
+### tui_audit
+
+**Profile:** full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes, rendering, input_protocol, shell_cli, lifecycle, lifecycle_exit, query_response
+
+### tui_coverage
+
+**Action:** detect, summary, collect, delta, uncovered, ledger, snapshot
+
+### tui_framework
+
+**Action:** detect, capabilities, adapter_snippet
+
+### tui_run
+
+**Action:** status, persist, close, context, list, resume, diagnose, new, bundle
+
+### tui_contract
+
+**Action:** load, validate, status, compare, scaffold, baseline
+
+### tui_workflow
+
+**Action:** construct, inspect, verify, diagnose
+
+<!-- END GENERATED SELECTORS -->
+
 ### tui_session
 Manage TUI sessions: start, restart, stop, list, status, plus the human
 control lease.
 
-**Actions:** `start`, `restart`, `stop`, `list`, `status`, `lease`, `release`
 
 Restart relaunches the SAME logical session: same id, next generation, reusing
 the stored launch spec. `start` accepts `isolation: local|clean|strict` (see
@@ -135,7 +198,6 @@ control lease (see above).
 ### tui_observe
 Observe terminal state.
 
-**Modes:** `summary`, `screen`, `cells`, `semantic`, `tree`, `nodes`, `diff`, `changes`, `scrollback`, `search`, `command_state`, `history`
 
 `diff` compares the previous observation to the current one through the one
 canonical `screen::diff`, returning the same `Transition` shape as
@@ -191,7 +253,6 @@ payloads are redacted to `${NAME}` parameter references in recordings.
 ### tui_act
 Drive keyboard/mouse input. Returns a screen transition.
 
-**Actions:** `key`, `keys`, `type`, `paste`, `raw`, `mouse_click`, `mouse_press`, `mouse_release`, `mouse_move`, `mouse_drag`, `mouse_scroll`, `resize`, `signal`
 
 Each act captures the event-sequence baseline before sending, waits anchored to
 that baseline, and reports `settled` honestly — plus `warnings` when the screen
@@ -214,7 +275,6 @@ never misreported.
 ### tui_wait
 Block until a condition holds.
 
-**Conditions:** `text`, `text_absent`, `screen_change`, `screen_stable`, `process_exit`, `title`, `bell`, `idle`, `command_done`, `command_output`
 
 `command_done`/`command_output` anchor on OSC 133 shell-integration edges
 (command_seq). A session with no integration marks fails honestly rather
@@ -226,7 +286,6 @@ just a boolean.
 ### tui_assert
 Assert UI facts.
 
-**Assertions:** `text`, `text_absent`, `position`, `focus`, `not_clipped`, `dimensions`, `exit_code`, `region`, `snapshot`, `structure`, `control_exists`, `focused_not`, `oracle`
 
 Unknown assertions return `invalid_request` (caller error), not
 `assertion_failed` (UI failure). `oracle` evaluates the shared Wave E
@@ -235,14 +294,12 @@ expression language (the same one contracts and scenario replay use).
 ### tui_checkpoint
 Save and compare named UI state checkpoints.
 
-**Actions:** `save`, `compare`, `list`, `delete`
 
 Checkpoints persist under the run's artifact root once the run is persistent.
 
 ### tui_scenario
 Record, save, list, export, and replay workflows as regression scenarios.
 
-**Actions:** `list`, `record_start`, `record_stop`, `save`, `export`, `run`
 
 `record_start` binds a recording to one session generation and returns an
 opaque `recording_id` — the identity for `record_stop` (names are display
@@ -264,7 +321,6 @@ live.
 Seeded random exploration, candidate generation, and screen-reading
 exploration.
 
-**Modes:** `random`, `guided_candidates`, `semantic`, `state_graph`
 
 The explorer records an ordered step per action while it happens (seq, action,
 before/after state identity, settle outcome, novelty) and feeds the run's state
@@ -289,7 +345,6 @@ app state, unlike the seeded random fuzz.
 ### tui_audit
 Run deterministic UX audits and return evidence-backed findings.
 
-**Profiles:** `full`, `keyboard`, `focus`, `resize`, `layout`, `clipping`, `discoverability`, `navigation`, `contract`, `color`, `performance`, `mouse`, `states`, `errors`
 
 Active profiles (keyboard, focus, resize/layout, clipping, navigation, mouse,
 color, performance, states, errors, and `full` as the composite) drive the app
@@ -318,7 +373,6 @@ Also available read-only as the `tui://findings/{finding_id}` resource.
 ### tui_workflow
 The construction workflow per finding — one object per answer, no autonomy.
 
-**Actions:** `inspect`, `verify`, `diagnose`
 
 `inspect` assembles the whole chain in one object: finding → component
 identity → source loci (provenance-tiered) → framework context (rooted at
@@ -343,7 +397,6 @@ fabricated percentage.
 ### tui_framework
 Detect TUI framework, run native probes, and hand out adapter snippets.
 
-**Actions:** `detect`, `capabilities`, `adapter_snippet`
 
 `adapter_snippet` returns a ready-to-paste NativeSemanticProtocol declarer
 for the detected framework (Ratatui, Textual, or the dependency-free Python
@@ -354,7 +407,6 @@ the side channel and the harness's inference yields to it.
 Design contracts: describe what the TUI is *supposed* to be in YAML, and check
 the running app against that description.
 
-**Actions:** `load`, `validate`, `status`, `compare`
 
 A contract declares viewports the layout must survive, components that must be
 present, interactions (a key sequence plus the oracle expressions that must
