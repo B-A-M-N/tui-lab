@@ -31,7 +31,7 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_framework` — Framework detection, capability probes, and NativeSemanticProtocol adapter snippets (Ratatui/Textual/Python).
   - action: detect, capabilities, adapter_snippet
 - `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, diagnose (or its alias repair): diagnostic evidence contexts per finding — provenance-tiered source loci, verification plan (targeted checks, replay only with a reproduction), observation-shaped next steps — never edit prescriptions, bundle for ONE finding (context + before/after regression diff), and context (this registry as JSON).
-  - action: status, persist, close, context, list, resume, diagnose, repair, new, bundle
+  - action: status, persist, close, context, list, resume, diagnose, new, bundle
 - `tui_contract` — Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (scaffold_mode=current) or from a bounded SAFE multi-state pass — initial screen, Tab focus walk, Escape, viewport probes (scaffold_mode=explore; lease-gated; every state cited in the scaffold.inferred extension; edit from observation toward intent).
   - action: load, validate, status, compare, scaffold, baseline
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.

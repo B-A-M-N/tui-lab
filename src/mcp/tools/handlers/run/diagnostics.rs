@@ -6,7 +6,7 @@
 
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, ok};
-use crate::mcp::params::{RunAction, TuiRunParams};
+use crate::mcp::params::TuiRunParams;
 use rmcp::serde_json::json;
 
 /// The live run's status snapshot, with live session ids attached.
@@ -37,23 +37,18 @@ pub(crate) fn context() -> rmcp::model::CallToolResult {
                 "role": "optional point-in-time snapshot correlation; absent tuicov degrades only that view, never the ledger",
             },
         },
+        // Audit P1.8: task-oriented routes through the machinery, built
+        // from the real parameter types (never handwritten JSON), so a
+        // step's arguments are always a grammar the server accepts.
+        "flows": crate::mcp::registry::flows(),
     }))
 }
 
-/// ── diagnose/repair: DiagnosticContexts for every finding ──
+/// ── diagnose: DiagnosticContexts for every finding ──
 /// Review §2: evidence contexts for investigation, not fix
-/// prescriptions. `repair` is an accepted alias (same arm); the
-/// response's `contract` field names the recontracted meaning so
-/// pre-beta callers see the change.
-pub(crate) fn diagnose(
-    run_action: RunAction,
-    s: &crate::mcp::tools::TuiLabServer,
-) -> rmcp::model::CallToolResult {
-    let contract_note: Option<String> = if matches!(run_action, RunAction::Repair) {
-        Some("'repair' is now an alias: this surface assembles diagnostic evidence (provenance-tiered loci, verification plans, next observations) — it does not prescribe or make edits".to_string())
-    } else {
-        None
-    };
+/// prescriptions. Beta-audit P1.6: the pre-beta `repair` alias is gone —
+/// carrying a name whose meaning reversed would confuse agents forever.
+pub(crate) fn diagnose(s: &crate::mcp::tools::TuiLabServer) -> rmcp::model::CallToolResult {
     let (contexts, skipped) = {
         let run = s.run.lock().unwrap();
         run.diagnostic_contexts()
@@ -68,14 +63,13 @@ pub(crate) fn diagnose(
     }
     ok(json!({
         "contract": "diagnostic",
-        "alias_for": if matches!(run_action, RunAction::Repair) { json!("diagnose") } else { serde_json::Value::Null },
         "contexts": contexts,
         "skipped": skipped,
-        "note": contract_note.unwrap_or_else(|| if skipped > 0 {
+        "note": if skipped > 0 {
             format!("{skipped} finding(s) could not form a context (no evidence) and were skipped")
         } else {
             "each context: the finding, provenance-tiered source loci, a verification plan (targeted checks; replay only with a reproduction), and observation-shaped next steps".to_string()
-        }),
+        },
     }))
 }
 

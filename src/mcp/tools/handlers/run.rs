@@ -47,7 +47,7 @@ pub(crate) async fn tui_run(
         RA::List => persist::list(s, p),
         RA::Status => diagnostics::status(s),
         RA::Context => diagnostics::context(),
-        RA::Diagnose | RA::Repair => diagnostics::diagnose(run_action, s),
+        RA::Diagnose => diagnostics::diagnose(s),
         RA::Bundle => diagnostics::bundle(s, p),
     }
 }
