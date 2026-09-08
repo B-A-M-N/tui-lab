@@ -423,6 +423,58 @@ pub fn skill_tool_section() -> String {
     out
 }
 
+/// P1.9: the README's per-tool selector vocabulary, generated — one
+/// authoritative declaration (`TOOLS` + the dispatch enums), every doc
+/// derived from it. A README `**Actions:**` line that drifted from the
+/// enum the handler actually dispatches on is the P1.9 defect class;
+/// this generator closes it. Output: for every tool with a selector,
+/// `### <tool>` then `**<Field>:** v1, v2, …`.
+pub fn readme_selector_section() -> String {
+    let mut out = String::from("<!-- BEGIN GENERATED SELECTORS (registry.rs) — regenerate: cargo run -- skill --write-readme -->\n\n");
+    for t in TOOLS {
+        let Some((field, values)) = t.selector else {
+            continue;
+        };
+        out.push_str(&format!(
+            "### {}\n\n**{}:** {}\n\n",
+            t.name,
+            // Capitalize the selector field for the prose style the README
+            // already uses ("**Actions:**", "**Modes:**").
+            {
+                let mut c = field.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            },
+            values.join(", ")
+        ));
+    }
+    out.push_str("<!-- END GENERATED SELECTORS -->\n");
+    out
+}
+
+/// P1.9: splice [`readme_selector_section`] into a README, replacing
+/// whatever currently sits between the generated markers. Returns `None`
+/// when the markers are missing — the README must carry the empty
+/// generated block before this can maintain it (no inventing structure).
+pub fn splice_readme_selectors(doc: &str) -> Option<String> {
+    const BEGIN: &str =
+        "<!-- BEGIN GENERATED SELECTORS (registry.rs) — regenerate: cargo run -- skill --write-readme -->";
+    const END: &str = "<!-- END GENERATED SELECTORS -->";
+    let start = doc.find(BEGIN)?;
+    let end = doc.find(END)? + END.len();
+    if end <= start {
+        return None;
+    }
+    // The generated section ends with exactly one newline; trim it here
+    // so repeated runs cannot accumulate blank lines at the seam (the
+    // doc's own bytes after the END marker are preserved verbatim).
+    let section = readme_selector_section();
+    let section = section.trim_end_matches('\n');
+    Some(format!("{}{}{}", &doc[..start], section, &doc[end..]))
+}
+
 /// Render the SKILL.md resource section from the same RESOURCES table the
 /// server advertises — one declaration, three consumers (list_resource_
 /// templates stays hand-written where it needs rmcp types; the registry
@@ -903,6 +955,49 @@ mod tests {
             snapshot.contains("snapshot") && snapshot.contains("tuicov"),
             "tui_coverage description must state snapshot's tuicov requirement: {snapshot}"
         );
+    }
+
+    /// P1.9: the README's generated selector block must be byte-equal to
+    /// what the generator produces right now — the README's public
+    /// selector tables are DERIVED (one authoritative declaration, every
+    /// doc derived), and a failure here means the registry changed
+    /// without `cargo run -- skill --write-readme`.
+    #[test]
+    fn readme_selector_block_matches_registry() {
+        let readme =
+            match std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")) {
+                Ok(r) => r,
+                // README absent in an exotic checkout: nothing to keep in parity.
+                Err(_) => return,
+            };
+        let section = readme_selector_section();
+        assert!(
+            readme.contains(&section),
+            "README's generated selector block drifted from the registry — regenerate: cargo run -- skill --write-readme"
+        );
+        // And no hand-written selector line may resurrect outside the
+        // generated block (that is the P1.9 drift class): the old
+        // `**Actions:**`-style lines now live only in the generated span.
+        let begin = readme
+            .find("<!-- BEGIN GENERATED SELECTORS")
+            .expect("begin marker");
+        let end = readme
+            .find("<!-- END GENERATED SELECTORS -->")
+            .expect("end marker");
+        for line in readme[..begin].lines().chain(readme[end..].lines()) {
+            for prefix in [
+                "**Actions:**",
+                "**Modes:**",
+                "**Conditions:**",
+                "**Assertions:**",
+                "**Profiles:**",
+            ] {
+                assert!(
+                    !line.trim_start().starts_with(prefix),
+                    "hand-written selector line outside the generated block: '{line}' — delete it, the registry generates these"
+                );
+            }
+        }
     }
 
     /// Audit P1.8: every flow step must round-trip — the arguments were
