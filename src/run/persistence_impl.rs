@@ -739,7 +739,7 @@ impl RunContext {
         if let Some(existing) = &self.run_dir {
             return Ok(existing.clone());
         }
-        let root = Self::runs_dir_for(base, &self.id());
+        let root = Self::runs_dir_for(base, self.id());
         std::fs::create_dir_all(root.join("checkpoints"))?;
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;

@@ -80,8 +80,7 @@ impl Session {
     /// (re-review P1 fix 9). Every [`crate::execution::ObservationAnchor`]
     /// created against this session gets a distinct, increasing index.
     pub fn next_anchor(&mut self) -> u64 {
-        let n = self.event_state.next_anchor();
-        n
+        self.event_state.next_anchor()
     }
 
     /// Suppress input recording for the duration of `f` (re-review P0 leak

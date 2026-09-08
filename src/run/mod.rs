@@ -408,9 +408,9 @@ impl RunContext {
         if self.run_dir.is_some() {
             if self.artifacts_store.has_journal() {
                 if let Ok(line) = serde_json::to_string(&record) {
-                    self.artifacts_store
-                        .journal()
-                        .map(|j| j.submit(record.seq, line));
+                    if let Some(j) = self.artifacts_store.journal() {
+                        j.submit(record.seq, line);
+                    }
                 }
             } else {
                 // First record of a persistent run: spawn the writer now
