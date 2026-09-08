@@ -43,7 +43,7 @@ tui-lab replay <run_id> [--root <dir>] [--full]
 
 ### tui_run
 The run lifecycle tool — `status`, `persist`, `close`, `list`, `resume`,
-`diagnose`/`repair` (per-finding diagnostic contexts), `bundle` (one
+`diagnose` (per-finding diagnostic contexts), `bundle` (one
 finding's context + regression diff), and `context` (the capability
 registry as JSON).
 

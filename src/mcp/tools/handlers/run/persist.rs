@@ -20,10 +20,25 @@ pub(crate) fn persist(
     if run.run_dir().is_some() {
         // Audit P1 (response freshness): "already persistent" is not a
         // no-op answer — a run can be persistent yet hold unflushed
-        // in-memory state. Flush (best-effort here; a failure is
-        // reported, not swallowed) and answer with the CURRENT
-        // durability picture, not a bare echo.
-        let flush = run.flush().err().map(|e| e.to_string());
+        // in-memory state. Flush and answer with the CURRENT durability
+        // picture, not a bare echo. Audit P1.7: a FAILED flush is not a
+        // success with `flush_error` inside it — the caller asked for
+        // durable evidence and did not get it, so that is an
+        // InternalError with the already-persistent context in the
+        // message, never a green envelope.
+        if let Err(e) = run.flush() {
+            let dir = run
+                .run_dir()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let id = run.id().to_string();
+            return err(
+                ErrorCategory::InternalError,
+                format!(
+                    "run {id} is already persistent at '{dir}' but flushing in-memory evidence failed: {e}"
+                ),
+            );
+        }
         let run_id = run.id().to_string();
         let artifact_root = run.run_dir().map(|d| d.to_string_lossy().to_string());
         let summary = run.status(Vec::new());
@@ -31,7 +46,6 @@ pub(crate) fn persist(
             "run_id": run_id,
             "already_persistent": true,
             "artifact_root": artifact_root,
-            "flush_error": flush,
             "final": summary,
         }));
     }

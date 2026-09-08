@@ -125,6 +125,7 @@ impl std::str::FromStr for BackendParam {
             "cli" => Ok(BackendParam::Cli),
             "line_cli" => Ok(BackendParam::LineCli),
             "pipe" => Ok(BackendParam::Pipe),
+            "tmux" => Ok(BackendParam::Tmux),
             other => Err(format!(
                 "unknown backend '{}' (expected one of: {})",
                 other,
@@ -166,5 +167,35 @@ impl From<IsolationParam> for crate::session::isolation::Isolation {
             IsolationParam::Clean => crate::session::isolation::Isolation::Clean,
             IsolationParam::Strict => crate::session::isolation::Isolation::Strict,
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_param_parity_tests {
+    use super::*;
+
+    /// Beta-audit P1.6: the schema's VARIANTS, the wire names, and the
+    /// FromStr parser must agree — a name the schema advertises MUST
+    /// parse. The `tmux` gap (advertised, never parseable) is pinned
+    /// here forever.
+    #[test]
+    fn every_advertised_variant_parses() {
+        for v in BackendParam::VARIANTS {
+            let parsed: BackendParam = v.parse().unwrap_or_else(|e| panic!("{v} must parse: {e}"));
+            assert_eq!(parsed.as_str(), *v, "round-trip for {v}");
+        }
+    }
+
+    /// And every parseable name is advertised — no hidden vocabulary.
+    #[test]
+    fn every_parseable_name_is_advertised() {
+        for name in ["auto", "portable_vt100", "cli", "line_cli", "pipe", "tmux"] {
+            assert!(name.parse::<BackendParam>().is_ok(), "{name} must parse");
+            assert!(
+                BackendParam::VARIANTS.contains(&name),
+                "{name} must be advertised"
+            );
+        }
+        assert!("nonsense".parse::<BackendParam>().is_err());
     }
 }

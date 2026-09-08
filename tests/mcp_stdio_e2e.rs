@@ -237,6 +237,27 @@ fn stdio_e2e_full_lifecycle() {
         tui_lab::mcp::registry::TOOLS.len(),
         "registry count matches the wire: {names:?}"
     );
+    // Audit P1.8: context serves the canonical flows over the wire, and
+    // every flow step names a real tool.
+    let flows = &registry["data"]["flows"];
+    for required in [
+        "debug_existing_tui",
+        "construct_or_refine_tui",
+        "regression_test_tui",
+    ] {
+        let flow = &flows[required];
+        assert!(
+            flow["steps"].as_array().is_some_and(|s| !s.is_empty()),
+            "flow {required} served with steps: {flows}"
+        );
+        for step in flow["steps"].as_array().unwrap() {
+            let tool = step["tool"].as_str().expect("step tool");
+            assert!(
+                names.contains(&tool.to_string()),
+                "flow {required} references '{tool}' which is not a served tool"
+            );
+        }
+    }
     for expected in [
         "tui_session",
         "tui_observe",

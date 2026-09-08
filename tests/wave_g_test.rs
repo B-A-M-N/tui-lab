@@ -2394,9 +2394,11 @@ async fn close_and_persist_responses_report_fresh_final_state() {
         "persist (already persistent)",
     );
     assert_eq!(again["already_persistent"], true, "{again}");
+    // P1.7: a failed flush is an InternalError envelope, never a success
+    // carrying `flush_error` — so a success here must not have the key.
     assert!(
-        again["flush_error"].is_null(),
-        "flush of an already-persistent run must succeed: {again}"
+        again.get("flush_error").is_none(),
+        "success envelope must not carry flush_error: {again}"
     );
     let final_again = &again["final"];
     assert!(
@@ -2710,4 +2712,87 @@ async fn inspect_frame_citation_is_provenance_scoped() {
             serde_json::json!({ "action": "stop", "id": sid_b }),
         ))
         .await;
+}
+
+// ─────────────────────────── P1.7: persist flush failure is an error ───────────────────────────
+
+/// Audit P1.7: an already-persistent run whose flush FAILS must return
+/// an error envelope (InternalError), not a success carrying
+/// `flush_error` inside it. Injected deterministically: after the first
+/// persist, `state_graph.json` is replaced by a DIRECTORY, so the
+/// rename-based flush write cannot proceed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn already_persistent_run_with_failing_flush_is_an_error() {
+    use std::fs;
+    use std::path::PathBuf;
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let id = start_session(&server, "print('persist-me'); input()").await;
+
+    let root = std::env::temp_dir().join("tui-lab-p17-flush-fail");
+    let _ = fs::remove_dir_all(&root);
+    let first = unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "persist", "root": root.to_string_lossy() }),
+            ))
+            .await,
+        "persist",
+    );
+    let dir = PathBuf::from(first["artifact_root"].as_str().expect("artifact root"));
+    assert!(dir.join("run.json").exists(), "promoted run wrote run.json");
+
+    // Sabotage: a directory where the flush wants to write a file.
+    // (create_dir_all on the parent succeeds; the rename of
+    // state_graph.json.tmp onto a non-empty-looking path fails.)
+    fs::remove_file(dir.join("state_graph.json")).expect("remove graph file");
+    fs::create_dir_all(dir.join("state_graph.json")).expect("make dir blocker");
+
+    let failed = unwrap_err(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "persist", "root": root.to_string_lossy() }),
+            ))
+            .await,
+        "persist with sabotaged flush",
+    );
+    let text = failed["error"]
+        .as_str()
+        .or_else(|| failed["message"].as_str())
+        .unwrap_or_else(|| panic!("error message in envelope: {failed}"))
+        .to_string();
+    assert!(
+        text.contains("already persistent") && text.contains("flush"),
+        "error must name the run, its durability, and the flush failure: {text}"
+    );
+    assert!(
+        !text.contains("flush_error"),
+        "the old success-key must not leak into the error text: {text}"
+    );
+
+    // Repair the tree so close can settle cleanly, and confirm a healthy
+    // re-persist answers with the success envelope again.
+    fs::remove_dir(dir.join("state_graph.json")).expect("remove dir blocker");
+    let healed = unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "persist", "root": root.to_string_lossy() }),
+            ))
+            .await,
+        "persist after repair",
+    );
+    assert_eq!(healed["already_persistent"], true, "{healed}");
+    assert!(
+        healed.get("flush_error").is_none(),
+        "success envelope must not carry flush_error: {healed}"
+    );
+
+    let _ = server
+        .tui_run(params_typed(serde_json::json!({ "action": "close" })))
+        .await;
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+    let _ = fs::remove_dir_all(&root);
 }

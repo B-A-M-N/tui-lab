@@ -201,6 +201,213 @@ pub fn to_json() -> serde_json::Value {
     })
 }
 
+// ── Canonical flows (audit P1.8) ──
+//
+// `tui_run action=context` pairs the raw registry with task-oriented
+// routes through the machinery. Each step is a REAL tool invocation:
+// the arguments are built from the actual `mcp::params` types and
+// serialized, never handwritten JSON — the same P0.4 rule the
+// DiagnosticContexts follow. A request the params type cannot
+// represent cannot appear in a flow, so the flows cannot advertise a
+// grammar the server rejects.
+//
+// Session ids are left as placeholders (`$session`) because flows are
+// published before any session exists; every other field is a
+// genuine default the handler accepts.
+
+/// The placeholder token for "the session id you already hold or just
+/// started" — the only non-literal in any flow step.
+pub const SESSION_PLACEHOLDER: &str = "$session";
+
+fn step(tool: &str, why: &str, args: serde_json::Value) -> serde_json::Value {
+    json!({ "tool": tool, "why": why, "arguments": args })
+}
+
+/// debug_existing_tui: attach/observe → understand → diagnose →
+/// experiment → baseline → verify. Encodes the real policy: start
+/// observationally, only drive after a diagnosis, and always leave a
+/// labeled baseline behind for the fix verification.
+fn flow_debug_existing_tui() -> serde_json::Value {
+    use crate::mcp::params::*;
+    json!({
+        "name": "debug_existing_tui",
+        "description": "Investigate a misbehaving or unfamiliar TUI: observe first, diagnose from evidence, experiment causally, then keep a baseline so the fix can be proven.",
+        "steps": [
+            step("tui_session", "start (or attach to an existing tmux pane) and hold the session id",
+                 serde_json::to_value(TuiSessionParams {
+                     action: "start".into(), command: Some("<command>".into()),
+                     args: None, cwd: None, env: None, cols: Some(120), rows: Some(40),
+                     backend: None, isolation: None, id: None, holder: None,
+                     ttl_ms: None, lease_id: None, target: None,
+                 }).unwrap()),
+            step("tui_observe", "the one-call construction view: frame identity, semantic controls with stable ids, affordances, contract verdicts",
+                 serde_json::to_value(TuiObserveParams {
+                     mode: Some(Known::Known(ObserveMode::Inspect)),
+                     idle_ms: None, id: Some(SESSION_PLACEHOLDER.into()),
+                     consumer: None, query: None, text: None, since_seq: None,
+                     until_seq: None, limit: None, event_types: None, target: None,
+                 }).unwrap()),
+            step("tui_audit", "passive first: observational profiles only — mutating ones are withheld and reported ORCH-GATED",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: None, compare_to: None, allow_mutation: Some(false),
+                     restart_between_mutations: None, allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_workflow", "the evidence chain for any finding: root cause → minimal reproduction → targeted validation plan",
+                 serde_json::to_value(TuiWorkflowParams {
+                     action: Known::Known(WorkflowAction::Diagnose),
+                     finding_id: None, id: Some(SESSION_PLACEHOLDER.into()),
+                     cwd: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_probe", "causal experiment on ONE suspect stimulus — everything materially different, event-scoped",
+                 serde_json::to_value(TuiProbeParams {
+                     stimulus: None, completion: None, capture: None, text: None,
+                     watch: None, quiet_ms: None, budget_ms: None,
+                     id: Some(SESSION_PLACEHOLDER.into()),
+                 }).unwrap()),
+            step("tui_intent", "preview (plan-only) then execute the targeted semantic action the diagnosis pointed at",
+                 serde_json::to_value(TuiIntentParams {
+                     target: crate::intent::ActionTarget::Focused,
+                     verb: IntentVerbParam::Name("activate".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), execute: Some(false),
+                     sensitive: None, completion: None, plan_id: None, max_risk: None,
+                 }).unwrap()),
+            step("tui_audit", "record the pre-fix state under a label — the baseline the fix is diffed against",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: Some("baseline".into()), compare_to: None,
+                     allow_mutation: Some(false), restart_between_mutations: None,
+                     allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_workflow", "after the fix: replay + re-check the finding live and read the verdict against the baseline",
+                 serde_json::to_value(TuiWorkflowParams {
+                     action: Known::Known(WorkflowAction::Verify),
+                     finding_id: Some("$finding_id".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), cwd: None,
+                     allow_mutation: Some(false),
+                 }).unwrap()),
+        ],
+    })
+}
+
+/// construct_or_refine_tui: detect the framework → scaffold the
+/// contract from observation → load/validate → conformance-check
+/// (passive) → refine with targeted exploration.
+fn flow_construct_or_refine_tui() -> serde_json::Value {
+    use crate::mcp::params::*;
+    json!({
+        "name": "construct_or_refine_tui",
+        "description": "Build or refine a TUI against a contract: detect the framework, scaffold candidate invariants from observation, then conform — driving only with explicit authorization.",
+        "steps": [
+            step("tui_framework", "identify the TUI framework and its adapter/native-channel state (root from cwd)",
+                 serde_json::to_value(TuiFrameworkParams {
+                     action: Known::Known(FrameworkAction::Detect),
+                     cwd: Some("$project_dir".into()), source: None, id: None,
+                 }).unwrap()),
+            step("tui_contract", "scaffold a candidate contract from observed frames only (current mode drives nothing)",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Scaffold),
+                     scaffold_mode: Some(Known::Known(ScaffoldMode::Current)),
+                     path: Some("$contract.yaml".into()), id: None,
+                     baseline: None, label: None, mode: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_contract", "validate the document's structure and evidence claims before conformance",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Validate),
+                     scaffold_mode: None, path: Some("$contract.yaml".into()), id: None,
+                     baseline: None, label: None, mode: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_contract", "static/passive conformance first: driving checks are reported UNVERIFIED, not executed",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Status),
+                     scaffold_mode: None, path: Some("$contract.yaml".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), baseline: None,
+                     label: None, mode: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_observe", "inspect the live frame against the loaded contract — per-control facts + violations",
+                 serde_json::to_value(TuiObserveParams {
+                     mode: Some(Known::Known(ObserveMode::Inspect)),
+                     idle_ms: None, id: Some(SESSION_PLACEHOLDER.into()),
+                     consumer: None, query: None, text: None, since_seq: None,
+                     until_seq: None, limit: None, event_types: None, target: None,
+                 }).unwrap()),
+            step("tui_contract", "after refining the app: full conformance at the chosen check mode (this DRIVES — explicit allow_mutation, the same authorization tui_audit requires)",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Status),
+                     scaffold_mode: None, path: Some("$contract.yaml".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), baseline: None,
+                     label: None, mode: Some("strict".into()), allow_mutation: Some(true),
+                 }).unwrap()),
+        ],
+    })
+}
+
+/// regression_test_tui: labeled audits → scenario capture → replay on
+/// every change → did-the-fix-hold bundle.
+fn flow_regression_test_tui() -> serde_json::Value {
+    use crate::mcp::params::*;
+    json!({
+        "name": "regression_test_tui",
+        "description": "Turn a verified-good state into a reusable regression gate: labeled baselines, recorded scenarios, replay diffs, and per-finding hold bundles.",
+        "steps": [
+            step("tui_audit", "record the known-good audit under a stable label",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: Some("baseline".into()), compare_to: None,
+                     allow_mutation: Some(false), restart_between_mutations: None,
+                     allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_scenario", "capture the interaction that must keep working as a replayable scenario",
+                 serde_json::to_value(TuiScenarioParams {
+                     action: Known::Known(ScenarioAction::Save),
+                     name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     recording_id: None, steps: None, parameters: None,
+                     on_failure: None, finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_run", "persist the run so the baseline + scenario survive the session",
+                 serde_json::to_value(TuiRunParams {
+                     action: Known::Known(RunAction::Persist),
+                     root: None, kill_sessions: None, run_id: None, run_dir: None,
+                     finding_id: None, compare_to: None,
+                     detach_existing_sessions: None, discard: None,
+                 }).unwrap()),
+            step("tui_scenario", "after a change: run the recorded path against the new build",
+                 serde_json::to_value(TuiScenarioParams {
+                     action: Known::Known(ScenarioAction::Run),
+                     name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     recording_id: None, steps: None, parameters: None,
+                     on_failure: None, finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_audit", "re-audit and diff against the baseline: FIXED / NEW / PERSISTING per finding",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: Some("current".into()), compare_to: Some("baseline".into()),
+                     allow_mutation: Some(false), restart_between_mutations: None,
+                     allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_run", "one finding's did-the-change-hold packet: context + verdict + side effects elsewhere",
+                 serde_json::to_value(TuiRunParams {
+                     action: Known::Known(RunAction::Bundle),
+                     root: None, kill_sessions: None, run_id: None, run_dir: None,
+                     finding_id: Some("$finding_id".into()),
+                     compare_to: Some("baseline".into()),
+                     detach_existing_sessions: None, discard: None,
+                 }).unwrap()),
+        ],
+    })
+}
+
+/// The canonical flows, in stable order. Each is built from typed
+/// request builders — see [`flow_debug_existing_tui`].
+pub fn flows() -> serde_json::Value {
+    json!({
+        "debug_existing_tui": flow_debug_existing_tui(),
+        "construct_or_refine_tui": flow_construct_or_refine_tui(),
+        "regression_test_tui": flow_regression_test_tui(),
+        "note": "arguments are serialized from the real parameter types; '$session'/'$finding_id'/'$project_dir'/'$contract.yaml' are placeholders the caller fills with real ids/paths",
+    })
+}
+
 /// Render the SKILL.md tool section from the registry (item 69: generation,
 /// not hand-maintained prose). The output is stable and alphabetical like
 /// the old hand-written list, but it cannot drift from the handlers because
@@ -696,5 +903,99 @@ mod tests {
             snapshot.contains("snapshot") && snapshot.contains("tuicov"),
             "tui_coverage description must state snapshot's tuicov requirement: {snapshot}"
         );
+    }
+
+    /// Audit P1.8: every flow step must round-trip — the arguments were
+    /// built from the real params types, so each must deserialize back
+    /// into THAT tool's params type, and the tool name must exist in the
+    /// registry. A flow that advertises a grammar the server rejects is a
+    /// bug caught at build time, not agent runtime.
+    #[test]
+    fn flow_steps_roundtrip_into_real_param_types() {
+        let flows = flows();
+        let registry_names: std::collections::BTreeSet<&str> =
+            TOOLS.iter().map(|t| t.name).collect();
+        // (tool -> params-parse closure): a tiny typed dispatch over the
+        // tools the flows reference. A flow step naming a tool not listed
+        // here fails the test until it is added — deliberate friction.
+        let parse: fn(&str, &serde_json::Value) -> Result<(), String> = |tool, args| {
+            let v = args.clone();
+            let parsed: Result<(), serde_json::Error> = match tool {
+                "tui_session" => {
+                    serde_json::from_value::<crate::mcp::params::TuiSessionParams>(v).map(|_| ())
+                }
+                "tui_observe" => {
+                    serde_json::from_value::<crate::mcp::params::TuiObserveParams>(v).map(|_| ())
+                }
+                "tui_audit" => {
+                    serde_json::from_value::<crate::mcp::params::TuiAuditParams>(v).map(|_| ())
+                }
+                "tui_workflow" => {
+                    serde_json::from_value::<crate::mcp::params::TuiWorkflowParams>(v).map(|_| ())
+                }
+                "tui_probe" => {
+                    serde_json::from_value::<crate::mcp::params::TuiProbeParams>(v).map(|_| ())
+                }
+                "tui_intent" => {
+                    serde_json::from_value::<crate::mcp::params::TuiIntentParams>(v).map(|_| ())
+                }
+                "tui_framework" => {
+                    serde_json::from_value::<crate::mcp::params::TuiFrameworkParams>(v).map(|_| ())
+                }
+                "tui_contract" => {
+                    serde_json::from_value::<crate::mcp::params::TuiContractParams>(v).map(|_| ())
+                }
+                "tui_scenario" => {
+                    serde_json::from_value::<crate::mcp::params::TuiScenarioParams>(v).map(|_| ())
+                }
+                "tui_run" => {
+                    serde_json::from_value::<crate::mcp::params::TuiRunParams>(v).map(|_| ())
+                }
+                _ => {
+                    return Err(format!(
+                    "flow references tool '{tool}' with no typed parser — add one or fix the flow"
+                ))
+                }
+            };
+            parsed.map_err(|e| format!("{tool}: {e}"))
+        };
+        for (name, flow) in flows.as_object().expect("flows object") {
+            if name == "note" {
+                continue;
+            }
+            let steps = flow["steps"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: steps array"));
+            assert!(!steps.is_empty(), "{name}: no steps");
+            for (i, s) in steps.iter().enumerate() {
+                let tool = s["tool"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}[{i}]: tool name"));
+                assert!(
+                    registry_names.contains(tool),
+                    "{name}[{i}]: tool '{tool}' not in the registry"
+                );
+                let args = &s["arguments"];
+                assert!(args.is_object(), "{name}[{i}]: arguments must be an object");
+                if let Err(e) = parse(tool, args) {
+                    panic!("{name}[{i}]: flow arguments do not deserialize into the real params type: {e}\nargs: {args}");
+                }
+                assert!(
+                    s["why"].as_str().is_some_and(|w| !w.is_empty()),
+                    "{name}[{i}]: every step carries a why"
+                );
+            }
+        }
+        // The audit's named flows all exist.
+        for required in [
+            "debug_existing_tui",
+            "construct_or_refine_tui",
+            "regression_test_tui",
+        ] {
+            assert!(
+                flows.get(required).is_some(),
+                "required flow '{required}' missing"
+            );
+        }
     }
 }

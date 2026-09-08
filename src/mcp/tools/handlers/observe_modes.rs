@@ -144,7 +144,10 @@ pub(crate) fn observe_mode_arm(
             }
         }
         OM::Changes => {
-            let consumer = p.consumer.clone().unwrap_or_else(|| "hermes".to_string());
+            // Beta-audit P1.6: the default consumer is neutral — a
+            // general-purpose tool must not leak one agent identity as
+            // the implied caller.
+            let consumer = p.consumer.clone().unwrap_or_else(|| "default".to_string());
             let batch = sess.events_for_consumer(&consumer);
             ok(json!({
                 "consumer": consumer,

@@ -76,12 +76,11 @@ pub(crate) async fn tui_contract(
             // listed, not hidden.
             let contract_root = {
                 let run = s.run.lock().unwrap();
-                let anchor = p
-                    .id
-                    .as_deref()
-                    .and_then(|sid| run.launch_spec(sid))
-                    .and_then(|spec| spec.cwd.clone())
-                    .or_else(|| run.primary_session_cwd().map(str::to_string));
+                let anchor =
+                    p.id.as_deref()
+                        .and_then(|sid| run.launch_spec(sid))
+                        .and_then(|spec| spec.cwd.clone())
+                        .or_else(|| run.primary_session_cwd().map(str::to_string));
                 anchor.map(|cwd| {
                     crate::session::ProjectLocator::locate(None, &cwd)
                         .root()
