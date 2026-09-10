@@ -393,31 +393,45 @@ pub(crate) async fn tui_scenario(
                     )
                 }
             };
-            let mut run = s.run.lock().unwrap();
-            if run.scenario_recording_step_count(&rec_id) == Some(0) {
-                return err(
-                    ErrorCategory::InvalidRequest,
-                    "the recording has no steps; drive at least one act/intent/wait/assert before record_stop",
-                );
-            }
-            match run.finish_scenario_recording(&rec_id) {
-                Some(scenario) => {
-                    let path: Option<String> = run
-                        .save_scenario(scenario.clone())
-                        .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
-                    ok(json!({
-                        "recording_id": rec_id,
-                        "scenario_id": scenario.id,
-                        "name": scenario.name,
-                        "steps": scenario.step_count(),
-                        "saved_to": path,
-                        "scenario": serde_json::to_value(&scenario).unwrap_or_default(),
-                    }))
+            // P1-48: reserve/finish in memory under a short lock, then
+            // perform the filesystem write outside the shared run lock.
+            let (scenario, _file_stem) = {
+                let mut run = s.run.lock().unwrap();
+                if run.scenario_recording_step_count(&rec_id) == Some(0) {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "the recording has no steps; drive at least one act/intent/wait/assert before record_stop",
+                    );
                 }
-                None => err(
-                    ErrorCategory::InvalidRequest,
-                    format!("no recording in progress with id '{}'", rec_id),
-                ),
+                match run.finish_scenario_recording(&rec_id) {
+                    Some(scenario) => {
+                        let stem = run.save_scenario_memory(scenario.clone());
+                        (scenario, stem)
+                    }
+                    None => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!("no recording in progress with id '{rec_id}'"),
+                        )
+                    }
+                }
+            };
+            let saved_to = s
+                .run
+                .lock()
+                .unwrap()
+                .scenario_file_dir()
+                .and_then(|dir| crate::run::scenario_impl::save_scenario_file(&dir, &scenario))
+                .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
+            {
+                ok(json!({
+                    "recording_id": rec_id,
+                    "scenario_id": scenario.id,
+                    "name": scenario.name,
+                    "steps": scenario.step_count(),
+                    "saved_to": saved_to,
+                    "scenario": serde_json::to_value(&scenario).unwrap_or_default(),
+                }))
             }
         }
         // explicit save of hand-authored steps (validated through the
