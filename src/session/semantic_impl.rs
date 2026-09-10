@@ -356,28 +356,25 @@ impl Session {
         Ok((screen, sem, tree, report))
     }
 
-    /// Fresh, non-settling pre-dispatch guard snapshot (beta audit P0-1).
+    /// Current fused snapshot WITHOUT advancing the observation cursor.
     ///
-    /// This advances the backend/native state without the ordinary settle
-    /// cursor, then returns the fused analysis of that current frame. It
-    /// exists specifically for mutation guards and pre-action baselines:
-    /// an asynchronously changing TUI can invalidate a cached `last()`
-    /// frame after the caller observed it, so a safety check must not
-    /// validate that stale belief. Native events are absorbed explicitly
-    /// so a cooperative app's focus-only change is visible even when it
-    /// emits no bytes/redraw.
-    pub fn peek_fresh(&mut self) -> anyhow::Result<crate::session::state::FrameAnalysis> {
+    /// Pumps pending backend/native facts and fuses the current grid, but
+    /// `last`/`previous` remain the public settled observation window. The
+    /// next explicit `observe()` still diffs against the user's own prior
+    /// observation, so guards/resources/preflights cannot rewrite that
+    /// history.
+    pub fn snapshot_fresh(&mut self) -> anyhow::Result<crate::session::state::FrameAnalysis> {
         self.native.poll();
         self.absorb_native_events();
         self.absorb_pending_ingest();
         let screen = self.backend.state()?;
-        // Install the fresh frame without pretending it settled: the next
-        // normal diff advances from the user's last ordinary observation.
-        if let Some(previous) = self.observation.advance(screen.clone()) {
-            self.emit_frame_events(&previous, &screen);
-        }
         self.absorb_query_answers();
         Ok(self.analyze_screen(screen))
+    }
+
+    /// Backward-compatible name for internal pre-dispatch snapshots.
+    pub fn peek_fresh(&mut self) -> anyhow::Result<crate::session::state::FrameAnalysis> {
+        self.snapshot_fresh()
     }
 
     /// Native semantic channel revision, suitable for exact stale-state
