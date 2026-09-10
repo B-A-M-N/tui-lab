@@ -32,6 +32,7 @@ async fn guard_refuses_act_on_structure_drift() {
             structure_hash: Some("not-the-live-hash".to_string()),
             focus_control_id: None,
             native_revision: None,
+            text_visible: None,
         };
         let err = tui_lab::execution::execute_act_with_guard(
             sess,

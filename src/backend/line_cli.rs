@@ -903,7 +903,10 @@ impl TerminalBackend for PtyLineBackend {
 
 impl PtyLineBackend {
     fn recorder_is_some(&self) -> bool {
-        false
+        self.recording_slot
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 }
 
