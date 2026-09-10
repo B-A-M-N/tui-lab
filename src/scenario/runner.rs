@@ -83,6 +83,96 @@ pub struct ScenarioRunReport {
     pub step_results: Vec<StepResult>,
 }
 
+/// Aggregate verdict across repeated runs (P1-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlakinessVerdict {
+    /// Every repeat passed. With `repeat=1`, this is an ordinary pass.
+    StablePass,
+    /// Every repeat failed. With `repeat=1`, this is an ordinary failure.
+    StableFailure,
+    /// Mixed pass/fail outcomes across repeats.
+    Flaky,
+}
+
+impl FlakinessVerdict {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::StablePass => "stable_pass",
+            Self::StableFailure => "stable_failure",
+            Self::Flaky => "flaky",
+        }
+    }
+}
+
+/// Aggregate result for repeated scenario replay. `runs` retains only the
+/// first and last run when repeat > 2; complete histories would scale N×
+/// exactly the way flakiness evidence should not.
+#[derive(Debug, serde::Serialize)]
+pub struct ScenarioRepeatReport {
+    pub repeat: u32,
+    pub passed_runs: u32,
+    pub failed_runs: u32,
+    pub verdict: FlakinessVerdict,
+    /// Pass rate as a percentage (0–100), rounded down.
+    pub pass_rate_pct: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_run: Option<ScenarioRunReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ScenarioRunReport>,
+}
+
+impl ScenarioRunner {
+    /// Repeat a replay and classify flakiness (P1-23). A repeat count of 1
+    /// is equivalent to [`Self::run_in_run_with_policy`] plus an aggregate
+    /// verdict.
+    pub fn run_repeat(
+        scenario: &Scenario,
+        session: &mut crate::session::state::Session,
+        values: &[ParameterValue],
+        run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+        policy: Option<super::model::FailurePolicy>,
+        repeat: u32,
+    ) -> ScenarioRepeatReport {
+        let repeat = repeat.max(1);
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+        let mut first: Option<ScenarioRunReport> = None;
+        let mut last: Option<ScenarioRunReport> = None;
+        for i in 0..repeat {
+            let report = Self::run_in_run_with_policy(scenario, session, values, run, policy);
+            let run_passed = report.steps_failed == 0 && report.steps_skipped == 0;
+            if run_passed {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
+            if first.is_none() {
+                first = Some(report);
+            } else if i == repeat.saturating_sub(1) {
+                last = Some(report);
+            }
+        }
+        let verdict = if failed == 0 {
+            FlakinessVerdict::StablePass
+        } else if passed == 0 {
+            FlakinessVerdict::StableFailure
+        } else {
+            FlakinessVerdict::Flaky
+        };
+        let pass_rate = ((passed * 100) / repeat.max(1)) as u8;
+        ScenarioRepeatReport {
+            repeat,
+            passed_runs: passed,
+            failed_runs: failed,
+            verdict,
+            pass_rate_pct: pass_rate,
+            first_run: first,
+            last_run: if repeat > 2 { last } else { None },
+        }
+    }
+}
+
 /// Replays a scenario against a session.
 pub struct ScenarioRunner;
 
