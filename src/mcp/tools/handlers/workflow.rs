@@ -200,6 +200,17 @@ fn component_identity(
                 })
             })
             .flatten();
+        // P1-46: classify the join method. Exact native/framework ID is
+        // the only attested route; the fallback coverage-target slug match
+        // is heuristic and stays non-actionable.
+        let join_method = native_id
+            .as_ref()
+            .map(|_| "exact_native_id")
+            .unwrap_or("coverage_target_heuristic");
+        let confidence = match join_method {
+            "exact_native_id" => 1.0,
+            _ => 0.7,
+        };
         let loci: Vec<_> = finding
             .source_refs
             .iter()
@@ -228,6 +239,8 @@ fn component_identity(
         identities.push(json!({
             "semantic_target": t,
             "native_id": native_id,
+            "join_method": join_method,
+            "join_confidence": confidence,
             "source_refs": loci,
             "loci_known": !loci.is_empty(),
             "provenance_scope": "target",
