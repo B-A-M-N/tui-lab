@@ -130,6 +130,10 @@ pub struct TmuxBackend {
     last_output_at_ms: u64,
     /// Last captured raw text, for change detection without re-parsing.
     last_capture: String,
+    /// Independent fingerprints: raw rendered text can change with color
+    /// only, while a canonical grid distinguishes content and visual state.
+    content_hash: String,
+    visual_hash: String,
     recording_slot: RecordingHookSlot,
     /// Kill the pane when TUI-Lab stops the session? Default NO: the TUI
     /// predates the session and must outlive it (item 18).
@@ -171,6 +175,8 @@ impl TmuxBackend {
             last_screen_change_at_ms: 0,
             last_output_at_ms: 0,
             last_capture: String::new(),
+            content_hash: String::new(),
+            visual_hash: String::new(),
             recording_slot: new_recording_hook_slot(),
             kill_on_stop: false,
             started: false,
@@ -319,6 +325,10 @@ impl TmuxBackend {
             self.last_title.clone(),
             Vec::new(),
         );
+        // Independent content/visual fingerprints: style-only pane changes
+        // alter the visual state without changing canonical text/content.
+        self.content_hash = state.semantic_identity();
+        self.visual_hash = state.visual_hash.clone();
         // Scrollback: tmux's own history buffer (bounded by the server's
         // history-limit; we take what it gives us rather than lying).
         if let Ok(hist) = self.tmux(&[
@@ -335,6 +345,16 @@ impl TmuxBackend {
             state.scrollback = lines[..start].to_vec();
         }
         Ok(state)
+    }
+
+    /// Visual-only edge marker: a rendered style change not reflected in
+    /// canonical content participates in interaction activity.
+    fn visual_only_edge(&self) -> u64 {
+        if self.visual_hash != self.content_hash {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -663,35 +683,10 @@ impl TerminalBackend for TmuxBackend {
     }
 
     fn search(&mut self, query: &str) -> BackendResult<Vec<SearchHit>> {
+        // P1-26: use the shared search engine. Backend choice must not
+        // change case sensitivity, all-hit behavior, or hit encoding.
         let state = self.refresh()?;
-        let mut hits = Vec::new();
-        for (y, line) in state.viewport_text.iter().enumerate() {
-            if let Some(x) = line.find(query) {
-                hits.push(SearchHit {
-                    region: "viewport".into(),
-                    row: y as u32,
-                    start: x as u32,
-                    len: query.len() as u32,
-                    line: line.clone(),
-                });
-            }
-        }
-        // Audit P0-41: search SCROLLBACK too. The pane history is the
-        // half of the buffer a crash most likely scrolled the evidence
-        // into; a viewport-only search silently missed it. Rows are
-        // indexed above the viewport (row 0 of scrollback = oldest).
-        for (y, line) in state.scrollback.iter().enumerate() {
-            if let Some(x) = line.find(query) {
-                hits.push(SearchHit {
-                    region: "scrollback".into(),
-                    row: y as u32,
-                    start: x as u32,
-                    len: query.len() as u32,
-                    line: line.clone(),
-                });
-            }
-        }
-        Ok(hits)
+        Ok(crate::backend::search_screen(&state, query))
     }
 
     fn command_state(&mut self) -> Option<CommandState> {
@@ -789,12 +784,20 @@ impl TerminalBackend for TmuxBackend {
     }
 
     fn event_state(&self) -> TerminalEventState {
+        // Content and visual are independent dimensions. Interaction is a
+        // superset of rendered content, visual-only changes, bells, and
+        // titles — all user-observable activity.
+        let content_seq = self.screen_seq;
+        let visual_seq = content_seq + self.visual_only_edge();
         TerminalEventState {
             output_seq: self.output_seq,
             screen_seq: self.screen_seq,
-            content_seq: self.screen_seq,
-            visual_seq: self.screen_seq,
-            interaction_seq: self.screen_seq + self.bell_seq,
+            content_seq,
+            visual_seq,
+            interaction_seq: self.screen_seq
+                + self.bell_seq
+                + self.title_seq
+                + self.visual_only_edge().saturating_sub(0),
             bell_seq: self.bell_seq,
             title_seq: self.title_seq,
             last_output_at: self.last_output_at_ms,
@@ -1068,6 +1071,8 @@ mod tests {
             last_screen_change_at_ms: 0,
             last_output_at_ms: 0,
             last_capture: String::new(),
+            content_hash: String::new(),
+            visual_hash: String::new(),
             recording_slot: new_recording_hook_slot(),
             kill_on_stop: false,
             started: false,
