@@ -19,6 +19,7 @@ async fn python_session(pool: &SessionPool, code: &str) -> String {
 fn history_projection_windows_filters_and_counts() {
     use tui_lab::events::{TerminalEvent, TerminalEventKind};
     let mk = |seq: u64, kind: TerminalEventKind| TerminalEvent {
+        monotonic_ms: 0,
         seq,
         at: 1000 + seq,
         session: "s".into(),
@@ -277,6 +278,7 @@ fn event_predicate_matches_conjunctively() {
     use tui_lab::events::TerminalEventKind;
     use tui_lab::mcp::params::EventPredicate;
     let mk = |seq: u64, kind: TerminalEventKind| tui_lab::events::TerminalEvent {
+        monotonic_ms: 0,
         seq,
         at: 1000 + seq,
         session: "s".into(),

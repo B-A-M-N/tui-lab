@@ -61,8 +61,11 @@ pub struct BusEvent {
     pub source: BusSource,
     /// That source's own 1-based counter (its Nth event).
     pub source_seq: u64,
-    /// Unix-millis timestamp.
+    /// Unix-millis timestamp (human correlation only).
     pub at: u64,
+    /// Monotonic milliseconds since process start (causal timing).
+    #[serde(default)]
+    pub monotonic_ms: u64,
     /// Session the event belongs to.
     pub session: String,
     /// What happened, per source.
@@ -177,6 +180,7 @@ impl EventBus {
             source,
             source_seq,
             at: now_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
             session: session.to_string(),
             kind,
         });
@@ -310,6 +314,7 @@ impl BusEvent {
             },
             source_seq,
             at: ev.at,
+            monotonic_ms: ev.monotonic_ms,
             session: ev.session.clone(),
             kind: BusEventKind::Terminal(ev.kind.clone()),
         }
@@ -411,6 +416,10 @@ mod tests {
         bus.publish_native("s", "focus:list");
         bus.publish_coverage("s", "src/main.rs:42");
         assert_eq!(bus.total(), 3, "all sources share one timeline");
+        assert!(
+            bus.since(0).events.windows(2).all(|w| w[0].monotonic_ms <= w[1].monotonic_ms),
+            "unified bus preserves monotonic causal stamps"
+        );
 
         let batch = bus.since(0);
         assert_eq!(batch.events.len(), 3);

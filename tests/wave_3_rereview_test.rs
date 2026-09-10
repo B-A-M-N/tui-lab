@@ -271,6 +271,7 @@ fn bell_only_change_counts_as_material() {
     let after = tui_lab::screen::ScreenState::new(80, 24);
     let transition = tui_lab::screen::diff::diff(&before, &after);
     let event = TerminalEvent {
+        monotonic_ms: 0,
         seq: 1,
         at: 0,
         session: "s".into(),
@@ -307,6 +308,7 @@ fn native_only_change_counts_as_material() {
     let after = tui_lab::screen::ScreenState::new(80, 24);
     let transition = tui_lab::screen::diff::diff(&before, &after);
     let event = TerminalEvent {
+        monotonic_ms: 0,
         seq: 2,
         at: 0,
         session: "s".into(),

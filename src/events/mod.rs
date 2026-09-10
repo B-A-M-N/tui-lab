@@ -37,8 +37,12 @@ pub use bus::{
 pub struct TerminalEvent {
     /// Monotonic sequence (per session, 1-based; 0 is "no events yet").
     pub seq: u64,
-    /// Unix-millis timestamp.
+    /// Unix-millis timestamp (human correlation only).
     pub at: u64,
+    /// Monotonic milliseconds since process start. Authoritative for
+    /// causal ordering and durations; immune to wall-clock changes.
+    #[serde(default)]
+    pub monotonic_ms: u64,
     /// Session the event belongs to (denormalized so a drained ring can be
     /// shipped to run artifacts without extra context).
     pub session: String,
@@ -180,6 +184,7 @@ impl TerminalEventQueue {
         let ev = TerminalEvent {
             seq,
             at: now_ms(),
+            monotonic_ms: monotonic_ms(),
             session: session.to_string(),
             generation,
             kind,
@@ -265,6 +270,14 @@ fn now_ms() -> u64 {
     unix_ms()
 }
 
+/// Milliseconds from a monotonic process-start origin.
+pub fn monotonic_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Unix-millis timestamp (public: transaction latency math shares the event
 /// queue's clock so input→first-byte is measured on ONE timeline).
 pub fn unix_ms() -> u64 {
@@ -292,6 +305,10 @@ mod tests {
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.cursor, b);
         assert!(batch.events[0].at > 0, "timestamped");
+        assert!(
+            batch.events[0].monotonic_ms <= batch.events[1].monotonic_ms,
+            "monotonic stamps are causal and non-decreasing"
+        );
         assert_eq!(batch.events[1].kind.name(), "process_started");
     }
 
@@ -360,6 +377,7 @@ mod tests {
         let ev = TerminalEvent {
             seq: 7,
             at: 1234,
+            monotonic_ms: 42,
             session: "s1".into(),
             generation: 2,
             kind: TerminalEventKind::ScreenChanged {
