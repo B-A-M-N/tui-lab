@@ -255,7 +255,7 @@ impl Capabilities {
             WaitCond::ProcessExit => WaitCapability::ProcessExit,
             WaitCond::Title(_) => WaitCapability::Title,
             WaitCond::Bell { .. } => WaitCapability::Bell,
-            WaitCond::AnyActivity { .. } => WaitCapability::ScreenChange,
+            WaitCond::AnyActivity { .. } => WaitCapability::AnyActivity,
             WaitCond::Idle { .. } => WaitCapability::Idle,
             WaitCond::CommandDone { .. } | WaitCond::CommandOutput { .. } => {
                 WaitCapability::CommandDone

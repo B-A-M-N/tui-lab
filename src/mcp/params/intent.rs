@@ -51,6 +51,13 @@ pub struct TuiIntentParams {
     /// `max_risk` covering them — planning alone never authorizes them.
     #[serde(default)]
     pub plan_id: Option<String>,
+    /// Explicit no-wait policy for the payload action. Equivalent to
+    /// completion=no_wait and preserved on recorded replay.
+    #[serde(default)]
+    pub no_wait: Option<bool>,
+    /// Explicit completion budget ceiling preserved on recorded replay.
+    #[serde(default)]
+    pub settle_budget_ms: Option<u64>,
     /// Finding 3D: explicit risk ceiling for execution. Accepted values:
     /// `safe` < `mutating` < `destructive` < `external_side_effect` <
     /// `unknown`. Execution is refused when the plan's risk exceeds this.

@@ -439,11 +439,13 @@ impl TerminalBackend for PortablePtyBackend {
                 self.write_input(&bytes)?;
             }
             Input::Keys(keys) => {
-                // Execute the complete sequence (spec section 32).
+                // Execute the complete sequence (spec section 32) without
+                // partial delivery: encode every key before the first write.
+                let mut payload: Vec<u8> = Vec::new();
                 for kev in keys {
-                    let bytes = encode_key(&kev, &modes)?;
-                    self.write_input(&bytes)?;
+                    payload.extend(encode_key(&kev, &modes)?);
                 }
+                self.write_input(&payload)?;
             }
             Input::Text(t) => {
                 let bytes = t.into_bytes();
@@ -465,36 +467,30 @@ impl TerminalBackend for PortablePtyBackend {
                 self.write_input(&b)?;
             }
             Input::MouseClick { button, x, y } => {
-                // Enforce mouse mode gating for press.
+                // A click is press + release back-to-back (audit item 8).
+                // Encode and validate the complete click BEFORE the press:
+                // Press-only mode cannot represent a complete click, and
+                // writing the press first would leave a half mutation.
                 match modes.mouse_mode {
                     MouseMode::None => {
                         return Err(BackendError::Unsupported(
                             "mouse reporting is not enabled by the application".into(),
                         ));
                     }
-                    MouseMode::Press
-                    | MouseMode::PressRelease
-                    | MouseMode::ButtonMotion
-                    | MouseMode::AnyMotion => {} // press is allowed
+                    MouseMode::Press => {
+                        return Err(BackendError::Unsupported(
+                            "mouse release not supported in Press-only mode; a complete click is unrepresentable".into(),
+                        ));
+                    }
+                    MouseMode::PressRelease | MouseMode::ButtonMotion | MouseMode::AnyMotion => {}
                 }
-                // A click is press + release back-to-back (audit item 8).
-                let press =
+                let mut payload =
                     encode_mouse_event(&MouseEvent::Press { button, x, y }, modes.mouse_encoding)?;
-                self.write_input(&press)?;
-                // Enforce mouse mode gating for release. Release is only
-                // rejected in the most minimal mode (Press / 1000); even
-                // 1002 (ButtonMotion) requires a release event so the
-                // application can distinguish it from a button-held drag.
-                if modes.mouse_mode == MouseMode::Press {
-                    return Err(BackendError::Unsupported(
-                        "mouse release not supported in Press-only mode".into(),
-                    ));
-                } // release allowed (PressRelease, ButtonMotion, AnyMotion)
-                let release = encode_mouse_event(
+                payload.extend(encode_mouse_event(
                     &MouseEvent::Release { button, x, y },
                     modes.mouse_encoding,
-                )?;
-                self.write_input(&release)?;
+                )?);
+                self.write_input(&payload)?;
             }
             Input::Mouse(ev) => {
                 // Enforce mouse mode gating.
@@ -675,7 +671,8 @@ impl TerminalBackend for PortablePtyBackend {
         caps.colors = true;
         caps.cell_attributes = true;
         caps.signals = cfg!(unix);
-        caps.native_semantic = true;
+        // Session overlays native_semantic after it proves the channel.
+        // (capability intentionally not claimed here)
         caps.process_ownership = super::ProcessOwnership::SpawnedChild;
         // --- audit finding 37: the portable engine is the reference backend —
         //     every operation-oriented capability it advertises is backed by a

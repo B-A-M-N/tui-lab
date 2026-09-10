@@ -271,6 +271,7 @@ fn flow_debug_existing_tui() -> serde_json::Value {
                      verb: IntentVerbParam::Name("activate".into()),
                      id: Some(SESSION_PLACEHOLDER.into()), execute: Some(false),
                      sensitive: None, completion: None, plan_id: None, max_risk: None,
+                     no_wait: None, settle_budget_ms: None,
                  }).unwrap()),
             step("tui_audit", "record the pre-fix state under a label — the baseline the fix is diffed against",
                  serde_json::to_value(TuiAuditParams {

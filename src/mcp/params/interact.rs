@@ -225,6 +225,19 @@ impl TuiCompletionParam {
         }
     }
 
+    /// The canonical wire name for this completion, so recorded scenarios
+    /// can persist it losslessly.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TuiCompletionParam::Name(n) => n.as_str(),
+            TuiCompletionParam::Spec(s) => match s {
+                CompletionSpec::StableScreen { .. } => "stable_screen",
+                CompletionSpec::TextAppears { .. } => "text_appears",
+                CompletionSpec::TextDisappears { .. } => "text_disappears",
+            },
+        }
+    }
+
     /// The quiet-window override declared by this wire value, if any
     /// (`{"type":"stable_screen","quiet_ms":400}`).
     pub fn quiet_ms(&self) -> Option<u64> {

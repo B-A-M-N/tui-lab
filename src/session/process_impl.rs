@@ -100,9 +100,8 @@ impl Session {
         // write their real tree there. A channel from a prior generation is
         // reset (same path, fresh content).
         if self.native.path.is_none() {
-            if let Ok(ch) = crate::semantic::native::NativeChannel::create() {
-                self.native = ch;
-            }
+            self.native = crate::semantic::native::NativeChannel::create()
+                .map_err(|e| anyhow::anyhow!("create native semantic channel: {e}"))?;
         } else {
             self.native.reset();
         }

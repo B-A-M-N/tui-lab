@@ -435,8 +435,21 @@ impl ScenarioRunner {
                                                         key,
                                                         ..
                                                     } => {
+                                                        let (
+                                                            focus_completion,
+                                                            focus_quiet,
+                                                            focus_budget,
+                                                            focus_no_wait,
+                                                        ) = intent_execution_policy(&params);
                                                         if let Err(e) = drive_intent_step(
-                                                            session, run, key, vis,
+                                                            session,
+                                                            run,
+                                                            key,
+                                                            vis,
+                                                            focus_completion,
+                                                            focus_quiet,
+                                                            focus_budget,
+                                                            focus_no_wait,
                                                         ) {
                                                             ok = false;
                                                             why = format!("focus move failed: {e}");
@@ -473,8 +486,21 @@ impl ScenarioRunner {
                                                         }
                                                     }
                                                     crate::intent::PlannedStep::Act(action) => {
+                                                        let (
+                                                            payload_completion,
+                                                            payload_quiet,
+                                                            payload_budget,
+                                                            payload_no_wait,
+                                                        ) = intent_execution_policy(&params);
                                                         if let Err(e) = drive_intent_step(
-                                                            session, run, action, vis,
+                                                            session,
+                                                            run,
+                                                            action,
+                                                            vis,
+                                                            payload_completion,
+                                                            payload_quiet,
+                                                            payload_budget,
+                                                            payload_no_wait,
                                                         ) {
                                                             ok = false;
                                                             why =
@@ -612,22 +638,27 @@ impl ScenarioRunner {
 /// same driving pipeline the live intent path uses (frames, ledger,
 /// event fold under the run's ticket), so a recorded intent's replay is
 /// evidenced identically to its original execution.
+#[allow(clippy::too_many_arguments)]
 fn drive_intent_step(
     session: &mut crate::session::state::Session,
     run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
     action: &crate::execution::CanonicalAction,
     vis: crate::execution::InputVisibility,
+    completion: crate::capture::CompletionPolicy,
+    quiet_ms: u64,
+    budget_ms: u64,
+    no_wait: bool,
 ) -> Result<crate::execution::InteractionTransaction, anyhow::Error> {
     match run {
         Some(run) => {
             let ticket = crate::execution::RunTicket::capture(run);
             let spec = crate::execution::CoreDriveSpec {
                 action,
-                quiet_ms: 150,
-                budget_ms: 1150,
-                no_wait: false,
+                quiet_ms,
+                budget_ms,
+                no_wait,
                 visibility: vis,
-                completion: crate::capture::CompletionPolicy::StableScreen,
+                completion,
                 guard: None,
                 scenario: None,
                 origin: crate::execution::DriveOrigin::Scenario,
@@ -635,10 +666,60 @@ fn drive_intent_step(
             };
             crate::execution::drive_pipeline(session, run, spec).map(|o| o.tx)
         }
-        None => {
-            crate::execution::execute_act_with_visibility(session, action, 150, 1150, false, vis)
-        }
+        None => crate::execution::execute_act_with_completion(
+            session, action, quiet_ms, budget_ms, no_wait, vis, completion,
+        ),
     }
+}
+
+/// Decode the recorded intent execution policy. Older scenarios without
+/// these fields keep the documented 150ms/1150ms StableScreen behavior.
+fn intent_execution_policy(
+    params: &serde_json::Value,
+) -> (crate::capture::CompletionPolicy, u64, u64, bool) {
+    use crate::capture::CompletionPolicy as CP;
+    let quiet = params
+        .get("quiet_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(150);
+    let budget = params
+        .get("settle_budget_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(quiet.saturating_add(1000));
+    let no_wait = params
+        .get("no_wait")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let completion = params
+        .get("completion")
+        .and_then(|v| v.as_str())
+        .map(|name| match name {
+            "first_change" => CP::FirstScreenChange,
+            "any_change" => CP::AnyObservableChange,
+            "text_appears" => CP::TextAppears(
+                params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            "text_disappears" => CP::TextDisappears(
+                params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            "process_exit" => CP::ProcessExit,
+            "command_done" => CP::CommandDone,
+            "bell" => CP::Bell,
+            "semantic_change" => CP::SemanticChange,
+            "may_be_silent" => CP::MayBeSilent,
+            "no_wait" => CP::NoWait,
+            _ => CP::StableScreen,
+        })
+        .unwrap_or(CP::StableScreen);
+    (completion, quiet, budget, no_wait)
 }
 
 /// Compile a recorded precondition into an executor [`MutationGuard`]

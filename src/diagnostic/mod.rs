@@ -214,14 +214,14 @@ pub fn run_probe_with_guard(
     // inside its own window and leaves the queue intact for every other
     // reader (re-review Wave-2: the queue is the authority; drains are gone).
 
-    // 1) Baseline — pure peek of the latest committed frame, cursor pinned
-    //    BEFORE any stimulus so the window is causal.
-    let before = session
-        .last()
-        .cloned()
-        .or_else(|| session.observe(0).ok())
-        .ok_or_else(|| anyhow::anyhow!("probe needs a baseline frame"))?;
+    // 1) Baseline. For a stimulated probe the canonical executor's exact
+    //    pre-dispatch frame is authoritative; for a drift probe use a pure
+    //    current snapshot. This prevents asynchronous drift between an
+    //    older cached observation and the actual stimulus from being
+    //    misattributed to the experiment.
+    let observed_before = session.snapshot_fresh()?.frame;
     let pre_seq = session.event_queue_last_seq();
+    let before = observed_before.clone();
 
     // 2+3) Apply the stimulus and decide "after" via the canonical
     //       executor's compiled completion plan. The transition-frame
@@ -264,6 +264,13 @@ pub fn run_probe_with_guard(
         Some(tx) => tx.after_frame.state.clone(),
         None => session.last().cloned().unwrap_or(before.clone()),
     };
+    // Stimulated probe causality: the public baseline is the executor's
+    // exact pre-send frame, so any drift observed before dispatch cannot
+    // be folded into the stimulus transition.
+    let before = tx
+        .as_ref()
+        .map(|tx| tx.before_frame.state.clone())
+        .unwrap_or(before);
 
     // 4) Diff.
     let transition = crate::screen::diff::diff(&before, &after);
