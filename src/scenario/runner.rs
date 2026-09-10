@@ -241,6 +241,41 @@ impl ScenarioRunner {
         let mut passed = 0;
         let mut failed = 0;
         let mut skipped = 0;
+        // P1-21: a scenario that owns a target (`inherit_session=false`)
+        // must not silently run against whatever session the caller
+        // supplied. Scenario-owned launch/restart/cleanup requires an
+        // ownership-aware runner surface; refuse the mismatch loudly until
+        // that surface exists rather than pretending a supplied session is
+        // the declared target.
+        if !scenario.inherit_session {
+            return ScenarioRunReport {
+                scenario_name: scenario.name.clone(),
+                scenario_id: scenario.id.clone(),
+                scenario_schema: scenario.schema.clone(),
+                started_monotonic_ms: Some(crate::events::monotonic_ms()),
+                finished_monotonic_ms: Some(crate::events::monotonic_ms()),
+                status: RunStatus::StoppedOnFailure,
+                steps_total: scenario.steps.len(),
+                steps_passed: 0,
+                steps_failed: 0,
+                steps_skipped: scenario.steps.len(),
+                step_results: scenario
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, step)| StepResult {
+                        index: i,
+                        kind: format!("{:?}", step.kind).to_lowercase(),
+                        passed: false,
+                        status: StepStatus::Skipped,
+                        error_category: Some(StepErrorCategory::InvalidParams),
+                        detail: "scenario_ownership_unsupported: inherit_session=false requires a scenario-owned launch/restart/cleanup runner surface".to_string(),
+                        transaction_seq: None,
+                        elapsed_ms: None,
+                    })
+                    .collect(),
+            };
+        }
         // Effective policy: caller override wins over the recorded one; the
         // serde default for old scenario files is stop — continuing past a
         // failed step compounds the failure it should be reporting (audit
