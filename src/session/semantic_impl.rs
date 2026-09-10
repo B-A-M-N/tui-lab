@@ -406,7 +406,13 @@ impl Session {
             &mut self.semantic.cache().borrow_mut(),
             &self.native,
         );
-        let semantic_identity = crate::semantic::semantic_identity_fused(&sem, &tree);
+        // P1-30: fused evidence uses the unified V2 projection so
+        // affordances/components/relationships/native revision participate
+        // in identity, not only controls/regions/tree.
+        let native_revision = self.native.revision();
+        let semantic_identity =
+            crate::semantic::SemanticIdentityV2::from_fused(&sem, &tree, native_revision)
+                .identity();
         crate::session::state::FrameAnalysis {
             frame: screen,
             semantic: sem,
