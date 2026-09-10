@@ -284,27 +284,29 @@ impl TuiLabServer {
         R: Send + 'static,
         F: FnOnce(&mut crate::session::Session, crate::execution::RunTicket) -> R + Send + 'static,
     {
-        // Capture the ticket INSIDE the same lock windows the guards use:
-        // the last lock read here is the ownership check, so re-reading the
-        // run id immediately after (still before any await on the actor)
-        // observes the same run unless a switch lands in that sliver — and
-        // the commit-time verify catches even that: the ticket names the
-        // run this job was authorized under AS OF the authorization
-        // locks, and any later commit into a different id refuses.
+        // P0-3: capture the sink/ticket UNDER THE SAME SHARED LIFECYCLE
+        // LEASE used for admission. A queued resume/new/close cannot land
+        // between authorization and actor dispatch: it waits for this
+        // lease, so the ticket names the run the session was admitted
+        // under, not a race-era value.
+        let lease = self.lifecycle.shared("with_sess_authorized").await;
+        self.admit_under_lease(id)?;
         let sink = crate::execution::RunEvidenceSink::capture(&self.run);
         let ticket = sink.ticket().clone();
-        // Beta-audit P0-7: the sink rides the SESSION for the job's whole
-        // actor turn, so every transaction the canonical executor produces
-        // inside it — including from paths that never see the run Arc
-        // (audit drivers, exploration, conformance, repro) — commits
-        // through the ONE ticket-verified pipeline.
-        self.with_sess(id, move |sess| {
-            sess.install_evidence_sink(sink);
-            let out = job(sess, ticket);
-            sess.take_evidence_sink();
-            out
-        })
-        .await
+        let out = self
+            .with_sess_leased(
+                id,
+                move |sess| {
+                    sess.install_evidence_sink(sink);
+                    let out = job(sess, ticket);
+                    sess.take_evidence_sink();
+                    out
+                },
+                &lease,
+            )
+            .await;
+        drop(lease);
+        out
     }
 
     /// Bind a freshly launched session to the current run, and its owner on

@@ -129,18 +129,31 @@ pub(crate) async fn tui_wait(
         }
         let selector = p.id.clone();
         let budget = p.budget_ms.unwrap_or(5000);
+        // Event waits get the SAME ticket-verified scenario/evidence
+        // bookkeeping as backend waits: otherwise record_start loses the
+        // step even though replay supports it.
+        let sink = crate::execution::RunEvidenceSink::capture(&s.run);
         return s
             .with_sess(
                 selector.as_deref(),
                 move |sess| match crate::execution::execute_wait_event(sess, &predicate, budget) {
-                    Ok(out) => ok(json!({
-                        "met": out.met,
-                        "timeout": !out.met,
-                        "matched_seq": out.matched_seq,
-                        "matched_at": out.matched_at,
-                        "last_seq": out.last_seq,
-                        "elapsed_ms": out.elapsed_ms,
-                    })),
+                    Ok(out) => {
+                        let (sid, gen) = (sess.id.clone(), sess.generation);
+                        sink.record_event(&sid, "wait");
+                        sink.record_scenario_wait(
+                            &sid,
+                            gen,
+                            serde_json::to_value(&p).unwrap_or_default(),
+                        );
+                        ok(json!({
+                            "met": out.met,
+                            "timeout": !out.met,
+                            "matched_seq": out.matched_seq,
+                            "matched_at": out.matched_at,
+                            "last_seq": out.last_seq,
+                            "elapsed_ms": out.elapsed_ms,
+                        }))
+                    }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
                 },
             )
