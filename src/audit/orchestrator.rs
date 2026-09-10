@@ -556,21 +556,23 @@ pub fn run_profile(session: &mut Session, profile_name: &str) -> Result<ProfileR
 ///                withheld with an ORCH-GATED finding naming why —
 ///                the default for sessions we did not launch
 /// AllowMutation  all profiles run (the historical behavior; explicit)
-/// DeepIsolation  AllowMutation plus restart-replay between
+/// RestartBetweenMutations  AllowMutation plus restart-replay between
 ///                PotentiallyMutating drivers so each sees a fresh app
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyPolicy {
     SafeOnly,
     AllowMutation,
-    DeepIsolation,
+    /// Formerly `RestartBetweenMutations`. The policy only restarts between mutating
+    /// probes and cannot undo filesystem/network/external side effects.
+    RestartBetweenMutations,
 }
 
 impl SafetyPolicy {
     /// Whether this profile may run at all under the policy.
     fn allows(&self, profile: &AuditProfile) -> bool {
         match self {
-            SafetyPolicy::AllowMutation | SafetyPolicy::DeepIsolation => true,
+            SafetyPolicy::AllowMutation | SafetyPolicy::RestartBetweenMutations => true,
             SafetyPolicy::SafeOnly => !profile.risk().is_invasive(),
         }
     }
@@ -835,17 +837,17 @@ fn run_profile_with_contract_impl(
         };
 
     // Wave 4 item 35 + audit P0-11: restart-replay between
-    // PotentiallyMutating drivers. Under DeepIsolation, before each
+    // PotentiallyMutating drivers. Under RestartBetweenMutations, before each
     // mutating driver the session is restarted from its LaunchSpec so the
     // driver sees a fresh app and leaves nothing behind for the next one.
-    // DeepIsolation is a CONTRACT, not an optimization: when isolation is
+    // RestartBetweenMutations is a CONTRACT, not an optimization: when isolation is
     // impossible (no LaunchSpec — attached brownfield), the audit refuses
     // invasive profiles outright instead of degrading to in-place
     // mutation. Observational-only profiles still run: they never touch
     // the app, so isolation is irrelevant to them.
-    let deep = policy == SafetyPolicy::DeepIsolation && session.launch().is_some();
+    let deep = policy == SafetyPolicy::RestartBetweenMutations && session.launch().is_some();
     let mut orchestration_notes: Vec<Finding> = Vec::new();
-    if policy == SafetyPolicy::DeepIsolation && !deep {
+    if policy == SafetyPolicy::RestartBetweenMutations && !deep {
         let requested_risk = descriptor(&profile).risk;
         if requested_risk.is_invasive() {
             // The requested profile can mutate and isolation is
@@ -1780,7 +1782,7 @@ mod tests {
             .expect("start");
         let report = pool
             .with_session(Some(&id), |s| {
-                run_profile_checked(s, "full", None, SafetyPolicy::DeepIsolation)
+                run_profile_checked(s, "full", None, SafetyPolicy::RestartBetweenMutations)
             })
             .await
             .expect("actor run")

@@ -76,7 +76,6 @@ pub fn handle(p: &TuiCoverageParams) -> Result<String, anyhow::Error> {
         | Some(CoverageAction::Summary)
         | Some(CoverageAction::Collect)
         | Some(CoverageAction::Delta)
-        | Some(CoverageAction::Uncovered)
         | None => match &action {
             Known::Other(other) => Ok(Envelope::<()>::fail(
                 ErrorCategory::InvalidRequest,

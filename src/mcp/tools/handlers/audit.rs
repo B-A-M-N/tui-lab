@@ -140,7 +140,7 @@ pub(crate) async fn tui_audit(
                  explicit, never implied by the isolation-like name",
             );
         }
-        crate::audit::orchestrator::SafetyPolicy::DeepIsolation
+        crate::audit::orchestrator::SafetyPolicy::RestartBetweenMutations
     } else if p.allow_mutation.unwrap_or(false) {
         crate::audit::orchestrator::SafetyPolicy::AllowMutation
     } else {
@@ -257,7 +257,7 @@ pub(crate) async fn tui_audit(
                 "policy": match policy {
                     crate::audit::orchestrator::SafetyPolicy::SafeOnly => "safe_only",
                     crate::audit::orchestrator::SafetyPolicy::AllowMutation => "allow_mutation",
-                    crate::audit::orchestrator::SafetyPolicy::DeepIsolation => {
+                    crate::audit::orchestrator::SafetyPolicy::RestartBetweenMutations => {
                         "restart_between_mutations"
                     }
                 },
