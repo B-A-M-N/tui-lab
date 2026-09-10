@@ -65,6 +65,10 @@ pub struct MutationGuardParam {
     /// Focused control id at decision time (fused semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_control_id: Option<String>,
+    /// Native semantic channel revision (beta rereview P0-1). A native-only
+    /// focus/state update can change the UI without changing the grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_revision: Option<u64>,
 }
 
 impl MutationGuardParam {
@@ -74,6 +78,7 @@ impl MutationGuardParam {
             generation: self.generation,
             structure_hash: self.structure_hash.clone(),
             focus_control_id: self.focus_control_id.clone(),
+            native_revision: self.native_revision,
         }
     }
 }

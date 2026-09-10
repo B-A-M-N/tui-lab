@@ -380,6 +380,13 @@ impl Session {
         Ok(self.analyze_screen(screen))
     }
 
+    /// Native semantic channel revision, suitable for exact stale-state
+    /// guards. Frames accepted by the channel advance this; an absent
+    /// channel is a stable `None`.
+    pub fn native_revision(&self) -> Option<u64> {
+        self.native.revision()
+    }
+
     /// THE authoritative per-frame analysis (re-review P0.4): one struct
     /// carrying the frame plus its fused semantic screen, semantic tree,
     /// native overlay report, and the fused semantic identity. Every

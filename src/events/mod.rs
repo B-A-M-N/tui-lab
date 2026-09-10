@@ -203,7 +203,10 @@ impl TerminalEventQueue {
             return batch;
         }
         let first_available = self.events[0].seq;
-        let gap = cursor != 0 && cursor + 1 < first_available;
+        // Cursor 0 explicitly means "from the beginning": when the retained
+        // window begins later because of eviction, that beginning is itself
+        // a gap, not a complete history.
+        let gap = cursor + 1 < first_available;
         let events: Vec<TerminalEvent> = self
             .events
             .iter()
@@ -328,6 +331,12 @@ mod tests {
         // A far-behind consumer learns about the gap.
         let batch = q.since(1);
         assert!(batch.gap, "consumer behind eviction must see the gap");
+        let from_zero = q.since(0);
+        assert!(
+            from_zero.gap,
+            "since(0) means 'from the beginning'; eviction makes that a partial view"
+        );
+        assert_eq!(from_zero.first_available, q.first_available());
         assert_eq!(batch.first_available, q.first_available());
         // An up-to-date consumer sees no gap.
         let fresh = q.since(q.last_seq());

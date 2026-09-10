@@ -237,7 +237,10 @@ impl EventBus {
     /// subscriber — this does not advance it.
     pub fn since(&self, cursor: u64) -> BusBatch {
         let first = self.events.front().map(|e| e.seq);
-        let gap = cursor != 0 && first.map(|f| cursor + 1 < f).unwrap_or(true);
+        // Cursor 0 asks from the beginning. If the retained front is newer,
+        // the subscriber explicitly requested a history that is only partly
+        // available; do not suppress that fact.
+        let gap = first.map(|f| cursor + 1 < f).unwrap_or(false);
         let events: Vec<BusEvent> = self
             .events
             .iter()

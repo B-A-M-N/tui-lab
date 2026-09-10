@@ -13,6 +13,40 @@ use rmcp::serde_json::json;
 /// conformance-running contract action — passive unless the caller
 /// explicitly passes allow_mutation=true. `tui_audit profile=contract`
 /// derives its policy from the same knob via SafetyPolicy.
+fn write_contract_atomically(
+    path: &std::path::Path,
+    yaml: &str,
+) -> Result<ScaffoldWriteMeta, anyhow::Error> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let existed = path.exists();
+    let tmp = path.with_extension("yaml.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(yaml.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    let bytes = yaml.len();
+    Ok(ScaffoldWriteMeta {
+        path: path.display().to_string(),
+        bytes,
+        hash: blake3::hash(yaml.as_bytes()).to_string(),
+        created: !existed,
+    })
+}
+
+struct ScaffoldWriteMeta {
+    path: String,
+    bytes: usize,
+    hash: String,
+    created: bool,
+}
+
 fn exec_policy(p: &TuiContractParams) -> crate::design::conformance::ExecPolicy {
     if p.allow_mutation.unwrap_or(false) {
         crate::design::conformance::ExecPolicy::Driving
@@ -430,6 +464,23 @@ pub(crate) async fn tui_contract(
                     Ok(y) => y,
                     Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
                 };
+                let saved_path = match p.path.as_deref() {
+                    Some(path) => {
+                        match write_contract_atomically(std::path::Path::new(path), &yaml) {
+                            Ok(meta) => Some(meta),
+                            Err(e) => return err(ErrorCategory::InvalidRequest, e.to_string()),
+                        }
+                    }
+                    None => None,
+                };
+                let saved_json = saved_path.as_ref().map(|m| {
+                    json!({
+                        "path": m.path,
+                        "bytes": m.bytes,
+                        "sha256": m.hash,
+                        "created": m.created,
+                    })
+                });
                 // The extension blob names the states, so the response can
                 // cite what the pass actually saw.
                 let ext = contract
@@ -443,6 +494,7 @@ pub(crate) async fn tui_contract(
                     "action": "scaffold",
                     "scaffold_mode": "explore",
                     "inferred": true,
+                    "saved_to": saved_json,
                     "contract_name": contract.schema.name,
                     "states_observed": state_count,
                     "components": contract.components.len(),
@@ -453,7 +505,7 @@ pub(crate) async fn tui_contract(
                     "focus_order": ext["states"].as_array().map(|_| ()),
                     "candidate_invariants": ext["candidate_invariants"],
                     "clipping_evidence": ext["clipping_evidence"],
-                    "note": "scaffolded from a bounded exploratory pass (initial screen, Tab focus walk, viewport probes; NO Escape — it is not state-preserving in general). Everything declared was SEEN, nothing is yet required, and the focus invariants are UNVERIFIED candidates — see candidate_invariants. Promote deliberately (required=true / mode=validation), then tui_contract action=check to prove the candidates.",
+                    "note": "scaffolded from a bounded exploratory pass (initial screen, Tab focus walk, viewport probes; NO Escape — it is not state-preserving in general). Everything declared was SEEN, nothing is yet required, and the focus invariants are UNVERIFIED candidates — see candidate_invariants. Promote deliberately (required=true / mode=validation), then tui_contract action=status to prove the candidates.",
                     "yaml": yaml,
                 }))
             } else {
@@ -475,10 +527,28 @@ pub(crate) async fn tui_contract(
                     Ok(y) => y,
                     Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
                 };
+                let saved_path = match p.path.as_deref() {
+                    Some(path) => {
+                        match write_contract_atomically(std::path::Path::new(path), &yaml) {
+                            Ok(meta) => Some(meta),
+                            Err(e) => return err(ErrorCategory::InvalidRequest, e.to_string()),
+                        }
+                    }
+                    None => None,
+                };
+                let saved_json = saved_path.as_ref().map(|m| {
+                    json!({
+                        "path": m.path,
+                        "bytes": m.bytes,
+                        "sha256": m.hash,
+                        "created": m.created,
+                    })
+                });
                 ok(json!({
                     "action": "scaffold",
                     "scaffold_mode": "current",
                     "inferred": true,
+                    "saved_to": saved_json,
                     "contract_name": contract.schema.name,
                     "components": contract.components.len(),
                     "oracles": contract.oracles.len(),

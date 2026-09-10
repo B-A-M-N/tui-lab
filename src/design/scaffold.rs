@@ -504,17 +504,17 @@ pub fn scaffold_multi_state(gathered: &GatheredStates, launch: (u16, u16)) -> Pr
     // outright were never proven by this pass (a Tab walk says nothing
     // about Shift+Tab; Escape was never sent at all). They surface as
     // UNVERIFIED candidates with a verification recipe; the author
-    // promotes them after `tui_contract action=check` proves them.
+    // promotes them after `tui_contract action=status` proves them.
     let candidates = vec![
         ProjectContract::scaffold_candidate(
             "reverse_tab_required",
             "unverified",
-            "run tui_contract action=check with a contract that declares reverse_tab_required: true — the behavior check sweeps Tab then Shift+Tab and proves the inverse",
+            "run tui_contract action=status with a contract that declares reverse_tab_required: true — the behavior check sweeps Tab then Shift+Tab and proves the inverse",
         ),
         ProjectContract::scaffold_candidate(
             "escape_closes_modal",
             "unverified",
-            "run tui_contract action=check with an interaction whose expect declares modal_open() — the behavior check opens a modal and proves Escape dismisses it",
+            "run tui_contract action=status with an interaction whose expect declares modal_open() — the behavior check opens a modal and proves Escape dismisses it",
         ),
         ProjectContract::scaffold_candidate(
             "destructive_require_confirmation",

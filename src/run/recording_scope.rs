@@ -84,6 +84,15 @@ impl ScenarioRecording {
         self.recorder
             .record_act_sensitive(action_params, payload_field, kind, byte_len);
     }
+    /// Record an act step with a replay precondition derived by the
+    /// driving pipeline (ordinary live recording).
+    pub fn record_act_with_expect(
+        &mut self,
+        params: serde_json::Value,
+        expect: crate::scenario::model::StepExpect,
+    ) {
+        self.recorder.record_act_with_expect(params, &expect);
+    }
     pub fn record_wait(&mut self, params: serde_json::Value) {
         self.recorder.record_wait(params);
     }
