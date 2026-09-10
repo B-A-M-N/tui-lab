@@ -164,30 +164,29 @@ impl RunContext {
     /// artifact path when persistence happened, so ephemeral runs report
     /// `saved_to: null` honestly but the scenario is still listed and
     /// exportable.
+    /// Save a scenario: memory first (canonical), then disk when the run is
+    /// persistent. Prefer [`Self::save_scenario_unlocked_disk`] at MCP/handler
+    /// boundaries so the filesystem write happens outside the shared run lock
+    /// (P1-48). This method remains for callers that already own the context
+    /// and accept a synchronous write.
     pub fn save_scenario(&mut self, scenario: crate::scenario::model::Scenario) -> Option<PathBuf> {
-        // File names stay human-readable: `<name>-<id suffix>.json`. The id
-        // suffix keeps two same-named scenarios from overwriting each other
-        // on disk while the name keeps the artifact browsable. Legacy files
-        // saved as plain `<name>.json` before ids existed still load (see
-        // load_scenario's fallbacks).
+        self.save_scenario_memory(scenario.clone());
+        let dir = self.run_dir.as_ref()?.join("scenarios");
+        save_scenario_file(&dir, &scenario)
+    }
+
+    /// Reserve the scenario in canonical memory and return its durable file
+    /// stem. No filesystem work occurs here.
+    pub fn save_scenario_memory(&mut self, scenario: crate::scenario::model::Scenario) -> String {
         let short_id = scenario.id.rsplit('-').next().unwrap_or("0").to_string();
         let file_stem = format!("{}-{}", sanitize(&scenario.name), short_id);
-        self.scenarios.save(scenario.clone());
-        let dir = self.run_dir.as_ref()?.join("scenarios");
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join(format!("{}.json", file_stem));
-        // Atomic write: temp file then rename (audit item 16).
-        let tmp = path.with_extension("json.tmp");
-        let payload = serde_json::to_value(&scenario).ok()?;
-        std::fs::write(
-            &tmp,
-            crate::run::formats::Envelope::wrap(crate::run::formats::tags::SCENARIO, payload)
-                .to_vec_pretty()
-                .ok()?,
-        )
-        .ok()?;
-        std::fs::rename(&tmp, &path).ok()?;
-        Some(path)
+        self.scenarios.save(scenario);
+        file_stem
+    }
+
+    /// Run dir for scenario persistence, when durable.
+    pub fn scenario_file_dir(&self) -> Option<PathBuf> {
+        self.run_dir.as_ref().map(|d| d.join("scenarios"))
     }
 
     /// List saved scenarios in this run: the in-memory canonical set (ids)
@@ -313,4 +312,29 @@ impl RunContext {
             })
             .collect()
     }
+}
+
+/// Atomic scenario file write. Called outside the shared run lock by
+/// handler boundaries (P1-48): the in-memory canonical save has already
+/// happened, so a filesystem failure only degrades persistence, never the
+/// live run model.
+pub(crate) fn save_scenario_file(
+    dir: &std::path::Path,
+    scenario: &crate::scenario::model::Scenario,
+) -> Option<std::path::PathBuf> {
+    let short_id = scenario.id.rsplit('-').next().unwrap_or("0").to_string();
+    let file_stem = format!("{}-{}", sanitize(&scenario.name), short_id);
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!("{file_stem}.json"));
+    let tmp = path.with_extension("json.tmp");
+    let payload = serde_json::to_value(scenario).ok()?;
+    std::fs::write(
+        &tmp,
+        crate::run::formats::Envelope::wrap(crate::run::formats::tags::SCENARIO, payload)
+            .to_vec_pretty()
+            .ok()?,
+    )
+    .ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
 }

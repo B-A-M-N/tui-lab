@@ -42,7 +42,7 @@ mod identity;
 mod launch_impl;
 mod ledger_impl;
 mod persistence_impl;
-mod scenario_impl;
+pub(crate) mod scenario_impl;
 mod scenario_store;
 
 pub use artifacts::{ArtifactKind, ArtifactRef};
