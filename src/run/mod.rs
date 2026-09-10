@@ -980,6 +980,7 @@ mod tests {
         // One synthetic event batch (no PTY needed for persistence logic).
         let ev = crate::events::TerminalEvent {
             at: 0,
+            monotonic_ms: 0,
             seq: 0,
             session: "incr-sess".to_string(),
             generation: 0,
