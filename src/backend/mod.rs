@@ -186,6 +186,22 @@ pub struct Capabilities {
     pub supported_waits: Vec<WaitCapability>,
     /// Which [`Input`] families the backend's `send_input()` accepts.
     pub input_families: Vec<InputFamily>,
+    /// Declared lossiness for observability transports (P1-24). `None`
+    /// means lossless/not applicable; a backend that samples state must
+    /// expose its interval and known blind spots here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability_fidelity: Option<ObservabilityFidelity>,
+}
+
+/// How observable state is captured and what that loses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObservabilityFidelity {
+    /// "lossless", "sampled", "reconstructed".
+    pub mode: String,
+    /// Sampling interval in milliseconds; 0 for lossless/not sampled.
+    pub sampling_ms: u64,
+    /// Known events that sampling can coalesce or miss.
+    pub blind_spots: Vec<String>,
 }
 
 impl Default for Capabilities {
@@ -227,6 +243,7 @@ impl Default for Capabilities {
             event_types: Vec::new(),
             supported_waits: Vec::new(),
             input_families: Vec::new(),
+            observability_fidelity: None,
         }
     }
 }
