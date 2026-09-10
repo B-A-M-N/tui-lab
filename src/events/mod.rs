@@ -7,10 +7,10 @@
 //! replay, and incremental observation all want the same answer, so they all
 //! consume this one stream.
 //!
-//! It also hosts the unified multi-source [`bus::EventBus`] that converges
-//! terminal, shell-command (OSC 133), native, and coverage events onto one
-//! ordered timeline (review P0: "a unified event bus"); the queue below is
-//! the terminal half of that timeline.
+//! It also hosts the bounded multi-source [`bus::EventHistoryProjection`]
+//! that converges terminal, shell-command (OSC 133), native, and coverage
+//! snapshots onto one ordered view. The queue below is the canonical
+//! terminal event authority; the projection is not another authority.
 //!
 //! Design constraints:
 //! - **Bounded**: a ring of [`EVENT_RING_CAPACITY`] events; eviction is
@@ -29,7 +29,8 @@ pub const EVENT_RING_CAPACITY: usize = 4096;
 pub mod bus;
 
 pub use bus::{
-    project_history, BusBatch, BusEvent, BusEventKind, BusSource, EventBus, HistoryQuery,
+    project_history, BusBatch, BusEvent, BusEventKind, BusSource, EventHistoryProjection,
+    HistoryQuery,
 };
 
 /// One thing that happened on a terminal, in order.
