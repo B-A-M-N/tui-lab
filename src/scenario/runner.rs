@@ -234,6 +234,7 @@ impl ScenarioRunner {
                             .wait_ms()
                             .or_else(|| req.completion_quiet_ms())
                             .unwrap_or(150);
+                        let budget = req.settle_budget_ms().unwrap_or(quiet.saturating_add(1000));
                         let completion = req
                             .completion()
                             .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
@@ -256,7 +257,7 @@ impl ScenarioRunner {
                                             let spec = crate::execution::CoreDriveSpec {
                                                 action: &action,
                                                 quiet_ms: quiet,
-                                                budget_ms: quiet.saturating_add(1000),
+                                                budget_ms: budget,
                                                 no_wait: req.no_wait(),
                                                 visibility: vis,
                                                 completion,
@@ -274,7 +275,7 @@ impl ScenarioRunner {
                                                 crate::execution::DriveOrigin::Scenario,
                                                 &action,
                                                 quiet,
-                                                quiet.saturating_add(1000),
+                                                budget,
                                                 req.no_wait(),
                                                 vis,
                                                 completion,
