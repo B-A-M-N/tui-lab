@@ -252,7 +252,7 @@ pub(crate) async fn tui_audit(
             };
             ok(json!({
                 "profile": profile_wire,
-                "mode": report.mode,
+                "mode": report.mode.name(),
                 "risk": risk,
                 "policy": match policy {
                     crate::audit::orchestrator::SafetyPolicy::SafeOnly => "safe_only",

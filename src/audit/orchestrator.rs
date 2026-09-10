@@ -525,12 +525,47 @@ impl MutationRisk {
     }
 }
 
+/// Typed execution mode for an audit report. Replaces the old string mode
+/// so callers can distinguish observational reads from TUI-driving runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditExecutionMode {
+    /// Analyzed one captured frame; no live observation loop.
+    StaticFrame,
+    /// Read live terminal state without driving input.
+    ObservationalLive,
+    /// Drove the TUI through the canonical executor.
+    Driving,
+    /// Static analysis plus live drivers (e.g. `full`).
+    Composite,
+    /// Some members ran, invasive members were withheld under safe-only.
+    Partial,
+    /// Nothing ran because safety gating withheld the profile.
+    Withheld,
+    /// The requested safety contract was unattainable; nothing ran.
+    Refused,
+}
+
+impl AuditExecutionMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::StaticFrame => "static_frame",
+            Self::ObservationalLive => "observational_live",
+            Self::Driving => "driving",
+            Self::Composite => "composite",
+            Self::Partial => "partial",
+            Self::Withheld => "withheld",
+            Self::Refused => "refused",
+        }
+    }
+}
+
 /// Result of one orchestrated profile run.
 pub struct ProfileReport {
     pub profile: AuditProfile,
     /// "active" (drove the app), "static" (one frame), or "composite"
     /// (static + active, i.e. `full`).
-    pub mode: &'static str,
+    pub mode: AuditExecutionMode,
     pub findings: Vec<Finding>,
     /// Focus edges recorded by this run's drivers (Wave D item 36). Callers
     /// merge it into the run's persistent graph; static profiles leave it
@@ -666,7 +701,7 @@ pub fn run_profile_checked(
             });
             return Ok(ProfileReport {
                 profile,
-                mode: "partial",
+                mode: AuditExecutionMode::Partial,
                 findings,
                 focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
                 metrics: Vec::new(),
@@ -674,7 +709,7 @@ pub fn run_profile_checked(
         }
         return Ok(ProfileReport {
             profile: profile.clone(),
-            mode: "withheld",
+            mode: AuditExecutionMode::Withheld,
             findings: vec![Finding {
                 id: "ORCH-GATED".into(),
                 rule_id: None,
@@ -758,7 +793,7 @@ fn run_profile_with_contract_impl(
             .map_err(|e| format!("contract check failed: {e}"))?;
         return Ok(ProfileReport {
             profile,
-            mode: "composite",
+            mode: AuditExecutionMode::Composite,
             findings: report.findings(),
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             metrics: Vec::new(),
@@ -775,7 +810,7 @@ fn run_profile_with_contract_impl(
         let name = profile.name();
         return Ok(ProfileReport {
             profile,
-            mode: "static",
+            mode: AuditExecutionMode::StaticFrame,
             findings: crate::audit::run(name, &screen, &sem).map_err(|e| e.to_string())?,
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             metrics: Vec::new(),
@@ -857,7 +892,7 @@ fn run_profile_with_contract_impl(
             let profile_name = profile.name();
             return Ok(ProfileReport {
                 profile,
-                mode: "refused",
+                mode: AuditExecutionMode::Refused,
                 findings: vec![Finding {
                     id: "ORCH-DEEP-REFUSED".into(),
                     rule_id: None,
@@ -1056,10 +1091,15 @@ fn run_profile_with_contract_impl(
     findings.extend(orchestration_notes);
     findings.extend(fs);
 
+    // An observational live driver only observes the current process; a
+    // transaction-driving profile changes it. Both used to collapse into
+    // "active", which hid safety-relevant behavior from callers.
     let mode = if profile.wants_static_composite() {
-        "composite"
+        AuditExecutionMode::Composite
+    } else if descriptor(&profile).transaction {
+        AuditExecutionMode::Driving
     } else {
-        "active"
+        AuditExecutionMode::ObservationalLive
     };
     Ok(ProfileReport {
         profile,
@@ -1295,7 +1335,7 @@ mod tests {
             .await
             .expect("actor run")
             .expect("run full");
-        assert_eq!(report.mode, "composite");
+        assert_eq!(report.mode, AuditExecutionMode::Composite);
         // A plain python echo screen has little to audit, but the composite
         // must include the static passes AND have attempted the drivers.
         let cats: Vec<&str> = report
@@ -1337,7 +1377,11 @@ mod tests {
                 .await
                 .expect("actor run")
                 .unwrap_or_else(|e| panic!("{name} must run: {e}"));
-            assert_eq!(report.mode, "static", "{name} is a static profile");
+            assert_eq!(
+                report.mode,
+                AuditExecutionMode::StaticFrame,
+                "{name} is a static profile"
+            );
             // A clean python screen can legitimately produce zero findings;
             // the contract is the run SUCCEEDS and carries only real rules.
             for f in &report.findings {
@@ -1397,7 +1441,8 @@ mod tests {
             .await
             .expect("actor run")
             .expect("run terminal_modes");
-        assert_eq!(report.mode, "active");
+        // terminal_modes reads retained raw traffic and drives nothing.
+        assert_eq!(report.mode, AuditExecutionMode::ObservationalLive);
         let report = {
             let inventory_ready = report.findings.iter().any(|f| f.id == "MODE-INVENTORY")
                 && serde_json::to_value(
@@ -1743,7 +1788,7 @@ mod tests {
             .await
             .expect("actor run")
             .expect("gated report");
-        assert_eq!(report.mode, "withheld");
+        assert_eq!(report.mode, AuditExecutionMode::Withheld);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].id, "ORCH-GATED");
         let detail = serde_json::to_value(&report.findings[0].evidence).unwrap();
@@ -1757,7 +1802,7 @@ mod tests {
             .await
             .expect("actor run")
             .expect("static report");
-        assert_eq!(report.mode, "static");
+        assert_eq!(report.mode, AuditExecutionMode::StaticFrame);
         pool.stop(&id).await.ok();
     }
 
@@ -1866,7 +1911,7 @@ mod tests {
             .await
             .expect("actor run")
             .expect("run keyboard");
-        assert_eq!(report.mode, "active");
+        assert_eq!(report.mode, AuditExecutionMode::Driving);
         pool.stop(&id).await.ok();
     }
 

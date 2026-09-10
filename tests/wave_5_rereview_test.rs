@@ -405,7 +405,10 @@ async fn lifecycle_exit_is_restart_required_and_gated() {
             report.findings.iter().any(|f| f.id == "ORCH-GATED"),
             "safe-only must withhold the exit audit"
         );
-        assert_eq!(report.mode, "withheld");
+        assert_eq!(
+            report.mode,
+            tui_lab::audit::orchestrator::AuditExecutionMode::Withheld
+        );
         // The app must still be alive.
         assert!(sess.process().running, "gated audit must not touch the app");
     })
