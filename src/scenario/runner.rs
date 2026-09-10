@@ -743,6 +743,7 @@ fn compile_expect_guard(
     let guard = crate::execution::MutationGuard {
         structure_hash: expect.structure_hash.clone(),
         focus_control_id: expect.focus_control_id.clone(),
+        text_visible: expect.text_present.clone(),
         ..Default::default()
     };
     (true, detail, Some(guard))

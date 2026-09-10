@@ -266,10 +266,21 @@ pub fn compile_completion(
 /// design (re-review P0: "50–150 ms, not 1+ seconds").
 pub const SILENT_GRACE_MS: u64 = 100;
 
-/// Whether a screen's viewport or scrollback contains `text`.
+/// Whether a screen's CURRENT viewport contains `text`. Action transitions
+/// are causal state changes, so history cannot satisfy or suppress them.
 pub fn screen_contains(screen: &ScreenState, text: &str) -> bool {
+    visible_text_contains(screen, text)
+}
+
+/// Current visible text only.
+pub fn visible_text_contains(screen: &ScreenState, text: &str) -> bool {
     screen.viewport_text.iter().any(|r| r.contains(text))
-        || screen.scrollback.iter().any(|r| r.contains(text))
+}
+
+/// Retained history/scrollback text. Use explicitly for historical checks,
+/// never for causal appearance/disappearance transitions.
+pub fn history_text_contains(screen: &ScreenState, text: &str) -> bool {
+    screen.scrollback.iter().any(|r| r.contains(text))
 }
 
 /// Interpret a [`CaptureStrategy`] against a live backend and return the

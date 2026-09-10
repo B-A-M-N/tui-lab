@@ -37,6 +37,11 @@ pub struct MutationGuard {
     /// advances, the guarded belief is stale even when the grid is equal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_revision: Option<u64>,
+    /// Text that must remain visible in the CURRENT viewport. This is a
+    /// separate predicate because normalization can mask content changes
+    /// in the structural identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_visible: Option<String>,
 }
 
 impl MutationGuard {
@@ -53,6 +58,7 @@ impl MutationGuard {
             structure_hash: analysis.map(|a| a.frame.structure_hash.clone()),
             focus_control_id: analysis.and_then(|a| a.semantic.focus.control_id.clone()),
             native_revision: None,
+            text_visible: None,
         }
     }
 
@@ -127,6 +133,17 @@ impl MutationGuard {
                 }));
             }
         }
+        if let Some(want_text) = &self.text_visible {
+            if !crate::capture::visible_text_contains(&analysis.frame, want_text) {
+                return Err(json!({
+                    "category": "stale_state",
+                    "check": "text_visible",
+                    "expected": want_text,
+                    "actual": null,
+                    "summary": "required visible text is no longer on the current screen",
+                }));
+            }
+        }
         if let Some(want_focus) = &self.focus_control_id {
             let actual = analysis.semantic.focus.control_id.as_deref();
             if actual != Some(want_focus.as_str()) {
@@ -172,6 +189,7 @@ mod tests {
             structure_hash: Some("abc".into()),
             focus_control_id: Some("button/save".into()),
             native_revision: Some(7),
+            text_visible: Some("[ Save ]".into()),
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("button/save"));

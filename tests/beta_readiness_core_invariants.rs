@@ -48,6 +48,7 @@ print('\nRECEIVED',repr(data),flush=True)
             structure_hash: Some(old_hash),
             focus_control_id: None,
             native_revision: None,
+            text_visible: None,
         };
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let err = tui_lab::execution::execute_act_with_guard(

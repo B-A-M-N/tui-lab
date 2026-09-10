@@ -46,10 +46,37 @@ pub(crate) async fn tui_record(
                     return refused;
                 }
                 sess.enable_recording(false);
+                let (boundary, fidelity, lossy) = match sess.backend_kind {
+                    crate::session::state::BackendKind::PortableVt
+                    | crate::session::state::BackendKind::PtyLine => (
+                        "pty-bytes",
+                        "raw_pty_stream",
+                        false,
+                    ),
+                    crate::session::state::BackendKind::Pipe => (
+                        "separated-streams",
+                        "separated_streams",
+                        false,
+                    ),
+                    crate::session::state::BackendKind::TmuxAttach => (
+                        "rendered-pane-snapshots",
+                        "rendered_snapshots",
+                        true,
+                    ),
+                };
+                let note = if lossy {
+                    "output is reconstructed from sampled pane snapshots; it is not a raw byte stream and cannot prove protocol timing".to_string()
+                } else if boundary == "separated-streams" {
+                    "stdout and stderr are captured at their stream boundaries; call format=stop to flush to a .cast file".to_string()
+                } else {
+                    "output is captured at the raw PTY byte boundary; call format=stop to flush to a .cast file".to_string()
+                };
                 ok(json!({
                     "recording": "started",
-                    "boundary": "pty-bytes",
-                    "note": "output is captured at the raw PTY byte boundary; call format=stop to flush to a .cast file"
+                    "boundary": boundary,
+                    "fidelity": fidelity,
+                    "lossy": lossy,
+                    "note": note
                 }))
             }
             // Detach + write the .cast into the run's recordings dir.

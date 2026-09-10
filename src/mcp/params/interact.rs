@@ -69,6 +69,10 @@ pub struct MutationGuardParam {
     /// focus/state update can change the UI without changing the grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_revision: Option<u64>,
+    /// Required visible text predicate, checked in the same pre-dispatch
+    /// fused frame as the rest of the guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_visible: Option<String>,
 }
 
 impl MutationGuardParam {
@@ -79,6 +83,7 @@ impl MutationGuardParam {
             structure_hash: self.structure_hash.clone(),
             focus_control_id: self.focus_control_id.clone(),
             native_revision: self.native_revision,
+            text_visible: self.text_visible.clone(),
         }
     }
 }
