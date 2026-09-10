@@ -10,12 +10,42 @@
 use super::model::{ParameterValue, Scenario, StepKind};
 use crate::mcp::params::{TuiActRequest, TuiAssertParams, TuiWaitParams};
 
+/// Typed step status (P1-22): consumers key on status, never prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+/// Stable error category for a failed/skipped step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepErrorCategory {
+    UnresolvedParameter,
+    StaleState,
+    InvalidParams,
+    ExecutionError,
+    Timeout,
+    SkippedDueToPriorFailure,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct StepResult {
     pub index: usize,
     pub kind: String,
     pub passed: bool,
+    pub status: StepStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<StepErrorCategory>,
     pub detail: String,
+    /// Executed act-transaction ledger sequence, when the replay ran inside
+    /// a run and evidence committed successfully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 /// How a replay ended (audit finding 5): a stop-policy replay that hit a
@@ -33,6 +63,8 @@ pub enum RunStatus {
 #[derive(Debug, serde::Serialize)]
 pub struct ScenarioRunReport {
     pub scenario_name: String,
+    pub scenario_id: String,
+    pub scenario_schema: String,
     /// How the replay ended (see [`RunStatus`]).
     pub status: RunStatus,
     pub steps_total: usize,
@@ -136,10 +168,14 @@ impl ScenarioRunner {
                     index: i,
                     kind: format!("{:?}", step.kind).to_lowercase(),
                     passed: false,
+                    status: StepStatus::Skipped,
+                    error_category: Some(StepErrorCategory::SkippedDueToPriorFailure),
                     detail: format!(
                         "skipped_due_to_prior_failure: step {at} failed and the scenario's \
                          on_failure policy is 'stop'; this step was not attempted"
                     ),
+                    transaction_seq: None,
+                    elapsed_ms: None,
                 });
                 skipped += 1;
                 continue;
@@ -153,11 +189,15 @@ impl ScenarioRunner {
                     index: i,
                     kind: format!("{:?}", step.kind).to_lowercase(),
                     passed: false,
+                    status: StepStatus::Failed,
+                    error_category: Some(StepErrorCategory::UnresolvedParameter),
                     detail: format!(
                         "unresolved_parameter: '{}' was not supplied (declare it via \
                          scenario parameters and pass its value at replay time)",
                         missing
                     ),
+                    transaction_seq: None,
+                    elapsed_ms: None,
                 });
                 failed += 1;
                 if policy == super::model::FailurePolicy::Stop {
@@ -179,9 +219,13 @@ impl ScenarioRunner {
                     if !guard_ok {
                         results.push(StepResult {
                             index: i,
-                            kind: format!("{:?}", step.kind),
+                            kind: format!("{:?}", step.kind).to_lowercase(),
                             passed: false,
+                            status: StepStatus::Failed,
+                            error_category: Some(StepErrorCategory::StaleState),
                             detail: format!("stale_state: {guard_detail}"),
+                            transaction_seq: None,
+                            elapsed_ms: None,
                         });
                         failed += 1;
                         if policy == super::model::FailurePolicy::Stop {
@@ -196,9 +240,13 @@ impl ScenarioRunner {
                     if !guard_ok {
                         results.push(StepResult {
                             index: i,
-                            kind: format!("{:?}", step.kind),
+                            kind: format!("{:?}", step.kind).to_lowercase(),
                             passed: false,
+                            status: StepStatus::Failed,
+                            error_category: Some(StepErrorCategory::StaleState),
                             detail: format!("stale_state: {guard_detail}"),
+                            transaction_seq: None,
+                            elapsed_ms: None,
                         });
                         failed += 1;
                         if policy == super::model::FailurePolicy::Stop {
@@ -615,12 +663,26 @@ impl ScenarioRunner {
                 index: i,
                 kind: format!("{:?}", step.kind).to_lowercase(),
                 passed: step_passed,
+                status: if step_passed {
+                    StepStatus::Passed
+                } else {
+                    StepStatus::Failed
+                },
+                error_category: if step_passed {
+                    None
+                } else {
+                    Some(StepErrorCategory::ExecutionError)
+                },
                 detail,
+                transaction_seq: None,
+                elapsed_ms: None,
             });
         }
 
         ScenarioRunReport {
             scenario_name: scenario.name.clone(),
+            scenario_id: scenario.id.clone(),
+            scenario_schema: scenario.schema.clone(),
             status: if stopped_at.is_some() {
                 RunStatus::StoppedOnFailure
             } else {
