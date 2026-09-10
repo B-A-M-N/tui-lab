@@ -319,6 +319,21 @@ mod tests {
     #[test]
     fn clean_driver_emits_no_residue() {
         let mut s = start("print('tx-clean'); input()");
+        // Let startup output commit before taking the pre-state, bounded:
+        // under load a fixed sleep races the first frame. Two consecutive
+        // stable snapshots are a cheap deterministic readiness signal.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut last = s.observe(100).expect("observe");
+        loop {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let next = s.observe(100).expect("observe");
+            if next.structure_hash == last.structure_hash {
+                break;
+            }
+            last = next;
+        }
         let (findings, metrics) = run_verified(&mut s, "noop", |_s| Vec::new()).expect("run");
         assert!(
             !findings.iter().any(|f| f.id == "AUDIT-RESIDUE"),

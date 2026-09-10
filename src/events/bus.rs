@@ -417,7 +417,10 @@ mod tests {
         bus.publish_coverage("s", "src/main.rs:42");
         assert_eq!(bus.total(), 3, "all sources share one timeline");
         assert!(
-            bus.since(0).events.windows(2).all(|w| w[0].monotonic_ms <= w[1].monotonic_ms),
+            bus.since(0)
+                .events
+                .windows(2)
+                .all(|w| w[0].monotonic_ms <= w[1].monotonic_ms),
             "unified bus preserves monotonic causal stamps"
         );
 

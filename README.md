@@ -165,7 +165,7 @@ this section is prose, the registry is the contract.
 
 ### tui_coverage
 
-**Action:** detect, summary, collect, delta, uncovered, ledger, snapshot
+**Action:** detect, summary, collect, delta, ledger, snapshot
 
 ### tui_framework
 

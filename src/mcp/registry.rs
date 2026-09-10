@@ -952,11 +952,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("tool {tool} missing from router"))
         };
         let coverage = desc("tui_coverage");
+        // P2-58: the safest contract is that `uncovered` is not a selector
+        // at all. The description must explain the missing denominator and
+        // point to delta.
         assert!(
-            coverage.contains("uncovered")
-                && (coverage.contains("explicitly unsupported")
-                    || coverage.contains("unsupported")),
-            "tui_coverage description must mark 'uncovered' unsupported up front: {coverage}"
+            coverage.to_lowercase().contains("no uncovered action")
+                && coverage.to_lowercase().contains("denominator")
+                && coverage.to_lowercase().contains("use delta"),
+            "tui_coverage must explain that uncovered is absent because there is no denominator: {coverage}"
         );
         let snapshot = desc("tui_coverage");
         assert!(

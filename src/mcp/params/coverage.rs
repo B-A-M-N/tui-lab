@@ -22,7 +22,7 @@ selector_enum!(
     CoverageAction;
     [
         Detect => "detect", Summary => "summary", Collect => "collect",
-        Delta => "delta", Uncovered => "uncovered", Ledger => "ledger",
+        Delta => "delta", Ledger => "ledger",
         Snapshot => "snapshot",
     ]
 );
