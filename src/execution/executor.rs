@@ -264,7 +264,15 @@ fn execute_act_inner(
             } else {
                 Some((sem.focus.control_id.clone(), sem.focus.control.clone()))
             };
-            (crate::semantic::semantic_identity_fused(&sem, &tree), focus)
+            (
+                crate::semantic::SemanticIdentityV2::from_fused(
+                    &sem,
+                    &tree,
+                    session.native_revision(),
+                )
+                .identity(),
+                focus,
+            )
         })
         .unwrap_or((Default::default(), None));
     // The ONE compiler runs on the pre-action frame before it moves into
@@ -527,7 +535,10 @@ fn execute_act_inner(
         // bare truth from cells.
         after_fused_identity = sess
             .fuse_frame_full(&after_frame.state)
-            .map(|(sem, tree)| crate::semantic::semantic_identity_fused(&sem, &tree))
+            .map(|(sem, tree)| {
+                crate::semantic::SemanticIdentityV2::from_fused(&sem, &tree, sess.native_revision())
+                    .identity()
+            })
             .unwrap_or_default();
     }
     if !after_fused_identity.is_empty() {
@@ -723,7 +734,14 @@ fn run_completion_plan(
                 // that already happened is invisible to the identity check.
                 let _ = session.observe(quiet_ms.min(30))?;
                 if let Some((sem, tree, _report)) = session.fused_frame() {
-                    if crate::semantic::semantic_identity_fused(&sem, &tree) != before_identity {
+                    if crate::semantic::SemanticIdentityV2::from_fused(
+                        &sem,
+                        &tree,
+                        session.native_revision(),
+                    )
+                    .identity()
+                        != before_identity
+                    {
                         let frame = session.observe(quiet_ms)?;
                         return Ok(CaptureOutcome {
                             reason: crate::backend::CaptureReason::ScreenChanged,

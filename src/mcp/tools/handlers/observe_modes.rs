@@ -583,7 +583,12 @@ pub(crate) fn inspect_view(
     };
     ok(json!({
         "frame": frame_record,
-        "semantic_identity": crate::semantic::semantic_identity_fused(&sem, &tree),
+        "semantic_identity": crate::semantic::SemanticIdentityV2::from_fused(
+            &sem,
+            &tree,
+            sess.native_revision(),
+        )
+        .identity(),
         "viewport": { "cols": screen.cols, "rows": screen.rows },
         "title": screen.title,
         "focus": {
