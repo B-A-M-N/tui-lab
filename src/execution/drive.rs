@@ -248,10 +248,21 @@ impl RunEvidenceSink {
                 .map_err(|e| e.to_string())
         };
         let frame_commits = [commit(&tx.before_frame), commit(&tx.after_frame)];
+        let frame_id = |r: &Result<u64, String>| r.clone().ok();
         // Run ledger (Wave-2 item 15): the reconstructable transaction
-        // record. Sensitive payloads are projected to Redacted(kind,
-        // byte_len) by the ledger itself.
-        let ledger_recorded = run.record_interaction(sid, tx).is_ok();
+        // record with direct generation/frame/event provenance. Sensitive
+        // payloads are projected to Redacted(kind, byte_len) by the ledger.
+        let ledger_recorded = run
+            .record_interaction(
+                sid,
+                gen,
+                frame_id(&frame_commits[0]),
+                frame_id(&frame_commits[1]),
+                tx.anchor.state.output_seq,
+                None,
+                tx,
+            )
+            .is_ok();
         let health = EvidenceHealth {
             frame_commits,
             ledger_recorded,

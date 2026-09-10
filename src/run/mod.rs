@@ -165,6 +165,23 @@ pub struct TransactionRecord {
     /// non-interaction entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Session generation at dispatch (older rows default absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+    /// Exact committed before/after frame ids, when the evidence sink
+    /// assigned them. Older rows default absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_frame_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_frame_id: Option<u64>,
+    /// Terminal event-queue range for the action window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_seq_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_seq_after: Option<u64>,
+    /// Exact write-boundary outcome for the logical dispatch.
+    #[serde(default)]
+    pub dispatch: Option<String>,
 }
 
 /// Ledger-sized summary of a [`crate::execution::RenderTransaction`].
@@ -194,9 +211,15 @@ impl TransactionRecord {
     }
 
     /// Build a record from a live [`crate::execution::InteractionTransaction`].
+    #[allow(clippy::too_many_arguments)]
     pub fn from_interaction(
         seq: u64,
         session: &str,
+        generation: u32,
+        before_frame_id: Option<u64>,
+        after_frame_id: Option<u64>,
+        event_seq_before: u64,
+        event_seq_after: Option<u64>,
         tx: &crate::execution::InteractionTransaction,
     ) -> Self {
         let settle = match tx.settle {
@@ -235,6 +258,12 @@ impl TransactionRecord {
                 dirty_cells: r.dirty_cells,
             }),
             origin: tx.origin.map(|o| o.as_str().to_string()),
+            generation: Some(generation),
+            before_frame_id,
+            after_frame_id,
+            event_seq_before: Some(event_seq_before),
+            event_seq_after,
+            dispatch: Some(tx.dispatch.name().to_string()),
         }
     }
 }
@@ -677,7 +706,15 @@ mod tests {
         )
         .expect("execute");
 
-        let _ = run.record_interaction("ledger-sess", &tx);
+        let _ = run.record_interaction(
+            "ledger-sess",
+            1,
+            None,
+            None,
+            tx.anchor.state.output_seq,
+            None,
+            &tx,
+        );
         let _ = run.record_event("ledger-sess", "wait");
 
         assert_eq!(run.transaction_total(), 2);
@@ -737,7 +774,7 @@ mod tests {
         };
         tx.before_frame.state.structure_hash = "b".into();
         tx.after_frame.state.structure_hash = "a".into();
-        let _ = run.record_interaction("origin-sess", &tx);
+        let _ = run.record_interaction("origin-sess", 1, None, None, 0, None, &tx);
         let _ = run.record_event("origin-sess", "wait");
         let ledger = run.transactions();
         assert_eq!(ledger[0].origin.as_deref(), Some("audit"));
@@ -1397,7 +1434,7 @@ mod tests {
             false,
         )
         .expect("execute");
-        let _ = run.record_interaction("fg-tx", &tx);
+        let _ = run.record_interaction("fg-tx", 1, None, None, 0, None, &tx);
 
         // The graph has at least one driven edge tagged with the EXACT
         // action identity (re-review P0): a Right keypress reads `right`,
@@ -1763,7 +1800,9 @@ mod tests {
             origin: None,
             dispatch: crate::execution::DispatchStatus::Sent,
         };
-        assert!(run.record_interaction("s", &tx).is_err());
+        assert!(run
+            .record_interaction("s", 1, None, None, 0, None, &tx)
+            .is_err());
         assert!(run.record_event("s", "wait").is_err());
         assert!(run.commit_frame(&mut frame, Some("s")).is_err());
         assert!(run

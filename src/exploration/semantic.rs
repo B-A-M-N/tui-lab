@@ -197,7 +197,15 @@ pub fn run_evidenced(
         let action_sig = action.signature();
         if session.evidence_sink().is_none() {
             if let Some(run) = run.as_deref_mut() {
-                let _ = run.record_interaction(&session.id, &tx);
+                let _ = run.record_interaction(
+                    &session.id,
+                    session.generation,
+                    None,
+                    None,
+                    tx.anchor.state.output_seq,
+                    None,
+                    &tx,
+                );
             }
         }
         let after = tx.after().clone();
