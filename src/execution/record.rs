@@ -371,6 +371,34 @@ impl DriveOrigin {
     }
 }
 
+/// Exact write-boundary state for one logical dispatch. A guard refusal
+/// never reaches the transport; a transport failure after bytes are known
+/// representable is at least unknown-partial and must be evidenced rather
+/// than disappearing through `?`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchStatus {
+    /// The action was refused before any transport write.
+    RefusedBeforeWrite,
+    /// The backend reported success after its complete payload write.
+    Sent,
+    /// The transport failed before any bytes were known to be written.
+    FailedBeforeWrite,
+    /// The transport failed at a point where partial delivery cannot be
+    /// ruled out. Evidence must record this explicitly.
+    PartialOrUnknown,
+}
+
+impl DispatchStatus {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::RefusedBeforeWrite => "refused_before_write",
+            Self::Sent => "sent",
+            Self::FailedBeforeWrite => "failed_before_write",
+            Self::PartialOrUnknown => "partial_or_unknown",
+        }
+    }
+}
+
 /// Settlement outcome for one interaction (re-review P1: `no_wait` must not
 /// report `settled` — "I did not test settlement" is not "it settled").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -79,6 +79,9 @@ pub struct InteractionTransaction {
     /// transactions built before the field existed (tests constructing
     /// literals).
     pub origin: Option<super::record::DriveOrigin>,
+    /// Exact write-boundary outcome. Evidence consumers can distinguish a
+    /// refusal from a sent action from an unknown-partial transport error.
+    pub dispatch: super::record::DispatchStatus,
 }
 
 /// The causal render record of ONE action (re-review item 19): "pressing

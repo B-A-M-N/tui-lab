@@ -26,7 +26,8 @@ pub use executor::{
     execute_act_with_guard_and_origin, execute_act_with_visibility,
 };
 pub use record::{
-    CanonicalAction, DriveOrigin, InputVisibility, ObservationAnchor, PersistedAction, SettleStatus,
+    CanonicalAction, DispatchStatus, DriveOrigin, InputVisibility, ObservationAnchor,
+    PersistedAction, SettleStatus,
 };
 pub use transaction::{ActionEnvelope, InteractionTransaction, RenderOp, RenderTransaction};
 pub use wait::{execute_assert, execute_wait, execute_wait_event, WaitEventOutcome};

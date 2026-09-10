@@ -194,17 +194,6 @@ pub fn execute_act_with_guard_and_origin(
     completion: CompletionPolicy,
     guard: Option<&MutationGuard>,
 ) -> Result<InteractionTransaction, anyhow::Error> {
-    // Guard validation happens FIRST — before the baseline capture, before
-    // anything else touches the session — so the checked state is the state
-    // the action lands in.
-    if let Some(g) = guard {
-        if let Err(stale) = g.validate_fresh(session) {
-            return Err(anyhow::anyhow!(
-                "stale_state: {}",
-                serde_json::to_string(&stale).unwrap_or_default()
-            ));
-        }
-    }
     execute_act_inner(
         session,
         origin,
@@ -215,6 +204,7 @@ pub fn execute_act_with_guard_and_origin(
         visibility,
         completion,
         None,
+        guard,
     )
 }
 
@@ -230,13 +220,23 @@ fn execute_act_inner(
     visibility: InputVisibility,
     completion: CompletionPolicy,
     transition_capture_frames: Option<usize>,
+    guard: Option<&MutationGuard>,
 ) -> Result<InteractionTransaction, anyhow::Error> {
     // Transition-capture evidence lands on the transaction (audit P0-16).
     let mut transition_frames_evidence: Option<serde_json::Value> = None;
-    // A transaction's causal baseline is current pre-dispatch state, not
-    // the agent's last settled observation. This also catches focus-only
-    // and semantic transitions from the native channel before the action.
-    let before = session.peek_fresh()?.frame;
+    // The ONLY pre-dispatch snapshot: taken immediately before the transport
+    // write and guarded against that exact revision. This closes the old
+    // validate→preflight→write race rather than narrowing it.
+    let preflight = session.snapshot_fresh()?;
+    let before = preflight.frame.clone();
+    if let Some(g) = guard {
+        if let Err(stale) = g.validate_analysis(&preflight, session, session.generation) {
+            return Err(anyhow::anyhow!(
+                "stale_state: {}",
+                serde_json::to_string(&stale).unwrap_or_default()
+            ));
+        }
+    }
     let baseline = session.event_state();
     // Pre-action event-queue cursor, captured BEFORE the send. Used by
     // CompletionPolicy::Event to anchor on events that fire *after* this
@@ -316,14 +316,49 @@ fn execute_act_inner(
     // event fires. Routing it through send()/Input::Resize silently left
     // launch.cols/rows stale, so a restart resurrected the old size.
     // Everything else is a transport write.
-    let send_result = match action {
-        CanonicalAction::Resize { cols, rows } => window.sess().resize(*cols, *rows),
-        _ => window.sess().send(action.to_input()),
+    let dispatch = match action {
+        CanonicalAction::Resize { cols, rows } => match window.sess().resize(*cols, *rows) {
+            Ok(()) => crate::execution::DispatchStatus::Sent,
+            Err(_) => crate::execution::DispatchStatus::PartialOrUnknown,
+        },
+        _ => match window.sess().send(action.to_input()) {
+            Ok(()) => crate::execution::DispatchStatus::Sent,
+            Err(_) => crate::execution::DispatchStatus::PartialOrUnknown,
+        },
     };
     let send_ms = send_start.elapsed().as_millis() as u64;
-    let send_failed = send_result.is_err();
-    if send_failed {
-        send_result?;
+    if dispatch == crate::execution::DispatchStatus::PartialOrUnknown {
+        window.commit();
+        let sid = session.id.clone();
+        let gen = session.generation;
+        let tx = InteractionTransaction {
+            action: ActionEnvelope::new(action.clone(), visibility),
+            anchor,
+            before_frame: before_frame.clone(),
+            after_frame: before_frame.clone(),
+            settle: SettleStatus::TimedOut,
+            transition: crate::screen::diff(&before_frame.state, &before_frame.state),
+            capture: None,
+            focus_before,
+            focus_after: None,
+            elapsed_ms: send_ms,
+            send_ms,
+            settle_ms: 0,
+            render: None,
+            transition_capture: Some(json!({
+                "dispatch": dispatch.name(),
+                "note": "transport reported failure after preflight; partial delivery cannot be ruled out"
+            })),
+            origin: Some(origin),
+            dispatch,
+        };
+        if let Some(sink) = session.evidence_sink() {
+            sink.commit(&sid, gen, &tx)?;
+            sink.fold(session);
+        }
+        return Err(anyhow::anyhow!(
+            "dispatch_partial_or_unknown: transport write failed; before-frame and dispatch evidence retained"
+        ));
     }
 
     // A declared `NoWait` completion is equivalent to the transport's
@@ -520,6 +555,7 @@ fn execute_act_inner(
         render,
         transition_capture: transition_frames_evidence,
         origin: Some(origin),
+        dispatch,
     };
 
     // Beta-audit P0-7: when authorized dispatch installed the run evidence
