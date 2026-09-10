@@ -137,14 +137,14 @@ impl TerminalProfile {
                 "colors",
                 "Color / attributes",
                 caps.colors,
-                true,
+                false,
                 "with it: color/style evidence is trustworthy; without: treat style as absent",
             ),
             (
                 "cell_attributes",
                 "Cell attributes",
                 caps.cell_attributes,
-                true,
+                false,
                 "with it: style diffs are reliable; without: style inference is unreliable",
             ),
             (
@@ -171,7 +171,7 @@ impl TerminalProfile {
             (
                 "signals",
                 "POSIX signals",
-                cfg!(unix),
+                caps.signals,
                 false,
                 "with it: ctrl+c / kill / SIGTERM are reliable; without: process teardown is best-effort",
             ),
@@ -309,20 +309,23 @@ impl TerminalProfile {
                     // Baseline defaults are genuinely universal; absence of a
                     // negotiation edge does not make them uncertain.
                     CapabilityState::Supported
-                } else if *id == "signals" && cfg!(unix) {
-                    // Platform truth, handled above via observed_flag too; this
-                    // arm is unreached when cfg!(unix), kept for clarity.
-                    CapabilityState::Supported
-                } else {
+                } else if matches!(
+                    *id,
+                    "mouse" | "kitty_keyboard" | "title" | "scrollback" | "bracketed_paste"
+                ) {
+                    // Negotiation-promoted: absence of a negotiation edge is
+                    // not refusal. The backend must prove support before use.
                     CapabilityState::Unverified
+                } else {
+                    // Intrinsic/session capability: `Capabilities::default()`
+                    // makes no claim, so a false flag is the backend's denial.
+                    CapabilityState::Unsupported
                 };
                 let evidence_text = match self_provided {
                     Some(s) => s.clone(),
                     None => {
                         if *is_baseline {
                             format!("baseline {} support (backend default)", name.to_lowercase())
-                        } else if *id == "signals" && cfg!(unix) {
-                            "POSIX signal dispatch available (platform default)".to_string()
                         } else if observed_flag {
                             observed_evidence_for(id)
                         } else {
@@ -428,14 +431,14 @@ mod tests {
             feat(&p, "kitty_keyboard").state,
             CapabilityState::Unverified
         );
-        // Baseline and platform truths stay truthful.
-        assert_eq!(feat(&p, "colors").state, CapabilityState::Supported);
+        // Capability defaults make no claim: a false flag is unavailable,
+        // not merely unobserved.
+        assert_eq!(feat(&p, "colors").state, CapabilityState::Unsupported);
         assert_eq!(
             feat(&p, "cell_attributes").state,
-            CapabilityState::Supported
+            CapabilityState::Unsupported
         );
-        #[cfg(unix)]
-        assert_eq!(feat(&p, "signals").state, CapabilityState::Supported);
+        assert_eq!(feat(&p, "signals").state, CapabilityState::Unsupported);
         // The verdict surfaces the unverified count.
         assert!(p.verdict.contains("unverified"));
     }

@@ -289,6 +289,22 @@ pub(crate) async fn tui_intent(
         .as_ref()
         .map(|c| c.to_policy())
         .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
+    // Persist these with the first-class intent step so replay executes
+    // the same operation (beta rereview P0-8).
+    let p_completion_name = p
+        .completion
+        .as_ref()
+        .map(|c| c.name())
+        .unwrap_or("stable_screen");
+    let p_completion_quiet = p
+        .completion
+        .as_ref()
+        .and_then(|c| c.quiet_ms())
+        .unwrap_or(150);
+    let p_budget = p
+        .settle_budget_ms
+        .unwrap_or(p_completion_quiet.saturating_add(1000));
+    let p_no_wait = p.no_wait.unwrap_or(false);
     let intent_id = format!("intent-{}", uuid::Uuid::new_v4().simple());
     let selector = p.id.clone();
     let target = p.target.clone();
@@ -669,12 +685,11 @@ pub(crate) async fn tui_intent(
                     "target": p.target,
                     "verb": intent_verb_json,
                     "sensitive": sensitive,
+                    "completion": p_completion_name,
+                    "quiet_ms": p_completion_quiet,
+                    "settle_budget_ms": p_budget,
+                    "no_wait": p_no_wait,
                 }),
-            );
-            sink.record_scenario_wait(
-                &sid,
-                gen,
-                json!({ "condition": "screen_stable", "note": format!("intent {intent_id} completed") }),
             );
         }
         ok(json!({

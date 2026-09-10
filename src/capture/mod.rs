@@ -286,6 +286,9 @@ pub fn capture_by_strategy(
     anchor_screen_seq: u64,
     budget: Duration,
 ) -> BackendResult<CaptureOutcome> {
+    // One deadline at top-level dispatch: a strategy may sample earlier,
+    // never extend the caller's wall clock.
+    let deadline = std::time::Instant::now() + budget;
     match strategy {
         CaptureStrategy::Stable { quiet_ms } => {
             let quiet = quiet_ms
@@ -408,8 +411,9 @@ pub fn capture_by_strategy(
             }
         }
         CaptureStrategy::DeadlineSnapshot { ms } => {
-            let dur = Duration::from_millis(*ms);
-            std::thread::sleep(dur);
+            let dur = Duration::from_millis(*ms).min(budget);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(dur.min(remaining));
             let frame = backend.state()?;
             Ok(CaptureOutcome {
                 reason: crate::backend::CaptureReason::Deadline,

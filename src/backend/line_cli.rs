@@ -520,6 +520,9 @@ impl TerminalBackend for PtyLineBackend {
                 }
             }
             Input::Keys(keys) => {
+                // Precompile the entire logical action: no key is written
+                // until every key is representable.
+                let mut payload: Vec<u8> = Vec::new();
                 for kev in keys {
                     if kev.modifiers != crate::backend::KeyModifiers::NONE {
                         return Err(BackendError::Unsupported(format!(
@@ -527,11 +530,11 @@ impl TerminalBackend for PtyLineBackend {
                         )));
                     }
                     match kev.code {
-                        crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
+                        crate::backend::KeyCode::Enter => payload.push(b'\n'),
                         crate::backend::KeyCode::Char(c) => {
                             let mut s = String::new();
                             s.push(c);
-                            self.write_input(s.as_bytes())?;
+                            payload.extend_from_slice(s.as_bytes());
                         }
                         _ => {
                             return Err(BackendError::Unsupported(
@@ -540,6 +543,7 @@ impl TerminalBackend for PtyLineBackend {
                         }
                     }
                 }
+                self.write_input(&payload)?;
             }
             Input::Raw(b) => {
                 self.write_input(&b)?;
@@ -754,7 +758,7 @@ impl TerminalBackend for PtyLineBackend {
             shell_integration: false,        // command_state() returns None (no OSC 133)
             stdout_stderr_separation: false, // single PTY master
             recording: true,                 // recording hook delivered on output/input
-            native_semantic: true,           // session-provided side channel
+            native_semantic: false,          // Session overlays this when the channel exists
             attach: false,                   // we spawn the child
             process_ownership: super::ProcessOwnership::SpawnedChild,
             query_response: false, // no device-query responder

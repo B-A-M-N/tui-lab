@@ -524,6 +524,9 @@ impl TerminalBackend for PipeBackend {
                 }
             }
             Input::Keys(keys) => {
+                // Encode and validate the whole sequence before the first
+                // write so a later unsupported key cannot leave a prefix.
+                let mut payload: Vec<u8> = Vec::new();
                 for kev in keys {
                     if kev.modifiers != crate::backend::KeyModifiers::NONE {
                         return Err(BackendError::Unsupported(format!(
@@ -531,11 +534,11 @@ impl TerminalBackend for PipeBackend {
                         )));
                     }
                     match kev.code {
-                        crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
+                        crate::backend::KeyCode::Enter => payload.push(b'\n'),
                         crate::backend::KeyCode::Char(c) => {
                             let mut s = String::new();
                             s.push(c);
-                            self.write_input(s.as_bytes())?;
+                            payload.extend_from_slice(s.as_bytes());
                         }
                         _ => {
                             return Err(BackendError::Unsupported(
@@ -544,6 +547,7 @@ impl TerminalBackend for PipeBackend {
                         }
                     }
                 }
+                self.write_input(&payload)?;
             }
             Input::Raw(b) => self.write_input(&b)?,
             Input::Mouse(_) | Input::MouseClick { .. } => {
@@ -738,9 +742,9 @@ impl TerminalBackend for PipeBackend {
             // review P1 #28: the pipe backend IS the stdout/stderr split — the
             // child is launched with separate stdout/stderr pipes.
             stdout_stderr_separation: true,
-            recording: true,       // recording hook delivered on output/input
-            native_semantic: true, // session-provided side channel
-            attach: false,         // we spawn the child
+            recording: true,        // recording hook delivered on output/input
+            native_semantic: false, // Session overlays this when the channel exists
+            attach: false,          // we spawn the child
             process_ownership: super::ProcessOwnership::SpawnedChild,
             query_response: false, // no device-query responder
             event_types: vec![
