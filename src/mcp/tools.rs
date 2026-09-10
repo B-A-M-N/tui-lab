@@ -663,8 +663,8 @@ impl TuiLabServer {
 #[rmcp::tool_handler]
 impl ServerHandler for TuiLabServer {
     // ── MCP resources (Wave G item 72) ─────────────────────────────────
-    // The live surface the agent can subscribe to instead of polling:
-    // current run manifest, per-session semantic/screen snapshots, and the
+    // The live on-demand read surface (no MCP subscriptions yet): current
+    // run manifest, per-session semantic/screen snapshots, timeline, and the
     // findings ledger. Everything is read-through (no caching): a read
     // reflects the session state at read time, and unknown ids are honest
     // `resource_not_found` errors, never empty placeholders.
