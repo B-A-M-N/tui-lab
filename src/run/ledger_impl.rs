@@ -27,14 +27,29 @@ impl RunContext {
     /// evicted, and the eviction is *declared* — `dropped_records` grows
     /// and `first_available_seq` moves, so a later flush/promotion can
     /// never present the run as replay-complete.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_interaction(
         &mut self,
         session: &str,
+        generation: u32,
+        before_frame_id: Option<u64>,
+        after_frame_id: Option<u64>,
+        event_seq_before: u64,
+        event_seq_after: Option<u64>,
         tx: &crate::execution::InteractionTransaction,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
         let seq = self.evidence.transactions.bump();
-        let mut record = TransactionRecord::from_interaction(seq, session, tx);
+        let mut record = TransactionRecord::from_interaction(
+            seq,
+            session,
+            generation,
+            before_frame_id,
+            after_frame_id,
+            event_seq_before,
+            event_seq_after,
+            tx,
+        );
         record.seq = seq;
         self.push_ledger(record);
         // Focus graph from transactions (audit item): every driving path
@@ -97,6 +112,12 @@ impl RunContext {
             persisted_action: None,
             render: None,
             origin: None,
+            generation: None,
+            before_frame_id: None,
+            after_frame_id: None,
+            event_seq_before: None,
+            event_seq_after: None,
+            dispatch: None,
         });
         Ok(())
     }
