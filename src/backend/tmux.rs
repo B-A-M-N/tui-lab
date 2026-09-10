@@ -509,19 +509,31 @@ impl TerminalBackend for TmuxBackend {
                 )))
             }
         };
+        // P1-24: collapse the logical action into ONE send-keys invocation.
+        // The old per-key loop allowed a later failure to leave an exact
+        // completed prefix; one argv plan makes the representable sequence
+        // all-or-nothing at the tmux control-command level.
+        let mut argv: Vec<String> = vec![
+            "send-keys".to_string(),
+            "-t".to_string(),
+            self.target.to_tmux(),
+        ];
         let mut sent = String::new();
         for k in &keys {
             match k {
                 K::Lit(text) => {
-                    self.tmux(&["send-keys", "-t", &self.target.to_tmux(), "-l", text])?;
+                    argv.push("-l".to_string());
+                    argv.push(text.clone());
                     sent.push_str(text);
                 }
                 K::Named(name) => {
-                    self.tmux(&["send-keys", "-t", &self.target.to_tmux(), name])?;
+                    argv.push(name.clone());
                     sent.push_str(&format!("[{name}]"));
                 }
             }
         }
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.tmux(&refs)?;
         if let Ok(slot) = self.recording_slot.lock() {
             if let Some(ref h) = *slot {
                 h.on_input(sent.as_bytes());
