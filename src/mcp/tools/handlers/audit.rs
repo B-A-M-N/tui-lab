@@ -146,9 +146,23 @@ pub(crate) async fn tui_audit(
     } else {
         crate::audit::orchestrator::SafetyPolicy::SafeOnly
     };
-    let risk = crate::audit::orchestrator::AuditProfile::parse(&profile)
-        .map(|ap| ap.risk().name().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let risk_obj = crate::audit::orchestrator::AuditProfile::parse(&profile)
+        .map(|ap| {
+            let risk = ap.risk();
+            serde_json::json!({
+                "name": risk.name(),
+                "side_effect_class": risk.side_effect_class(),
+                "recovery_guarantee": risk.recovery_guarantee(),
+            })
+        })
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "name": "unknown",
+                "side_effect_class": "unknown",
+                "recovery_guarantee": "unknown",
+            })
+        });
+    let risk = risk_obj["name"].as_str().unwrap_or("unknown").to_string();
 
     // The audit ENGINE owns the static-vs-active decision (re-review
     // P0 fix 2): `full` is the composite (static + every non-
@@ -254,6 +268,7 @@ pub(crate) async fn tui_audit(
                 "profile": profile_wire,
                 "mode": report.mode.name(),
                 "risk": risk,
+                "risk_effects": risk_obj,
                 "policy": match policy {
                     crate::audit::orchestrator::SafetyPolicy::SafeOnly => "safe_only",
                     crate::audit::orchestrator::SafetyPolicy::AllowMutation => "allow_mutation",
