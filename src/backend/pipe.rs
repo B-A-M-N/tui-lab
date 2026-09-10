@@ -794,6 +794,7 @@ impl TerminalBackend for PipeBackend {
                 WaitCapability::AnyActivity,
                 WaitCapability::Idle,
             ],
+            observability_fidelity: None,
             input_families: vec![
                 InputFamily::Key,
                 InputFamily::Paste,

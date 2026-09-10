@@ -809,6 +809,7 @@ impl TerminalBackend for PtyLineBackend {
                 WaitCapability::AnyActivity,
                 WaitCapability::Idle,
             ],
+            observability_fidelity: None,
             input_families: vec![
                 InputFamily::Key,
                 InputFamily::Paste,

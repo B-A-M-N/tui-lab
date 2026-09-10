@@ -763,6 +763,17 @@ impl TerminalBackend for TmuxBackend {
             // `raw_input: false` and the send-path refusal. Text-shaped
             // payload delivery is the Key/Paste families.
             input_families: vec![InputFamily::Key, InputFamily::Paste, InputFamily::Resize],
+            // P1-24: sampled pane polling is lossy by construction. Declare it
+            // in the capability matrix rather than implying a raw byte stream.
+            observability_fidelity: Some(super::ObservabilityFidelity {
+                mode: "sampled".to_string(),
+                sampling_ms: 50,
+                blind_spots: vec![
+                    "rapid frame changes coalesced between polls".to_string(),
+                    "multiple bells inside one interval counted as one edge".to_string(),
+                    "raw protocol timing unavailable".to_string(),
+                ],
+            }),
         }
     }
 
