@@ -250,6 +250,11 @@ pub struct ActCommon {
     pub completion: Option<TuiCompletionParam>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// Explicit completion budget ceiling (beta audit P0.6). Omitted means
+    /// the historical default (`wait_ms + 1000ms`). It is never silently
+    /// expanded; call it through the canonical executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_budget_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Re-review P0.9: expected-state guard. Validated atomically with
@@ -266,6 +271,7 @@ impl ActCommon {
             no_wait: None,
             completion: None,
             wait_ms: None,
+            settle_budget_ms: None,
             id: None,
             guard: None,
         }
@@ -583,6 +589,30 @@ impl TuiActRequest {
             TuiActRequest::Signal(p) => p.common.no_wait,
         }
         .unwrap_or(false)
+    }
+
+    /// Shared transport fields, regardless of action variant.
+    pub fn common(&self) -> &ActCommon {
+        match self {
+            TuiActRequest::Key(p) => &p.common,
+            TuiActRequest::Keys(p) => &p.common,
+            TuiActRequest::Type(p) => &p.common,
+            TuiActRequest::Paste(p) => &p.common,
+            TuiActRequest::Raw(p) => &p.common,
+            TuiActRequest::MouseClick(p) => &p.common,
+            TuiActRequest::MousePress(p) => &p.common,
+            TuiActRequest::MouseRelease(p) => &p.common,
+            TuiActRequest::MouseMove(p) => &p.common,
+            TuiActRequest::MouseDrag(p) => &p.common,
+            TuiActRequest::MouseScroll(p) => &p.common,
+            TuiActRequest::Resize(p) => &p.common,
+            TuiActRequest::Signal(p) => &p.common,
+        }
+    }
+
+    /// Caller-supplied completion ceiling, when declared.
+    pub fn settle_budget_ms(&self) -> Option<u64> {
+        self.common().settle_budget_ms
     }
 
     pub fn wait_ms(&self) -> Option<u64> {

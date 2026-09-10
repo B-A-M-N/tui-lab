@@ -405,6 +405,7 @@ fn next_observations(
                             no_wait: None,
                             completion: None,
                             wait_ms: None,
+                            settle_budget_ms: None,
                             id: session_id.map(String::from),
                             guard: None,
                         },

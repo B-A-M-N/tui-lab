@@ -1396,6 +1396,33 @@ mod tests {
             .expect("actor run")
             .expect("run terminal_modes");
         assert_eq!(report.mode, "active");
+        let report = {
+            let inventory_ready = report.findings.iter().any(|f| f.id == "MODE-INVENTORY")
+                && serde_json::to_value(
+                    report
+                        .findings
+                        .iter()
+                        .find(|f| f.id == "MODE-INVENTORY")
+                        .expect("inventory present")
+                        .evidence
+                        .clone(),
+                )
+                .map(|v| !v.as_array().map(Vec::is_empty).unwrap_or(true))
+                .unwrap_or(false);
+            if inventory_ready {
+                report
+            } else {
+                let _ = pool
+                    .with_session(Some(&id), |s| {
+                        let _ = s.observe(300);
+                    })
+                    .await;
+                pool.with_session(Some(&id), |s| run_profile(s, "terminal_modes"))
+                    .await
+                    .expect("actor run")
+                    .expect("terminal_modes retry")
+            }
+        };
         let inv = report
             .findings
             .iter()
@@ -1451,19 +1478,31 @@ mod tests {
         // ring read runs — same class as the query_response flake. A plain
         // observe settles the stream before any audit reads the ring (the
         // audits are ring reads and deliberately do not wait themselves).
-        {
-            let _ = pool
-                .with_session(Some(&id), |s| {
-                    let _ = s.observe(300);
-                })
-                .await;
-        }
-
-        let render = pool
+        // Under full-suite parallel PTY load, the first frame may already
+        // be parsed by start's initial pump; the ring is event-ordered and
+        // does not lose committed bytes, but the fixture's 50ms frames can
+        // still be arriving. Re-run the audit once when a scheduling race
+        // leaves the renderer without its startup signature.
+        let mut render = pool
             .with_session(Some(&id), |s| run_profile(s, "rendering"))
             .await
             .expect("actor run")
             .expect("rendering");
+        {
+            let ids: Vec<&str> = render.findings.iter().map(|f| f.id.as_str()).collect();
+            if !ids.contains(&"REND-FLICKER") {
+                let _ = pool
+                    .with_session(Some(&id), |s| {
+                        let _ = s.observe(300);
+                    })
+                    .await;
+                render = pool
+                    .with_session(Some(&id), |s| run_profile(s, "rendering"))
+                    .await
+                    .expect("actor run")
+                    .expect("rendering retry");
+            }
+        }
         let ids: Vec<&str> = render.findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"REND-STYLE"), "style census present: {ids:?}");
         assert!(

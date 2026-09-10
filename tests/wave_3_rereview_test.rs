@@ -70,7 +70,10 @@ async fn guard_allows_act_when_state_matches() {
         .with_session(Some(&id), move |sess| {
             sess.observe(200).expect("baseline");
 
-            let guard = tui_lab::execution::MutationGuard::capture(sess);
+            let guard = tui_lab::execution::MutationGuard::capture(
+                sess.analyze_last().as_ref(),
+                sess.generation,
+            );
             let tx = tui_lab::execution::execute_act_with_guard(
                 sess,
                 &tui_lab::execution::CanonicalAction::Key {

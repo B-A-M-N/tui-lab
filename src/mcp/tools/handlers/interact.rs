@@ -157,6 +157,11 @@ pub(crate) async fn tui_act(
     let completion = p
         .completion()
         .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
+    // An explicit caller budget is a deadline, not a suggestion (beta
+    // audit P0.6). Omitted fields keep the historical default. The
+    // executor honors `settle_budget_ms` exactly; it no longer expands it
+    // to quiet + 1000.
+    let budget = p.settle_budget_ms().unwrap_or(quiet.saturating_add(1000));
     // Beta-audit P0-6: the authorized entry — the run ticket is captured
     // under the same lock window as with_sess's closed-run + ownership
     // guards, and every evidence commit verifies it.
@@ -170,7 +175,7 @@ pub(crate) async fn tui_act(
                 DriveSpec {
                     action: &action,
                     quiet_ms: quiet,
-                    budget_ms: quiet.saturating_add(1000),
+                    budget_ms: budget,
                     no_wait: p.no_wait(),
                     visibility,
                     completion,

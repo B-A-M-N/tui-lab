@@ -198,7 +198,7 @@ pub fn execute_act_with_guard_and_origin(
     // anything else touches the session — so the checked state is the state
     // the action lands in.
     if let Some(g) = guard {
-        if let Err(stale) = g.validate(session) {
+        if let Err(stale) = g.validate_fresh(session) {
             return Err(anyhow::anyhow!(
                 "stale_state: {}",
                 serde_json::to_string(&stale).unwrap_or_default()
@@ -233,10 +233,10 @@ fn execute_act_inner(
 ) -> Result<InteractionTransaction, anyhow::Error> {
     // Transition-capture evidence lands on the transaction (audit P0-16).
     let mut transition_frames_evidence: Option<serde_json::Value> = None;
-    let before = match session.last().cloned() {
-        Some(s) => s,
-        None => session.observe(0)?,
-    };
+    // A transaction's causal baseline is current pre-dispatch state, not
+    // the agent's last settled observation. This also catches focus-only
+    // and semantic transitions from the native channel before the action.
+    let before = session.peek_fresh()?.frame;
     let baseline = session.event_state();
     // Pre-action event-queue cursor, captured BEFORE the send. Used by
     // CompletionPolicy::Event to anchor on events that fire *after* this
@@ -335,10 +335,10 @@ fn execute_act_inner(
         // Even with no_wait, capture a fresh frame so callers always get
         // both before and after — but settlement was NOT tested. Reporting
         // `SettleStatus::Skipped` is the honest answer (re-review P1 fix 8).
-        let s = window.sess().observe(quiet_ms)?;
+        let s = window.sess().peek_fresh()?.frame;
         (SettleStatus::Skipped, 0, s, None, None)
     } else {
-        let budget = settle_budget_ms.max(quiet_ms.saturating_add(1000));
+        let budget = settle_budget_ms;
         // Transition capture (audit P0-16): when armed, the FIRST distinct
         // screen edges after the send are collected HERE — at the
         // transition, before the settle wait — so the redraw/flicker frames
@@ -651,7 +651,7 @@ fn run_completion_plan(
                     if matcher.matches(&ev.kind) {
                         let frame = session.observe(quiet_ms)?;
                         return Ok(CaptureOutcome {
-                            reason: crate::backend::CaptureReason::ScreenChanged,
+                            reason: crate::backend::CaptureReason::EventMatched,
                             met: true,
                             screen_seq: session.event_state().screen_seq,
                             output_seq: session.event_state().output_seq,
@@ -753,12 +753,13 @@ fn run_completion_plan(
         Plan::TextDisappears(text, was_present) => {
             let start = std::time::Instant::now();
             if !was_present {
-                // Text was never there: the transition already holds. One
-                // fresh frame documents it; no wait is needed.
-                let frame = session.observe(quiet_ms)?;
+                // "Disappears" is a transition, not a current-state
+                // predicate. An absent precondition means the requested
+                // causal transition cannot be observed.
+                let frame = session.observe(0)?;
                 return Ok(CaptureOutcome {
-                    reason: crate::backend::CaptureReason::TextAbsent,
-                    met: true,
+                    reason: crate::backend::CaptureReason::Deadline,
+                    met: false,
                     screen_seq: session.event_state().screen_seq,
                     output_seq: session.event_state().output_seq,
                     frame,
@@ -794,9 +795,9 @@ fn run_completion_plan(
             }
         }
         Plan::Immediate => {
-            let frame = session.observe(quiet_ms)?;
+            let frame = session.peek_fresh()?.frame;
             Ok(CaptureOutcome {
-                reason: crate::backend::CaptureReason::Deadline,
+                reason: crate::backend::CaptureReason::Immediate,
                 met: true,
                 screen_seq: session.event_state().screen_seq,
                 output_seq: session.event_state().output_seq,
@@ -1196,6 +1197,7 @@ mod tests {
                 no_wait: Some(true),
                 completion: None,
                 wait_ms: Some(500),
+                settle_budget_ms: None,
                 id: Some("s1".into()),
                 guard: None,
             },

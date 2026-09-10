@@ -558,7 +558,7 @@ impl TerminalBackend for PortablePtyBackend {
             bell_seq: match &cond {
                 WaitCond::Bell {
                     after_bell_seq: Some(seq),
-                } => seq.saturating_sub(1),
+                } => *seq,
                 _ => self.events.bell_seq(),
             },
             interaction_seq: self.interaction_seq(),
@@ -669,6 +669,14 @@ impl TerminalBackend for PortablePtyBackend {
         // This engine retains the raw PTY byte ring (`recent_raw_output`),
         // so protocol capture is genuinely available.
         caps.protocol_capture = true;
+        // Deliberate opt-ins: the vt100 emulator supplies real color/cell
+        // attributes, killpg supplies Unix signals, the session provisions
+        // the native side channel, and this backend spawns the child.
+        caps.colors = true;
+        caps.cell_attributes = true;
+        caps.signals = cfg!(unix);
+        caps.native_semantic = true;
+        caps.process_ownership = super::ProcessOwnership::SpawnedChild;
         // --- audit finding 37: the portable engine is the reference backend —
         //     every operation-oriented capability it advertises is backed by a
         //     real implementation the conformance suite exercises (finding 61).
@@ -809,11 +817,10 @@ mod osc8_tests {
     #[test]
     fn osc8_hyperlink_captured_in_screen_state() {
         let mut b = PortablePtyBackend::new(40, 5);
-        let fixture = std::env::temp_dir().join("osc8_fixture.py");
-        std::fs::write(&fixture, include_str!("/tmp/osc8_fixture.py")).unwrap();
+        let code = "import sys,time; sys.stdout.write('\\x1b[H\\x1b[2J'); sys.stdout.write('before '); sys.stdout.write('\\x1b]8;;https://example.com/docs\\x1b\\\\docs\\x1b]8;;\\x1b\\\\'); sys.stdout.write(' after\\n'); sys.stdout.flush(); time.sleep(30)";
         b.start(
             "python3",
-            &[fixture.to_string_lossy().to_string()],
+            &["-c".to_string(), code.to_string()],
             None,
             &[],
             40,

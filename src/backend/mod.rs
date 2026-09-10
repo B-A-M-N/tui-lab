@@ -105,6 +105,9 @@ pub enum InputFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessOwnership {
+    /// No lifecycle authority claim has been made. Optional capabilities
+    /// and lifecycle authority fail closed rather than guessing.
+    Unknown,
     /// The backend launched the child. It is our direct child: signals are
     /// deliverable and `process()` returns the REAL exit code/signal.
     SpawnedChild,
@@ -188,12 +191,12 @@ impl Default for Capabilities {
         Capabilities {
             mouse: false, // negotiated per application; promoted on first mouse mode
             kitty_keyboard: false,
-            colors: true,
-            cell_attributes: true,
+            colors: false,
+            cell_attributes: false,
             title: false,           // promoted when the first OSC title is observed
             scrollback: false,      // promoted only when scrollback rows are actually captured
             bracketed_paste: false, // reported true once we can see the negotiation
-            signals: cfg!(unix),    // arbitrary POSIX signals require killpg (Unix only)
+            signals: false,         // backends opt in when signal delivery is implemented
             // Conservative: promoted true only by backends that genuinely
             // retain the raw ring. The default profile makes no claim.
             protocol_capture: false,
@@ -211,11 +214,13 @@ impl Default for Capabilities {
             // any backend (the child is launched with the channel env pair),
             // so it is genuinely a session-provided capability — honest to
             // advertise once, for every backend, not a per-engine guess.
-            native_semantic: true,
+            // Session provisions the native side channel; a bare backend
+            // capability descriptor must not claim it before that happens.
+            native_semantic: false,
             attach: false,
             // The default profile claims nothing about lifecycle authority;
             // each backend states its own.
-            process_ownership: ProcessOwnership::SpawnedChild,
+            process_ownership: ProcessOwnership::Unknown,
             query_response: false,
             event_types: Vec::new(),
             supported_waits: Vec::new(),
@@ -242,42 +247,26 @@ impl Capabilities {
     /// portable engine (title not yet observed, but genuinely watchable) is
     /// NOT blocked.
     pub fn require_wait(&self, cond: &WaitCond) -> Result<(), BackendError> {
-        let supported = &self.supported_waits;
-        let missing: Option<&'static str> = match cond {
-            WaitCond::Text(_) | WaitCond::TextAbsent(_) => None,
-            WaitCond::ScreenChange => None,
-            WaitCond::ScreenStable { .. } => None,
-            WaitCond::ProcessExit => None,
-            WaitCond::Title(_) => {
-                if supported.contains(&WaitCapability::Title) {
-                    None
-                } else {
-                    Some("title waits")
-                }
-            }
-            WaitCond::Bell { .. } => {
-                if supported.contains(&WaitCapability::Bell) {
-                    None
-                } else {
-                    Some("bell waits")
-                }
-            }
-            WaitCond::AnyActivity { .. } => None,
-            WaitCond::Idle { .. } => None,
+        let required = match cond {
+            WaitCond::Text(_) => WaitCapability::Text,
+            WaitCond::TextAbsent(_) => WaitCapability::TextAbsent,
+            WaitCond::ScreenChange => WaitCapability::ScreenChange,
+            WaitCond::ScreenStable { .. } => WaitCapability::ScreenStable,
+            WaitCond::ProcessExit => WaitCapability::ProcessExit,
+            WaitCond::Title(_) => WaitCapability::Title,
+            WaitCond::Bell { .. } => WaitCapability::Bell,
+            WaitCond::AnyActivity { .. } => WaitCapability::ScreenChange,
+            WaitCond::Idle { .. } => WaitCapability::Idle,
             WaitCond::CommandDone { .. } | WaitCond::CommandOutput { .. } => {
-                if supported.contains(&WaitCapability::CommandDone) {
-                    None
-                } else {
-                    Some("OSC 133 shell-integration (command) waits")
-                }
+                WaitCapability::CommandDone
             }
         };
-        match missing {
-            Some(what) => Err(BackendError::Unsupported(format!(
-                "{what} are unsupported on this backend; the wait was rejected instead of timing out"
-            ))),
-            None => Ok(()),
+        if !self.supported_waits.contains(&required) {
+            return Err(BackendError::Unsupported(format!(
+                "{required:?} waits are unsupported on this backend; the wait was rejected instead of timing out"
+            )));
         }
+        Ok(())
     }
 }
 
@@ -788,10 +777,16 @@ pub enum WaitReason {
 /// `CaptureReason` directly. `From` conversions preserve compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureReason {
+    /// The action returned without testing settlement (`no_wait`).
+    Immediate,
     /// A screen settled to stable for the required quiet interval.
     Settled,
     /// A screen-change was detected.
     ScreenChanged,
+    /// A matching session event fired after the action anchor.
+    EventMatched,
+    /// The fused semantic identity changed after the action anchor.
+    SemanticChanged,
     /// The watched text appeared on screen.
     TextMatched,
     /// The watched text disappeared from screen.
@@ -831,6 +826,9 @@ impl From<WaitReason> for CaptureReason {
 impl From<CaptureReason> for WaitReason {
     fn from(c: CaptureReason) -> Self {
         match c {
+            CaptureReason::Immediate
+            | CaptureReason::EventMatched
+            | CaptureReason::SemanticChanged => WaitReason::ScreenChange,
             CaptureReason::TextMatched => WaitReason::Text,
             CaptureReason::TextAbsent => WaitReason::TextAbsent,
             CaptureReason::ScreenChanged => WaitReason::ScreenChange,
@@ -1028,8 +1026,11 @@ mod tests {
     #[test]
     fn capture_reason_round_trips_through_wait_reason() {
         for r in [
+            CaptureReason::Immediate,
             CaptureReason::Settled,
             CaptureReason::ScreenChanged,
+            CaptureReason::EventMatched,
+            CaptureReason::SemanticChanged,
             CaptureReason::TextMatched,
             CaptureReason::TextAbsent,
             CaptureReason::ProcessExit,
@@ -1042,10 +1043,28 @@ mod tests {
         ] {
             let w: WaitReason = r.into();
             let back: CaptureReason = w.into();
-            // OutputClosed/Cancelled map to Idle on the WaitReason side;
-            // everything else is a stable round-trip.
-            if matches!(r, CaptureReason::OutputClosed | CaptureReason::Cancelled) {
-                assert!(matches!(back, CaptureReason::Idle));
+            // The legacy wait taxonomy has no Immediate/Event/Semantic
+            // variants; those map to ScreenChange when narrowed. Likewise,
+            // OutputClosed/Cancelled map to Idle.
+            if matches!(
+                r,
+                CaptureReason::OutputClosed
+                    | CaptureReason::Cancelled
+                    | CaptureReason::Immediate
+                    | CaptureReason::EventMatched
+                    | CaptureReason::SemanticChanged
+            ) {
+                let expected = if matches!(
+                    r,
+                    CaptureReason::Immediate
+                        | CaptureReason::EventMatched
+                        | CaptureReason::SemanticChanged
+                ) {
+                    CaptureReason::ScreenChanged
+                } else {
+                    CaptureReason::Idle
+                };
+                assert_eq!(back, expected, "narrowed reason for {:?}", r);
             } else {
                 assert_eq!(back, r, "round-trip for {:?}", r);
             }

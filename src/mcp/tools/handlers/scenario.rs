@@ -373,6 +373,12 @@ pub(crate) async fn tui_scenario(
         SA::Save => {
             let name = p.name.clone().unwrap_or_else(|| "scenario".into());
             let steps = p.steps.clone().unwrap_or_default();
+            if steps.is_empty() {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    "a scenario must contain at least one step; use record_start/record_stop to capture a live flow or provide act/intent/wait/assert steps",
+                );
+            }
             let mut recorder = crate::scenario::recorder::ScenarioRecorder::new(name.clone());
             for s in &steps {
                 // Canonical step shape = flat ({kind, ...params}), the
@@ -411,12 +417,13 @@ pub(crate) async fn tui_scenario(
                 };
                 match kind.as_str() {
                     "act" => recorder.record_act(params),
+                    "intent" => recorder.record_intent(params),
                     "wait" => recorder.record_wait(params),
                     "assert" => recorder.record_assert(params),
                     other => {
                         return err(
                             ErrorCategory::InvalidRequest,
-                            format!("unknown step kind '{}' (act|wait|assert)", other),
+                            format!("unknown step kind '{}' (act|intent|wait|assert)", other),
                         )
                     }
                 }

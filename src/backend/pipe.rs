@@ -600,7 +600,7 @@ impl TerminalBackend for PipeBackend {
         let baseline_bell_seq = match &cond {
             WaitCond::Bell {
                 after_bell_seq: Some(seq),
-            } => seq.saturating_sub(1),
+            } => *seq,
             _ => self.bell_seq,
         };
         let baseline_interaction_seq = self.screen_seq + self.bell_seq;
