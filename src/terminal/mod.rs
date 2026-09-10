@@ -52,6 +52,145 @@ impl CapabilityState {
     }
 }
 
+/// A transport-independent terminal persona (P1-49/50): what a *terminal*
+/// claims to be, independent of how the child is hosted. A persona is a
+/// declared compatibility input — transport capabilities remain evidence in
+/// [`Capabilities`], while these declarations describe the environment the
+/// target observes (TERM/COLORTERM, color depth, protocol expectations).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalPersona {
+    /// Stable id, e.g. `"xterm-256color"`, `"kitty"`, `"dumb"`.
+    pub id: String,
+    /// `TERM` the child observes.
+    pub term: String,
+    /// `COLORTERM`, when the persona declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colorterm: Option<String>,
+    /// Declared color depth: `none`, `16`, `256`, or `truecolor`.
+    pub color_depth: String,
+    /// Declared protocol support (by stable ids). These are *persona
+    /// declarations*; runtime evidence may still promote/deny them in
+    /// profile rows.
+    pub supports: Vec<TerminalPersonaFeature>,
+    /// Environment pairs a launch using this persona must inject.
+    pub env: Vec<(String, String)>,
+}
+
+/// Stable persona feature vocabulary (P1-49).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPersonaFeature {
+    ApplicationCursor,
+    AlternateScreen,
+    BracketedPaste,
+    Mouse,
+    MouseSgr,
+    KittyKeyboard,
+    Osc8,
+    SynchronizedUpdates,
+    QueryResponses,
+}
+
+impl TerminalPersonaFeature {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ApplicationCursor => "application_cursor",
+            Self::AlternateScreen => "alternate_screen",
+            Self::BracketedPaste => "bracketed_paste",
+            Self::Mouse => "mouse",
+            Self::MouseSgr => "mouse_sgr",
+            Self::KittyKeyboard => "kitty_keyboard",
+            Self::Osc8 => "osc8",
+            Self::SynchronizedUpdates => "synchronized_updates",
+            Self::QueryResponses => "query_responses",
+        }
+    }
+}
+
+impl TerminalPersona {
+    /// The canonical built-in personas for matrix runs.
+    pub fn builtin() -> Vec<Self> {
+        vec![
+            Self {
+                id: "dumb".into(),
+                term: "dumb".into(),
+                colorterm: None,
+                color_depth: "none".into(),
+                supports: vec![],
+                env: vec![("TERM".into(), "dumb".into())],
+            },
+            Self {
+                id: "xterm".into(),
+                term: "xterm".into(),
+                colorterm: None,
+                color_depth: "16".into(),
+                supports: vec![
+                    TerminalPersonaFeature::ApplicationCursor,
+                    TerminalPersonaFeature::AlternateScreen,
+                ],
+                env: vec![("TERM".into(), "xterm".into())],
+            },
+            Self {
+                id: "xterm-256color".into(),
+                term: "xterm-256color".into(),
+                colorterm: None,
+                color_depth: "256".into(),
+                supports: vec![
+                    TerminalPersonaFeature::ApplicationCursor,
+                    TerminalPersonaFeature::AlternateScreen,
+                    TerminalPersonaFeature::Osc8,
+                ],
+                env: vec![("TERM".into(), "xterm-256color".into())],
+            },
+            Self {
+                id: "truecolor".into(),
+                term: "xterm-256color".into(),
+                colorterm: Some("truecolor".into()),
+                color_depth: "truecolor".into(),
+                supports: vec![
+                    TerminalPersonaFeature::ApplicationCursor,
+                    TerminalPersonaFeature::AlternateScreen,
+                    TerminalPersonaFeature::BracketedPaste,
+                    TerminalPersonaFeature::Osc8,
+                    TerminalPersonaFeature::SynchronizedUpdates,
+                    TerminalPersonaFeature::QueryResponses,
+                ],
+                env: vec![
+                    ("TERM".into(), "xterm-256color".into()),
+                    ("COLORTERM".into(), "truecolor".into()),
+                ],
+            },
+        ]
+    }
+
+    /// The launch env pairs for this persona (persona env wins over caller
+    /// pairs for the keys it owns).
+    pub fn apply_env(&self, env: &mut Vec<(String, String)>) {
+        for (k, v) in &self.env {
+            if let Some(pair) = env.iter_mut().find(|(ek, _)| ek == k) {
+                pair.1 = v.clone();
+            } else {
+                env.push((k.clone(), v.clone()));
+            }
+        }
+    }
+
+    /// Whether this persona declares a feature.
+    pub fn declares(&self, feature: TerminalPersonaFeature) -> bool {
+        self.supports.contains(&feature)
+    }
+}
+
+/// Differential result for running the same scenario/check across personas
+/// (P1-49): the persona declaration plus the outcome's stable JSON payload.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PersonaMatrixRow<T> {
+    pub persona: String,
+    pub term: String,
+    pub colorterm: Option<String>,
+    pub outcome: T,
+}
+
 /// One row of a [`TerminalProfile`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProfileFeature {
@@ -489,5 +628,37 @@ mod tests {
             "absence must be stated as absence: {}",
             feat(&p, "mouse").evidence
         );
+    }
+}
+
+#[cfg(test)]
+mod persona_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_personas_cover_color_and_protocol_ladder() {
+        let personas = TerminalPersona::builtin();
+        assert_eq!(personas.len(), 4);
+        assert_eq!(personas[0].term, "dumb");
+        assert_eq!(personas[3].color_depth, "truecolor");
+        assert!(personas[3].declares(TerminalPersonaFeature::SynchronizedUpdates));
+        assert!(!personas[0].declares(TerminalPersonaFeature::Osc8));
+    }
+
+    #[test]
+    fn persona_env_overrides_only_owned_keys() {
+        let persona = TerminalPersona::builtin().remove(3);
+        let mut env = vec![
+            ("TERM".to_string(), "vt100".to_string()),
+            ("MY_VAR".to_string(), "keep".to_string()),
+        ];
+        persona.apply_env(&mut env);
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "TERM" && v == "xterm-256color"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "COLORTERM" && v == "truecolor"));
+        assert!(env.iter().any(|(k, v)| k == "MY_VAR" && v == "keep"));
     }
 }
