@@ -18,9 +18,12 @@
 use std::time::{Duration, Instant};
 
 use crate::backend::{
-    new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
-    Input, InputModes, MouseEvent, MouseMode, ObserveResult, RecordingHook, RecordingHookSlot,
-    TerminalEventState, WaitCond, WaitOutcome, WaitReason,
+    new_recording_hook_slot,
+    trait_def::TerminalBackend,
+    trait_def::{StartupOutcome, StartupPhase},
+    BackendError, BackendResult, Capabilities, Input, InputModes, MouseEvent, MouseMode,
+    ObserveResult, RecordingHook, RecordingHookSlot, TerminalEventState, WaitCond, WaitOutcome,
+    WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -374,10 +377,18 @@ impl TerminalBackend for PortablePtyBackend {
         self.raw.clear();
         self.emulator.callbacks_mut().query_responses.clear();
 
-        // give the process a moment to emit initial frame
-        std::thread::sleep(Duration::from_millis(150));
-        // initial pump so state() is immediately meaningful
+        // Readiness is observable, not a fixed sleep: pump immediately, then
+        // give the child a bounded chance to emit first output/frame. A blank
+        // first frame remains valid; deadline only means "not stronger yet".
+        let deadline = Instant::now() + Duration::from_millis(250);
         let _ = self.pump();
+        while Instant::now() < deadline
+            && self.events.output_seq() == 0
+            && self.process_pty.has_session()
+        {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = self.pump();
+        }
         Ok(())
     }
 
@@ -387,6 +398,30 @@ impl TerminalBackend for PortablePtyBackend {
         self.process_pty.terminate();
         self.reader_recording_hook = None;
         Ok(())
+    }
+
+    fn startup_outcome(&mut self) -> StartupOutcome {
+        let render_observed = self.events.screen_seq() > 0;
+        let phase = if !self.process().running {
+            StartupPhase::ProcessExited
+        } else if render_observed {
+            if self.events.screen_seq() > 1 {
+                StartupPhase::StableFrame
+            } else {
+                StartupPhase::FirstRender
+            }
+        } else if self.events.output_seq() > 0 {
+            StartupPhase::FirstOutput
+        } else {
+            StartupPhase::Spawned
+        };
+        StartupOutcome {
+            phase,
+            at_unix_ms: crate::events::unix_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
+            elapsed_ms: 0,
+            render_observed,
+        }
     }
 
     fn state(&mut self) -> BackendResult<ScreenState> {

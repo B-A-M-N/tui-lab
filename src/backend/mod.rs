@@ -26,6 +26,8 @@ pub mod protocol;
 pub mod raw_capture;
 pub mod tmux;
 pub mod trait_def;
+pub use trait_def::{StartupOutcome, StartupPhase};
+
 pub mod wait;
 
 pub use line_cli::PtyLineBackend;

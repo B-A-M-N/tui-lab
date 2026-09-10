@@ -288,6 +288,11 @@ impl Session {
         self.backend.input_modes()
     }
 
+    /// Evidence-shaped startup readiness for the current generation.
+    pub fn startup_outcome(&mut self) -> crate::backend::trait_def::StartupOutcome {
+        self.backend.startup_outcome()
+    }
+
     pub fn backend_version(&self) -> &'static str {
         match self.backend_kind {
             BackendKind::PortableVt => "portable-pty+vt100/0.1",

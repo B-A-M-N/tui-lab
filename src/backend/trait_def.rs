@@ -11,6 +11,53 @@ use super::{
 use crate::screen::{ProcessState, ScreenState};
 use std::time::Duration;
 
+/// What actually happened while a backend brought its target up (P1-41).
+/// This replaces arbitrary fixed sleeps as the readiness authority: a blank
+/// TUI is valid, and a deadline without output is not success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPhase {
+    /// Child/transport spawned successfully.
+    Spawned,
+    /// At least one byte/output chunk arrived.
+    FirstOutput,
+    /// A rendered/synthetic screen was materialized.
+    FirstRender,
+    /// The first materialized frame remained unchanged on a second pump.
+    StableFrame,
+    /// The child was already dead when checked.
+    ProcessExited,
+    /// The readiness deadline elapsed before a stronger phase.
+    Deadline,
+}
+
+impl StartupPhase {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::FirstOutput => "first_output",
+            Self::FirstRender => "first_render",
+            Self::StableFrame => "stable_frame",
+            Self::ProcessExited => "process_exited",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+
+/// Evidence-shaped startup result.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartupOutcome {
+    pub phase: StartupPhase,
+    /// Wall-clock correlation time.
+    pub at_unix_ms: u64,
+    /// Monotonic process-start milliseconds.
+    pub monotonic_ms: u64,
+    /// How long readiness detection took.
+    pub elapsed_ms: u64,
+    /// Whether a render was observed (may be legitimately blank).
+    pub render_observed: bool,
+}
+
 pub trait TerminalBackend: Send {
     /// Start the target process under a PTY at the given size.
     fn start(
@@ -25,6 +72,19 @@ pub trait TerminalBackend: Send {
 
     /// Stop the backend, killing the child (and its process group) if alive.
     fn stop(&mut self) -> BackendResult<()>;
+
+    /// Evidence-shaped readiness state for the current generation.
+    /// Backends that track output/screen counters should override this;
+    /// the default reports only that the transport reached `start` success.
+    fn startup_outcome(&mut self) -> StartupOutcome {
+        StartupOutcome {
+            phase: StartupPhase::Spawned,
+            at_unix_ms: crate::events::unix_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
+            elapsed_ms: 0,
+            render_observed: false,
+        }
+    }
 
     /// Observe current terminal state (parse buffered PTY bytes into a screen).
     fn state(&mut self) -> BackendResult<ScreenState>;
