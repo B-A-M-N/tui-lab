@@ -116,35 +116,37 @@ pub(crate) async fn tui_record(
                 // (goal spec: promotion preserves "recordings already held
                 // in memory") — the content is also returned inline.
                 let size = body.len() as u64;
+                // Write the durable artifact OUTSIDE the run lock (P1-48):
+                // reserve/register under the lock, but never let a slow disk
+                // stall the shared run context.
+                let persisted = run
+                    .lock()
+                    .unwrap()
+                    .run_dir()
+                    .cloned()
+                    .map(|dir| atomic_write_artifact(&dir.join("recordings"), &file_name, body.as_bytes()));
                 let (path, artifact) = {
                     let mut run = run.lock().unwrap();
-                    match run.run_dir().cloned() {
-                        Some(dir) => {
-                            let rec_dir = dir.join("recordings");
-                            let _ = std::fs::create_dir_all(&rec_dir);
-                            let file = rec_dir.join(&file_name);
-                            match std::fs::write(&file, &body) {
-                                Ok(()) => {
-                                    // Typed ref for the persisted artifact (Wave B item 15).
-                                    let rel = std::path::PathBuf::from("recordings")
-                                        .join(&file_name);
-                                    let r = run.register_artifact(
-                                        crate::run::ArtifactKind::Recording,
-                                        Some(rel),
-                                        Some(size),
-                                        Some(sess.id.clone()),
-                                        format!("pty recording, {} events", events),
-                                    )
-                                    .ok();
-                                    (Some(file.to_string_lossy().to_string()), r)
-                                }
-                                Err(e) => {
-                                    return err(
-                                        ErrorCategory::BackendError,
-                                        format!("recording flush failed: {}", e),
-                                    )
-                                }
-                            }
+                    match persisted {
+                        Some(Ok(file)) => {
+                            // Typed ref for the persisted artifact (Wave B item 15).
+                            let rel = std::path::PathBuf::from("recordings").join(&file_name);
+                            let r = run
+                                .register_artifact(
+                                    crate::run::ArtifactKind::Recording,
+                                    Some(rel),
+                                    Some(size),
+                                    Some(sess.id.clone()),
+                                    format!("pty recording, {} events", events),
+                                )
+                                .ok();
+                            (Some(file.to_string_lossy().to_string()), r)
+                        }
+                        Some(Err(e)) => {
+                            return err(
+                                ErrorCategory::BackendError,
+                                format!("recording flush failed: {e}"),
+                            )
                         }
                         None => {
                             run.hold_recording(file_name, body.clone());
@@ -207,38 +209,35 @@ pub(crate) async fn tui_record(
                     ext,
                 );
                 let size = body.len() as u64;
+                // Durable capture writes happen outside the run lock (P1-48).
+                let persisted = run
+                    .lock()
+                    .unwrap()
+                    .run_dir()
+                    .cloned()
+                    .map(|dir| atomic_write_artifact(&dir.join("captures"), &file_name, &body));
                 let (path, artifact) = {
                     let mut run = run.lock().unwrap();
                     let kind = crate::run::ArtifactKind::Capture;
-                    match run.run_dir().cloned() {
-                        Some(dir) => {
-                            let cap_dir = dir.join("captures");
-                            let _ = std::fs::create_dir_all(&cap_dir);
-                            let file = cap_dir.join(&file_name);
-                            match std::fs::write(&file, &body) {
-                                Ok(()) => {
-                                    let rel =
-                                        std::path::PathBuf::from("captures").join(&file_name);
-                                    let r = run.register_artifact(
-                                        kind,
-                                        Some(rel),
-                                        Some(size),
-                                        Some(sess.id.clone()),
-                                        format!(
-                                            "screen capture {}x{} ({} format)",
-                                            screen.cols, screen.rows, ext
-                                        ),
-                                    )
-                                    .ok();
-                                    (Some(file.to_string_lossy().to_string()), r)
-                                }
-                                Err(e) => {
-                                    return err(
-                                        ErrorCategory::BackendError,
-                                        format!("capture write failed: {e}"),
-                                    )
-                                }
-                            }
+                    match persisted {
+                        Some(Ok(file)) => {
+                            let rel = std::path::PathBuf::from("captures").join(&file_name);
+                            let r = run
+                                .register_artifact(
+                                    kind,
+                                    Some(rel),
+                                    Some(size),
+                                    Some(sess.id.clone()),
+                                    format!(
+                                        "screen capture {}x{} ({} format)",
+                                        screen.cols, screen.rows, ext
+                                    ),
+                                )
+                                .ok();
+                            (Some(file.to_string_lossy().to_string()), r)
+                        }
+                        Some(Err(e)) => {
+                            return err(ErrorCategory::BackendError, format!("capture write failed: {e}"))
                         }
                         None => {
                             run.hold_capture(file_name, body.clone(), ext);
@@ -283,6 +282,26 @@ pub(crate) async fn tui_record(
 /// Body of `tui_scenario` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
 /// whose private fields this child module can see unchanged.
+/// Atomic file write for durable artifacts. Callers should reserve/register
+/// evidence under the run lock separately; this helper performs the actual
+/// filesystem write outside any shared lock window and returns persistence
+/// health rather than silently swallowing errors.
+fn atomic_write_artifact(
+    dir: &std::path::Path,
+    file_name: &str,
+    body: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let file = dir.join(file_name);
+    let tmp = file.with_extension(format!(
+        "{}.tmp",
+        file.extension().and_then(|e| e.to_str()).unwrap_or("part")
+    ));
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &file).map_err(|e| e.to_string())?;
+    Ok(file)
+}
+
 pub(crate) async fn tui_scenario(
     s: &crate::mcp::tools::TuiLabServer,
     p: rmcp::handler::server::wrapper::Parameters<TuiScenarioParams>,

@@ -639,7 +639,7 @@ async fn lease_blocks_driving_and_allows_observing() {
             .await,
         "static audit under lease",
     );
-    assert_eq!(static_audit["mode"], "static", "{static_audit}");
+    assert_eq!(static_audit["mode"], "static_frame", "{static_audit}");
 
     // Review §5: passive LIVE-SESSION audits observe the raw ring and fused
     // frame but send nothing — they must stay available under a human lease
@@ -664,7 +664,7 @@ async fn lease_blocks_driving_and_allows_observing() {
             &format!("{passive} audit under lease"),
         );
         assert_eq!(
-            run["mode"], "active",
+            run["mode"], "observational_live",
             "{passive} is a live-session reader; it must run under a human lease: {run}"
         );
         // And it produced a finding_count (the audit actually ran).
