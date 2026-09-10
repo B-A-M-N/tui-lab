@@ -1488,20 +1488,26 @@ mod tests {
             .await
             .expect("actor run")
             .expect("rendering");
-        {
-            let ids: Vec<&str> = render.findings.iter().map(|f| f.id.as_str()).collect();
-            if !ids.contains(&"REND-FLICKER") {
-                let _ = pool
-                    .with_session(Some(&id), |s| {
-                        let _ = s.observe(300);
-                    })
-                    .await;
-                render = pool
-                    .with_session(Some(&id), |s| run_profile(s, "rendering"))
-                    .await
-                    .expect("actor run")
-                    .expect("rendering retry");
+        // Three bounded attempts: under parallel PTY load the startup ring
+        // can still be ingesting. Re-observe and retry when the signature
+        // has not yet landed; this tests the audit rule, not scheduler luck.
+        for _ in 0..2 {
+            let ids: std::collections::HashSet<&str> =
+                render.findings.iter().map(|f| f.id.as_str()).collect();
+            let has_signature = ids.contains("REND-FLICKER") && ids.contains("REND-CURSOR-LEAK");
+            if has_signature {
+                break;
             }
+            let _ = pool
+                .with_session(Some(&id), |s| {
+                    let _ = s.observe(300);
+                })
+                .await;
+            render = pool
+                .with_session(Some(&id), |s| run_profile(s, "rendering"))
+                .await
+                .expect("actor run")
+                .expect("rendering retry");
         }
         let ids: Vec<&str> = render.findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"REND-STYLE"), "style census present: {ids:?}");

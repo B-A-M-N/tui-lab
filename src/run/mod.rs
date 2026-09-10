@@ -733,6 +733,7 @@ mod tests {
             render: None,
             transition_capture: None,
             origin: Some(crate::execution::DriveOrigin::Audit),
+            dispatch: crate::execution::DispatchStatus::Sent,
         };
         tx.before_frame.state.structure_hash = "b".into();
         tx.after_frame.state.structure_hash = "a".into();
@@ -1760,6 +1761,7 @@ mod tests {
             render: None,
             transition_capture: None,
             origin: None,
+            dispatch: crate::execution::DispatchStatus::Sent,
         };
         assert!(run.record_interaction("s", &tx).is_err());
         assert!(run.record_event("s", "wait").is_err());
