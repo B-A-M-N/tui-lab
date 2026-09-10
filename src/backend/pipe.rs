@@ -31,9 +31,10 @@ use vt100::Parser;
 
 use crate::backend::line_types::{now_ms, CommandState, SearchHit};
 use crate::backend::{
-    new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
-    Input, InputModes, ObserveResult, RecordingHookSlot, TerminalEventState, WaitCond, WaitOutcome,
-    WaitReason,
+    new_recording_hook_slot,
+    trait_def::{StartupOutcome, StartupPhase, TerminalBackend},
+    BackendError, BackendResult, Capabilities, Input, InputModes, ObserveResult, RecordingHookSlot,
+    TerminalEventState, WaitCond, WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -461,9 +462,15 @@ impl TerminalBackend for PipeBackend {
         let now = Instant::now();
         self.last_output_instant = now;
         self.last_screen_change_instant = now;
-        // Give the process a moment to emit initial output (parity).
-        std::thread::sleep(Duration::from_millis(150));
+        // Readiness is observable: wait briefly for first output, never a
+        // fixed sleep. Deadline with no output is reported by
+        // startup_outcome rather than treated as success.
+        let deadline = Instant::now() + Duration::from_millis(250);
         self.pump();
+        while Instant::now() < deadline && self.output_seq == 0 && self.child.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            self.pump();
+        }
         Ok(())
     }
 
@@ -485,6 +492,30 @@ impl TerminalBackend for PipeBackend {
         self.chunk_rx = None;
         self.child_pid = None;
         Ok(())
+    }
+
+    fn startup_outcome(&mut self) -> StartupOutcome {
+        let render_observed = self.screen_seq > 0;
+        let phase = if !self.process().running {
+            StartupPhase::ProcessExited
+        } else if render_observed {
+            if self.screen_seq > 1 {
+                StartupPhase::StableFrame
+            } else {
+                StartupPhase::FirstRender
+            }
+        } else if self.output_seq > 0 {
+            StartupPhase::FirstOutput
+        } else {
+            StartupPhase::Spawned
+        };
+        StartupOutcome {
+            phase,
+            at_unix_ms: crate::events::unix_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
+            elapsed_ms: 0,
+            render_observed,
+        }
     }
 
     fn state(&mut self) -> BackendResult<ScreenState> {
