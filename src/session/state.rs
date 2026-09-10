@@ -170,22 +170,38 @@ fn emit_semantic_frame_events(
     prev: &ScreenState,
     next: &ScreenState,
     cache: &mut crate::semantic::SemanticCache,
+    native_revision: Option<u64>,
 ) {
     let prev_sem = cache.analyze(prev).sem;
     let next_sem = cache.analyze(next).sem;
-    if prev_sem.focus.control_id != next_sem.focus.control_id
-        || prev_sem.focus.control != next_sem.focus.control
-    {
+    let prev_focus = prev_sem.focus.clone();
+    let next_focus = next_sem.focus.clone();
+    if prev_focus.control_id != next_focus.control_id || prev_focus.control != next_focus.control {
         events.push(
             session,
             generation,
             crate::events::TerminalEventKind::FocusChanged {
-                from: prev_sem.focus.control_id.or(prev_sem.focus.control),
-                to: next_sem.focus.control_id.or(next_sem.focus.control),
+                from: prev_focus.control_id.or(prev_focus.control),
+                to: next_focus.control_id.or(next_focus.control),
             },
         );
     }
-    if prev.semantic_identity() != next.semantic_identity() {
+    // P1-31: compare the same unified V2 fused projection used by evidence
+    // and completion paths. A native-only revision can produce a semantic
+    // edge even when the grid is unchanged.
+    let prev_id = crate::semantic::SemanticIdentityV2::from_fused(
+        &prev_sem,
+        &crate::semantic::build_tree(prev),
+        native_revision,
+    )
+    .identity();
+    let next_id = crate::semantic::SemanticIdentityV2::from_fused(
+        &next_sem,
+        &crate::semantic::build_tree(next),
+        native_revision,
+    )
+    .identity();
+    if prev_id != next_id {
         events.push(
             session,
             generation,
@@ -460,6 +476,7 @@ impl Session {
                 prev,
                 next,
                 &mut cache,
+                self.native.revision(),
             );
         }
         if prev.process.running && !next.process.running {
@@ -582,7 +599,7 @@ mod emission_tests {
 
         let mut q = crate::events::TerminalEventQueue::new();
         let mut cache = crate::semantic::SemanticCache::new();
-        emit_semantic_frame_events(&mut q, "s", 1, &a, &b, &mut cache);
+        emit_semantic_frame_events(&mut q, "s", 1, &a, &b, &mut cache, None);
         let batch = q.since(0);
         assert!(
             batch.events.iter().any(|e| matches!(
@@ -601,7 +618,7 @@ mod emission_tests {
         let mut c = base(1);
         c.viewport_text[3] = "[ New Button ]".into();
         let mut q2 = crate::events::TerminalEventQueue::new();
-        emit_semantic_frame_events(&mut q2, "s", 1, &a, &c, &mut cache);
+        emit_semantic_frame_events(&mut q2, "s", 1, &a, &c, &mut cache, None);
         let batch2 = q2.since(0);
         assert!(
             batch2
@@ -619,7 +636,7 @@ mod emission_tests {
         // Honest negative: identical semantics (same screen twice) emits
         // NEITHER event.
         let mut q3 = crate::events::TerminalEventQueue::new();
-        emit_semantic_frame_events(&mut q3, "s", 1, &a, &a.clone(), &mut cache);
+        emit_semantic_frame_events(&mut q3, "s", 1, &a, &a.clone(), &mut cache, None);
         assert!(
             q3.since(0).events.is_empty(),
             "identical frames must emit no semantic events"
