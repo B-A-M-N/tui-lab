@@ -357,11 +357,18 @@ fn flow_regression_test_tui() -> serde_json::Value {
                      allow_mutation: Some(false), restart_between_mutations: None,
                      allow_process_restart: None,
                  }).unwrap()),
-            step("tui_scenario", "capture the interaction that must keep working as a replayable scenario",
+            step("tui_scenario", "begin recording the interaction that must keep working",
                  serde_json::to_value(TuiScenarioParams {
-                     action: Known::Known(ScenarioAction::Save),
+                     action: Known::Known(ScenarioAction::RecordStart),
                      name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
                      recording_id: None, steps: None, parameters: None,
+                     on_failure: None, finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_scenario", "finish the recorded flow after driving/assertions; the recorder owns the nonempty step set",
+                 serde_json::to_value(TuiScenarioParams {
+                     action: Known::Known(ScenarioAction::RecordStop),
+                     name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     recording_id: Some("$recording_id".into()), steps: None, parameters: None,
                      on_failure: None, finding_id: None, asset_type: None,
                  }).unwrap()),
             step("tui_run", "persist the run so the baseline + scenario survive the session",
@@ -404,7 +411,7 @@ pub fn flows() -> serde_json::Value {
         "debug_existing_tui": flow_debug_existing_tui(),
         "construct_or_refine_tui": flow_construct_or_refine_tui(),
         "regression_test_tui": flow_regression_test_tui(),
-        "note": "arguments are serialized from the real parameter types; '$session'/'$finding_id'/'$project_dir'/'$contract.yaml' are placeholders the caller fills with real ids/paths",
+        "note": "arguments are serialized from the real parameter types; '$session', '$recording_id', '$finding_id', '$project_dir', '$contract.yaml' are placeholders the caller fills with real ids/paths",
     })
 }
 

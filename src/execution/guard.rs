@@ -39,55 +39,64 @@ impl MutationGuard {
     /// caller sends when it wants "act only if the world hasn't moved
     /// since right now" (racy-read protection for the executor's own
     /// window).
-    pub fn capture(session: &crate::session::state::Session) -> Self {
-        let screen_fused = session.analyze_last();
+    pub fn capture(
+        analysis: Option<&crate::session::state::FrameAnalysis>,
+        generation: u32,
+    ) -> Self {
         MutationGuard {
-            generation: Some(session.generation),
-            structure_hash: screen_fused
-                .as_ref()
-                .map(|a| a.frame.structure_hash.clone()),
-            focus_control_id: screen_fused
-                .as_ref()
-                .and_then(|a| a.semantic.focus.control_id.clone()),
+            generation: Some(generation),
+            structure_hash: analysis.map(|a| a.frame.structure_hash.clone()),
+            focus_control_id: analysis.and_then(|a| a.semantic.focus.control_id.clone()),
         }
     }
 
     /// Validate against live state. `Ok(())` means every declared
     /// expectation holds; `Err(payload)` is the structured `stale_state`
     /// JSON naming the first violated expectation, expected vs actual.
-    pub fn validate(
+    pub fn validate_fresh(
         &self,
-        session: &crate::session::state::Session,
+        session: &mut crate::session::state::Session,
+    ) -> Result<(), serde_json::Value> {
+        // A guard is a claim about CURRENT terminal state. Pump the backend
+        // and native channel immediately before dispatch; analyzing the
+        // last settled observation cannot close the observe→act race because
+        // the target process changes independently of TUI-Lab method calls.
+        let analysis = session.peek_fresh().map_err(|e| {
+            json!({
+                "category": "stale_state",
+                "check": "refresh",
+                "expected": "a fresh pre-dispatch frame",
+                "actual": e.to_string(),
+                "summary": "cannot verify the guarded state: pre-dispatch refresh failed"
+            })
+        })?;
+        self.validate_analysis(&analysis, session.generation)
+    }
+
+    /// Validate against a fused frame the caller acquired atomically. This
+    /// is pure policy; executor paths must use [`Self::validate_fresh`].
+    pub fn validate_analysis(
+        &self,
+        analysis: &crate::session::state::FrameAnalysis,
+        generation: u32,
     ) -> Result<(), serde_json::Value> {
         // Generation first: a restart invalidates everything else.
         if let Some(want_gen) = self.generation {
-            if session.generation != want_gen {
+            if generation != want_gen {
                 return Err(json!({
                     "category": "stale_state",
                     "check": "generation",
                     "expected": want_gen,
-                    "actual": session.generation,
+                    "actual": generation,
                     "summary": format!(
-                        "session restarted since the guard was captured (generation {want_gen} -> {})",
-                        session.generation
+                        "session restarted since the guard was captured (generation {want_gen} -> {generation})"
                     ),
                 }));
             }
         }
-        // Fused analysis once; both structure and focus compare against it.
-        let analysis = session.analyze_last();
-        let Some(analysis) = analysis else {
-            if self.structure_hash.is_some() || self.focus_control_id.is_some() {
-                return Err(json!({
-                    "category": "stale_state",
-                    "check": "frame",
-                    "expected": "an observed frame",
-                    "actual": null,
-                    "summary": "no frame has been observed yet; guard cannot hold",
-                }));
-            }
-            return Ok(());
-        };
+        // Both structure and focus compare against the supplied fused
+        // analysis. Empty terminal state is a valid screen; the earlier
+        // `Option<FrameAnalysis>` conflation treated it as "no frame".
         if let Some(want_hash) = &self.structure_hash {
             if &analysis.frame.structure_hash != want_hash {
                 return Err(json!({

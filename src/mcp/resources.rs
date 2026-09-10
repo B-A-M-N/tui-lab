@@ -243,17 +243,19 @@ pub(crate) mod resolve {
                         let profile = sess.terminal_profile();
                         return Some(serde_json::to_string_pretty(&profile).unwrap_or_default());
                     }
-                    // Passive resource read: consume the latest COMMITTED
-                    // frame without triggering a settle cycle and WITHOUT
-                    // advancing the session-global previous/current baseline.
-                    // The explicit `observe()` path (tui_observe) is the only
-                    // thing that should move a consumer's diff cursor; a peek
-                    // at the screen must be observationally pure. We only
-                    // settle once to establish a first frame if none exists
-                    // (a freshly-started session that was never observed).
-                    let screen = match sess.last() {
-                        Some(f) => f.clone(),
-                        None => sess.observe(40).ok()?,
+                    // Passive resource read: peek CURRENT state without a
+                    // settle cycle. A cached committed frame is stale by
+                    // definition when the target changes asynchronously
+                    // (beta audit item 32); `peek_fresh` pumps bytes/native
+                    // facts without the ordinary quiet wait. If the pump
+                    // fails, the last committed frame remains the best
+                    // available snapshot.
+                    let screen = match sess.peek_fresh() {
+                        Ok(f) => f.frame,
+                        Err(_) => match sess.last() {
+                            Some(f) => f.clone(),
+                            None => sess.observe(40).ok()?,
+                        },
                     };
                     if matches!(session_view, SessionView::Semantic) {
                         // Fused truth: the resource serves the SAME analysis
