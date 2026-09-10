@@ -82,6 +82,37 @@ pub struct ScenarioLaunch {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    /// Exact spawn transport for deterministic replay.
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// Isolation profile for deterministic replay.
+    #[serde(default = "default_isolation")]
+    pub isolation: String,
+}
+
+fn default_backend() -> String {
+    "auto".to_string()
+}
+
+fn default_isolation() -> String {
+    "local".to_string()
+}
+
+impl ScenarioLaunch {
+    /// The session launch specification implied by this scenario-owned
+    /// target.
+    pub fn to_launch_spec(&self) -> crate::session::state::LaunchSpec {
+        crate::session::state::LaunchSpec {
+            command: self.command.clone(),
+            args: self.args.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            cols: self.cols,
+            rows: self.rows,
+            backend: self.backend.clone(),
+            isolation: self.isolation.clone(),
+        }
+    }
 }
 
 fn default_cols() -> u16 {
@@ -249,9 +280,10 @@ impl Scenario {
         self.steps.len()
     }
 
-    /// Validate that the scenario has at least one step.
+    /// Structural validity: nonempty steps and, when the scenario owns a
+    /// target (`inherit_session=false`), a launch specification.
     pub fn is_valid(&self) -> bool {
-        !self.steps.is_empty()
+        !self.steps.is_empty() && (self.inherit_session || self.launch.is_some())
     }
 
     /// The declared parameter names (re-review P0.3), so a caller can learn
@@ -306,4 +338,44 @@ fn substitute(
         _ => {}
     }
     v
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn test_launch() -> ScenarioLaunch {
+        ScenarioLaunch {
+            command: "python3".into(),
+            args: vec!["-c".into(), "print('x')".into()],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        }
+    }
+
+    #[test]
+    fn scenario_launch_converts_to_session_spec() {
+        let spec = test_launch().to_launch_spec();
+        assert_eq!(spec.command, "python3");
+        assert_eq!(spec.backend, "auto");
+        assert_eq!(spec.isolation, "local");
+        assert_eq!((spec.cols, spec.rows), (80, 24));
+    }
+
+    #[test]
+    fn scenario_owned_target_requires_launch() {
+        let mut sc = Scenario::new("owned");
+        sc = sc.act(serde_json::json!({"action":"key","key":"enter"}));
+        sc.inherit_session = false;
+        assert!(
+            !sc.is_valid(),
+            "scenario-owned target without launch must be structurally invalid"
+        );
+        sc.launch = Some(test_launch());
+        assert!(sc.is_valid());
+    }
 }
