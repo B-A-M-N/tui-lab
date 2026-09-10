@@ -27,6 +27,27 @@ pub(crate) async fn tui_session(
             ),
         );
     };
+    // Action-scoped field validation (P1-20): meaningless fields must
+    // not silently ride a request, and attach-only selectors must not
+    // appear on spawn.
+    if p.target.is_some() && *action != A::Attach {
+        return err(
+            ErrorCategory::InvalidRequest,
+            "target is attach-only; use tui_session action=attach target=...",
+        );
+    }
+    if p.attach_backend.is_some() && *action != A::Attach {
+        return err(
+            ErrorCategory::InvalidRequest,
+            "attach_backend is attach-only; use tui_session action=attach attach_backend=tmux",
+        );
+    }
+    if *action == A::Attach && (p.command.is_some() || p.args.is_some()) {
+        return err(
+            ErrorCategory::InvalidRequest,
+            "command/args are spawn-only; action=attach adopts an existing pane via target",
+        );
+    }
     match action {
         A::Start => {
             // Beta-audit P0.1: the shared lifecycle lease spans the
@@ -154,6 +175,21 @@ pub(crate) async fn tui_session(
             // Beta-audit P0.1: same whole-operation lease as Start —
             // an attach authorized under run A binds to run A.
             let _lease = s.lifecycle.shared("session-attach").await;
+            if let Some(known) = p.attach_backend.as_ref() {
+                if known.known() != Some(&crate::mcp::params::AttachBackendParam::Tmux) {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        format!(
+                            "unknown attach backend '{}' (supported: {})",
+                            match known {
+                                crate::mcp::params::Known::Other(o) => o.clone(),
+                                _ => String::new(),
+                            },
+                            <crate::mcp::params::AttachBackendParam as crate::mcp::params::EnumVariants>::VARIANTS.join(", ")
+                        ),
+                    );
+                }
+            }
             let target = match p.target.as_deref() {
                 Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                 _ => {

@@ -233,12 +233,13 @@ fn flow_debug_existing_tui() -> serde_json::Value {
         "name": "debug_existing_tui",
         "description": "Investigate a misbehaving or unfamiliar TUI: observe first, diagnose from evidence, experiment causally, then keep a baseline so the fix can be proven.",
         "steps": [
-            step("tui_session", "start (or attach to an existing tmux pane) and hold the session id",
+            step("tui_session", "start a fixture/process; use action=attach target=... attach_backend=tmux for an existing pane",
                  serde_json::to_value(TuiSessionParams {
                      action: "start".into(), command: Some("<command>".into()),
                      args: None, cwd: None, env: None, cols: Some(120), rows: Some(40),
                      backend: None, isolation: None, id: None, holder: None,
                      ttl_ms: None, lease_id: None, target: None,
+                     attach_backend: None,
                  }).unwrap()),
             step("tui_observe", "the one-call construction view: frame identity, semantic controls with stable ids, affordances, contract verdicts",
                  serde_json::to_value(TuiObserveParams {
