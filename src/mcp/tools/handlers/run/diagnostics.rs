@@ -58,7 +58,7 @@ pub(crate) fn diagnose(s: &crate::mcp::tools::TuiLabServer) -> rmcp::model::Call
             "contract": "diagnostic",
             "contexts": [],
             "skipped": 0,
-            "note": "no findings recorded in this run — run an audit first (tui_audit action=run)",
+            "note": "no findings recorded in this run — run an audit first (tui_audit profile=...)",
         }));
     }
     ok(json!({
@@ -113,7 +113,7 @@ pub(crate) fn bundle(
                 "baseline": compare_label,
                 "baseline_available": run.finding_baseline(&compare_label).is_some(),
                 "comparable": false,
-                "note": "no completed audit pass recorded in this run yet — run tui_audit action=run (label=baseline before the change; compare_to=baseline after). The finding ledger is cumulative history and is deliberately NOT used as the current set.",
+                "note": "no completed audit pass recorded in this run yet — run tui_audit with label=baseline before the change and compare_to=baseline after. The finding ledger is cumulative history and is deliberately NOT used as the current set.",
             }));
         }
     };

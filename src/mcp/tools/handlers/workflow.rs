@@ -564,7 +564,7 @@ async fn diagnose_all(
             "workflow": "construction",
             "findings": [],
             "skipped": 0,
-            "note": "no findings recorded in this run — run an audit first (tui_audit action=run)",
+            "note": "no findings recorded in this run — run an audit first (tui_audit profile=...)",
         }));
     }
     ok(json!({
