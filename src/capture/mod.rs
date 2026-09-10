@@ -373,42 +373,24 @@ pub fn capture_by_strategy(
         }
         CaptureStrategy::UntilExit => wait_capture(backend, WaitCond::ProcessExit, budget),
         CaptureStrategy::UntilEvent(_matcher) => {
-            // Re-review P0 (arbitrary Event): the backend cannot match kinds,
-            // so this layer waits for ANY post-anchor observable edge and
-            // reports honestly: `met` requires the edge AND a non-wildcard
-            // matcher... the exact kind match still happens at session level
-            // against the drained event queue (the backend exposes
-            // sequences, not kinds). What changed: no false Bell reason, no
-            // `met` without an edge, and the outcome says which sequence
-            // moved so the caller can correlate with the queue.
+            // Route through the backend's event-aware wait loop so pending
+            // PTY/pipe bytes are pumped while waiting. The backend cannot
+            // match event kinds; it proves the next observable edge, and a
+            // session-level matcher narrows the kind.
             let baseline = backend.event_state();
-            let baseline_interaction = baseline.screen_seq + baseline.bell_seq + baseline.title_seq;
-            let start = std::time::Instant::now();
-            loop {
-                let now = backend.event_state();
-                let moved = now.screen_seq + now.bell_seq + now.title_seq > baseline_interaction;
-                if moved || start.elapsed() >= budget {
-                    let frame = backend.state()?;
-                    return Ok(CaptureOutcome {
-                        // The edge is real but the KIND match is not proven
-                        // here — `met: false` would overclaim failure, so we
-                        // report the edge with ScreenChanged and let the
-                        // session-level matcher deliver the verdict.
-                        reason: if moved {
-                            crate::backend::CaptureReason::ScreenChanged
-                        } else {
-                            crate::backend::CaptureReason::Deadline
-                        },
-                        met: moved,
-                        screen_seq: now.screen_seq,
-                        output_seq: now.output_seq,
-                        frame,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        frames: None,
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
+            let out = backend.wait(
+                WaitCond::AnyActivity {
+                    after_interaction_seq: Some(baseline.interaction_seq),
+                },
+                budget,
+            )?;
+            let mut capture = CaptureOutcome::from_wait(out);
+            capture.reason = if capture.met {
+                crate::backend::CaptureReason::ScreenChanged
+            } else {
+                crate::backend::CaptureReason::Deadline
+            };
+            Ok(capture)
         }
         CaptureStrategy::DeadlineSnapshot { ms } => {
             let dur = Duration::from_millis(*ms).min(budget);

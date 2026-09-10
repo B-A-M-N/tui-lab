@@ -126,13 +126,9 @@ pub(crate) async fn tui_probe(
                     return refused;
                 }
             }
-            // Item 13: the duration-sample capture needs its delay AFTER the
-            // settle; fold it into the effective budget so the wait inside
-            // the probe accounts for it.
-            let effective_budget = match frame_capture {
-                Some((_, extra_ms)) if extra_ms > 0 => budget_ms.saturating_add(extra_ms),
-                _ => budget_ms,
-            };
+            // Budget is an end-to-end ceiling. Duration samples must fit
+            // inside it, not extend it; the diagnostic layer schedules the
+            // sample against the same overall allowance.
             // Audit P0-16: the capture spec rides INTO the probe — the
             // transition collector arms at the stimulus, not after settle.
             match crate::diagnostic::run_probe_with_guard(
@@ -141,7 +137,7 @@ pub(crate) async fn tui_probe(
                 completion,
                 &watch,
                 quiet_ms,
-                effective_budget,
+                budget_ms,
                 probe_guard.as_ref(),
                 visibility,
                 frame_capture,
