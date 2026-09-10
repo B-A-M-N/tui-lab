@@ -139,6 +139,16 @@ pub const RESOURCES: &[ResourceCapability] = &[
             "Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).",
     },
     ResourceCapability {
+        uri: "tui://runs/{run_id}/timeline",
+        description:
+            "First-class causal timeline over the retained transaction window: dispatch provenance, generation, event anchors, before/after frame references, settlement, and render citations joined per transaction.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/timeline/{seq}",
+        description:
+            "One joined causal timeline entry by transaction seq: the primary debugging artifact for a single interaction.",
+    },
+    ResourceCapability {
         uri: "tui://runs/{run_id}/scenarios",
         description:
             "Saved scenarios in a run (review P1 evidence-addressability): ids, names, step counts, and the per-scenario URI. Live runs read memory+disk; persisted runs are restored read-only.",

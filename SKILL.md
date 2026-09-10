@@ -97,6 +97,8 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 ## Resources (tui://)
 
 - `tui://runs/{run_id}` — Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).
+- `tui://runs/{run_id}/timeline` — First-class causal timeline over the retained transaction window: dispatch provenance, generation, event anchors, before/after frame references, settlement, and render citations joined per transaction.
+- `tui://runs/{run_id}/timeline/{seq}` — One joined causal timeline entry by transaction seq: the primary debugging artifact for a single interaction.
 - `tui://runs/{run_id}/scenarios` — Saved scenarios in a run (review P1 evidence-addressability): ids, names, step counts, and the per-scenario URI. Live runs read memory+disk; persisted runs are restored read-only.
 - `tui://runs/{run_id}/scenarios/{scenario_id}` — One scenario by id (or unambiguous name) — the full recorded step list, addressable as evidence.
 - `tui://runs/{run_id}/transactions` — The declared-replay transaction ledger (bounded retained window + lifetime count). Citable as the run's interaction history.

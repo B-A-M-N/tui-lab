@@ -87,6 +87,85 @@ pub(crate) fn run_scoped_payload(
             .unwrap_or_default())
         }
         // One transaction by ledger seq.
+        // First-class causal timeline: dispatch provenance + event anchors
+        // + frame references + render citations joined into one artifact.
+        ("timeline", None) => {
+            let txs = run.transactions();
+            let items: Vec<serde_json::Value> = txs
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "seq": t.seq,
+                        "at": t.at,
+                        "generation": t.generation,
+                        "session": t.session,
+                        "action": t.action,
+                        "origin": t.origin,
+                        "dispatch": t.dispatch,
+                        "settle": t.settle,
+                        "settle_reason": t.settle_reason,
+                        "before_structure": t.before_structure,
+                        "after_structure": t.after_structure,
+                        "before_frame_id": t.before_frame_id,
+                        "after_frame_id": t.after_frame_id,
+                        "event_seq_before": t.event_seq_before,
+                        "event_seq_after": t.event_seq_after,
+                        "elapsed_ms": t.elapsed_ms,
+                        "send_ms": t.send_ms,
+                        "settle_ms": t.settle_ms,
+                        "render": t.render,
+                        "uri": format!("tui://runs/{run_id}/timeline/{}", t.seq),
+                    })
+                })
+                .collect();
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "run": run_id,
+                "retained": txs.len(),
+                "lifetime": run.transaction_total(),
+                "note": "causal timeline over the retained transaction window; per-entry URIs address one transaction's joined evidence",
+                "timeline": items,
+            }))
+            .unwrap_or_default())
+        }
+        // One joined timeline entry. This is the primary debugging artifact
+        // for "I pressed X and something weird happened": no manual join
+        // across ledger + frame ids + event anchors + render citations.
+        ("timeline", Some(key)) => {
+            let seq: u64 = key.parse().map_err(|_| {
+                format!(
+                    "timeline key '{key}' is not a transaction ledger seq (integer); tui://runs/{run_id}/timeline lists the retained window"
+                )
+            })?;
+            let tx = run.transactions().iter().find(|t| t.seq == seq).ok_or_else(
+                || {
+                    format!(
+                        "no timeline entry with seq {seq} in run '{run_id}' (retained window: {} records; the ledger may have evicted old records)",
+                        run.transactions().len()
+                    )
+                },
+            )?;
+            let before_uri = tx.before_frame_id.map(|id| format!("tui://runs/{run_id}/frames/{id}"));
+            let after_uri = tx.after_frame_id.map(|id| format!("tui://runs/{run_id}/frames/{id}"));
+            let payload = serde_json::json!({
+                "run": run_id,
+                "transaction": tx,
+                "references": {
+                    "before_frame": before_uri,
+                    "after_frame": after_uri,
+                    "events": {
+                        "before_seq": tx.event_seq_before,
+                        "after_seq": tx.event_seq_after,
+                    },
+                    "render_range": tx.render.as_ref().map(|r| serde_json::json!({
+                        "start": r.range_start,
+                        "end": r.range_end,
+                        "complete": r.complete,
+                    })),
+                },
+                "note": "event_seq_before/after anchor the terminal event window; frame references are present when evidence committed through the sink",
+            });
+            Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+        }
         ("transactions", Some(key)) => {
             let seq: u64 = key.parse().map_err(|_| {
                 format!(
@@ -104,7 +183,7 @@ pub(crate) fn run_scoped_payload(
             Ok(serde_json::to_string_pretty(tx).unwrap_or_default())
         }
         (other, _) => Err(format!(
-            "unknown run-scoped resource '{other}' under run '{run_id}' (expected 'scenarios' or 'transactions', each optionally followed by an id/seq)"
+            "unknown run-scoped resource '{other}' under run '{run_id}' (expected 'timeline', 'scenarios', or 'transactions', each optionally followed by an id/seq)"
         )),
     }
 }
