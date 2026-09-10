@@ -523,6 +523,28 @@ impl MutationRisk {
     pub fn is_invasive(&self) -> bool {
         *self != MutationRisk::Observational
     }
+
+    /// The likely side-effect class of a driver with this risk (P1-40).
+    /// This names what can change, not whether it is safe.
+    pub fn side_effect_class(&self) -> &'static str {
+        match self {
+            Self::Observational => "ui_state_read",
+            Self::Reversible => "ui_state",
+            Self::RestartRequired => "process",
+            Self::PotentiallyMutating => "external",
+        }
+    }
+
+    /// The best recovery guarantee offered by TUI-Lab for a driver with
+    /// this risk. `external` changes are explicitly not undoable.
+    pub fn recovery_guarantee(&self) -> &'static str {
+        match self {
+            Self::Observational => "none_needed",
+            Self::Reversible => "ui_restore",
+            Self::RestartRequired => "restart",
+            Self::PotentiallyMutating => "external_rollback_unavailable",
+        }
+    }
 }
 
 /// Typed execution mode for an audit report. Replaces the old string mode
