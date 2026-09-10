@@ -266,6 +266,7 @@ impl ScenarioRunner {
                 None => None,
             };
             let step_started = std::time::Instant::now();
+            let mut executed_tx: Option<crate::execution::InteractionTransaction> = None;
             let (step_passed, detail) = match step.kind {
                 StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
                     Ok(req) => {
@@ -304,7 +305,10 @@ impl ScenarioRunner {
                                     // like a live tui_act. Scenario capture stays
                                     // off (the step IS the scenario); the
                                     // envelope-sensitive visibility still rides.
-                                    let outcome = match run {
+                                    let outcome: Result<
+                                        crate::execution::InteractionTransaction,
+                                        anyhow::Error,
+                                    > = match run {
                                         Some(run) => {
                                             // Beta-audit P0-6: capture the run
                                             // identity at replay dispatch; the
@@ -322,8 +326,15 @@ impl ScenarioRunner {
                                                 origin: crate::execution::DriveOrigin::Scenario,
                                                 ticket,
                                             };
-                                            crate::execution::drive_pipeline(session, run, spec)
-                                                .map(|o| o.tx)
+                                            // Keep the outcome so the step can
+                                            // cite the committed transaction
+                                            // sequence directly.
+                                            match crate::execution::drive_pipeline(
+                                                session, run, spec,
+                                            ) {
+                                                Ok(o) => Ok(o.tx),
+                                                Err(e) => Err(e),
+                                            }
                                         }
                                         None => {
                                             crate::execution::execute_act_with_guard_and_origin(
@@ -340,14 +351,16 @@ impl ScenarioRunner {
                                         }
                                     };
                                     match outcome {
-                                        Ok(tx) => (
-                                            tx.settled(),
-                                            format!(
+                                        Ok(tx) => {
+                                            let settled = tx.settled();
+                                            let detail = format!(
                                                 "act executed, settled={:?} ({})",
                                                 tx.settle,
                                                 tx.settle_reason()
-                                            ),
-                                        ),
+                                            );
+                                            executed_tx = Some(tx);
+                                            (settled, detail)
+                                        }
                                         Err(e) => (false, format!("act failed: {e}")),
                                     }
                                 }
@@ -668,6 +681,21 @@ impl ScenarioRunner {
             }
 
             let elapsed = step_started.elapsed().as_millis() as u64;
+            let transaction_seq = executed_tx.as_ref().and_then(|tx| {
+                run.and_then(|run| {
+                    let run = run.lock().unwrap();
+                    run.transactions()
+                        .iter()
+                        .rev()
+                        .find(|r| {
+                            r.session == session.id
+                                && r.before_structure == tx.before().structure_hash
+                                && r.after_structure == tx.after().structure_hash
+                                && r.action == tx.name()
+                        })
+                        .map(|r| r.seq)
+                })
+            });
             results.push(StepResult {
                 index: i,
                 kind: format!("{:?}", step.kind).to_lowercase(),
@@ -683,7 +711,7 @@ impl ScenarioRunner {
                     Some(StepErrorCategory::ExecutionError)
                 },
                 detail,
-                transaction_seq: None,
+                transaction_seq,
                 elapsed_ms: Some(elapsed),
             });
         }
