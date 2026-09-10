@@ -53,6 +53,23 @@ impl RunContext {
         Ok(())
     }
 
+    /// Record an act step with a replay precondition into every matching
+    /// session-generation recording. The ordinary live recording path uses
+    /// this so the exact pre-dispatch frame becomes the replay guard.
+    pub fn record_scenario_act_with_expect(
+        &mut self,
+        session_id: &str,
+        generation: u32,
+        params: serde_json::Value,
+        expect: crate::scenario::model::StepExpect,
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
+        for r in self.scenarios.recorders_for(session_id, generation) {
+            r.record_act_with_expect(params.clone(), expect.clone());
+        }
+        Ok(())
+    }
+
     /// Record a SENSITIVE act step into matching session-generation
     /// recordings (re-review P0.3): the payload field becomes a `${NAME}`
     /// reference and the parameter is declared on the scenario. The secret
@@ -99,6 +116,13 @@ impl RunContext {
             r.record_assert(params.clone());
         }
         Ok(())
+    }
+
+    /// Current recorded step count for one recording id. `None` when the
+    /// recording does not exist. Used to refuse an empty record_stop
+    /// without consuming the in-progress recorder.
+    pub fn scenario_recording_step_count(&self, recording_id: &str) -> Option<usize> {
+        self.scenarios.recording_step_count(recording_id)
     }
 
     /// Finish a recording by id: returns the completed scenario and stops

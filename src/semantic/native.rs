@@ -679,6 +679,14 @@ impl NativeChannel {
         self.native_seq
     }
 
+    /// Monotonic channel revision for stale-state guards: the latest
+    /// native sequence when the channel exists, otherwise `None`. A guard
+    /// can therefore distinguish "no native channel" from "no native
+    /// update yet" without treating zero as a live revision.
+    pub fn revision(&self) -> Option<u64> {
+        self.path.as_ref().map(|_| self.native_seq)
+    }
+
     /// Reset (session restart): keep the path, drop the state.
     pub fn reset(&mut self) {
         self.latest = None;

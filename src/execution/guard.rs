@@ -32,6 +32,11 @@ pub struct MutationGuard {
     /// cooperative app's native focus participates).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_control_id: Option<String>,
+    /// Native semantic channel revision at decision time. A cooperative
+    /// app can change focus/state with no pixel change; if this revision
+    /// advances, the guarded belief is stale even when the grid is equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_revision: Option<u64>,
 }
 
 impl MutationGuard {
@@ -47,6 +52,7 @@ impl MutationGuard {
             generation: Some(generation),
             structure_hash: analysis.map(|a| a.frame.structure_hash.clone()),
             focus_control_id: analysis.and_then(|a| a.semantic.focus.control_id.clone()),
+            native_revision: None,
         }
     }
 
@@ -70,7 +76,7 @@ impl MutationGuard {
                 "summary": "cannot verify the guarded state: pre-dispatch refresh failed"
             })
         })?;
-        self.validate_analysis(&analysis, session.generation)
+        self.validate_analysis(&analysis, session, session.generation)
     }
 
     /// Validate against a fused frame the caller acquired atomically. This
@@ -78,6 +84,7 @@ impl MutationGuard {
     pub fn validate_analysis(
         &self,
         analysis: &crate::session::state::FrameAnalysis,
+        session: &crate::session::state::Session,
         generation: u32,
     ) -> Result<(), serde_json::Value> {
         // Generation first: a restart invalidates everything else.
@@ -106,6 +113,17 @@ impl MutationGuard {
                     "actual": analysis.frame.structure_hash,
                     "summary": "screen structure changed since the guard was captured \
                                 (layout shifted, a modal opened, or content replaced)",
+                }));
+            }
+        }
+        if let Some(want_rev) = self.native_revision {
+            if session.native_revision() != Some(want_rev) {
+                return Err(json!({
+                    "category": "stale_state",
+                    "check": "native_revision",
+                    "expected": want_rev,
+                    "actual": session.native_revision(),
+                    "summary": "native semantic state changed since the guard was captured",
                 }));
             }
         }
@@ -153,6 +171,7 @@ mod tests {
             generation: Some(3),
             structure_hash: Some("abc".into()),
             focus_control_id: Some("button/save".into()),
+            native_revision: Some(7),
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("button/save"));

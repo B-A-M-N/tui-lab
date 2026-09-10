@@ -317,6 +317,30 @@ impl RunEvidenceSink {
             .is_ok()
     }
 
+    /// Record one scenario act step with the completed transaction's
+    /// causal precondition (ordinary live recording). The payload shape is
+    /// unchanged; `expect` becomes the replay guard derived from the exact
+    /// `before_frame`.
+    pub fn record_scenario_act_with_expect(
+        &self,
+        sid: &str,
+        gen: u32,
+        params: serde_json::Value,
+        tx: &crate::execution::InteractionTransaction,
+    ) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        let expect = crate::scenario::model::StepExpect {
+            structure_hash: Some(tx.before_frame.state.structure_hash.clone()),
+            focus_control_id: tx.focus_before.as_ref().and_then(|f| f.0.clone()),
+            text_present: None,
+        };
+        run.record_scenario_act_with_expect(sid, gen, params, expect)
+            .is_ok()
+    }
+
     /// Record one scenario assert step, generation-scoped.
     pub fn record_scenario_assert(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
         let mut run = self.run.lock().unwrap();

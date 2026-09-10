@@ -98,13 +98,9 @@ impl ScenarioRecorder {
     pub fn record_act_with_expect(
         &mut self,
         params: serde_json::Value,
-        tx: &crate::execution::InteractionTransaction,
+        expect: &super::model::StepExpect,
     ) {
-        let expect = super::model::StepExpect {
-            structure_hash: Some(tx.before_frame.state.structure_hash.clone()),
-            focus_control_id: tx.focus_before.as_ref().and_then(|f| f.0.clone()),
-            text_present: None,
-        };
+        let expect = expect.clone();
         self.scenario = Scenario {
             steps: {
                 let mut steps = self.scenario.steps.clone();

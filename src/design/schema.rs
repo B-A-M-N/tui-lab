@@ -347,7 +347,7 @@ impl ProjectContract {
         // about Shift+Tab). Both land in `candidate_invariants` as
         // unverified with a how-to-verify recipe; promotion into real
         // contract flags is the author's deliberate act — ideally after
-        // `tui_contract action=check` proves them.
+        // `tui_contract action=status` proves them.
         let ext = contract
             .schema
             .extensions
@@ -357,12 +357,12 @@ impl ProjectContract {
             Self::scaffold_candidate(
                 "reverse_tab_required",
                 "unverified",
-                "run tui_contract action=check with a contract that declares reverse_tab_required: true — the behavior check sweeps Tab then Shift+Tab and proves the inverse",
+                "run tui_contract action=status with a contract that declares reverse_tab_required: true — the behavior check sweeps Tab then Shift+Tab and proves the inverse",
             ),
             Self::scaffold_candidate(
                 "escape_closes_modal",
                 "unverified",
-                "run tui_contract action=check with an interaction whose expect declares modal_open() — the behavior check opens a modal and proves Escape dismisses it",
+                "run tui_contract action=status with an interaction whose expect declares modal_open() — the behavior check opens a modal and proves Escape dismisses it",
             ),
         ]);
 

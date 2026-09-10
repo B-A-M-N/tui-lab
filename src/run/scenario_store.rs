@@ -67,6 +67,13 @@ impl ScenarioStore {
             .collect()
     }
 
+    /// Recorded step count for one recording id; `None` when absent.
+    pub(super) fn recording_step_count(&self, recording_id: &str) -> Option<usize> {
+        self.recorders
+            .get(recording_id)
+            .map(|r| r.recorder.step_count_hint())
+    }
+
     /// Finish a recording by id: returns the completed scenario and stops
     /// tracking it.
     pub(super) fn finish_recording(

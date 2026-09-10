@@ -348,6 +348,12 @@ pub(crate) async fn tui_scenario(
                 }
             };
             let mut run = s.run.lock().unwrap();
+            if run.scenario_recording_step_count(&rec_id) == Some(0) {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    "the recording has no steps; drive at least one act/intent/wait/assert before record_stop",
+                );
+            }
             match run.finish_scenario_recording(&rec_id) {
                 Some(scenario) => {
                     let path: Option<String> = run
