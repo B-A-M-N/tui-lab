@@ -65,6 +65,30 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Run a saved scenario against a real session, reusing the canonical
+    /// kernel (the same runner/evidence path MCP uses). Machine output JSON.
+    Scenario {
+        /// Scenario id or unambiguous name.
+        #[arg(long = "scenario")]
+        scenario: String,
+        /// Command to launch as the replay target (the scenario currently
+        /// requires `inherit_session=true`; this CLI starts the supplied
+        /// target and drives it).
+        #[arg(long = "command")]
+        command: String,
+        /// Arguments for the command.
+        #[arg(last = true)]
+        args: Vec<String>,
+        /// Number of repeat runs for flakiness classification.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Failure policy override: stop or continue.
+        #[arg(long)]
+        on_failure: Option<String>,
+        /// Sensitive parameter value `NAME=value`; repeatable.
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -96,7 +120,123 @@ async fn main() -> anyhow::Result<()> {
         Commands::Replay { run_id, root, full } => {
             replay(&run_id, root.as_deref(), full)?;
         }
+        Commands::Scenario {
+            scenario,
+            command,
+            args,
+            repeat,
+            on_failure,
+            params,
+        } => {
+            scenario_cli(
+                &scenario,
+                &command,
+                &args,
+                repeat,
+                on_failure.as_deref(),
+                &params,
+            )
+            .await?;
+        }
     }
+    Ok(())
+}
+
+/// The CI-facing scenario runner over the exact library kernel. It starts a
+/// real session, loads the scenario from the requested run, replays through
+/// [`tui_lab::scenario::runner::ScenarioRunner`], and prints stable JSON.
+async fn scenario_cli(
+    scenario_key: &str,
+    command: &str,
+    args: &[String],
+    repeat: u32,
+    on_failure: Option<&str>,
+    params: &[String],
+) -> anyhow::Result<()> {
+    use tui_lab::scenario::model::FailurePolicy;
+    use tui_lab::scenario::runner::{FlakinessVerdict, ScenarioRunner};
+
+    let policy_override = match on_failure {
+        None => None,
+        Some("stop") => Some(FailurePolicy::Stop),
+        Some("continue") => Some(FailurePolicy::Continue),
+        Some(other) => anyhow::bail!("unknown on_failure '{other}' (expected stop|continue)"),
+    };
+    let mut parameter_values = Vec::new();
+    for raw in params {
+        let (name, value) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid --param '{raw}' (expected NAME=value)"))?;
+        parameter_values.push(tui_lab::scenario::model::ParameterValue {
+            name: name.to_string(),
+            value: value.to_string(),
+        });
+    }
+
+    let pool = tui_lab::session::SessionPool::new();
+    let sid = pool
+        .start(command, args, None, &[], 80, 24, "auto", "local")
+        .await?;
+    // The run context is loaded from the current directory's runs root.
+    // This CLI intentionally requires an explicit persisted run (scenario
+    // files are run-scoped evidence, not global names).
+    let scenario = {
+        let mut loaded = None;
+        let cwd = std::env::current_dir()?;
+        let mut entries = std::fs::read_dir(cwd.join(".tui-lab/runs"))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect::<Vec<_>>();
+        entries.sort();
+        for dir in entries.into_iter().rev() {
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(run) = tui_lab::run::RunContext::restore(&dir) else {
+                continue;
+            };
+            if let Ok(sc) = run.load_scenario(scenario_key) {
+                loaded = Some(sc);
+                break;
+            }
+        }
+        loaded.ok_or_else(|| {
+            anyhow::anyhow!("scenario '{scenario_key}' not found under ./.tui-lab/runs")
+        })?
+    };
+
+    let report = {
+        let run = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
+        pool.with_session(Some(&sid), move |sess| {
+            ScenarioRunner::run_repeat(
+                &scenario,
+                sess,
+                &parameter_values,
+                Some(&run),
+                policy_override,
+                repeat,
+            )
+        })
+        .await?
+    };
+    let verdict = report.verdict.name();
+    let passed = report.verdict == FlakinessVerdict::StablePass;
+    let json = serde_json::json!({
+        "scenario": scenario_key,
+        "session": sid,
+        "repeat": report.repeat,
+        "passed_runs": report.passed_runs,
+        "failed_runs": report.failed_runs,
+        "pass_rate_pct": report.pass_rate_pct,
+        "verdict": verdict,
+        "passed": passed,
+        "first_run": report.first_run,
+        "last_run": report.last_run,
+    });
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    if !passed {
+        anyhow::bail!("scenario replay did not stably pass");
+    }
+    pool.stop(&sid).await.ok();
     Ok(())
 }
 
