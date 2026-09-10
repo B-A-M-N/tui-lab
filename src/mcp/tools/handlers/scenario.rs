@@ -567,42 +567,64 @@ pub(crate) async fn tui_scenario(
                 // Audit P0-21: the replay runs inside the run context, so
                 // every executed act step lands in the transaction ledger
                 // and frame evidence through the shared driving pipeline.
-                let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
-                    &scenario,
-                    sess,
-                    &parameter_values,
-                    Some(&run),
-                    policy_override,
-                );
+                let repeat = p.repeat.unwrap_or(1).max(1);
+                let (base, passed) = if repeat > 1 {
+                    let aggregate = crate::scenario::runner::ScenarioRunner::run_repeat(
+                        &scenario,
+                        sess,
+                        &parameter_values,
+                        Some(&run),
+                        policy_override,
+                        repeat,
+                    );
+                    let passed =
+                        aggregate.verdict == crate::scenario::runner::FlakinessVerdict::StablePass;
+                    (
+                        json!({
+                            "repeat": aggregate.repeat,
+                            "repeat_verdict": aggregate.verdict,
+                            "repeat_pass_rate_pct": aggregate.pass_rate_pct,
+                            "passed_runs": aggregate.passed_runs,
+                            "failed_runs": aggregate.failed_runs,
+                            "first_run": aggregate.first_run,
+                            "last_run": aggregate.last_run,
+                        }),
+                        passed,
+                    )
+                } else {
+                    let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
+                        &scenario,
+                        sess,
+                        &parameter_values,
+                        Some(&run),
+                        policy_override,
+                    );
+                    let passed = report.steps_failed == 0 && report.steps_skipped == 0;
+                    (
+                        json!({
+                            "name": report.scenario_name,
+                            "scenario_id": report.scenario_id,
+                            "schema": report.scenario_schema,
+                            "status": report.status,
+                            "steps_total": report.steps_total,
+                            "steps_passed": report.steps_passed,
+                            "steps_failed": report.steps_failed,
+                            "steps_skipped": report.steps_skipped,
+                            "step_results": report.step_results,
+                        }),
+                        passed,
+                    )
+                };
                 let (sid, gen) = (sess.id.clone(), sess.generation);
                 let _ = run
                     .lock()
                     .unwrap()
                     .record_event(&sid, &format!("scenario_run:{}", scenario.name));
-                let base = json!({
-                    "name": report.scenario_name,
-                    "session": sid,
-                    "generation": gen,
-                    "status": report.status,
-                    "steps_total": report.steps_total,
-                    "steps_passed": report.steps_passed,
-                    "steps_failed": report.steps_failed,
-                    "steps_skipped": report.steps_skipped,
-                    "step_results": report.step_results,
-                });
-                if report.steps_failed == 0 && report.steps_skipped == 0 {
-                    let mut v = base;
-                    v["passed"] = json!(true);
-                    ok(v)
-                } else {
-                    // Real regression (or a stop-policy halt): envelope stays
-                    // success (transport ok), payload reports the failure
-                    // honestly. `passed` is false the moment anything failed
-                    // OR was skipped — a skipped step is not a pass.
-                    let mut v = base;
-                    v["passed"] = json!(false);
-                    ok(v)
-                }
+                let mut v = base;
+                v["session"] = json!(sid);
+                v["generation"] = json!(gen);
+                v["passed"] = json!(passed);
+                ok(v)
             })
             .await
             .unwrap_or_else(|e| e)
