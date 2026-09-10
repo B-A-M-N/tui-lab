@@ -65,6 +65,12 @@ pub struct ScenarioRunReport {
     pub scenario_name: String,
     pub scenario_id: String,
     pub scenario_schema: String,
+    /// Monotonic process-start milliseconds at run start/end. These bound
+    /// the causal run, unlike wall-clock metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_monotonic_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_monotonic_ms: Option<u64>,
     /// How the replay ended (see [`RunStatus`]).
     pub status: RunStatus,
     pub steps_total: usize,
@@ -140,6 +146,7 @@ impl ScenarioRunner {
         run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
         policy_override: Option<super::model::FailurePolicy>,
     ) -> ScenarioRunReport {
+        let started_monotonic_ms = crate::events::monotonic_ms();
         let mut results = Vec::new();
         let mut passed = 0;
         let mut failed = 0;
@@ -258,6 +265,7 @@ impl ScenarioRunner {
                 }
                 None => None,
             };
+            let step_started = std::time::Instant::now();
             let (step_passed, detail) = match step.kind {
                 StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
                     Ok(req) => {
@@ -659,6 +667,7 @@ impl ScenarioRunner {
                 }
             }
 
+            let elapsed = step_started.elapsed().as_millis() as u64;
             results.push(StepResult {
                 index: i,
                 kind: format!("{:?}", step.kind).to_lowercase(),
@@ -675,7 +684,7 @@ impl ScenarioRunner {
                 },
                 detail,
                 transaction_seq: None,
-                elapsed_ms: None,
+                elapsed_ms: Some(elapsed),
             });
         }
 
@@ -683,6 +692,8 @@ impl ScenarioRunner {
             scenario_name: scenario.name.clone(),
             scenario_id: scenario.id.clone(),
             scenario_schema: scenario.schema.clone(),
+            started_monotonic_ms: Some(started_monotonic_ms),
+            finished_monotonic_ms: Some(crate::events::monotonic_ms()),
             status: if stopped_at.is_some() {
                 RunStatus::StoppedOnFailure
             } else {
