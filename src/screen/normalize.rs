@@ -46,7 +46,7 @@ pub struct VolatileClass {
 /// Normalization policy: a set of volatile-token regexes that should be
 /// replaced with stable placeholders during structure hashing.
 ///
-/// Audit item 13: policies are extensible via [`NormalizationPolicy::from_patterns`].
+/// Audit item 13: policies are extensible via `NormalizationPolicy::from_patterns`.
 #[derive(Debug, Clone)]
 pub struct NormalizationPolicy {
     /// Regex patterns for volatile content (clocks, percentages, timers,

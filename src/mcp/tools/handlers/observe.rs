@@ -26,76 +26,77 @@ pub(crate) async fn tui_assert(
         );
     }
     let selector = p.id.clone();
-    let run = s.run.clone();
-    s.with_sess(selector.as_deref(), move |sess| {
-        let screen = match sess.observe(40) {
-            Ok(s) => s,
-            Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-        };
-        if is_oracle {
-            let expr = p
-                .text
-                .clone()
-                .or_else(|| p.reference.clone())
-                .expect("validated above");
-            let sem = sess
-                .fused_frame()
-                .map(|(s, _, _)| s)
-                .unwrap_or_else(|| semantic::analyze(&screen));
-            let outcome = crate::design::eval_static(&expr, &screen, &sem);
-            {
-                // Scoped to the resolved session generation (item 5).
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = run.lock().unwrap();
-                let _ = run.record_scenario_assert(
-                    &sid,
-                    gen,
-                    serde_json::json!({ "assertion": "oracle", "text": expr }),
-                );
-            }
-            if outcome.passed {
-                ok(json!({
-                    "passed": true,
-                    "assertion": "oracle",
-                    "expression": expr,
-                    "detail": outcome.detail,
-                    "flavor": outcome.flavor,
-                }))
-            } else if outcome.parse_error.is_some() {
-                // A malformed expression is a caller error, not a UI failure.
-                err(ErrorCategory::InvalidRequest, outcome.detail)
+    // Audit finding 29: capture AFTER lifecycle admission through the
+    // single evidenced entry point.
+    let result = s
+        .with_sess_evidenced(selector.as_deref(), move |sess, sink| {
+            let screen = match sess.observe(40) {
+                Ok(s) => s,
+                Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+            };
+            if is_oracle {
+                let expr = p
+                    .text
+                    .clone()
+                    .or_else(|| p.reference.clone())
+                    .expect("validated above");
+                let sem = sess
+                    .fused_frame()
+                    .map(|(s, _, _)| s)
+                    .unwrap_or_else(|| semantic::analyze(&screen));
+                let outcome = crate::design::eval_static(&expr, &screen, &sem);
+                {
+                    // Scoped to the resolved session generation (item 5).
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
+                    sink.record_scenario_assert(
+                        &sid,
+                        gen,
+                        serde_json::json!({ "assertion": "oracle", "text": expr }),
+                    );
+                }
+                if outcome.passed {
+                    ok(json!({
+                        "passed": true,
+                        "assertion": "oracle",
+                        "expression": expr,
+                        "detail": outcome.detail,
+                        "flavor": outcome.flavor,
+                    }))
+                } else if outcome.parse_error.is_some() {
+                    // A malformed expression is a caller error, not a UI failure.
+                    err(ErrorCategory::InvalidRequest, outcome.detail)
+                } else {
+                    err_continued(
+                        ErrorCategory::AssertionFailed,
+                        format!("oracle '{}' failed: {}", expr, outcome.detail),
+                    )
+                }
             } else {
-                err_continued(
-                    ErrorCategory::AssertionFailed,
-                    format!("oracle '{}' failed: {}", expr, outcome.detail),
-                )
+                // Go through the canonical assert executor (re-review P0).
+                let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
+                {
+                    // Scoped to the resolved session generation (item 5).
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
+                    sink.record_scenario_assert(
+                        &sid,
+                        gen,
+                        serde_json::to_value(&p).unwrap_or_default(),
+                    );
+                }
+                if passed {
+                    ok(json!({ "passed": true, "assertion": p.assertion_name() }))
+                } else if let Some(ErrorCategory::InvalidRequest) = invalid {
+                    // Unknown assertion name (or missing required param): a caller error,
+                    // NOT a UI failure (spec section 37).
+                    err(ErrorCategory::InvalidRequest, detail)
+                } else {
+                    err_continued(ErrorCategory::AssertionFailed, detail)
+                }
             }
-        } else {
-            // Go through the canonical assert executor (re-review P0).
-            let (passed, detail, invalid) = crate::execution::execute_assert(&p, &screen);
-            {
-                // Scoped to the resolved session generation (item 5).
-                let (sid, gen) = (sess.id.clone(), sess.generation);
-                let mut run = run.lock().unwrap();
-                let _ = run.record_scenario_assert(
-                    &sid,
-                    gen,
-                    serde_json::to_value(&p).unwrap_or_default(),
-                );
-            }
-            if passed {
-                ok(json!({ "passed": true, "assertion": p.assertion_name() }))
-            } else if let Some(ErrorCategory::InvalidRequest) = invalid {
-                // Unknown assertion name (or missing required param): a caller error,
-                // NOT a UI failure (spec section 37).
-                err(ErrorCategory::InvalidRequest, detail)
-            } else {
-                err_continued(ErrorCategory::AssertionFailed, detail)
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|e| e)
+        })
+        .await
+        .unwrap_or_else(|e| e);
+    result
 }
 
 /// Body of `tui_wait` (Phase 5 extraction): the #[tool] method in
@@ -128,21 +129,31 @@ pub(crate) async fn tui_wait(
         }
         let selector = p.id.clone();
         let budget = p.budget_ms.unwrap_or(5000);
+        // Event waits get the SAME post-admission evidenced entry point
+        // as ordinary waits; no sink is captured at the handler boundary.
         return s
-            .with_sess(
-                selector.as_deref(),
-                move |sess| match crate::execution::execute_wait_event(sess, &predicate, budget) {
-                    Ok(out) => ok(json!({
-                        "met": out.met,
-                        "timeout": !out.met,
-                        "matched_seq": out.matched_seq,
-                        "matched_at": out.matched_at,
-                        "last_seq": out.last_seq,
-                        "elapsed_ms": out.elapsed_ms,
-                    })),
+            .with_sess_evidenced(selector.as_deref(), move |sess, sink| {
+                match crate::execution::execute_wait_event(sess, &predicate, budget) {
+                    Ok(out) => {
+                        let (sid, gen) = (sess.id.clone(), sess.generation);
+                        sink.record_event(&sid, "wait");
+                        sink.record_scenario_wait(
+                            &sid,
+                            gen,
+                            serde_json::to_value(&p).unwrap_or_default(),
+                        );
+                        ok(json!({
+                            "met": out.met,
+                            "timeout": !out.met,
+                            "matched_seq": out.matched_seq,
+                            "matched_at": out.matched_at,
+                            "last_seq": out.last_seq,
+                            "elapsed_ms": out.elapsed_ms,
+                        }))
+                    }
                     Err(e) => err(ErrorCategory::BackendError, e.to_string()),
-                },
-            )
+                }
+            })
             .await
             .unwrap_or_else(|e| e);
     }
@@ -151,45 +162,44 @@ pub(crate) async fn tui_wait(
         None => return err(ErrorCategory::InvalidRequest, "unsupported wait condition"),
     };
     let selector = p.id.clone();
-    let run = s.run.clone();
-    // Go through the canonical wait executor (re-review P0), inside the
-    // session actor.
-    s.with_sess(selector.as_deref(), move |sess| {
-        match crate::execution::execute_wait(sess, cond, p.budget_ms.unwrap_or(5000)) {
-            Ok(out) => {
-                // Scoped to the resolved session generation (item 5).
-                {
-                    let (sid, gen) = (sess.id.clone(), sess.generation);
-                    let mut run = run.lock().unwrap();
-                    let _ = run.record_event(&sid, "wait");
-                    let _ = run.record_scenario_wait(
-                        &sid,
-                        gen,
-                        serde_json::to_value(&p).unwrap_or_default(),
-                    );
-                }
-                ok(json!({
-                    "met": out.met,
-                "timeout": !out.met,
-                "reason": format!("{:?}", out.reason),
-                "elapsed_ms": out.elapsed_ms,
-                "screen_seq": out.screen_seq,
-                "output_seq": out.output_seq,
-                    "state": {
-                        "structure_hash": out.state.structure_hash,
-                        "visual_hash": out.state.visual_hash,
-                        "process": {
-                            "running": out.state.process.running,
-                            "exit_code": out.state.process.exit_code,
+    // Audit finding 29: sink capture follows lifecycle admission.
+    let result = s
+        .with_sess_evidenced(selector.as_deref(), move |sess, sink| {
+            match crate::execution::execute_wait(sess, cond, p.budget_ms.unwrap_or(5000)) {
+                Ok(out) => {
+                    // Scoped to the resolved session generation (item 5).
+                    {
+                        let (sid, gen) = (sess.id.clone(), sess.generation);
+                        sink.record_event(&sid, "wait");
+                        sink.record_scenario_wait(
+                            &sid,
+                            gen,
+                            serde_json::to_value(&p).unwrap_or_default(),
+                        );
+                    }
+                    ok(json!({
+                        "met": out.met,
+                    "timeout": !out.met,
+                    "reason": format!("{:?}", out.reason),
+                    "elapsed_ms": out.elapsed_ms,
+                    "screen_seq": out.screen_seq,
+                    "output_seq": out.output_seq,
+                        "state": {
+                            "structure_hash": out.state.structure_hash,
+                            "visual_hash": out.state.visual_hash,
+                            "process": {
+                                "running": out.state.process.running,
+                                "exit_code": out.state.process.exit_code,
+                            },
                         },
-                    },
-                }))
+                    }))
+                }
+                Err(e) => err(ErrorCategory::BackendError, e.to_string()),
             }
-            Err(e) => err(ErrorCategory::BackendError, e.to_string()),
-        }
-    })
-    .await
-    .unwrap_or_else(|e| e)
+        })
+        .await
+        .unwrap_or_else(|e| e);
+    result
 }
 
 /// Body of `tui_observe` (Phase 5 extraction): the #[tool] method in
@@ -224,8 +234,16 @@ pub(crate) async fn tui_observe(
     }
     let mode = mode.known().copied().unwrap();
     let selector = p.id.clone();
+    // Beta-audit P0.3: the observe fold goes through a ticket-verified
+    // sink instead of the raw current-run Arc (sweep() below uses it;
+    // same fold body, same verification every other driving path uses).
+    // The plain Arc stays for observe_mode_arm's READS (contract
+    // lookup, committed-frame citation) — reads are not evidence
+    // commits and need no ticket.
     let run = s.run.clone();
-    s.with_sess(selector.as_deref(), move |sess| {
+    // Audit finding 29: observation evidence is admitted and sink-captured
+    // through the ONE entry point; no handler-boundary capture.
+    s.with_sess_evidenced(selector.as_deref(), move |sess, sink| {
         // Lazy screen capture (re-review item 5): only the modes that
         // render a screen need to pay a settle cycle and advance the
         // session baseline. `changes`/`scrollback`/`search`/
@@ -233,7 +251,7 @@ pub(crate) async fn tui_observe(
         // cost no PTY round-trip and do NOT move `previous` — a passive
         // read must not re-anchor someone's diff baseline.
         let screen = if mode_needs_sweep(mode) {
-            match sweep(sess, &run, p.idle_ms.unwrap_or(80)) {
+            match sweep(sess, &sink, p.idle_ms.unwrap_or(80)) {
                 Ok(screen) => Some(screen),
                 Err((c, m)) => return err(c, m),
             }
@@ -268,22 +286,21 @@ fn mode_needs_sweep(mode: crate::mcp::params::ObserveMode) -> bool {
 /// incremental event persistence (re-review Wave-2) and native coverage
 /// ingestion (re-review P1 item 17) ride EVERY observation, regardless of
 /// which mode triggered it.
-fn sweep(
+pub(crate) fn sweep(
     sess: &mut crate::session::Session,
-    run: &std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
+    sink: &crate::execution::RunEvidenceSink,
     idle: u64,
 ) -> Result<crate::screen::ScreenState, (ErrorCategory, String)> {
     let screen = match sess.observe(idle) {
         Ok(screen) => screen,
         Err(e) => return Err((ErrorCategory::BackendError, e.to_string())),
     };
-    // Beta-audit P0-6: the fold's run writes go through the ONE
-    // ticket-verified fold (persistence cursor + coverage ingestion) so a
-    // run switch mid-observe drops the fold instead of spilling this
-    // session's events into the new run. The ticket is captured here —
-    // inside the actor job, at the same moment the session was authorized
-    // by with_sess's guards — one lock window, no cross-await.
-    let ticket = crate::execution::RunTicket::capture(run);
-    crate::execution::fold_session_events(sess, run, &ticket);
+    // Beta-audit P0-6/P0.3: the fold's run writes go through the ONE
+    // ticket-verified fold (persistence cursor + coverage ingestion) so
+    // a run switch mid-observe drops the fold instead of spilling this
+    // session's events into the new run. The sink was captured at the
+    // handler boundary — the same authorization moment that admitted
+    // this actor job.
+    sink.fold(sess);
     Ok(screen)
 }

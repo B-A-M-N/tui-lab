@@ -108,9 +108,12 @@ pub(crate) async fn tui_probe(
     let quiet_ms = p.quiet_ms.unwrap_or(120);
     let budget_ms = p.budget_ms.unwrap_or(5000);
     let selector = p.id.clone();
-    let run = s.run.clone();
     // Beta-audit P0-6: the authorized entry — the run ticket rides the
     // same authorization lock window; the ledger commit verifies it.
+    // Beta-audit P0.3: run-side bookkeeping goes through the session's
+    // installed evidence sink (ticket-verified), not the current-run
+    // Arc — a handler that grabbed `run` here could misattribute a
+    // probe's scenario/event records across a run switch.
     s.with_sess_authorized(selector.as_deref(), move |sess, _ticket| {
             // Audit P0-2: a stimulus that sends input IS machine driving.
             // The human control lease refuses it exactly like tui_act —
@@ -123,13 +126,9 @@ pub(crate) async fn tui_probe(
                     return refused;
                 }
             }
-            // Item 13: the duration-sample capture needs its delay AFTER the
-            // settle; fold it into the effective budget so the wait inside
-            // the probe accounts for it.
-            let effective_budget = match frame_capture {
-                Some((_, extra_ms)) if extra_ms > 0 => budget_ms.saturating_add(extra_ms),
-                _ => budget_ms,
-            };
+            // Budget is an end-to-end ceiling. Duration samples must fit
+            // inside it, not extend it; the diagnostic layer schedules the
+            // sample against the same overall allowance.
             // Audit P0-16: the capture spec rides INTO the probe — the
             // transition collector arms at the stimulus, not after settle.
             match crate::diagnostic::run_probe_with_guard(
@@ -138,15 +137,22 @@ pub(crate) async fn tui_probe(
                 completion,
                 &watch,
                 quiet_ms,
-                effective_budget,
+                budget_ms,
                 probe_guard.as_ref(),
                 visibility,
                 frame_capture,
             ) {
                 Ok(result) => {
+                    // Beta-audit P0.3: ALL run-side bookkeeping through
+                    // the ticket-verified sink. The sink is installed by
+                    // with_sess_authorized for this whole actor turn; a
+                    // run switch drops the records (returned `false`)
+                    // instead of writing them into the new run.
+                    let sink = sess
+                        .evidence_sink()
+                        .expect("authorized dispatch installs the evidence sink");
+                    let (sid, gen) = (sess.id.clone(), sess.generation);
                     {
-                        let (sid, gen) = (sess.id.clone(), sess.generation);
-                        let mut run = run.lock().unwrap();
                         // Beta-audit P0-7: a stimulated probe's causal
                         // interaction transaction was ALREADY committed by
                         // the executor through the session's installed
@@ -155,8 +161,7 @@ pub(crate) async fn tui_probe(
                         // double-book the probe. Drift probes (no stimulus)
                         // keep the plain marker event.
                         if result.transaction.is_none() {
-                            let sid = sess.id.clone();
-                            let _ = run.record_event(&sid, "probe");
+                            sink.record_event(&sid, "probe");
                         }
                         // Audit P0-17: a probe is not a `wait` step. The old
                         // recording stuffed the whole TuiProbeParams into a
@@ -205,7 +210,7 @@ pub(crate) async fn tui_probe(
                                     Some(field) => {
                                         let byte_len =
                                             stim_shape.map(|(_, l)| l).unwrap_or_default();
-                                        let _ = run.record_scenario_act_sensitive(
+                                        sink.record_scenario_act_sensitive(
                                             &sid,
                                             gen,
                                             params,
@@ -221,10 +226,10 @@ pub(crate) async fn tui_probe(
                                                 serde_json::Value::Bool(true),
                                             );
                                         }
-                                        let _ = run.record_scenario_act(&sid, gen, params);
+                                        sink.record_scenario_act(&sid, gen, params);
                                     }
                                     None => {
-                                        let _ = run.record_scenario_act(&sid, gen, params);
+                                        sink.record_scenario_act(&sid, gen, params);
                                     }
                                 }
                             }

@@ -51,7 +51,7 @@ impl IntentPlanTicket {
 
     /// The plan fingerprint this ticket authorizes: control + verb + risk
     /// + step shape. Execute-time resolution must produce the same
-    /// fingerprint or the ticket refuses.
+    ///   fingerprint or the ticket refuses.
     pub(crate) fn fingerprint(
         &self,
         control_id: &str,

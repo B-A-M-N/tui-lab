@@ -206,6 +206,7 @@ impl ContractReport {
                 }
             );
             out.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: id.to_string(),
                 rule_id: None,
                 severity,
@@ -234,12 +235,40 @@ impl ContractReport {
 }
 
 /// Which behavior properties were actually observed by driving the app.
-/// Filled by [`check_behavior`]; active oracles read from it instead of
+/// Filled by `check_behavior`; active oracles read from it instead of
 /// guessing.
 #[derive(Debug, Default, Clone)]
 pub struct ObservedBehavior {
     pub escape_closes_modal: Option<bool>,
     pub reverse_tab_is_inverse: Option<bool>,
+}
+
+/// How much of the conformance engine may run (beta-audit P0.7): one
+/// mutation-authorization model shared by EVERY conformance entry point.
+/// The audit surface derives this from its SafetyPolicy; the contract
+/// tool defaults to Passive and requires explicit consent to drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecPolicy {
+    /// No driving at all: document validation, component checks, and
+    /// static oracles run against the CURRENT frame; every driving group
+    /// (interactions, layout resizes, behavior probes, active oracles)
+    /// is reported Unverified with how to allow it. An operation named
+    /// `status` must never mutate the app by default.
+    Passive,
+    /// Full conformance: declared keys are sent, resizes run, Escape/Tab
+    /// probes drive. Requires the caller's explicit mutation consent
+    /// (the MCP layer's allow_mutation, or the audit surface's
+    /// SafetyPolicy).
+    Driving,
+}
+
+impl ExecPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecPolicy::Passive => "passive",
+            ExecPolicy::Driving => "driving",
+        }
+    }
 }
 
 /// Run the full conformance check against a live session.
@@ -259,11 +288,104 @@ pub fn check_contract_with_mode(
     contract: &ProjectContract,
     mode_override: Option<crate::design::schema::ContractMode>,
 ) -> anyhow::Result<ContractReport> {
+    check_contract_policy(session, contract, mode_override, ExecPolicy::Driving)
+}
+
+/// [`check_contract_with_mode`] with an explicit execution policy
+/// (beta-audit P0.7). This is THE single conformance entry point — every
+/// caller states how much the engine may do, and the engine applies it.
+pub fn check_contract_policy(
+    session: &mut Session,
+    contract: &ProjectContract,
+    mode_override: Option<crate::design::schema::ContractMode>,
+    policy: ExecPolicy,
+) -> anyhow::Result<ContractReport> {
     let mut results = Vec::new();
     let mut driven = 0u32;
 
     // 1. Document validation (static).
     results.extend(validate_document(contract));
+
+    if policy == ExecPolicy::Passive {
+        // No driving: interactions, layout resizes, behavior probes, and
+        // active oracles are ALL Unverified — an honest absence, not a
+        // failure (item 32). The detail names the consent that lifts it.
+        let unverified = |group: &'static str, name: String, what: &str| CheckResult {
+            group,
+            name,
+            verdict: Verdict::Unverified,
+            detail: format!(
+                "{what} requires driving the app; this check ran passive \
+                 (no mutations). Re-run with allow_mutation=true to execute it."
+            ),
+            required: false,
+        };
+        for i in &contract.interactions {
+            results.push(unverified(
+                "interaction",
+                i.name.clone(),
+                &format!("interaction [{}]", i.keys.join(",")),
+            ));
+        }
+        for lc in &contract.layout {
+            let name = lc.name.clone().unwrap_or_else(|| "layout".to_string());
+            results.push(unverified("layout", name, "layout/resize survival"));
+        }
+        for v in &contract.viewports {
+            results.push(unverified(
+                "layout",
+                format!("viewport {}x{}", v.cols, v.rows),
+                "viewport clipping",
+            ));
+        }
+        if contract.escape_closes_modal {
+            results.push(unverified(
+                "behavior",
+                "escape_closes_modal".to_string(),
+                "the Escape-dismissal property",
+            ));
+        }
+        if contract.reverse_tab_required {
+            results.push(unverified(
+                "behavior",
+                "reverse_tab_required".to_string(),
+                "the Shift+Tab-reverses-Tab property",
+            ));
+        }
+        // Components + static top-level oracles against the current
+        // frame only.
+        results.extend(check_components(session, contract));
+        results.extend(check_top_level_oracles(
+            session,
+            contract,
+            &crate::design::conformance::ObservedBehavior::default(),
+        ));
+        let mode = mode_override.unwrap_or(contract.schema.mode);
+        let verdict = results.iter().fold(Verdict::Pass, |acc, r| {
+            let v = match r.verdict {
+                Verdict::Fail => {
+                    if r.required || mode.optional_failure_is_fatal() {
+                        Verdict::Fail
+                    } else {
+                        Verdict::Warn
+                    }
+                }
+                Verdict::Unverified if mode.unverified_is_fatal() => Verdict::Fail,
+                other => other,
+            };
+            acc.merge(v)
+        });
+        return Ok(ContractReport {
+            contract: contract.schema.name.clone(),
+            version: contract.schema.version.clone(),
+            verdict,
+            mode,
+            results,
+            driven_actions: 0,
+            session_mutated: false,
+            residue: Vec::new(),
+        });
+    }
 
     // Restore point: audits must leave the terminal as they found it.
     let (orig_cols, orig_rows) = (session.cols(), session.rows());
@@ -492,31 +614,15 @@ fn check_one_component(
     let role = comp.role.trim().to_lowercase();
     let want = role.as_str();
 
-    // 1) Screen-level components (table / tree / scrollbar).
+    // P2 (contract inspect duplicates conformance logic): the three-way
+    // presence rule below used to be reimplemented (minus the
+    // confidence gate) by the inspect view. `component_role_present`
+    // is now THE rule — both callers share it, and the screen-level
+    // component detection runs ONCE per frame, not once per contract
+    // component.
     let components = semantic::detect_components(screen);
-    let component_hit = components.iter().any(|c| match c {
-        semantic::Component::Table(_) => want == "table",
-        semantic::Component::Tree(_) => want == "tree",
-        semantic::Component::Scrollbar(_) => want == "scrollbar",
-    });
-
-    // 2) Region kinds (dialog / panel / toolbar / footer / list …).
-    let region_hit = sem
-        .regions
-        .iter()
-        .any(|r| format!("{:?}", r.kind).to_lowercase() == want);
-
-    // 3) Semantic node roles (menu, command_palette, …) — anywhere in the
-    //    tree. Confidence-gated (item 36): a node whose role inference is
-    //    weak (score < 0.6) does not count as a *hit* — and if nothing else
-    //    matched either, its best candidate is named in the failure detail
-    //    so the author can tighten the contract or fix the detector. A
-    //    low-confidence heuristic must never be the sole hard evidence for
-    //    a PASS.
-    let node_hit = role_matches(want, &tree.root);
+    let found = component_role_present(want, sem, &components, &tree.root);
     let best_guess = best_role_guess(want, &tree.root);
-
-    let found = component_hit || region_hit || node_hit;
     if !found {
         let detail = match &best_guess {
             Some((id, conf)) => format!(
@@ -574,6 +680,36 @@ fn check_one_component(
 }
 
 /// Recursive role-slug match over the semantic node tree.
+/// THE static component-presence predicate (P2): does a contract
+/// component role exist on this frame? Three loci, one rule, shared by
+/// the conformance engine and the observe-inspect contract verdict so
+/// they can never disagree:
+///
+/// 1. Screen-level components (table / tree / scrollbar) — pass the
+///    `detect_components` result in; callers checking many roles against
+///    one screen compute it ONCE.
+/// 2. Region kinds (dialog / panel / toolbar / footer / list …).
+/// 3. Semantic node roles — confidence-gated (item 36): a node whose
+///    role inference is weak (score < 0.6) is never a hard PASS on its
+///    own.
+pub(crate) fn component_role_present(
+    want: &str,
+    sem: &semantic::SemanticScreen,
+    components: &[semantic::Component],
+    root: &semantic::SemanticNode,
+) -> bool {
+    let component_hit = components.iter().any(|c| match c {
+        semantic::Component::Table(_) => want == "table",
+        semantic::Component::Tree(_) => want == "tree",
+        semantic::Component::Scrollbar(_) => want == "scrollbar",
+    });
+    let region_hit = sem
+        .regions
+        .iter()
+        .any(|r| format!("{:?}", r.kind).to_lowercase() == want);
+    component_hit || region_hit || role_matches(want, root)
+}
+
 fn role_matches(want: &str, node: &semantic::SemanticNode) -> bool {
     if node.role.slug() == want && node.confidence.score >= 0.6 {
         return true;
@@ -1439,5 +1575,131 @@ mod wave5_verdict_tests {
 
     fn fold_strict_gate() -> bool {
         crate::design::ContractMode::Strict.unverified_is_fatal()
+    }
+
+    /// P2 (contract inspect duplicates conformance logic): the shared
+    /// predicate's contract — each locus counts, the confidence gate holds,
+    /// and the inspect view calling this instead of a local copy cannot
+    /// disagree with the conformance engine.
+    #[test]
+    fn component_role_present_matches_each_locus() {
+        fn node(id: &str, role: semantic::Role, score: f32) -> semantic::SemanticNode {
+            semantic::SemanticNode {
+                id: id.into(),
+                role,
+                parent: None,
+                bounds: semantic::regions::Bounds {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                label: None,
+                value: None,
+                state: Default::default(),
+                children: vec![],
+                affordances: vec![],
+                identity: None,
+                confidence: semantic::Confidence::inferred(score, &["test"]),
+            }
+        }
+        let tree = semantic::SemanticTree {
+            root: node("root", semantic::Role::Screen, 0.9),
+            layers: Default::default(),
+        };
+        // One "panel" region.
+        let sem = semantic::SemanticScreen {
+            cols: 80,
+            rows: 24,
+            regions: vec![semantic::Region {
+                id: "r1".into(),
+                kind: semantic::RegionKind::Panel,
+                title: None,
+                bounds: semantic::regions::Bounds {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 4,
+                },
+                confidence: semantic::Confidence::inferred(0.9, &["test"]),
+                parent_id: None,
+                child_ids: vec![],
+                clipping_state: semantic::ClippingState::None,
+            }],
+            controls: Vec::new(),
+            focus: semantic::FocusInfo {
+                control: None,
+                control_id: None,
+                confidence: 0.0,
+                evidence: Vec::new(),
+            },
+            relationships: Vec::new(),
+            affordances: Vec::new(),
+            components: Vec::new(),
+        };
+        let no_components: Vec<semantic::Component> = Vec::new();
+
+        // Region locus: role "panel" hits the RegionKind.
+        assert!(component_role_present(
+            "panel",
+            &sem,
+            &no_components,
+            &tree.root
+        ));
+
+        // Node locus, HIGH-confidence match.
+        let mut tree_hit = tree.clone();
+        tree_hit
+            .root
+            .children
+            .push(node("menu1", semantic::Role::Menu, 0.9));
+        assert!(component_role_present(
+            "menu",
+            &sem,
+            &no_components,
+            &tree_hit.root
+        ));
+
+        // Node locus BELOW the 0.6 gate is NOT a hit (item 36).
+        let mut tree_weak = tree.clone();
+        tree_weak
+            .root
+            .children
+            .push(node("menu2", semantic::Role::Menu, 0.4));
+        assert!(
+            !component_role_present("menu", &sem, &no_components, &tree_weak.root),
+            "a low-confidence node must never be a hard hit"
+        );
+
+        // Absence everywhere: no such role in any locus.
+        assert!(!component_role_present(
+            "table",
+            &sem,
+            &no_components,
+            &tree.root
+        ));
+        assert!(!component_role_present(
+            "no-such-role",
+            &sem,
+            &no_components,
+            &tree.root
+        ));
+
+        // Component locus: a hand-built Table detection makes role "table"
+        // present even with no regions/nodes naming it.
+        let table = vec![semantic::Component::Table(semantic::TableComponent {
+            bounds: semantic::regions::Bounds {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+            columns: vec![(0, "name".into())],
+            row_count: 2,
+            header_y: 0,
+            confidence: semantic::Confidence::inferred(0.9, &["test"]),
+            evidence: vec!["test".into()],
+        })];
+        assert!(component_role_present("table", &sem, &table, &tree.root));
     }
 }

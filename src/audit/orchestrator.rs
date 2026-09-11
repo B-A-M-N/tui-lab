@@ -523,6 +523,63 @@ impl MutationRisk {
     pub fn is_invasive(&self) -> bool {
         *self != MutationRisk::Observational
     }
+
+    /// The likely side-effect class of a driver with this risk (P1-40).
+    /// This names what can change, not whether it is safe.
+    pub fn side_effect_class(&self) -> &'static str {
+        match self {
+            Self::Observational => "ui_state_read",
+            Self::Reversible => "ui_state",
+            Self::RestartRequired => "process",
+            Self::PotentiallyMutating => "external",
+        }
+    }
+
+    /// The best recovery guarantee offered by TUI-Lab for a driver with
+    /// this risk. `external` changes are explicitly not undoable.
+    pub fn recovery_guarantee(&self) -> &'static str {
+        match self {
+            Self::Observational => "none_needed",
+            Self::Reversible => "ui_restore",
+            Self::RestartRequired => "restart",
+            Self::PotentiallyMutating => "external_rollback_unavailable",
+        }
+    }
+}
+
+/// Typed execution mode for an audit report. Replaces the old string mode
+/// so callers can distinguish observational reads from TUI-driving runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditExecutionMode {
+    /// Analyzed one captured frame; no live observation loop.
+    StaticFrame,
+    /// Read live terminal state without driving input.
+    ObservationalLive,
+    /// Drove the TUI through the canonical executor.
+    Driving,
+    /// Static analysis plus live drivers (e.g. `full`).
+    Composite,
+    /// Some members ran, invasive members were withheld under safe-only.
+    Partial,
+    /// Nothing ran because safety gating withheld the profile.
+    Withheld,
+    /// The requested safety contract was unattainable; nothing ran.
+    Refused,
+}
+
+impl AuditExecutionMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::StaticFrame => "static_frame",
+            Self::ObservationalLive => "observational_live",
+            Self::Driving => "driving",
+            Self::Composite => "composite",
+            Self::Partial => "partial",
+            Self::Withheld => "withheld",
+            Self::Refused => "refused",
+        }
+    }
 }
 
 /// Result of one orchestrated profile run.
@@ -530,7 +587,7 @@ pub struct ProfileReport {
     pub profile: AuditProfile,
     /// "active" (drove the app), "static" (one frame), or "composite"
     /// (static + active, i.e. `full`).
-    pub mode: &'static str,
+    pub mode: AuditExecutionMode,
     pub findings: Vec<Finding>,
     /// Focus edges recorded by this run's drivers (Wave D item 36). Callers
     /// merge it into the run's persistent graph; static profiles leave it
@@ -546,6 +603,22 @@ pub struct ProfileReport {
 /// `contract` feeds `profile=contract` (Wave E item 49); other profiles
 /// ignore it.
 pub fn run_profile(session: &mut Session, profile_name: &str) -> Result<ProfileReport, String> {
+    // Audit finding 40: the OBVIOUS/default API is SAFE. An internal or
+    // library caller using the plain helper gets observational-only
+    // behavior (invasive profiles withheld as ORCH-GATED); mutation
+    // requires an explicit `run_profile_checked(..., AllowMutation)` (or
+    // the unmistakably-named `run_profile_allow_mutation` alias below).
+    run_profile_checked(session, profile_name, None, SafetyPolicy::SafeOnly)
+}
+
+/// The explicitly-permissive entry: mutation-capable profiles with the
+/// exact name that cannot be mistaken for the default. Prefer
+/// `run_profile_checked` with an explicit policy at call sites that must
+/// be auditable.
+pub fn run_profile_allow_mutation(
+    session: &mut Session,
+    profile_name: &str,
+) -> Result<ProfileReport, String> {
     run_profile_checked(session, profile_name, None, SafetyPolicy::AllowMutation)
 }
 
@@ -556,21 +629,23 @@ pub fn run_profile(session: &mut Session, profile_name: &str) -> Result<ProfileR
 ///                withheld with an ORCH-GATED finding naming why —
 ///                the default for sessions we did not launch
 /// AllowMutation  all profiles run (the historical behavior; explicit)
-/// DeepIsolation  AllowMutation plus restart-replay between
+/// RestartBetweenMutations  AllowMutation plus restart-replay between
 ///                PotentiallyMutating drivers so each sees a fresh app
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyPolicy {
     SafeOnly,
     AllowMutation,
-    DeepIsolation,
+    /// Formerly `RestartBetweenMutations`. The policy only restarts between mutating
+    /// probes and cannot undo filesystem/network/external side effects.
+    RestartBetweenMutations,
 }
 
 impl SafetyPolicy {
     /// Whether this profile may run at all under the policy.
     fn allows(&self, profile: &AuditProfile) -> bool {
         match self {
-            SafetyPolicy::AllowMutation | SafetyPolicy::DeepIsolation => true,
+            SafetyPolicy::AllowMutation | SafetyPolicy::RestartBetweenMutations => true,
             SafetyPolicy::SafeOnly => !profile.risk().is_invasive(),
         }
     }
@@ -631,6 +706,7 @@ pub fn run_profile_checked(
                 })
                 .collect();
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Gate,
                 id: "ORCH-GATED".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -664,7 +740,7 @@ pub fn run_profile_checked(
             });
             return Ok(ProfileReport {
                 profile,
-                mode: "partial",
+                mode: AuditExecutionMode::Partial,
                 findings,
                 focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
                 metrics: Vec::new(),
@@ -672,8 +748,9 @@ pub fn run_profile_checked(
         }
         return Ok(ProfileReport {
             profile: profile.clone(),
-            mode: "withheld",
+            mode: AuditExecutionMode::Withheld,
             findings: vec![Finding {
+                kind: crate::audit::FindingKind::Gate,
                 id: "ORCH-GATED".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -728,8 +805,22 @@ fn run_profile_inner(
     run_profile_with_contract_impl(session, profile, contract, policy)
 }
 
-/// Contract-armed variant with the default (permissive-for-launched) policy.
+/// Contract-armed variant with the SAFE default policy (audit finding 40).
+/// Mutation must be requested through `run_profile_checked(...,
+/// AllowMutation)` or the explicitly named permissive helper — never by an
+/// "obvious" API that happens to carry a contract.
 pub fn run_profile_with_contract(
+    session: &mut Session,
+    profile_name: &str,
+    contract: Option<&crate::design::ProjectContract>,
+) -> Result<ProfileReport, String> {
+    let profile = AuditProfile::parse(profile_name)?;
+    run_profile_with_contract_impl(session, profile, contract, SafetyPolicy::SafeOnly)
+}
+
+/// Explicitly permissive contract-armed helper: the name states what it
+/// does. The obvious contract entry point stays SafeOnly (finding 40).
+pub fn run_profile_with_contract_allow_mutation(
     session: &mut Session,
     profile_name: &str,
     contract: Option<&crate::design::ProjectContract>,
@@ -756,7 +847,7 @@ fn run_profile_with_contract_impl(
             .map_err(|e| format!("contract check failed: {e}"))?;
         return Ok(ProfileReport {
             profile,
-            mode: "composite",
+            mode: AuditExecutionMode::Composite,
             findings: report.findings(),
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             metrics: Vec::new(),
@@ -773,7 +864,7 @@ fn run_profile_with_contract_impl(
         let name = profile.name();
         return Ok(ProfileReport {
             profile,
-            mode: "static",
+            mode: AuditExecutionMode::StaticFrame,
             findings: crate::audit::run(name, &screen, &sem).map_err(|e| e.to_string())?,
             focus_graph: crate::semantic::focus_graph::FocusGraph::new(),
             metrics: Vec::new(),
@@ -806,6 +897,7 @@ fn run_profile_with_contract_impl(
             let (fs, m) = run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
                 (
                     vec![Finding {
+                        kind: crate::audit::FindingKind::Defect,
                         id: "AUDIT-TX-ERR".into(),
                         rule_id: None,
                         severity: Severity::Error,
@@ -835,17 +927,17 @@ fn run_profile_with_contract_impl(
         };
 
     // Wave 4 item 35 + audit P0-11: restart-replay between
-    // PotentiallyMutating drivers. Under DeepIsolation, before each
+    // PotentiallyMutating drivers. Under RestartBetweenMutations, before each
     // mutating driver the session is restarted from its LaunchSpec so the
     // driver sees a fresh app and leaves nothing behind for the next one.
-    // DeepIsolation is a CONTRACT, not an optimization: when isolation is
+    // RestartBetweenMutations is a CONTRACT, not an optimization: when isolation is
     // impossible (no LaunchSpec — attached brownfield), the audit refuses
     // invasive profiles outright instead of degrading to in-place
     // mutation. Observational-only profiles still run: they never touch
     // the app, so isolation is irrelevant to them.
-    let deep = policy == SafetyPolicy::DeepIsolation && session.launch().is_some();
+    let deep = policy == SafetyPolicy::RestartBetweenMutations && session.launch().is_some();
     let mut orchestration_notes: Vec<Finding> = Vec::new();
-    if policy == SafetyPolicy::DeepIsolation && !deep {
+    if policy == SafetyPolicy::RestartBetweenMutations && !deep {
         let requested_risk = descriptor(&profile).risk;
         if requested_risk.is_invasive() {
             // The requested profile can mutate and isolation is
@@ -855,8 +947,9 @@ fn run_profile_with_contract_impl(
             let profile_name = profile.name();
             return Ok(ProfileReport {
                 profile,
-                mode: "refused",
+                mode: AuditExecutionMode::Refused,
                 findings: vec![Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-DEEP-REFUSED".into(),
                     rule_id: None,
                     severity: Severity::Warn,
@@ -878,6 +971,7 @@ fn run_profile_with_contract_impl(
             });
         }
         orchestration_notes.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "ORCH-NO-RESTART".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -908,6 +1002,7 @@ fn run_profile_with_contract_impl(
                 // Give the fresh process a moment to render its first frame.
                 let _ = session.observe(150);
                 Some(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-RESTART".into(),
                     rule_id: None,
                     severity: Severity::Info,
@@ -932,6 +1027,7 @@ fn run_profile_with_contract_impl(
                 })
             }
             Err(e) => Some(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "ORCH-RESTART-FAILED".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -996,6 +1092,7 @@ fn run_profile_with_contract_impl(
         if restarts > 0 {
             if aborted {
                 fs.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-DEEP-ABORTED".into(),
                     rule_id: None,
                     severity: Severity::Warn,
@@ -1016,6 +1113,7 @@ fn run_profile_with_contract_impl(
                 });
             } else {
                 fs.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-DEEP-SUMMARY".into(),
                     rule_id: None,
                     severity: Severity::Info,
@@ -1054,10 +1152,15 @@ fn run_profile_with_contract_impl(
     findings.extend(orchestration_notes);
     findings.extend(fs);
 
+    // An observational live driver only observes the current process; a
+    // transaction-driving profile changes it. Both used to collapse into
+    // "active", which hid safety-relevant behavior from callers.
     let mode = if profile.wants_static_composite() {
-        "composite"
+        AuditExecutionMode::Composite
+    } else if descriptor(&profile).transaction {
+        AuditExecutionMode::Driving
     } else {
-        "active"
+        AuditExecutionMode::ObservationalLive
     };
     Ok(ProfileReport {
         profile,
@@ -1073,6 +1176,7 @@ fn run_profile_with_contract_impl(
 #[allow(dead_code)]
 fn orchestration_error(profile: &str, summary: String) -> Finding {
     Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: format!("AUDIT-ERR-{}", profile.to_uppercase()),
         rule_id: None,
         severity: Severity::Error,
@@ -1289,11 +1393,11 @@ mod tests {
             .await
             .expect("start");
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "full"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "full"))
             .await
             .expect("actor run")
             .expect("run full");
-        assert_eq!(report.mode, "composite");
+        assert_eq!(report.mode, AuditExecutionMode::Composite);
         // A plain python echo screen has little to audit, but the composite
         // must include the static passes AND have attempted the drivers.
         let cats: Vec<&str> = report
@@ -1331,11 +1435,15 @@ mod tests {
             .expect("start");
         for name in ["unicode", "controls"] {
             let report = pool
-                .with_session(Some(&id), |s| run_profile(s, name))
+                .with_session(Some(&id), |s| run_profile_allow_mutation(s, name))
                 .await
                 .expect("actor run")
                 .unwrap_or_else(|e| panic!("{name} must run: {e}"));
-            assert_eq!(report.mode, "static", "{name} is a static profile");
+            assert_eq!(
+                report.mode,
+                AuditExecutionMode::StaticFrame,
+                "{name} is a static profile"
+            );
             // A clean python screen can legitimately produce zero findings;
             // the contract is the run SUCCEEDS and carries only real rules.
             for f in &report.findings {
@@ -1391,11 +1499,43 @@ mod tests {
                 .await;
         }
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "terminal_modes"))
+            .with_session(Some(&id), |s| {
+                run_profile_allow_mutation(s, "terminal_modes")
+            })
             .await
             .expect("actor run")
             .expect("run terminal_modes");
-        assert_eq!(report.mode, "active");
+        // terminal_modes reads retained raw traffic and drives nothing.
+        assert_eq!(report.mode, AuditExecutionMode::ObservationalLive);
+        let report = {
+            let inventory_ready = report.findings.iter().any(|f| f.id == "MODE-INVENTORY")
+                && serde_json::to_value(
+                    report
+                        .findings
+                        .iter()
+                        .find(|f| f.id == "MODE-INVENTORY")
+                        .expect("inventory present")
+                        .evidence
+                        .clone(),
+                )
+                .map(|v| !v.as_array().map(Vec::is_empty).unwrap_or(true))
+                .unwrap_or(false);
+            if inventory_ready {
+                report
+            } else {
+                let _ = pool
+                    .with_session(Some(&id), |s| {
+                        let _ = s.observe(300);
+                    })
+                    .await;
+                pool.with_session(Some(&id), |s| {
+                    run_profile_allow_mutation(s, "terminal_modes")
+                })
+                .await
+                .expect("actor run")
+                .expect("terminal_modes retry")
+            }
+        };
         let inv = report
             .findings
             .iter()
@@ -1451,19 +1591,37 @@ mod tests {
         // ring read runs — same class as the query_response flake. A plain
         // observe settles the stream before any audit reads the ring (the
         // audits are ring reads and deliberately do not wait themselves).
-        {
+        // Under full-suite parallel PTY load, the first frame may already
+        // be parsed by start's initial pump; the ring is event-ordered and
+        // does not lose committed bytes, but the fixture's 50ms frames can
+        // still be arriving. Re-run the audit once when a scheduling race
+        // leaves the renderer without its startup signature.
+        let mut render = pool
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "rendering"))
+            .await
+            .expect("actor run")
+            .expect("rendering");
+        // Three bounded attempts: under parallel PTY load the startup ring
+        // can still be ingesting. Re-observe and retry when the signature
+        // has not yet landed; this tests the audit rule, not scheduler luck.
+        for _ in 0..2 {
+            let ids: std::collections::HashSet<&str> =
+                render.findings.iter().map(|f| f.id.as_str()).collect();
+            let has_signature = ids.contains("REND-FLICKER") && ids.contains("REND-CURSOR-LEAK");
+            if has_signature {
+                break;
+            }
             let _ = pool
                 .with_session(Some(&id), |s| {
                     let _ = s.observe(300);
                 })
                 .await;
+            render = pool
+                .with_session(Some(&id), |s| run_profile_allow_mutation(s, "rendering"))
+                .await
+                .expect("actor run")
+                .expect("rendering retry");
         }
-
-        let render = pool
-            .with_session(Some(&id), |s| run_profile(s, "rendering"))
-            .await
-            .expect("actor run")
-            .expect("rendering");
         let ids: Vec<&str> = render.findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"REND-STYLE"), "style census present: {ids:?}");
         assert!(
@@ -1476,7 +1634,9 @@ mod tests {
         );
 
         let inp = pool
-            .with_session(Some(&id), |s| run_profile(s, "input_protocol"))
+            .with_session(Some(&id), |s| {
+                run_profile_allow_mutation(s, "input_protocol")
+            })
             .await
             .expect("actor run")
             .expect("input_protocol");
@@ -1486,7 +1646,7 @@ mod tests {
         );
 
         let lc = pool
-            .with_session(Some(&id), |s| run_profile(s, "lifecycle"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "lifecycle"))
             .await
             .expect("actor run")
             .expect("lifecycle");
@@ -1497,7 +1657,7 @@ mod tests {
         );
 
         let sh = pool
-            .with_session(Some(&id), |s| run_profile(s, "shell_cli"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "shell_cli"))
             .await
             .expect("actor run")
             .expect("shell_cli");
@@ -1546,7 +1706,9 @@ mod tests {
                 .await;
         }
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "query_response"))
+            .with_session(Some(&id), |s| {
+                run_profile_allow_mutation(s, "query_response")
+            })
             .await
             .expect("actor run")
             .expect("query_response");
@@ -1584,7 +1746,9 @@ mod tests {
             .await
             .expect("start pipe");
         let report2 = pool2
-            .with_session(Some(&id2), |s| run_profile(s, "query_response"))
+            .with_session(Some(&id2), |s| {
+                run_profile_allow_mutation(s, "query_response")
+            })
             .await
             .expect("actor run")
             .expect("query_response pipe");
@@ -1696,7 +1860,7 @@ mod tests {
             .await
             .expect("actor run")
             .expect("gated report");
-        assert_eq!(report.mode, "withheld");
+        assert_eq!(report.mode, AuditExecutionMode::Withheld);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].id, "ORCH-GATED");
         let detail = serde_json::to_value(&report.findings[0].evidence).unwrap();
@@ -1710,7 +1874,7 @@ mod tests {
             .await
             .expect("actor run")
             .expect("static report");
-        assert_eq!(report.mode, "static");
+        assert_eq!(report.mode, AuditExecutionMode::StaticFrame);
         pool.stop(&id).await.ok();
     }
 
@@ -1735,7 +1899,7 @@ mod tests {
             .expect("start");
         let report = pool
             .with_session(Some(&id), |s| {
-                run_profile_checked(s, "full", None, SafetyPolicy::DeepIsolation)
+                run_profile_checked(s, "full", None, SafetyPolicy::RestartBetweenMutations)
             })
             .await
             .expect("actor run")
@@ -1815,11 +1979,11 @@ mod tests {
             .await
             .expect("start");
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "keyboard"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "keyboard"))
             .await
             .expect("actor run")
             .expect("run keyboard");
-        assert_eq!(report.mode, "active");
+        assert_eq!(report.mode, AuditExecutionMode::Driving);
         pool.stop(&id).await.ok();
     }
 

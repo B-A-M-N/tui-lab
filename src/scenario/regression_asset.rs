@@ -376,6 +376,7 @@ mod tests {
 
     fn finding(id: &str, ev: Vec<EvidenceRef>, reproduction: Option<String>) -> Finding {
         Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: id.into(),
             rule_id: None,
             severity: Severity::Warn,

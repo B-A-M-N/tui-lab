@@ -11,7 +11,7 @@ use super::*;
 impl RunContext {
     /// The loaded project contract, if any. Feeds exploration candidates
     /// (item 49) and `tui_contract status/compare`. Round-2 (G1): delegates
-    /// to the cohesive [`super::contract_state::ContractState`].
+    /// to the cohesive `super::contract_state::ContractState`.
     pub fn contract(&self) -> Option<&crate::design::ProjectContract> {
         self.contract.contract()
     }
@@ -37,9 +37,26 @@ impl RunContext {
     }
 
     /// Store (or overwrite) a labeled audit-finding baseline (item 67).
-    /// Round-2 (G1): delegates to [`super::finding_store::FindingStore`].
+    /// Round-2 (G1): delegates to `super::finding_store::FindingStore`.
     pub fn record_finding_baseline(&mut self, label: &str, findings: Vec<crate::audit::Finding>) {
         self.findings.record_baseline(label, findings);
+    }
+
+    /// Beta-audit P0.10: record a completed audit pass as THE current
+    /// snapshot (replaces any previous one — this is the newest pass,
+    /// not history).
+    pub fn record_audit_pass(&mut self, findings: Vec<crate::audit::Finding>) {
+        self.findings.record_pass(findings);
+    }
+
+    /// The latest completed audit pass's findings, when one has been
+    /// recorded in this run. Falls back to nothing — a run with no
+    /// completed pass has no "current set" to compare against, and
+    /// callers must say so rather than substitute the cumulative
+    /// ledger (whose stale copies turn fixed defects into persisting
+    /// ones).
+    pub fn latest_audit_pass(&self) -> Option<&[crate::audit::Finding]> {
+        self.findings.latest_pass()
     }
 
     /// Fetch a labeled audit-finding baseline.
@@ -63,6 +80,21 @@ impl RunContext {
         compare_label: &str,
     ) -> std::collections::HashSet<String> {
         self.findings.resolved_fingerprints(compare_label)
+    }
+
+    /// Beta-audit P1.2: persist one `tui_workflow action=verify`
+    /// execution, keyed by the finding's fingerprint, so a later caller
+    /// can cite the verification instead of re-deriving it.
+    pub fn record_verification(&mut self, rec: crate::audit::verification::VerificationRecord) {
+        self.findings.record_verification(rec);
+    }
+
+    /// Verification records for one finding fingerprint, newest last.
+    pub fn verifications_for(
+        &self,
+        finding_fingerprint: &str,
+    ) -> Vec<crate::audit::verification::VerificationRecord> {
+        self.findings.verifications_for(finding_fingerprint)
     }
 
     pub fn record_contract_baseline(

@@ -90,9 +90,26 @@ impl RunContext {
         self.evidence.events.set_cursor(consumer, seq);
     }
 
+    /// Record a declared event-ring gap crossed by a consumer (audit
+    /// finding 30). Available events are still recorded, but status must
+    /// report that this consumer's history is incomplete.
+    pub fn note_event_gap(&mut self, consumer: &str, first_available: Option<u64>) {
+        self.evidence.events.note_gap(consumer, first_available);
+    }
+
+    /// Declared event-ring gaps, oldest first.
+    pub fn event_gaps(&self) -> &[(String, Option<u64>)] {
+        self.evidence.events.gaps()
+    }
+
+    /// Whether ANY evidence consumer crossed a declared event-ring gap.
+    pub fn event_history_incomplete(&self) -> bool {
+        !self.evidence.events.gaps().is_empty()
+    }
+
     /// The coverage ledger (target → entry), for readers that fold over
     /// all entries. Round-2 (G1): delegates to
-    /// [`coverage_state::CoverageState`].
+    /// `coverage_state::CoverageState`.
     pub fn coverage_ledger(&self) -> &std::collections::BTreeMap<String, CoverageEntry> {
         self.coverage.entries()
     }

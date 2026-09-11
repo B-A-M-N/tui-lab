@@ -54,7 +54,9 @@ pub(crate) fn minimize_crash_finding(
         // restart. Report the attempt; emit no reproduction finding.
         let mut run = server.run.lock().unwrap();
         let _ = run.extend_findings(vec![crate::audit::Finding {
-            id: format!("EXPLORE-CRASH-{}", exit.action_index),
+            kind: crate::audit::FindingKind::Defect,
+            id:
+             format!("EXPLORE-CRASH-{}", exit.action_index),
             rule_id: None,
             severity: Severity::Warn,
             category: Category::Other("exploration".into()),
@@ -99,8 +101,9 @@ pub(crate) fn minimize_crash_finding(
     let scenario_id = scenario.id.clone();
     let saved = {
         let mut run = server.run.lock().unwrap();
-        run.save_scenario(scenario);
+        let _ = run.save_scenario(scenario);
         let _ = run.extend_findings(vec![crate::audit::Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: format!("EXPLORE-CRASH-{}", exit.action_index),
             rule_id: None,
             severity: Severity::Error,
@@ -142,4 +145,3 @@ pub(crate) fn minimize_crash_finding(
         "attempts": pipeline.attempts,
     })
 }
-

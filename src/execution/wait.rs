@@ -30,24 +30,33 @@ pub fn execute_wait_event(
     predicate: &crate::mcp::params::EventPredicate,
     budget_ms: u64,
 ) -> Result<WaitEventOutcome, anyhow::Error> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(budget_ms);
+    // Audit finding 31: an incremental event cursor — each iteration reads
+    // ONLY the events since the last scan (`events_since(cursor)`), never
+    // a full retained-ring rescan per tick (O(n) per iteration over a
+    // large ring). Ring gaps and backend observation failures PROPAGATE
+    // instead of being suppressed.
+    let mut cursor = session.event_queue_last_seq();
     loop {
         session.poll_native();
-        let matched = session
-            .all_events()
-            .into_iter()
-            .find(|ev| predicate.matches(ev));
-        if let Some(ev) = matched {
+        let batch = session.events_since(cursor);
+        if batch.gap {
+            return Err(anyhow::anyhow!(
+                "event-ring gap: events between seq {cursor} and {} were evicted; the wait cannot prove causality",
+                batch.first_available.map(|s| s.to_string()).unwrap_or_else(|| "none retained".into())
+            ));
+        }
+        if let Some(ev) = batch.events.iter().find(|ev| predicate.matches(ev)) {
             return Ok(WaitEventOutcome {
                 met: true,
                 matched_seq: ev.seq,
                 matched_at: ev.at,
                 last_seq: session.event_queue_last_seq(),
-                elapsed_ms: std::time::Instant::now()
-                    .duration_since(deadline - std::time::Duration::from_millis(budget_ms))
-                    .as_millis() as u64,
+                elapsed_ms: start.elapsed().as_millis() as u64,
             });
         }
+        cursor = batch.cursor;
         if std::time::Instant::now() >= deadline {
             return Ok(WaitEventOutcome {
                 met: false,
@@ -58,9 +67,13 @@ pub fn execute_wait_event(
             });
         }
         // A brief observe keeps the queue moving (bytes + native frames
-        // fold in here) without busy-spinning the PTY.
-        let _ = session.observe(20);
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        // fold in here) without busy-spinning the PTY. Observation
+        // errors are NOT discarded — a dead backend must fail the wait,
+        // never silently spin until its budget.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let idle = remaining.min(std::time::Duration::from_millis(30));
+        session.observe(idle.as_millis() as u64)?;
+        std::thread::sleep(std::time::Duration::from_millis(15));
     }
 }
 

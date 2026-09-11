@@ -131,7 +131,7 @@ impl<T> Envelope<T> {
 }
 
 /// Convert our internal result into an rmcp [`ErrorData`] (for hard failures)
-/// or a successful [`CallToolResult`] carrying an envelope string.
+/// or a successful `CallToolResult` carrying an envelope string.
 pub fn to_error_data(cat: ErrorCategory, msg: impl Into<String>) -> ErrorData {
     let code = match cat {
         ErrorCategory::InvalidRequest => ErrorCode::INVALID_PARAMS,

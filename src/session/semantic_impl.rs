@@ -177,6 +177,12 @@ impl Session {
         self.backend.screen_changes_since(after_seq)
     }
 
+    /// Audit finding 45: monotonic per-change log. Causal latency uses
+    /// this, never the Unix-millisecond correlation log.
+    pub fn screen_monotonic_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        self.backend.screen_monotonic_changes_since(after_seq)
+    }
+
     /// Wave-2 (streams): the pipe engine's genuine stdout/stderr line
     /// separation. Returns `(stdout, stderr)`; `(empty, empty)` on engines
     /// that interleave by construction.
@@ -206,6 +212,16 @@ impl Session {
     /// the last (re)start. Used for real previous→current diffs (audit item 12).
     pub fn previous(&self) -> Option<&ScreenState> {
         self.observation.previous()
+    }
+
+    /// Test-only observation seeding: install a screen as the session's
+    /// last settled observation without a backend round-trip, so unit
+    /// tests can exercise consumers of `last()` (frame provenance,
+    /// diffing) against a known screen. `#[cfg(test)]` — production code
+    /// must go through `observe()`.
+    #[cfg(test)]
+    pub(crate) fn seed_last_observation(&mut self, screen: ScreenState) {
+        let _ = self.observation.advance(screen);
     }
 
     /// Semantic analysis of the last settled frame, served from the per-session
@@ -346,6 +362,41 @@ impl Session {
         Ok((screen, sem, tree, report))
     }
 
+    /// Current fused snapshot WITHOUT advancing the observation cursor.
+    ///
+    /// Pumps pending backend/native facts and fuses the current grid, but
+    /// `last`/`previous` remain the public settled observation window. The
+    /// next explicit `observe()` still diffs against the user's own prior
+    /// observation, so guards/resources/preflights cannot rewrite that
+    /// history.
+    pub fn snapshot_fresh(&mut self) -> anyhow::Result<crate::session::state::FrameAnalysis> {
+        self.native.poll();
+        self.absorb_native_events();
+        self.absorb_pending_ingest();
+        let screen = self.backend.state()?;
+        self.absorb_query_answers();
+        Ok(self.analyze_screen(screen))
+    }
+
+    /// Backward-compatible name for internal pre-dispatch snapshots.
+    pub fn peek_fresh(&mut self) -> anyhow::Result<crate::session::state::FrameAnalysis> {
+        self.snapshot_fresh()
+    }
+
+    /// Native semantic channel revision, suitable for exact stale-state
+    /// guards. Frames accepted by the channel advance this; an absent
+    /// channel is a stable `None`.
+    pub fn native_revision(&self) -> Option<u64> {
+        self.native.revision()
+    }
+
+    /// Test seam: make the native channel declare focus without changing
+    /// the parsed grid. This is exactly the drift class the pre-dispatch
+    /// guard must catch (native-only focus move, no pixels changed).
+    pub fn test_declare_native_focus(&mut self, control_id: &str) {
+        self.native.test_declare_focus_for_drift_fixture(control_id);
+    }
+
     /// THE authoritative per-frame analysis (re-review P0.4): one struct
     /// carrying the frame plus its fused semantic screen, semantic tree,
     /// native overlay report, and the fused semantic identity. Every
@@ -368,7 +419,13 @@ impl Session {
             &mut self.semantic.cache().borrow_mut(),
             &self.native,
         );
-        let semantic_identity = crate::semantic::semantic_identity_fused(&sem, &tree);
+        // P1-30: fused evidence uses the unified V2 projection so
+        // affordances/components/relationships/native revision participate
+        // in identity, not only controls/regions/tree.
+        let native_revision = self.native.revision();
+        let semantic_identity =
+            crate::semantic::SemanticIdentityV2::from_fused(&sem, &tree, native_revision)
+                .identity();
         crate::session::state::FrameAnalysis {
             frame: screen,
             semantic: sem,

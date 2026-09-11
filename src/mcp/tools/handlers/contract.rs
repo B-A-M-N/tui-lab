@@ -2,12 +2,75 @@
 
 pub(crate) mod check;
 
-use check::{contract_mode_override, diff_contract_reports};
 use crate::audit::{Category, Severity};
 use crate::error::ErrorCategory;
 use crate::mcp::helpers::{err, ok};
 use crate::mcp::params::*;
+use check::{contract_mode_override, diff_contract_reports};
 use rmcp::serde_json::json;
+
+/// Beta-audit P0.7: ONE mutation-authorization rule for every
+/// conformance-running contract action — passive unless the caller
+/// explicitly passes allow_mutation=true. `tui_audit profile=contract`
+/// derives its policy from the same knob via SafetyPolicy.
+fn write_contract_atomically(
+    path: &std::path::Path,
+    yaml: &str,
+) -> Result<ScaffoldWriteMeta, anyhow::Error> {
+    use std::io::Write;
+    // Audit finding 52: never create a file the loader cannot read. JSON
+    // extensions get JSON here; YAML extensions get YAML; anything else is
+    // rejected before mutation.
+    let serialised = match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => {
+            serde_json::to_string_pretty(
+                &serde_yaml::from_str::<crate::design::ProjectContract>(yaml).map_err(|e| {
+                    anyhow::anyhow!("contract scaffold YAML conversion failed: {e}")
+                })?,
+            )? + "\n"
+        }
+        Some("yaml" | "yml") => yaml.to_string(),
+        _ => anyhow::bail!(
+            "unsupported contract scaffold extension {:?}; use .json, .yaml, or .yml",
+            path.extension()
+        ),
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let existed = path.exists();
+    let tmp = path.with_extension("yaml.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(serialised.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    let bytes = serialised.len();
+    Ok(ScaffoldWriteMeta {
+        path: path.display().to_string(),
+        bytes,
+        hash: blake3::hash(serialised.as_bytes()).to_string(),
+        created: !existed,
+    })
+}
+
+struct ScaffoldWriteMeta {
+    path: String,
+    bytes: usize,
+    hash: String,
+    created: bool,
+}
+
+fn exec_policy(p: &TuiContractParams) -> crate::design::conformance::ExecPolicy {
+    if p.allow_mutation.unwrap_or(false) {
+        crate::design::conformance::ExecPolicy::Driving
+    } else {
+        crate::design::conformance::ExecPolicy::Passive
+    }
+}
 
 /// Body of `tui_contract` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
@@ -55,10 +118,53 @@ pub(crate) async fn tui_contract(
                     )
                 }
             };
-            // Apply to EVERY live session (item 48 semantics): one actor
-            // job per session, none blocking another.
+            // Beta-audit P1.5: a run represents ONE TUI project. The
+            // contract's normalization policy applies ONLY to sessions
+            // whose launch cwd resolves to the same project root as the
+            // contract-bearing directory — a foreign-root session (a
+            // different application in the same run) is never silently
+            // normalized by another app's policy. Foreign sessions are
+            // listed, not hidden.
+            let contract_root = {
+                let run = s.run.lock().unwrap();
+                let anchor =
+                    p.id.as_deref()
+                        .and_then(|sid| run.launch_spec(sid))
+                        .and_then(|spec| spec.cwd.clone())
+                        .or_else(|| run.primary_session_cwd().map(str::to_string));
+                anchor.map(|cwd| {
+                    crate::session::ProjectLocator::locate(None, &cwd)
+                        .root()
+                        .to_string()
+                })
+            };
             let mut applied: Vec<String> = Vec::new();
+            let mut skipped_foreign: Vec<String> = Vec::new();
             for sid in s.sessions.list() {
+                // Same-project check: this session's launch cwd must
+                // resolve to the contract's project root.
+                let same_project = {
+                    let run = s.run.lock().unwrap();
+                    let session_root =
+                        run.launch_spec(&sid)
+                            .and_then(|spec| spec.cwd.clone())
+                            .map(|cwd| {
+                                crate::session::ProjectLocator::locate(None, &cwd)
+                                    .root()
+                                    .to_string()
+                            });
+                    match (&contract_root, session_root) {
+                        // No anchor at all: no scoping info — apply (the
+                        // legacy single-project behavior) and say so.
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(a), Some(b)) => a == &b,
+                    }
+                };
+                if !same_project {
+                    skipped_foreign.push(sid);
+                    continue;
+                }
                 let policy_for_session = policy.clone();
                 if let Ok(id) = s
                     .with_sess(Some(&sid), move |sess| {
@@ -83,6 +189,13 @@ pub(crate) async fn tui_contract(
                     "oracles": contract.oracles.len(),
                     "volatile_patterns": contract.volatile_patterns.len(),
                     "policy_applied_to_sessions": applied,
+                    "policy_skipped_foreign_sessions": skipped_foreign,
+                    "project_root_scope": contract_root,
+                    "scoping_note": if skipped_foreign.is_empty() {
+                        None
+                    } else {
+                        Some("foreign-root sessions were NOT normalized by this contract's policy — they belong to a different project".to_string())
+                    },
                 })
             };
             ok(json!({ "loaded": true, "path": path, "contract": summary }))
@@ -142,8 +255,10 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
-            check::check_contract_against(s, p.id.as_deref(), contract, mode_override)
-                .await
+            // Beta-audit P0.7: passive by default — a status check never
+            // drives the app unless the caller explicitly consents.
+            let policy = exec_policy(&p);
+            check::check_contract_against(s, p.id.as_deref(), contract, mode_override, policy).await
         }
         // ── compare: run conformance now, diff against the baseline ──
         CT::Compare => {
@@ -163,11 +278,13 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
+            let policy = exec_policy(&p);
             let current = match check::check_contract_inner(
                 s,
                 p.id.as_deref(),
                 contract.clone(),
                 mode_override,
+                policy,
             )
             .await
             {
@@ -203,6 +320,7 @@ pub(crate) async fn tui_contract(
                         let findings: Vec<crate::audit::Finding> = regressions
                             .iter()
                             .map(|(name, before, after)| crate::audit::Finding {
+                                kind: crate::audit::FindingKind::Defect,
                                 id: "CONTRACT-REGRESSION".into(),
                                 rule_id: None,
                                 severity: Severity::Error,
@@ -279,9 +397,11 @@ pub(crate) async fn tui_contract(
             let selector = p.id.clone();
             let run = s.run.clone();
             if scaffold_mode == SM::Explore {
-                // The multi-state pass DRIVES the app (Tab / Escape /
-                // resize), so the human control lease gates it exactly
-                // like every other driver.
+                // The multi-state pass DRIVES the app (Tab / resize),
+                // so the human control lease gates it exactly like
+                // every other driver. (Beta-audit P0.6: Escape is no
+                // longer in the pass — it is not state-preserving in
+                // general.)
                 let scaffolded = s
                     .with_sess(selector.as_deref(), move |sess| {
                         if let Some(refused) = crate::mcp::helpers::lease_refused(sess) {
@@ -362,6 +482,23 @@ pub(crate) async fn tui_contract(
                     Ok(y) => y,
                     Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
                 };
+                let saved_path = match p.path.as_deref() {
+                    Some(path) => {
+                        match write_contract_atomically(std::path::Path::new(path), &yaml) {
+                            Ok(meta) => Some(meta),
+                            Err(e) => return err(ErrorCategory::InvalidRequest, e.to_string()),
+                        }
+                    }
+                    None => None,
+                };
+                let saved_json = saved_path.as_ref().map(|m| {
+                    json!({
+                        "path": m.path,
+                        "bytes": m.bytes,
+                        "digest": {"algorithm": "blake3", "value": m.hash},
+                        "created": m.created,
+                    })
+                });
                 // The extension blob names the states, so the response can
                 // cite what the pass actually saw.
                 let ext = contract
@@ -375,6 +512,7 @@ pub(crate) async fn tui_contract(
                     "action": "scaffold",
                     "scaffold_mode": "explore",
                     "inferred": true,
+                    "saved_to": saved_json,
                     "contract_name": contract.schema.name,
                     "states_observed": state_count,
                     "components": contract.components.len(),
@@ -383,7 +521,9 @@ pub(crate) async fn tui_contract(
                     "viewports": contract.viewports.iter().map(|v| json!({"cols": v.cols, "rows": v.rows})).collect::<Vec<_>>(),
                     "states": ext["states"],
                     "focus_order": ext["states"].as_array().map(|_| ()),
-                    "note": "scaffolded from a SAFE multi-state pass (initial screen, Tab focus walk, Escape, viewport probes) — everything declared was SEEN, nothing is yet required. Edit required=true / mode=validation as you fix intent, then tui_contract action=validate.",
+                    "candidate_invariants": ext["candidate_invariants"],
+                    "clipping_evidence": ext["clipping_evidence"],
+                    "note": "scaffolded from a bounded exploratory pass (initial screen, Tab focus walk, viewport probes; NO Escape — it is not state-preserving in general). Everything declared was SEEN, nothing is yet required, and the focus invariants are UNVERIFIED candidates — see candidate_invariants. Promote deliberately (required=true / mode=validation), then tui_contract action=status to prove the candidates.",
                     "yaml": yaml,
                 }))
             } else {
@@ -405,10 +545,28 @@ pub(crate) async fn tui_contract(
                     Ok(y) => y,
                     Err(e) => return err(ErrorCategory::InternalError, e.to_string()),
                 };
+                let saved_path = match p.path.as_deref() {
+                    Some(path) => {
+                        match write_contract_atomically(std::path::Path::new(path), &yaml) {
+                            Ok(meta) => Some(meta),
+                            Err(e) => return err(ErrorCategory::InvalidRequest, e.to_string()),
+                        }
+                    }
+                    None => None,
+                };
+                let saved_json = saved_path.as_ref().map(|m| {
+                    json!({
+                        "path": m.path,
+                        "bytes": m.bytes,
+                        "digest": {"algorithm": "blake3", "value": m.hash},
+                        "created": m.created,
+                    })
+                });
                 ok(json!({
                     "action": "scaffold",
                     "scaffold_mode": "current",
                     "inferred": true,
+                    "saved_to": saved_json,
                     "contract_name": contract.schema.name,
                     "components": contract.components.len(),
                     "oracles": contract.oracles.len(),
@@ -440,11 +598,13 @@ pub(crate) async fn tui_contract(
                 Ok(m) => m,
                 Err(e) => return err(ErrorCategory::InvalidRequest, e),
             };
+            let policy = exec_policy(&p);
             let report = match check::check_contract_inner(
                 s,
                 p.id.as_deref(),
                 contract,
                 mode_override,
+                policy,
             )
             .await
             {
@@ -473,5 +633,29 @@ pub(crate) async fn tui_contract(
                 ),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod scaffold_write_tests {
+    use super::*;
+
+    #[test]
+    fn json_path_gets_parseable_json_and_blake3_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract.json");
+        let meta = write_contract_atomically(&path, "").expect("json write");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: crate::design::ProjectContract = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, crate::design::ProjectContract::default());
+        assert_eq!(meta.hash, blake3::hash(raw.as_bytes()).to_string());
+    }
+
+    #[test]
+    fn unsupported_extension_is_refused_without_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract.toml");
+        assert!(write_contract_atomically(&path, "").is_err());
+        assert!(!path.exists());
     }
 }

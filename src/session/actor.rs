@@ -451,8 +451,29 @@ impl SessionPool {
         Ok(id)
     }
 
+    /// Exact-spec launch for scenario-owned execution. Unlike the
+    /// exploded 8-argument surface, this preserves every env pair (including
+    /// internal persona behavior-contract bindings) and records exactly the
+    /// requested backend/isolation selector.
+    pub async fn start_with_spec(&self, spec: LaunchSpec) -> Result<String, anyhow::Error> {
+        let id = format!("sess-{}", uuid::Uuid::new_v4().simple());
+        let s = Session::new(id.clone(), spec.command.clone());
+        let actor = SessionActor::spawn(s);
+        let launch_spec = spec;
+        actor
+            .send(move |s: &mut Session| s.start_with_spec(launch_spec))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))??;
+        self.directory
+            .write()
+            .expect("session directory")
+            .insert(id.clone(), actor);
+        *self.active.lock().expect("active pointer") = Some(id.clone());
+        Ok(id)
+    }
+
     /// Typed-engine launch (re-review P0): the engine arrives as
-    /// [`BackendKind`], not a string the launch layer re-interprets. The
+    /// `BackendKind`, not a string the launch layer re-interprets. The
     /// engine name recorded in the spec is derived from the kind — one
     /// source of truth, no parse drift between MCP param and engine.
     #[allow(clippy::too_many_arguments)]
@@ -1088,9 +1109,7 @@ mod tests {
             .await
             .expect("start");
         // Retain the handle BEFORE any stop machinery runs.
-        let handle = pool
-            .resolve(Some(&id))
-            .expect("handle resolves pre-stop");
+        let handle = pool.resolve(Some(&id)).expect("handle resolves pre-stop");
 
         // Concurrently: one task spams sends on the pre-held handle while
         // stop runs. Every send must either land BEFORE closing was

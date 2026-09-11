@@ -46,10 +46,23 @@ pub(crate) async fn tui_record(
                     return refused;
                 }
                 sess.enable_recording(false);
+                let metadata = sess.recording_fidelity().unwrap_or_default();
+                let boundary = metadata["boundary"].as_str().unwrap_or("unknown").to_string();
+                let fidelity = metadata["fidelity"].as_str().unwrap_or("unknown").to_string();
+                let lossy = metadata["lossy"].as_bool().unwrap_or(false);
+                let note = if lossy {
+                    "output is reconstructed from sampled pane snapshots; it is not a raw byte stream and cannot prove protocol timing".to_string()
+                } else if boundary == "separated-streams" {
+                    "stdout and stderr are captured at their stream boundaries; call format=stop to flush to a .cast file".to_string()
+                } else {
+                    "output is captured at the raw PTY byte boundary; call format=stop to flush to a .cast file".to_string()
+                };
                 ok(json!({
                     "recording": "started",
-                    "boundary": "pty-bytes",
-                    "note": "output is captured at the raw PTY byte boundary; call format=stop to flush to a .cast file"
+                    "boundary": boundary,
+                    "fidelity": fidelity,
+                    "lossy": lossy,
+                    "note": note
                 }))
             }
             // Detach + write the .cast into the run's recordings dir.
@@ -70,9 +83,9 @@ pub(crate) async fn tui_record(
                         )
                     }
                 };
-                let (events, ndjson) = {
+                let (events, ndjson, fidelity_metadata) = {
                     let r = rec.lock().expect("recorder");
-                    (r.event_count(), r.to_ndjson())
+                    (r.event_count(), r.to_ndjson(), r.fidelity_metadata())
                 };
                 let body = ndjson.join("\n") + "\n";
                 let file_name = format!(
@@ -89,35 +102,43 @@ pub(crate) async fn tui_record(
                 // (goal spec: promotion preserves "recordings already held
                 // in memory") — the content is also returned inline.
                 let size = body.len() as u64;
+                // Write the durable artifact OUTSIDE the run lock (P1-48):
+                // reserve/register under the lock, but never let a slow disk
+                // stall the shared run context.
+                let persisted = run
+                    .lock()
+                    .unwrap()
+                    .run_dir()
+                    .cloned()
+                    .map(|dir| atomic_write_artifact(&dir.join("recordings"), &file_name, body.as_bytes()));
                 let (path, artifact) = {
                     let mut run = run.lock().unwrap();
-                    match run.run_dir().cloned() {
-                        Some(dir) => {
-                            let rec_dir = dir.join("recordings");
-                            let _ = std::fs::create_dir_all(&rec_dir);
-                            let file = rec_dir.join(&file_name);
-                            match std::fs::write(&file, &body) {
-                                Ok(()) => {
-                                    // Typed ref for the persisted artifact (Wave B item 15).
-                                    let rel = std::path::PathBuf::from("recordings")
-                                        .join(&file_name);
-                                    let r = run.register_artifact(
-                                        crate::run::ArtifactKind::Recording,
-                                        Some(rel),
-                                        Some(size),
-                                        Some(sess.id.clone()),
-                                        format!("pty recording, {} events", events),
-                                    )
-                                    .ok();
-                                    (Some(file.to_string_lossy().to_string()), r)
-                                }
-                                Err(e) => {
-                                    return err(
-                                        ErrorCategory::BackendError,
-                                        format!("recording flush failed: {}", e),
-                                    )
-                                }
-                            }
+                    match persisted {
+                        Some(Ok(file)) => {
+                            // Typed ref for the persisted artifact (Wave B item 15).
+                            let rel = std::path::PathBuf::from("recordings").join(&file_name);
+                            let r = run
+                                .register_artifact(
+                                    crate::run::ArtifactKind::Recording,
+                                    Some(rel),
+                                    Some(size),
+                                    Some(sess.id.clone()),
+                                    format!(
+                                        "{} recording, {} events",
+                                        fidelity_metadata["fidelity"]
+                                            .as_str()
+                                            .unwrap_or("unknown"),
+                                        events
+                                    ),
+                                )
+                                .ok();
+                            (Some(file.to_string_lossy().to_string()), r)
+                        }
+                        Some(Err(e)) => {
+                            return err(
+                                ErrorCategory::BackendError,
+                                format!("recording flush failed: {e}"),
+                            )
                         }
                         None => {
                             run.hold_recording(file_name, body.clone());
@@ -128,7 +149,11 @@ pub(crate) async fn tui_record(
                                 None,
                                 Some(size),
                                 Some(sess.id.clone()),
-                                format!("pty recording, {} events (held, ephemeral run)", events),
+                                format!(
+                                    "{} recording, {} events (held, ephemeral run)",
+                                    fidelity_metadata["fidelity"].as_str().unwrap_or("unknown"),
+                                    events
+                                ),
                             )
                             .ok();
                             (None, r)
@@ -138,6 +163,8 @@ pub(crate) async fn tui_record(
                 ok(json!({
                     "recording": "stopped",
                     "events": events,
+                    "boundary": fidelity_metadata["boundary"],
+                    "fidelity": fidelity_metadata,
                     "saved_to": path,
                     "artifact": artifact.as_ref().map(|a| serde_json::json!({
                         "id": a.id,
@@ -180,38 +207,35 @@ pub(crate) async fn tui_record(
                     ext,
                 );
                 let size = body.len() as u64;
+                // Durable capture writes happen outside the run lock (P1-48).
+                let persisted = run
+                    .lock()
+                    .unwrap()
+                    .run_dir()
+                    .cloned()
+                    .map(|dir| atomic_write_artifact(&dir.join("captures"), &file_name, &body));
                 let (path, artifact) = {
                     let mut run = run.lock().unwrap();
                     let kind = crate::run::ArtifactKind::Capture;
-                    match run.run_dir().cloned() {
-                        Some(dir) => {
-                            let cap_dir = dir.join("captures");
-                            let _ = std::fs::create_dir_all(&cap_dir);
-                            let file = cap_dir.join(&file_name);
-                            match std::fs::write(&file, &body) {
-                                Ok(()) => {
-                                    let rel =
-                                        std::path::PathBuf::from("captures").join(&file_name);
-                                    let r = run.register_artifact(
-                                        kind,
-                                        Some(rel),
-                                        Some(size),
-                                        Some(sess.id.clone()),
-                                        format!(
-                                            "screen capture {}x{} ({} format)",
-                                            screen.cols, screen.rows, ext
-                                        ),
-                                    )
-                                    .ok();
-                                    (Some(file.to_string_lossy().to_string()), r)
-                                }
-                                Err(e) => {
-                                    return err(
-                                        ErrorCategory::BackendError,
-                                        format!("capture write failed: {e}"),
-                                    )
-                                }
-                            }
+                    match persisted {
+                        Some(Ok(file)) => {
+                            let rel = std::path::PathBuf::from("captures").join(&file_name);
+                            let r = run
+                                .register_artifact(
+                                    kind,
+                                    Some(rel),
+                                    Some(size),
+                                    Some(sess.id.clone()),
+                                    format!(
+                                        "screen capture {}x{} ({} format)",
+                                        screen.cols, screen.rows, ext
+                                    ),
+                                )
+                                .ok();
+                            (Some(file.to_string_lossy().to_string()), r)
+                        }
+                        Some(Err(e)) => {
+                            return err(ErrorCategory::BackendError, format!("capture write failed: {e}"))
                         }
                         None => {
                             run.hold_capture(file_name, body.clone(), ext);
@@ -256,6 +280,26 @@ pub(crate) async fn tui_record(
 /// Body of `tui_scenario` (Phase 5 extraction): the #[tool] method in
 /// `super` decodes params and delegates here. `s` is the server,
 /// whose private fields this child module can see unchanged.
+/// Atomic file write for durable artifacts. Callers should reserve/register
+/// evidence under the run lock separately; this helper performs the actual
+/// filesystem write outside any shared lock window and returns persistence
+/// health rather than silently swallowing errors.
+fn atomic_write_artifact(
+    dir: &std::path::Path,
+    file_name: &str,
+    body: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let file = dir.join(file_name);
+    let tmp = file.with_extension(format!(
+        "{}.tmp",
+        file.extension().and_then(|e| e.to_str()).unwrap_or("part")
+    ));
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &file).map_err(|e| e.to_string())?;
+    Ok(file)
+}
+
 pub(crate) async fn tui_scenario(
     s: &crate::mcp::tools::TuiLabServer,
     p: rmcp::handler::server::wrapper::Parameters<TuiScenarioParams>,
@@ -292,6 +336,17 @@ pub(crate) async fn tui_scenario(
         SA::RecordStart => {
             let name = p.name.clone().unwrap_or_else(|| "scenario".into());
             let selector = p.id.clone();
+            // The caller's replay failure policy is part of the recording
+            // contract, not only a one-shot run override. Without this, a
+            // RecordStart(continue) flow silently reverts to Stop on replay.
+            let on_failure = match p.on_failure.as_ref().and_then(Known::known) {
+                Some(ScenarioFailurePolicy::Continue) => {
+                    crate::scenario::model::FailurePolicy::Continue
+                }
+                Some(ScenarioFailurePolicy::Stop) | None => {
+                    crate::scenario::model::FailurePolicy::Stop
+                }
+            };
             let run = s.run.clone();
             let started = s
                 .with_sess(selector.as_deref(), move |sess| {
@@ -299,7 +354,7 @@ pub(crate) async fn tui_scenario(
                     let rec_id = run
                         .lock()
                         .unwrap()
-                        .begin_scenario_recording(&name, &sid, gen);
+                        .begin_scenario_recording_with_policy(&name, &sid, gen, on_failure);
                     ok(json!({
                         "recording_id": rec_id.as_str(),
                         "name": name,
@@ -347,25 +402,63 @@ pub(crate) async fn tui_scenario(
                     )
                 }
             };
-            let mut run = s.run.lock().unwrap();
-            match run.finish_scenario_recording(&rec_id) {
-                Some(scenario) => {
-                    let path: Option<String> = run
-                        .save_scenario(scenario.clone())
-                        .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
-                    ok(json!({
-                        "recording_id": rec_id,
-                        "scenario_id": scenario.id,
-                        "name": scenario.name,
-                        "steps": scenario.step_count(),
-                        "saved_to": path,
-                        "scenario": serde_json::to_value(&scenario).unwrap_or_default(),
-                    }))
+            // P1-48: reserve/finish in memory under a short lock, then
+            // perform the filesystem write outside the shared run lock.
+            let (scenario, _file_stem) = {
+                let mut run = s.run.lock().unwrap();
+                if run.scenario_recording_step_count(&rec_id) == Some(0) {
+                    return err(
+                        ErrorCategory::InvalidRequest,
+                        "the recording has no steps; drive at least one act/intent/wait/assert before record_stop",
+                    );
                 }
-                None => err(
-                    ErrorCategory::InvalidRequest,
-                    format!("no recording in progress with id '{}'", rec_id),
+                match run.finish_scenario_recording(&rec_id) {
+                    Some(scenario) => {
+                        let stem = run.save_scenario_memory(scenario.clone());
+                        (scenario, stem)
+                    }
+                    None => {
+                        return err(
+                            ErrorCategory::InvalidRequest,
+                            format!("no recording in progress with id '{rec_id}'"),
+                        )
+                    }
+                }
+            };
+            // Audit finding 28: the stop-recording path reports persistence
+            // health as a typed outcome — never silently maps a write
+            // failure to `saved_to:null` (which is also the honest
+            // ephemeral answer, so the two must be distinguishable).
+            let (saved_to, persistence) = match s
+                .run
+                .lock()
+                .unwrap()
+                .scenario_file_dir()
+                .map(|dir| crate::run::scenario_impl::save_scenario_file(&dir, &scenario))
+            {
+                Some(Some(p)) => (
+                    Some(p.to_string_lossy().to_string()),
+                    serde_json::Value::String("persisted".into()),
                 ),
+                Some(None) => {
+                    let reason = "scenario file write failed; memory holds the canonical scenario";
+                    (
+                        None,
+                        serde_json::json!({ "status": "failed", "error": reason }),
+                    )
+                }
+                None => (None, serde_json::Value::String("ephemeral".into())),
+            };
+            {
+                ok(json!({
+                    "recording_id": rec_id,
+                    "scenario_id": scenario.id,
+                    "name": scenario.name,
+                    "steps": scenario.step_count(),
+                    "saved_to": saved_to,
+                    "persistence": persistence,
+                    "scenario": serde_json::to_value(&scenario).unwrap_or_default(),
+                }))
             }
         }
         // explicit save of hand-authored steps (validated through the
@@ -373,6 +466,12 @@ pub(crate) async fn tui_scenario(
         SA::Save => {
             let name = p.name.clone().unwrap_or_else(|| "scenario".into());
             let steps = p.steps.clone().unwrap_or_default();
+            if steps.is_empty() {
+                return err(
+                    ErrorCategory::InvalidRequest,
+                    "a scenario must contain at least one step; use record_start/record_stop to capture a live flow or provide act/intent/wait/assert steps",
+                );
+            }
             let mut recorder = crate::scenario::recorder::ScenarioRecorder::new(name.clone());
             for s in &steps {
                 // Canonical step shape = flat ({kind, ...params}), the
@@ -411,12 +510,13 @@ pub(crate) async fn tui_scenario(
                 };
                 match kind.as_str() {
                     "act" => recorder.record_act(params),
+                    "intent" => recorder.record_intent(params),
                     "wait" => recorder.record_wait(params),
                     "assert" => recorder.record_assert(params),
                     other => {
                         return err(
                             ErrorCategory::InvalidRequest,
-                            format!("unknown step kind '{}' (act|wait|assert)", other),
+                            format!("unknown step kind '{}' (act|intent|wait|assert)", other),
                         )
                     }
                 }
@@ -424,14 +524,21 @@ pub(crate) async fn tui_scenario(
             let scenario = recorder.build();
             let count = scenario.step_count();
             let scenario_id = scenario.id.clone();
-            let path: Option<String> = s
-                .run
-                .lock()
-                .unwrap()
-                .save_scenario(scenario.clone())
-                .map(|p: std::path::PathBuf| p.to_string_lossy().to_string());
+            let saved = s.run.lock().unwrap().save_scenario(scenario.clone());
+            let (path, persistence) = match saved {
+                crate::run::ScenarioPersist::Persisted(p) => {
+                    (Some(p.to_string_lossy().to_string()), "persisted")
+                }
+                crate::run::ScenarioPersist::HeldEphemeral => (None, "ephemeral"),
+                crate::run::ScenarioPersist::Failed(reason) => {
+                    return err(
+                        ErrorCategory::BackendError,
+                        format!("scenario save failed: {reason}"),
+                    )
+                }
+            };
             ok(
-                json!({ "scenario_id": scenario_id, "name": name, "steps": count, "saved_to": path }),
+                json!({ "scenario_id": scenario_id, "name": name, "steps": count, "saved_to": path, "persistence": persistence }),
             )
         }
         SA::Export => {
@@ -454,6 +561,22 @@ pub(crate) async fn tui_scenario(
         // canonical executor — the regression path: record once, run
         // again later, get a real pass/fail per step.
         SA::Run => {
+            // Audit finding 24: scenario-owned targets are routed through
+            // the scenario-owned launch path FIRST. The runner then
+            // verifies the exact launch contract and restarts between
+            // repeats, so it never silently borrows an inherited target.
+            if let Some(scenario_launch) =
+                load_scenario_launch(&s.run, &p.name.clone().unwrap_or_default())
+            {
+                if !scenario_launch.inherit_session {
+                    return run_scenario_owned(
+                        s,
+                        rmcp::handler::server::wrapper::Parameters(p),
+                        scenario_launch,
+                    )
+                    .await;
+                }
+            }
             let name = match &p.name {
                 Some(n) => n.clone(),
                 None => return err(ErrorCategory::InvalidRequest, "run requires 'name'"),
@@ -527,42 +650,79 @@ pub(crate) async fn tui_scenario(
                 // Audit P0-21: the replay runs inside the run context, so
                 // every executed act step lands in the transaction ledger
                 // and frame evidence through the shared driving pipeline.
-                let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
-                    &scenario,
-                    sess,
-                    &parameter_values,
-                    Some(&run),
-                    policy_override,
-                );
+                let repeat = p.repeat.unwrap_or(1).max(1);
+                let (base, passed) = if repeat > 1 {
+                    let aggregate = if scenario.inherit_session {
+                        crate::scenario::runner::ScenarioRunner::run_repeat_with_reset(
+                            &scenario,
+                            sess,
+                            &parameter_values,
+                            Some(&run),
+                            policy_override,
+                            repeat,
+                            crate::scenario::runner::ResetMode::Continue,
+                        )
+                    } else {
+                        // Owned launch + exact launch-spec verification +
+                        // relaunch between iterations (findings 18/24).
+                        crate::scenario::runner::ScenarioRunner::run_repeat_with_reset(
+                            &scenario,
+                            sess,
+                            &parameter_values,
+                            Some(&run),
+                            policy_override,
+                            repeat,
+                            crate::scenario::runner::ResetMode::Restart,
+                        )
+                    };
+                    let passed =
+                        aggregate.verdict == crate::scenario::runner::FlakinessVerdict::StablePass;
+                    (
+                        json!({
+                            "repeat": aggregate.repeat,
+                            "repeat_verdict": aggregate.verdict,
+                            "repeat_pass_rate_pct": aggregate.pass_rate_pct,
+                            "passed_runs": aggregate.passed_runs,
+                            "failed_runs": aggregate.failed_runs,
+                            "first_run": aggregate.first_run,
+                            "last_run": aggregate.last_run,
+                        }),
+                        passed,
+                    )
+                } else {
+                    let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
+                        &scenario,
+                        sess,
+                        &parameter_values,
+                        Some(&run),
+                        policy_override,
+                    );
+                    let passed = report.steps_failed == 0 && report.steps_skipped == 0;
+                    (
+                        json!({
+                            "name": report.scenario_name,
+                            "scenario_id": report.scenario_id,
+                            "schema": report.scenario_schema,
+                            "status": report.status,
+                            "steps_total": report.steps_total,
+                            "steps_passed": report.steps_passed,
+                            "steps_failed": report.steps_failed,
+                            "steps_skipped": report.steps_skipped,
+                            "step_results": report.step_results,
+                        }),
+                        passed,
+                    )
+                };
                 let (sid, gen) = (sess.id.clone(), sess.generation);
                 let _ = run
                     .lock()
                     .unwrap()
                     .record_event(&sid, &format!("scenario_run:{}", scenario.name));
-                let base = json!({
-                    "name": report.scenario_name,
-                    "session": sid,
-                    "generation": gen,
-                    "status": report.status,
-                    "steps_total": report.steps_total,
-                    "steps_passed": report.steps_passed,
-                    "steps_failed": report.steps_failed,
-                    "steps_skipped": report.steps_skipped,
-                    "step_results": report.step_results,
-                });
-                if report.steps_failed == 0 && report.steps_skipped == 0 {
-                    let mut v = base;
-                    v["passed"] = json!(true);
-                    ok(v)
-                } else {
-                    // Real regression (or a stop-policy halt): envelope stays
-                    // success (transport ok), payload reports the failure
-                    // honestly. `passed` is false the moment anything failed
-                    // OR was skipped — a skipped step is not a pass.
-                    let mut v = base;
-                    v["passed"] = json!(false);
-                    ok(v)
-                }
+                let mut v = base;
+                v["session"] = json!(sid);
+                v["generation"] = json!(gen);
+                v["passed"] = json!(passed);
+                ok(v)
             })
             .await
             .unwrap_or_else(|e| e)
@@ -654,10 +814,21 @@ pub(crate) async fn tui_scenario(
             for a in &assets {
                 let mut v = serde_json::to_value(a).unwrap_or_default();
                 if let Some(sc) = a.as_scenario() {
-                    let saved = run.save_scenario(sc.clone());
-                    v["saved_to"] = saved
-                        .map(|p| serde_json::Value::String(p.to_string_lossy().to_string()))
-                        .unwrap_or(serde_json::Value::Null);
+                    match run.save_scenario(sc.clone()) {
+                        crate::run::ScenarioPersist::Persisted(p) => {
+                            v["saved_to"] =
+                                serde_json::Value::String(p.to_string_lossy().to_string())
+                        }
+                        crate::run::ScenarioPersist::HeldEphemeral => {
+                            v["saved_to"] = serde_json::Value::Null;
+                            v["persistence"] = serde_json::Value::String("ephemeral".into());
+                        }
+                        crate::run::ScenarioPersist::Failed(reason) => {
+                            v["saved_to"] = serde_json::Value::Null;
+                            v["persistence"] = serde_json::Value::String("failed".into());
+                            v["persistence_error"] = serde_json::Value::String(reason);
+                        }
+                    }
                     v["scenario_id"] = serde_json::Value::String(sc.id.clone());
                 }
                 persisted.push(v);
@@ -687,5 +858,177 @@ pub(crate) async fn tui_scenario(
                 "review_gate": "all assets are generated/inferred and REQUIRE REVIEW before use — generation never auto-runs or promotes to required",
             }))
         }
+    }
+}
+
+/// Look up a scenario by name/id and retain only its ownership contract.
+/// Errors become `None` so the ordinary Run path can surface the canonical
+/// "no such scenario" refusal; an owned scenario cannot be silently rerouted.
+fn load_scenario_launch(
+    run: &std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>,
+    key: &str,
+) -> Option<crate::scenario::model::Scenario> {
+    if key.trim().is_empty() {
+        return None;
+    }
+    let run = run.lock().ok()?;
+    run.load_scenario(key).ok()
+}
+
+/// Execute a scenario that owns its target: launch exactly `launch`, run
+/// it under the normal runner, then clean up with RAII even on error.
+/// Finding 24: ownership means launch + cleanup, not merely a type flag.
+async fn run_scenario_owned(
+    s: &crate::mcp::tools::TuiLabServer,
+    p: rmcp::handler::server::wrapper::Parameters<TuiScenarioParams>,
+    scenario: crate::scenario::model::Scenario,
+) -> rmcp::model::CallToolResult {
+    let p = p.0;
+    let Some(launch) = scenario.launch.as_ref() else {
+        return err(
+            ErrorCategory::InvalidRequest,
+            "scenario ownership requires a launch specification",
+        );
+    };
+    // The shared lifecycle lease spans launch, replay, and cleanup, so no
+    // run transition can strand a scenario-owned child between stages.
+    let _lease = s.lifecycle.shared("scenario-owned-run").await;
+    if s.run.lock().unwrap().is_closed() {
+        return err(
+            ErrorCategory::RunClosed,
+            "current run is closed; resume it or start a fresh run before launching a scenario-owned target",
+        );
+    }
+    let isolation = match crate::session::isolation::Isolation::parse(&launch.isolation) {
+        Ok(iso) => iso,
+        Err(e) => return err(ErrorCategory::InvalidRequest, e.to_string()),
+    };
+    let backend = launch.backend.clone();
+    let started = s
+        .sessions
+        .start(
+            &launch.command,
+            &launch.args,
+            launch.cwd.as_deref(),
+            &launch.env,
+            launch.cols,
+            launch.rows,
+            &backend,
+            isolation.name(),
+        )
+        .await;
+    let sid = match started {
+        Ok(id) => id,
+        Err(e) => {
+            return err(
+                ErrorCategory::BackendError,
+                format!("scenario target launch failed: {e}"),
+            )
+        }
+    };
+    s.bind_session_owner(&sid);
+    // Force registration even when the backend selector maps identically
+    // to auto: the recorded launch, not the pool's default, is the source
+    // of truth for repeat verification.
+    let _ = &backend;
+    // Run the ordinary typed Run branch with the scenario-owned session
+    // explicitly selected. `run_scenario_owned` holds its own lifecycle
+    // lease, so invoke the session arm directly rather than recursing into
+    // the whole handler.
+    let run_arc = s.run.clone();
+    let parameter_values: Vec<crate::scenario::model::ParameterValue> = p
+        .parameters
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .map(|(name, value)| crate::scenario::model::ParameterValue {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let policy_override = None;
+    let repeat = p.repeat.unwrap_or(1).max(1);
+    let scenario_name = scenario.name.clone();
+    let result = s
+        .with_sess(Some(&sid), move |sess| {
+            if let Some(refused) = lease_refused(sess) {
+                return refused;
+            }
+            let (base, passed) = if repeat > 1 {
+                let aggregate = crate::scenario::runner::ScenarioRunner::run_repeat_with_reset(
+                    &scenario,
+                    sess,
+                    &parameter_values,
+                    Some(&run_arc),
+                    policy_override,
+                    repeat,
+                    crate::scenario::runner::ResetMode::Restart,
+                );
+                let passed =
+                    aggregate.verdict == crate::scenario::runner::FlakinessVerdict::StablePass;
+                (
+                    json!({
+                        "repeat": aggregate.repeat,
+                        "repeat_verdict": aggregate.verdict,
+                        "repeat_pass_rate_pct": aggregate.pass_rate_pct,
+                        "passed_runs": aggregate.passed_runs,
+                        "failed_runs": aggregate.failed_runs,
+                        "first_run": aggregate.first_run,
+                        "last_run": aggregate.last_run,
+                    }),
+                    passed,
+                )
+            } else {
+                let report = crate::scenario::runner::ScenarioRunner::run_in_run_with_policy(
+                    &scenario,
+                    sess,
+                    &parameter_values,
+                    Some(&run_arc),
+                    policy_override,
+                );
+                let passed = report.steps_failed == 0 && report.steps_skipped == 0;
+                (
+                    json!({
+                        "name": report.scenario_name,
+                        "scenario_id": report.scenario_id,
+                        "schema": report.scenario_schema,
+                        "status": report.status,
+                        "steps_total": report.steps_total,
+                        "steps_passed": report.steps_passed,
+                        "steps_failed": report.steps_failed,
+                        "steps_skipped": report.steps_skipped,
+                        "step_results": report.step_results,
+                    }),
+                    passed,
+                )
+            };
+            let (session_id, generation) = (sess.id.clone(), sess.generation);
+            let _ = run_arc
+                .lock()
+                .unwrap()
+                .record_event(&session_id, &format!("scenario_owned_run:{scenario_name}"));
+            let mut v = base;
+            v["session_owned"] = json!(true);
+            v["session"] = json!(session_id);
+            v["generation"] = json!(generation);
+            v["passed"] = json!(passed);
+            ok(v)
+        })
+        .await
+        .unwrap_or_else(|e| e);
+    // Cleanup is unconditional. A stop failure is visible as an error
+    // result if the replay otherwise passed; it never leaves an orphan
+    // scenario-owned process while pretending success.
+    match s.sessions.stop(&sid).await {
+        Ok(()) if result.is_error != Some(true) => result,
+        Ok(()) => result,
+        Err(e) => err(
+            ErrorCategory::BackendError,
+            format!(
+                "scenario-owned target cleanup failed: {e}; replay envelope may still be meaningful but the run is not clean"
+            ),
+        ),
     }
 }

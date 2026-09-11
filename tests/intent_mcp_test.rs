@@ -109,10 +109,7 @@ async fn plan_save(server: &TuiLabServer, id: &str) -> String {
         .await;
     let plan = unwrap_ok(&raw, "intent plan");
     assert_eq!(plan["mode"], "planned", "{plan}");
-    plan["plan_id"]
-        .as_str()
-        .expect("plan_id")
-        .to_string()
+    plan["plan_id"].as_str().expect("plan_id").to_string()
 }
 
 #[tokio::test]
@@ -565,9 +562,7 @@ async fn execute_enters_run_evidence_and_scenario_recording() {
         .cloned()
         .unwrap_or_default();
     let payload_step = steps.iter().find(|s| {
-        s["kind"] == "intent"
-            && s["target"]["text"] == "Save"
-            && s["verb"] == "activate"
+        s["kind"] == "intent" && s["target"]["text"] == "Save" && s["verb"] == "activate"
     });
     assert!(
         payload_step.is_some(),
@@ -796,7 +791,9 @@ async fn plan_id_binds_the_whole_plan_not_just_the_control() {
         "execute=true without a plan_id must refuse: {env}"
     );
     assert!(
-        serde_json::to_string(&env).unwrap_or_default().contains("plan_id_required"),
+        serde_json::to_string(&env)
+            .unwrap_or_default()
+            .contains("plan_id_required"),
         "the refusal names the missing plan_id: {env}"
     );
 
@@ -884,7 +881,10 @@ async fn recorded_intent_replays_re_resolved_not_as_frozen_keys() {
             .await,
         "record start",
     );
-    let rec_id = rec["recording_id"].as_str().expect("recording_id").to_string();
+    let rec_id = rec["recording_id"]
+        .as_str()
+        .expect("recording_id")
+        .to_string();
     let raw = server
         .tui_intent(params_typed(serde_json::json!({
             "target": { "by": "text", "text": "Save" },

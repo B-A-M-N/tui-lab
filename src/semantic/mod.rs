@@ -186,6 +186,81 @@ impl FocusOption for SemanticScreen {
     }
 }
 
+/// One versioned semantic identity projection (P1-30): the same conceptual
+/// universe for bare and fused paths, differing only in which facts are
+/// populated. Controls, regions, affordances, components, relationships,
+/// focus, and tree state participate, each deterministically sorted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SemanticIdentityV2 {
+    /// Identity schema version; changes any time the projection changes.
+    pub version: u32,
+    /// Dimensions included. Fused inputs may populate all; bare inputs
+    /// populate the screen-derived subset.
+    pub controls: Vec<crate::semantic::controls::Control>,
+    pub regions: Vec<crate::semantic::regions::Region>,
+    pub affordances: Vec<crate::semantic::affordance::Affordance>,
+    pub components: Vec<crate::semantic::components::Component>,
+    pub relationships: Vec<crate::semantic::relationships::SemanticRelation>,
+    pub focus: crate::semantic::focus::FocusInfo,
+    /// Fused tree node identities: `(id, role, label, value, bounds, state)`.
+    /// Empty for bare paths.
+    pub tree_nodes: Vec<crate::semantic::node::SemanticNode>,
+    /// Native channel revision, when a fused path saw one.
+    pub native_revision: Option<u64>,
+}
+
+impl SemanticIdentityV2 {
+    pub fn from_screen(screen: &ScreenState) -> Self {
+        let sem = analyze(screen);
+        Self {
+            version: 2,
+            controls: sem.controls.clone(),
+            regions: sem.regions.clone(),
+            affordances: sem.affordances.clone(),
+            components: sem.components.clone(),
+            relationships: sem.relationships.clone(),
+            focus: sem.focus.clone(),
+            tree_nodes: Vec::new(),
+            native_revision: None,
+        }
+    }
+
+    pub fn from_fused(
+        sem: &SemanticScreen,
+        tree: &SemanticTree,
+        native_revision: Option<u64>,
+    ) -> Self {
+        let mut nodes = Vec::new();
+        collect_nodes_rec(&tree.root, &mut nodes);
+        let tree_nodes = nodes.into_iter().cloned().collect();
+        Self {
+            version: 2,
+            controls: sem.controls.clone(),
+            regions: sem.regions.clone(),
+            affordances: sem.affordances.clone(),
+            components: sem.components.clone(),
+            relationships: sem.relationships.clone(),
+            focus: sem.focus.clone(),
+            tree_nodes,
+            native_revision,
+        }
+    }
+
+    fn digest(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(b"tui-lab:semantic-identity:v2:");
+        let canonical = serde_json::to_vec(self).unwrap_or_default();
+        h.update(&(canonical.len() as u64).to_le_bytes());
+        h.update(&canonical);
+        h.finalize().to_hex().to_string()
+    }
+
+    /// Canonical identity string.
+    pub fn identity(&self) -> String {
+        format!("tui-lab:semantic-identity:v2:{}", self.digest())
+    }
+}
+
 /// Versioned BLAKE3 identity over the fused semantic screen + tree.
 /// Uses a canonical JSON serialization of roles, labels, bounds, focus,
 /// enabled/state fields so native overlays and inference changes are both
@@ -463,6 +538,43 @@ pub fn fuse_tree(
 mod interaction_cache_tests {
     use super::*;
     use crate::screen::{Cell, Color, CursorState, ProcessState, ScreenState};
+
+    /// P1-30: the unified V2 projection must be deterministic under
+    /// collection reordering and must change when a screen-derived
+    /// affordance changes even if the tree itself is identical.
+    #[test]
+    fn semantic_identity_v2_is_canonical_and_affordance_sensitive() {
+        let screen = screen_with_two_buttons(10);
+        let a = SemanticIdentityV2::from_screen(&screen).identity();
+        // Re-analyze a copy: collection construction order should not alter
+        // the canonical digest.
+        let b = SemanticIdentityV2::from_screen(&screen).identity();
+        assert_eq!(a, b, "same semantic facts must produce one identity");
+
+        // A disabled affordance is semantic truth even when the same text
+        // remains on screen. Dimming every cell is the analyzer's direct
+        // enabled-state signal, so the projection must change.
+        let mut styled = screen.clone();
+        for cell in styled.cells.iter_mut().filter(|c| !c.text.is_empty()) {
+            cell.dim = true;
+        }
+        let changed = SemanticIdentityV2::from_fused(
+            &analyze(&styled),
+            &crate::semantic::tree_builder::build_tree(&styled),
+            None,
+        )
+        .identity();
+        let unchanged = SemanticIdentityV2::from_fused(
+            &analyze(&screen),
+            &crate::semantic::tree_builder::build_tree(&screen),
+            None,
+        )
+        .identity();
+        assert_ne!(
+            changed, unchanged,
+            "affordance change must alter the V2 identity"
+        );
+    }
 
     fn screen_with_two_buttons(focus_col: u16) -> ScreenState {
         // "[ Save ]  [ Cancel ]" — identical text either way; only the

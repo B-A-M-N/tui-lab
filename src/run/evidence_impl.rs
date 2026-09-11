@@ -26,7 +26,7 @@ impl RunContext {
 
     /// The run's graphs (focus history + exploration), for readers that
     /// fold over them directly. Round-2 (G1): delegates to
-    /// [`graph_state::RunGraphs`].
+    /// `graph_state::RunGraphs`.
     pub fn graphs(&self) -> &graph_state::RunGraphs {
         &self.graphs
     }

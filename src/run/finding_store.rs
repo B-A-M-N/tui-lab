@@ -21,6 +21,17 @@ pub(super) struct FindingStore {
     /// X; `tui_audit compare_to=X` diffs the fresh pass against the stored
     /// one via finding fingerprints.
     baselines: HashMap<String, Vec<crate::audit::Finding>>,
+    /// Beta-audit P0.10: the most recent COMPLETED audit pass, as a
+    /// first-class snapshot. The cumulative `findings` ledger is arrival-
+    /// ordered history; a regression comparison against it would keep
+    /// reporting a fixed defect as persisting for as long as an older
+    /// pass's copy sits in the ledger. The bundle surface compares
+    /// against THIS instead.
+    latest_pass: Option<Vec<crate::audit::Finding>>,
+    /// Beta-audit P1.2: verification records — one per
+    /// `tui_workflow action=verify` execution, so an agent can CITE a
+    /// verification later instead of re-deriving it.
+    verifications: Vec<crate::audit::verification::VerificationRecord>,
 }
 
 impl FindingStore {
@@ -29,6 +40,8 @@ impl FindingStore {
         FindingStore {
             findings: Vec::new(),
             baselines: HashMap::new(),
+            latest_pass: None,
+            verifications: Vec::new(),
         }
     }
 
@@ -38,6 +51,10 @@ impl FindingStore {
         FindingStore {
             findings,
             baselines: HashMap::new(),
+            // A restored run has history but no live pass snapshot; the
+            // first fresh audit after restore records one.
+            latest_pass: None,
+            verifications: Vec::new(),
         }
     }
 
@@ -55,6 +72,19 @@ impl FindingStore {
     /// Evidence count for status/ledger summaries.
     pub(super) fn len(&self) -> usize {
         self.findings.len()
+    }
+
+    /// Beta-audit P0.10: record a completed audit pass as THE current
+    /// snapshot. Called once per completed audit run with that pass's
+    /// findings (not accumulated).
+    pub(super) fn record_pass(&mut self, findings: Vec<crate::audit::Finding>) {
+        self.latest_pass = Some(findings);
+    }
+
+    /// The latest completed pass's findings, when one has been recorded
+    /// in this run.
+    pub(super) fn latest_pass(&self) -> Option<&[crate::audit::Finding]> {
+        self.latest_pass.as_deref()
     }
 
     /// Store (or overwrite) a labeled audit-finding baseline (item 67).
@@ -93,5 +123,25 @@ impl FindingStore {
             }
         }
         out
+    }
+
+    /// Beta-audit P1.2: persist one verification execution.
+    pub(super) fn record_verification(
+        &mut self,
+        rec: crate::audit::verification::VerificationRecord,
+    ) {
+        self.verifications.push(rec);
+    }
+
+    /// Verification records for one finding fingerprint, newest last.
+    pub(super) fn verifications_for(
+        &self,
+        finding_fingerprint: &str,
+    ) -> Vec<crate::audit::verification::VerificationRecord> {
+        self.verifications
+            .iter()
+            .filter(|r| r.finding_fingerprint == finding_fingerprint)
+            .cloned()
+            .collect()
     }
 }

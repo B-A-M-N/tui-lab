@@ -58,6 +58,17 @@ impl Session {
         self.evidence_sink = Some(std::sync::Arc::new(sink));
     }
 
+    /// Install an already-shared sink. Authorized dispatch uses this so
+    /// the exact captured ticket/run identity is reused everywhere (and a
+    /// second commit of an already-committed transaction can detect the
+    /// same sink).
+    pub fn install_evidence_sink_arc(
+        &mut self,
+        sink: std::sync::Arc<crate::execution::RunEvidenceSink>,
+    ) {
+        self.evidence_sink = Some(sink);
+    }
+
     /// Clear the sink (end of the authorized job). Returns what was
     /// installed, for the dispatcher's health reporting.
     pub fn take_evidence_sink(
@@ -80,8 +91,7 @@ impl Session {
     /// (re-review P1 fix 9). Every [`crate::execution::ObservationAnchor`]
     /// created against this session gets a distinct, increasing index.
     pub fn next_anchor(&mut self) -> u64 {
-        let n = self.event_state.next_anchor();
-        n
+        self.event_state.next_anchor()
     }
 
     /// Suppress input recording for the duration of `f` (re-review P0 leak
@@ -96,11 +106,15 @@ impl Session {
         result.map_err(anyhow::Error::from)
     }
 
-    /// Live capability query: re-asks the backend so capabilities negotiated
-    /// *after* start (mouse, bracketed paste, title) are visible (audit
-    /// item 11). `capabilities_at_start()` keeps the historical snapshot.
+    /// Live capability query: re-asks the backend, then overlays session-
+    /// provisioned capabilities. `native_semantic` is not a transport fact:
+    /// it becomes supported only when the session actually created a
+    /// channel path and injected its environment pair.
     pub fn capabilities(&mut self) -> Capabilities {
-        self.backend.capabilities()
+        let mut caps = self.backend.capabilities();
+        let native_available = self.native.env_pair().is_some();
+        caps.native_semantic = native_available;
+        caps
     }
 
     /// Evidence-backed terminal profile for this session (Wave G review P1/P2

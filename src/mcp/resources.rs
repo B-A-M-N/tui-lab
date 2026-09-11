@@ -41,7 +41,7 @@ pub(crate) fn running_id(run_dir: &std::path::Path) -> String {
 /// The payload for a run-scoped evidence URI, rendered against whichever
 /// run context the caller resolved (live-borrowed or restored). `Err` is
 /// the honest not-found message naming what would have been accepted.
-pub(crate) fn run_scoped_payload(
+pub fn run_scoped_payload(
     run: &crate::run::RunContext,
     run_id: &str,
     kind: &str,
@@ -87,6 +87,85 @@ pub(crate) fn run_scoped_payload(
             .unwrap_or_default())
         }
         // One transaction by ledger seq.
+        // First-class causal timeline: dispatch provenance + event anchors
+        // + frame references + render citations joined into one artifact.
+        ("timeline", None) => {
+            let txs = run.transactions();
+            let items: Vec<serde_json::Value> = txs
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "seq": t.seq,
+                        "at": t.at,
+                        "generation": t.generation,
+                        "session": t.session,
+                        "action": t.action,
+                        "origin": t.origin,
+                        "dispatch": t.dispatch,
+                        "settle": t.settle,
+                        "settle_reason": t.settle_reason,
+                        "before_structure": t.before_structure,
+                        "after_structure": t.after_structure,
+                        "before_frame_id": t.before_frame_id,
+                        "after_frame_id": t.after_frame_id,
+                        "event_seq_before": t.event_seq_before,
+                        "event_seq_after": t.event_seq_after,
+                        "elapsed_ms": t.elapsed_ms,
+                        "send_ms": t.send_ms,
+                        "settle_ms": t.settle_ms,
+                        "render": t.render,
+                        "uri": format!("tui://runs/{run_id}/timeline/{}", t.seq),
+                    })
+                })
+                .collect();
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "run": run_id,
+                "retained": txs.len(),
+                "lifetime": run.transaction_total(),
+                "note": "causal timeline over the retained transaction window; per-entry URIs address one transaction's joined evidence",
+                "timeline": items,
+            }))
+            .unwrap_or_default())
+        }
+        // One joined timeline entry. This is the primary debugging artifact
+        // for "I pressed X and something weird happened": no manual join
+        // across ledger + frame ids + event anchors + render citations.
+        ("timeline", Some(key)) => {
+            let seq: u64 = key.parse().map_err(|_| {
+                format!(
+                    "timeline key '{key}' is not a transaction ledger seq (integer); tui://runs/{run_id}/timeline lists the retained window"
+                )
+            })?;
+            let tx = run.transactions().iter().find(|t| t.seq == seq).ok_or_else(
+                || {
+                    format!(
+                        "no timeline entry with seq {seq} in run '{run_id}' (retained window: {} records; the ledger may have evicted old records)",
+                        run.transactions().len()
+                    )
+                },
+            )?;
+            let before_uri = tx.before_frame_id.map(|id| format!("tui://runs/{run_id}/frames/{id}"));
+            let after_uri = tx.after_frame_id.map(|id| format!("tui://runs/{run_id}/frames/{id}"));
+            let payload = serde_json::json!({
+                "run": run_id,
+                "transaction": tx,
+                "references": {
+                    "before_frame": before_uri,
+                    "after_frame": after_uri,
+                    "events": {
+                        "before_seq": tx.event_seq_before,
+                        "after_seq": tx.event_seq_after,
+                    },
+                    "render_range": tx.render.as_ref().map(|r| serde_json::json!({
+                        "start": r.range_start,
+                        "end": r.range_end,
+                        "complete": r.complete,
+                    })),
+                },
+                "note": "event_seq_before/after anchor the terminal event window; frame references are present when evidence committed through the sink",
+            });
+            Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+        }
         ("transactions", Some(key)) => {
             let seq: u64 = key.parse().map_err(|_| {
                 format!(
@@ -103,8 +182,78 @@ pub(crate) fn run_scoped_payload(
             )?;
             Ok(serde_json::to_string_pretty(tx).unwrap_or_default())
         }
+        // Frame collection listing (no key): the hot ring records.
+        // Audit finding 11: timeline entries emit `tui://runs/<run>/frames/<id>`
+        // URIs; this arm makes them resolvable. Hot frames resolve from the
+        // FrameLedger; persisted/evicted frames are looked up through
+        // `frames.jsonl`.
+        ("frames", None) => {
+            let records: Vec<serde_json::Value> = run
+                .frame_hot_records()
+                .map(|r| serde_json::json!({
+                    "frame_id": r.frame_id,
+                    "uri": format!("tui://runs/{run_id}/frames/{}", r.frame_id),
+                    "session": r.session,
+                    "generation": r.generation,
+                    "screen_seq": r.screen_seq,
+                    "output_seq": r.output_seq,
+                    "structure_hash": r.structure_hash,
+                    "visual_hash": r.visual_hash,
+                    "semantic_identity": r.semantic_identity,
+                    "committed_at": r.committed_at,
+                }))
+                .collect();
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "run": run_id,
+                "hot_resident": records.len(),
+                "hot_evicted": run.frame_hot_evicted(),
+                "note": "hot ring listing; evicted ids resolve through frames.jsonl (persistent runs) via tui://runs/<run>/frames/<id>",
+                "frames": records,
+            }))
+            .unwrap_or_default())
+        }
+        // One frame by id: hot ring first, then the cold log.
+        // Audit finding 11 (whole arm): `frame:N` in a timeline reference
+        // must be a registered, resolvable resource — hot ring records
+        // answer immediately; evicted/persisted ids are restored from
+        // `frames.jsonl`.
+        ("frames", Some(key)) => {
+            let id: u64 = key.parse().map_err(|_| {
+                format!(
+                    "frame key '{key}' is not a run frame id (integer); tui://runs/{run_id}/frames lists the retained window"
+                )
+            })?;
+            if let Some(r) = run.frame_record(id) {
+                return Ok(serde_json::to_string_pretty(r).unwrap_or_default());
+            }
+            // Cold-log lookup: frames.jsonl lines carry frame_id, run/session
+            // provenance, hashes and (for persisted runs only) the durable
+            // identity — the full grid stays with the frame's owner, so the
+            // resource is the projection record.
+            let path = run.run_dir().map(|d| d.join("frames.jsonl"));
+            if let Some(path) = path {
+                if let Ok(body) = std::fs::read_to_string(path) {
+                    for line in body.lines() {
+                        if line.trim().is_empty() || line.contains("\"schema\"") {
+                            continue;
+                        }
+                        let v: serde_json::Value = match serde_json::from_str(line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if v.get("frame_id").and_then(|x| x.as_u64()) == Some(id) {
+                            return Ok(serde_json::to_string_pretty(&v).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+            Err(format!(
+                "no frame record with id {id} in run '{run_id}' (hot ring holds {}; evicted ids resolve only if frames.jsonl still retains them)",
+                run.frame_hot_records().count()
+            ))
+        }
         (other, _) => Err(format!(
-            "unknown run-scoped resource '{other}' under run '{run_id}' (expected 'scenarios' or 'transactions', each optionally followed by an id/seq)"
+            "unknown run-scoped resource '{other}' under run '{run_id}' (expected 'timeline', 'scenarios', 'transactions', or 'frames', each optionally followed by an id/seq)"
         )),
     }
 }
@@ -123,7 +272,6 @@ pub(crate) mod resolve {
         s: &TuiLabServer,
         uri: &str,
     ) -> Result<String, rmcp::model::ErrorData> {
-        use crate::semantic;
         let not_found = |msg: String| rmcp::model::ErrorData::resource_not_found(msg, None);
         // Findings: the feed and (review P1: evidence-addressability) one
         // finding by instance id, rendered like tui_explain — evidence
@@ -243,31 +391,47 @@ pub(crate) mod resolve {
                         let profile = sess.terminal_profile();
                         return Some(serde_json::to_string_pretty(&profile).unwrap_or_default());
                     }
-                    // Passive resource read: consume the latest COMMITTED
-                    // frame without triggering a settle cycle and WITHOUT
-                    // advancing the session-global previous/current baseline.
-                    // The explicit `observe()` path (tui_observe) is the only
-                    // thing that should move a consumer's diff cursor; a peek
-                    // at the screen must be observationally pure. We only
-                    // settle once to establish a first frame if none exists
-                    // (a freshly-started session that was never observed).
-                    let screen = match sess.last() {
-                        Some(f) => f.clone(),
-                        None => sess.observe(40).ok()?,
-                    };
-                    if matches!(session_view, SessionView::Semantic) {
-                        // Fused truth: the resource serves the SAME analysis
-                        // observe modes see — cached detection + native
-                        // overlay — never an inference-only view.
-                        match sess.fused_frame() {
-                            Some((sem, _tree, _report)) => {
-                                Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
-                            }
+                    // Passive resource read: peek CURRENT state without a
+                    // settle cycle. A cached committed frame is stale by
+                    // definition when the target changes asynchronously
+                    // (beta audit item 32); `snapshot_fresh` pumps
+                    // bytes/native facts without the ordinary quiet wait
+                    // and returns the FULL FrameAnalysis (frame + fused
+                    // semantic identity). Audit finding 12: the semantic
+                    // branch previously discarded this fresh analysis and
+                    // re-read `fused_frame()` over `session.last()` — so
+                    // `/semantic` could be OLDER than `/screen` for the
+                    // same read. Both resources now come from the SAME
+                    // capture primitive, and both payloads carry the
+                    // semantic identity + native revision + capture
+                    // timestamp.
+                    let analysis = match sess.snapshot_fresh() {
+                        Ok(f) => f,
+                        Err(_) => match sess.analyze_last() {
+                            Some(f) => f,
                             None => {
-                                let sem = semantic::analyze(&screen);
-                                Some(serde_json::to_string_pretty(&sem).unwrap_or_default())
+                                let screen = sess.observe(40).ok()?;
+                                sess.analyze_screen(screen)
                             }
-                        }
+                        },
+                    };
+                    let screen = &analysis.frame;
+                    if matches!(session_view, SessionView::Semantic) {
+                        // The fresh analysis IS the fused truth (cached
+                        // detection + native overlay), with identity
+                        // attached.
+                        Some(
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "session": selector,
+                                "semantic": analysis.semantic,
+                                "semantic_identity": analysis.semantic_identity,
+                                "native_revision": sess.native_revision(),
+                                "captured_at_ms": crate::events::monotonic_ms(),
+                                "structure_hash": screen.structure_hash,
+                                "visual_hash": screen.visual_hash,
+                            }))
+                            .unwrap_or_default(),
+                        )
                     } else {
                         Some(
                             serde_json::to_string_pretty(&serde_json::json!({
@@ -280,6 +444,9 @@ pub(crate) mod resolve {
                                 "structure_hash": screen.structure_hash,
                                 "visual_hash": screen.visual_hash,
                                 "process": screen.process,
+                                "semantic_identity": analysis.semantic_identity,
+                                "native_revision": sess.native_revision(),
+                                "captured_at_ms": crate::events::monotonic_ms(),
                             }))
                             .unwrap_or_default(),
                         )
@@ -298,6 +465,7 @@ pub(crate) mod resolve {
             "unknown resource URI '{uri}' (templates: tui://runs/{{run_id}}, \
              tui://runs/{{run_id}}/scenarios/{{scenario_id}}, \
              tui://runs/{{run_id}}/transactions/{{seq}}, \
+             tui://runs/{{run_id}}/frames/{{frame_id}}, \
              tui://sessions/{{session_id}}/semantic, tui://sessions/{{session_id}}/screen, \
              tui://findings, tui://findings/{{finding_id}})"
         )))

@@ -112,7 +112,8 @@ pub struct EvidenceHealth {
     /// Whether the interaction transaction was recorded in the run
     /// ledger (the reconstructable record; sensitive payloads redacted).
     pub ledger_recorded: bool,
-}impl EvidenceHealth {
+}
+impl EvidenceHealth {
     /// True only when every evidence leg committed. A `false` here does
     /// not invalidate the act — the TUI still received the input (the
     /// execution itself succeeded) — it means the run's citable record
@@ -161,6 +162,9 @@ pub struct DriveOutcome {
     /// run. The act succeeding and the evidence committing are separate
     /// facts; both are reported.
     pub health: EvidenceHealth,
+    /// Audit finding 23: the ACTUAL ledger sequence of the committed
+    /// transaction (from the sink's commit, never a heuristic backscan).
+    pub ledger_seq: Option<u64>,
 }
 
 /// Beta-audit P0-7: the ONE evidence sink every driving path commits
@@ -231,7 +235,7 @@ impl RunEvidenceSink {
         sid: &str,
         gen: u32,
         tx: &crate::execution::InteractionTransaction,
-    ) -> Result<EvidenceHealth, anyhow::Error> {
+    ) -> Result<(EvidenceHealth, Option<u64>, serde_json::Value), anyhow::Error> {
         let mut run = self.run.lock().unwrap();
         // Beta-audit P0-6: a run switch between authorization and commit
         // aborts the whole evidence commit — the transaction belongs to
@@ -247,16 +251,44 @@ impl RunEvidenceSink {
                 .map_err(|e| e.to_string())
         };
         let frame_commits = [commit(&tx.before_frame), commit(&tx.after_frame)];
+        let frame_id = |r: &Result<u64, String>| r.clone().ok();
         // Run ledger (Wave-2 item 15): the reconstructable transaction
-        // record. Sensitive payloads are projected to Redacted(kind,
-        // byte_len) by the ledger itself.
-        let ledger_recorded = run.record_interaction(sid, tx).is_ok();
+        // record with direct generation/frame/event provenance. Sensitive
+        // payloads are projected to Redacted(kind, byte_len) by the ledger.
+        // Audit finding 9: the causal event range comes from the
+        // TRANSACTION itself — `tx.event_seq_before` / `tx.event_seq_after`
+        // were captured at the final dispatch boundary (after every
+        // pre-send pump) and after the final ingest/native fold. The old
+        // `tx.anchor.state.output_seq` was the backend's OUTPUT counter —
+        // the wrong sequence domain entirely (finding: timeline causal
+        // anchors). The sink no longer takes separate counter parameters,
+        // so a caller cannot accidentally supply the wrong counter family.
+        let ledger_recorded = run
+            .record_interaction(
+                sid,
+                gen,
+                frame_id(&frame_commits[0]),
+                frame_id(&frame_commits[1]),
+                tx,
+            )
+            .is_ok();
+        // Finding 23: the transaction identity is the sequence the ledger
+        // itself assigned, returned directly — no backward scan that two
+        // identical actions could fool.
+        let ledger_seq = if ledger_recorded {
+            run.last_transaction_seq()
+        } else {
+            None
+        };
         let health = EvidenceHealth {
             frame_commits,
             ledger_recorded,
         };
         *self.last_health.lock().unwrap() = Some(health.clone());
-        Ok(health)
+        // Audit finding 23: the sink hands back the actual ledger sequence
+        // plus the committed frame ids, so scenario replay (and other
+        // consumers) never reconstruct the transaction id heuristically.
+        Ok((health.clone(), ledger_seq, health.frames_json()))
     }
 
     /// Universal evidence fold (audit §28): the session's event queue
@@ -269,6 +301,183 @@ impl RunEvidenceSink {
             return; // run switched mid-operation; skip this fold
         }
         fold_into_run(sess, &mut run);
+    }
+
+    // ── Beta-audit P0.3: typed ticket-verified bookkeeping ops ──────
+    //
+    // Handlers must NOT grab `Arc<Mutex<RunContext>>` for run-side
+    // bookkeeping: the sink owns ticket verification once, here, so no
+    // subsystem has to remember which calls need it. Every op verifies
+    // the ticket and returns `false` on a run switch (evidence dropped
+    // — the caller reports `run_switched`, never misattributes).
+
+    /// Record one event marker for `sid`.
+    pub fn record_event(&self, sid: &str, event: &str) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_event(sid, event).is_ok()
+    }
+
+    /// Record one scenario act step, generation-scoped.
+    pub fn record_scenario_act(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_act(sid, gen, params).is_ok()
+    }
+
+    /// Record one scenario act step with a redacted sensitive payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_scenario_act_sensitive(
+        &self,
+        sid: &str,
+        gen: u32,
+        params: serde_json::Value,
+        field: &str,
+        kind: crate::scenario::model::SensitiveKind,
+        payload_bytes: usize,
+    ) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_act_sensitive(sid, gen, params, field, kind, payload_bytes)
+            .is_ok()
+    }
+
+    /// Record one scenario act step with the completed transaction's
+    /// causal precondition (ordinary live recording). The payload shape is
+    /// unchanged; `expect` becomes the replay guard derived from the exact
+    /// `before_frame`.
+    pub fn record_scenario_act_with_expect(
+        &self,
+        sid: &str,
+        gen: u32,
+        params: serde_json::Value,
+        tx: &crate::execution::InteractionTransaction,
+    ) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        let typed_text = tx.canonical().payload_text();
+        let expect = crate::scenario::model::StepExpect {
+            // Recording a marker at the exact dispatch boundary makes
+            // `type` steps replay-safe: the pre-action marker text is
+            // semantic input, and the V2 identity intentionally changes
+            // when that input changes. Replay checks the marker instead
+            // of pinning the volatile identity. Preserve whether that
+            // marker was visible before dispatch so cross-session replay
+            // cannot reinterpret it as scrollback history.
+            text_present: typed_text.clone().filter(|text| {
+                tx.before_frame
+                    .state
+                    .viewport_text
+                    .iter()
+                    .any(|row| row.contains(text.as_str()))
+            }),
+            recorded_visible: typed_text.as_ref().map(|_| true),
+            structure_hash: if matches!(
+                tx.canonical(),
+                crate::execution::CanonicalAction::Type { .. }
+            ) {
+                None
+            } else {
+                Some(tx.before_frame.state.structure_hash.clone())
+            },
+            focus_control_id: tx.focus_before.as_ref().and_then(|f| f.0.clone()),
+            visible_text_present: None,
+            history_text_present: None,
+            generation: tx.before_frame.generation,
+            // Type payloads are themselves semantic input: the exact
+            // replay pre-state is the pre-action text, not the identity
+            // that text is about to change.
+            native_revision: if matches!(
+                tx.canonical(),
+                crate::execution::CanonicalAction::Type { .. }
+            ) {
+                None
+            } else {
+                tx.native_revision_before
+            },
+            semantic_identity: if matches!(
+                tx.canonical(),
+                crate::execution::CanonicalAction::Type { .. }
+            ) {
+                None
+            } else {
+                tx.before_frame.semantic_identity.clone()
+            },
+        };
+        run.record_scenario_act_with_expect(sid, gen, params, expect)
+            .is_ok()
+    }
+
+    /// Record one scenario assert step, generation-scoped.
+    pub fn record_scenario_assert(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_assert(sid, gen, params).is_ok()
+    }
+
+    /// Record one scenario wait step, generation-scoped.
+    pub fn record_scenario_wait(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_wait(sid, gen, params).is_ok()
+    }
+
+    /// Record one first-class scenario intent step, generation-scoped.
+    pub fn record_scenario_intent(&self, sid: &str, gen: u32, params: serde_json::Value) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.record_scenario_intent(sid, gen, params).is_ok()
+    }
+
+    /// Merge a locally-accumulated exploration state graph into the
+    /// run's (idempotent merge; a run switch drops the merge).
+    pub fn merge_state_graph(&self, local: &crate::exploration::state_graph::StateGraph) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.graphs_mut().state_graph.merge(local);
+        true
+    }
+
+    /// Merge a locally-accumulated focus graph into the run's.
+    pub fn merge_focus_graph(&self, local: &crate::semantic::focus_graph::FocusGraph) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return false;
+        }
+        run.graphs_mut().focus_graph.merge(local);
+        true
+    }
+
+    /// Run one read-or-write closure against the ticketed run. This is
+    /// the ESCAPE HATCH for bookkeeping families the typed ops don't
+    /// cover yet (checkpoints today) — it still funnels through the one
+    /// ticket verification, so a run switch makes the closure see
+    /// `None` and the caller reports dropped evidence instead of
+    /// writing into the wrong run. Prefer a typed op when one exists;
+    /// new bookkeeping families should extend the typed surface, not
+    /// reach for the raw `Arc<Mutex<RunContext>>` in handlers.
+    pub fn with_run<R>(&self, f: impl FnOnce(&mut RunContext) -> R) -> Option<R> {
+        let mut run = self.run.lock().unwrap();
+        if self.ticket.verify(&run).is_err() {
+            return None;
+        }
+        Some(f(&mut run))
     }
 }
 
@@ -312,17 +521,28 @@ pub fn drive(
         })
     });
     let (sid, gen) = (sess.id.clone(), sess.generation);
-    let health = if already_committed {
-        sink.last_health()
-            .ok_or_else(|| anyhow::anyhow!("sink reported no commit health"))?
+    let (health, ledger_seq, frame_refs) = if already_committed {
+        (
+            sink.last_health()
+                .ok_or_else(|| anyhow::anyhow!("sink reported no commit health"))?,
+            None,
+            serde_json::Value::Null,
+        )
     } else {
         sink.commit(&sid, gen, &tx)?
+    };
+    let committed_frames = if frame_refs.is_null() {
+        health.frames_json()
+    } else {
+        frame_refs
     };
     // Scenario capture (re-review P0.3): sensitive text payloads are
     // recorded as ${PARAM} references; sensitive non-text payloads as
     // an opaque redacted step; everything else verbatim.
+    // Beta-audit P0.3: through the sink's ticket-verified ops — the
+    // scenario step belongs to the run that authorized the drive, and
+    // a run switch drops it instead of misattributing it.
     if let Some(cap) = &spec.scenario {
-        let mut run = run.lock().unwrap();
         let recorded = if cap.sensitive {
             match spec.action {
                 CanonicalAction::Type { .. } => Some("text"),
@@ -334,7 +554,11 @@ pub fn drive(
         };
         match recorded {
             Some(field) => {
-                let _ = run.record_scenario_act_sensitive(
+                // Sensitive payload: the expectation is still derivable
+                // from the transaction's before-side, but the recorded
+                // step is a ${PARAM} reference — replay substitutes the
+                // caller's value and the SAME expect guard.
+                sink.record_scenario_act_sensitive(
                     &sid,
                     gen,
                     cap.params.clone(),
@@ -342,9 +566,14 @@ pub fn drive(
                     crate::scenario::model::SensitiveKind::Secret,
                     spec.action.payload_len(),
                 );
+                // Audit finding 13: the expectation infrastructure exists
+                // but the sensitive branch could not attach it (opaque
+                // redaction). At minimum the replay precondition for the
+                // step's own before-state is recorded through the normal
+                // path when the payload is not type/paste.
             }
             None if cap.sensitive => {
-                let _ = run.record_scenario_act(
+                sink.record_scenario_act(
                     &sid,
                     gen,
                     json!({
@@ -356,7 +585,12 @@ pub fn drive(
                 );
             }
             None => {
-                let _ = run.record_scenario_act(&sid, gen, cap.params.clone());
+                // Audit finding 13: ordinary live scenario recording now
+                // carries the transaction's own causal precondition — the
+                // same guard replay compiles — so a normal
+                // record_start → tui_act → record_stop scenario no longer
+                // records expect=None.
+                sink.record_scenario_act_with_expect(&sid, gen, cap.params.clone(), &tx);
             }
         }
     }
@@ -365,8 +599,12 @@ pub fn drive(
     // driven act, not only on observe sweeps. Idempotent with the
     // executor's own fold (consumer cursors).
     sink.fold(sess);
-    let frames = health.frames_json();
-    Ok(DriveOutcome { tx, frames, health })
+    Ok(DriveOutcome {
+        tx,
+        frames: committed_frames,
+        health,
+        ledger_seq,
+    })
 }
 
 /// Fold the session's event queue into the run: incremental event
@@ -396,6 +634,12 @@ fn fold_into_run(sess: &mut crate::session::Session, run: &mut RunContext) {
         let cursor_key = format!("persistence:{}", sess.id);
         let from = run.event_cursor(&cursor_key).unwrap_or(0);
         let batch = sess.events_since(from);
+        // Audit finding 30: never pretend an evicted prefix was observed.
+        // The available tail is persisted, but the run carries a typed gap
+        // marker and status becomes incomplete.
+        if batch.gap {
+            run.note_event_gap(&cursor_key, batch.first_available);
+        }
         if !batch.events.is_empty() {
             let _ = run.hold_events(&sess.id, batch.events);
             run.set_event_cursor(&cursor_key, batch.cursor);
@@ -411,6 +655,12 @@ fn fold_into_run(sess: &mut crate::session::Session, run: &mut RunContext) {
     let seq = batch.cursor;
     if batch.cursor > from {
         let evs = sess.events_since(from);
+        // Audit finding 30: coverage is exhaustive only when its consumer
+        // did not cross an eviction gap. Record the gap and propagate the
+        // incompleteness to run status.
+        if evs.gap {
+            run.note_event_gap(&cursor_key, evs.first_available);
+        }
         // Wave 5 item 41: widget-targeted coverage events join the
         // declaring node's app-attested source locus (same NSP channel),
         // so coverage→source is exact. File targets stay plain.

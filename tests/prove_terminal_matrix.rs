@@ -200,6 +200,43 @@ async fn size_matrix_floor_classic_and_wide() {
     }
 }
 
+/// P1-49: run the same fixture/assertions across canonical terminal
+/// personas. Persona declarations are launch inputs (`TERM`/`COLORTERM`
+/// env), independent of transport; the outcome is the stable matrix row
+/// contract (persona identity + environment + per-point assertions).
+#[tokio::test]
+async fn terminal_persona_matrix_holds() {
+    use tui_lab::terminal::TerminalPersona;
+    let (_dir, app) = fixture_dir();
+    let pool = SessionPool::new();
+    for persona in TerminalPersona::builtin() {
+        let mut env = Vec::new();
+        persona.apply_env(&mut env);
+        let label = format!("persona:{}", persona.id);
+        let sid = start_at(&pool, &app, 80, 24, &env).await;
+        assert_profile_holds(&pool, &sid, 80, 24, 1, &label).await;
+        let outcome = serde_json::json!({
+            "term": persona.term,
+            "colorterm": persona.colorterm,
+            "color_depth": persona.color_depth,
+            "adapter_available": pool
+                .with_session(Some(&sid), |sess| sess.adapter_status().adapter_available)
+                .await
+                .unwrap_or(false),
+        });
+        let row = tui_lab::terminal::PersonaMatrixRow {
+            persona: persona.id.clone(),
+            term: persona.term.clone(),
+            colorterm: persona.colorterm.clone(),
+            outcome,
+        };
+        // The row is the machine-readable differential result contract.
+        assert_eq!(row.persona, persona.id);
+        assert!(row.outcome["adapter_available"].as_bool().unwrap_or(false));
+        pool.stop(&sid).await.ok();
+    }
+}
+
 /// The env matrix: TERM variations and a scrubbed environment. The
 /// observations and audit machinery must hold under each; the frame's
 /// process stays alive (a TERM the app cannot use must not silently kill

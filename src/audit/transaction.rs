@@ -160,6 +160,7 @@ where
         // never checked.
         None => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "AUDIT-UNVERIFIED".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -251,6 +252,7 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
     }
     let structure_only = residue.structure_changed && !residue.has_residue();
     Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "AUDIT-RESIDUE".into(),
         rule_id: None,
         severity: if structure_only {
@@ -319,6 +321,21 @@ mod tests {
     #[test]
     fn clean_driver_emits_no_residue() {
         let mut s = start("print('tx-clean'); input()");
+        // Let startup output commit before taking the pre-state, bounded:
+        // under load a fixed sleep races the first frame. Two consecutive
+        // stable snapshots are a cheap deterministic readiness signal.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut last = s.observe(100).expect("observe");
+        loop {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let next = s.observe(100).expect("observe");
+            if next.structure_hash == last.structure_hash {
+                break;
+            }
+            last = next;
+        }
         let (findings, metrics) = run_verified(&mut s, "noop", |_s| Vec::new()).expect("run");
         assert!(
             !findings.iter().any(|f| f.id == "AUDIT-RESIDUE"),
@@ -394,14 +411,19 @@ mod tests {
              line = sys.stdin.readline(); \
              sys.stdout.write('\\x1b]0;after\\x07\\x1b[?25l'); sys.stdout.flush()";
         let mut s = start(script);
-        // Let the initial title land.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let pre = PreState::capture(&mut s).expect("pre");
-        assert_eq!(
-            pre.title.as_deref(),
-            Some("before"),
-            "pre captured the title"
-        );
+        // The title arrives asynchronously; under full-suite PTY load a
+        // fixed sleep can race it. Observe repeatedly, within a bounded
+        // deadline, until the terminal title is visible.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut pre = PreState::capture(&mut s).expect("pre");
+        while pre.title.as_deref() != Some("before") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre never captured the title"
+            );
+            let _ = s.observe(50);
+            pre = PreState::capture(&mut s).expect("pre");
+        }
         assert!(pre.cursor_visible, "cursor visible at rest");
         // "Driver": send a key; the child changes title + hides cursor.
         // (Enter, not a plain char: the child blocks on readline, which
@@ -483,8 +505,8 @@ mod tests {
             // No change at all: run_verified would push nothing.
         }
         // run_verified applies the same policy end-to-end.
-        let (findings, _metrics) = run_verified(&mut s, "structure-probe", |_s| Vec::new())
-            .expect("run");
+        let (findings, _metrics) =
+            run_verified(&mut s, "structure-probe", |_s| Vec::new()).expect("run");
         for f in findings.iter().filter(|f| f.id == "AUDIT-RESIDUE") {
             assert!(
                 f.severity == Severity::Warn || f.severity == Severity::Info,

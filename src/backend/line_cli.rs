@@ -30,9 +30,10 @@ use vt100::Parser;
 
 use crate::backend::line_types::{CommandState, SearchHit};
 use crate::backend::{
-    new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
-    Input, InputModes, MouseEvent, ObserveResult, RecordingHookSlot, TerminalEventState, WaitCond,
-    WaitOutcome, WaitReason,
+    new_recording_hook_slot,
+    trait_def::{StartupOutcome, StartupPhase, TerminalBackend},
+    BackendError, BackendResult, Capabilities, DispatchOutcome, Input, InputModes, MouseEvent,
+    ObserveResult, RecordingHookSlot, TerminalEventState, WaitCond, WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -450,10 +451,15 @@ impl TerminalBackend for PtyLineBackend {
         self.last_output_instant = now;
         self.last_screen_change_instant = now;
         self.child_pid = self.child.as_ref().and_then(|c| c.process_id());
-        // Give the process a moment to emit initial output (same contract
-        // as the PTY backend).
-        std::thread::sleep(Duration::from_millis(150));
+        // Readiness is observable: wait briefly for first output, never a
+        // fixed sleep. Deadline with no output is reported by
+        // startup_outcome rather than treated as success.
+        let deadline = Instant::now() + Duration::from_millis(250);
         self.pump();
+        while Instant::now() < deadline && self.output_seq == 0 && self.child.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            self.pump();
+        }
         Ok(())
     }
 
@@ -477,6 +483,30 @@ impl TerminalBackend for PtyLineBackend {
         self.reader_recording_hook = None;
         self.child_pid = None;
         Ok(())
+    }
+
+    fn startup_outcome(&mut self) -> StartupOutcome {
+        let render_observed = self.screen_seq > 0;
+        let phase = if !self.process().running {
+            StartupPhase::ProcessExited
+        } else if render_observed {
+            if self.screen_seq > 1 {
+                StartupPhase::StableFrame
+            } else {
+                StartupPhase::FirstRender
+            }
+        } else if self.output_seq > 0 {
+            StartupPhase::FirstOutput
+        } else {
+            StartupPhase::Spawned
+        };
+        StartupOutcome {
+            phase,
+            at_unix_ms: crate::events::unix_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
+            elapsed_ms: 0,
+            render_observed,
+        }
     }
 
     fn state(&mut self) -> BackendResult<ScreenState> {
@@ -520,6 +550,9 @@ impl TerminalBackend for PtyLineBackend {
                 }
             }
             Input::Keys(keys) => {
+                // Precompile the entire logical action: no key is written
+                // until every key is representable.
+                let mut payload: Vec<u8> = Vec::new();
                 for kev in keys {
                     if kev.modifiers != crate::backend::KeyModifiers::NONE {
                         return Err(BackendError::Unsupported(format!(
@@ -527,11 +560,11 @@ impl TerminalBackend for PtyLineBackend {
                         )));
                     }
                     match kev.code {
-                        crate::backend::KeyCode::Enter => self.write_input(b"\n")?,
+                        crate::backend::KeyCode::Enter => payload.push(b'\n'),
                         crate::backend::KeyCode::Char(c) => {
                             let mut s = String::new();
                             s.push(c);
-                            self.write_input(s.as_bytes())?;
+                            payload.extend_from_slice(s.as_bytes());
                         }
                         _ => {
                             return Err(BackendError::Unsupported(
@@ -540,6 +573,7 @@ impl TerminalBackend for PtyLineBackend {
                         }
                     }
                 }
+                self.write_input(&payload)?;
             }
             Input::Raw(b) => {
                 self.write_input(&b)?;
@@ -580,6 +614,106 @@ impl TerminalBackend for PtyLineBackend {
         Ok(())
     }
 
+    fn dispatch(&mut self, input: Input) -> DispatchOutcome {
+        self.pump();
+        if self.writer.is_none() {
+            return DispatchOutcome::failed_before_write(BackendError::NoSession);
+        }
+        let write =
+            |this: &mut Self, bytes: &[u8]| -> BackendResult<()> { this.write_input(bytes) };
+        let prepared = match input {
+            Input::Text(t) | Input::Paste(t) => Ok(t.into_bytes()),
+            Input::Key(kev) => {
+                if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(format!(
+                        "line CLI backend cannot encode modified keys (got {kev:?}); use portable_vt100 for full key semantics"
+                    )));
+                }
+                match kev.code {
+                    crate::backend::KeyCode::Enter => Ok(b"\n".to_vec()),
+                    crate::backend::KeyCode::Char(c) => Ok(c.to_string().into_bytes()),
+                    _ => return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                        "line CLI backend supports Char/Enter keys only; use portable_vt100 for full key semantics".into(),
+                    )),
+                }
+            }
+            Input::Keys(keys) => {
+                let mut payload: Vec<u8> = Vec::new();
+                for kev in keys {
+                    if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                        return DispatchOutcome::failed_before_write(BackendError::Unsupported(format!(
+                            "line CLI backend cannot encode modified keys (got {kev:?}); use portable_vt100 for full key semantics"
+                        )));
+                    }
+                    match kev.code {
+                        crate::backend::KeyCode::Enter => payload.push(b'\n'),
+                        crate::backend::KeyCode::Char(c) => {
+                            let mut s = String::new();
+                            s.push(c);
+                            payload.extend_from_slice(s.as_bytes());
+                        }
+                        _ => return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                            "line CLI backend supports Char/Enter keys only; use portable_vt100 for full key semantics".into(),
+                        )),
+                    }
+                }
+                Ok(payload)
+            }
+            Input::Raw(b) => Ok(b),
+            Input::Mouse(_) | Input::MouseClick { .. } => {
+                return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                    "mouse is meaningless on a line CLI backend (no terminal grid reports input)"
+                        .into(),
+                ))
+            }
+            Input::Resize { cols, rows } => {
+                self.cols = cols;
+                self.rows = rows;
+                if let Some(master) = self.master.as_ref() {
+                    if let Err(e) = master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }) {
+                        return DispatchOutcome::failed_in_write(BackendError::Spawn(
+                            e.to_string(),
+                        ));
+                    }
+                }
+                self.notify(|hook| hook.on_resize(cols, rows));
+                return DispatchOutcome::ok();
+            }
+            Input::Signal(sig) => {
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = self.child_pid {
+                        let r = unsafe { libc::kill(-(pid as i32), sig) };
+                        if r != 0 {
+                            let _ = unsafe { libc::kill(pid as i32, sig) };
+                        }
+                        return DispatchOutcome::ok();
+                    }
+                    return DispatchOutcome::failed_before_write(BackendError::NoSession);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = sig;
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                        "arbitrary POSIX signals are only available on Unix".into(),
+                    ));
+                }
+            }
+        };
+        match prepared {
+            Ok(bytes) => match write(self, &bytes) {
+                Ok(()) => DispatchOutcome::ok(),
+                Err(e) => DispatchOutcome::failed_in_write(e),
+            },
+            Err(e) => DispatchOutcome::failed_before_write(e),
+        }
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) -> BackendResult<()> {
         self.cols = cols;
         self.rows = rows;
@@ -608,7 +742,7 @@ impl TerminalBackend for PtyLineBackend {
         let baseline_bell_seq = match &cond {
             WaitCond::Bell {
                 after_bell_seq: Some(seq),
-            } => seq.saturating_sub(1),
+            } => *seq,
             _ => self.bell_seq,
         };
         let baseline_interaction_seq = self.screen_seq + self.bell_seq;
@@ -754,7 +888,7 @@ impl TerminalBackend for PtyLineBackend {
             shell_integration: false,        // command_state() returns None (no OSC 133)
             stdout_stderr_separation: false, // single PTY master
             recording: true,                 // recording hook delivered on output/input
-            native_semantic: true,           // session-provided side channel
+            native_semantic: false,          // Session overlays this when the channel exists
             attach: false,                   // we spawn the child
             process_ownership: super::ProcessOwnership::SpawnedChild,
             query_response: false, // no device-query responder
@@ -775,6 +909,9 @@ impl TerminalBackend for PtyLineBackend {
                 WaitCapability::AnyActivity,
                 WaitCapability::Idle,
             ],
+            observability_fidelity: None,
+            synchronized_updates: false,
+            osc8: false,
             input_families: vec![
                 InputFamily::Key,
                 InputFamily::Paste,
@@ -899,7 +1036,10 @@ impl TerminalBackend for PtyLineBackend {
 
 impl PtyLineBackend {
     fn recorder_is_some(&self) -> bool {
-        false
+        self.recording_slot
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 }
 

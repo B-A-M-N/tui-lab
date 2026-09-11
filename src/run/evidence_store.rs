@@ -222,6 +222,12 @@ pub(super) struct EventLedger {
     /// Per-consumer event cursors (re-review P1): exactly-once ingestion
     /// positions for coverage folding and other event-derived ledgers.
     cursors: HashMap<String, u64>,
+    /// Declared ring gaps crossed by a consumer before the cursor
+    /// advanced (audit finding 30): each entry is `(consumer, first
+    /// retained seq)` in gap order. Persistence/coverage consumers that
+    /// crossed one are incomplete, even though the available tail was
+    /// recorded.
+    gap_markers: Vec<(String, Option<u64>)>,
 }
 
 impl EventLedger {
@@ -231,7 +237,19 @@ impl EventLedger {
             held: Vec::new(),
             flushed_counts: HashMap::new(),
             cursors: HashMap::new(),
+            gap_markers: Vec::new(),
         }
+    }
+
+    /// Record one declared gap for a consumer.
+    pub(super) fn note_gap(&mut self, consumer: &str, first_available: Option<u64>) {
+        self.gap_markers
+            .push((consumer.to_string(), first_available));
+    }
+
+    /// Declared event-ring gaps, oldest first.
+    pub(super) fn gaps(&self) -> &[(String, Option<u64>)] {
+        &self.gap_markers
     }
 
     /// Count one observation/wait event.

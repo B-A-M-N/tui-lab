@@ -34,13 +34,15 @@ pub struct TuiSessionParams {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
-    /// Engine selector (re-review P0): typed as `Known<BackendParam>` so an
-    /// unknown name still reaches the envelope as `invalid_request` with the
-    /// accepted list, matching the isolation param's contract.
+    /// Spawn engine selector. Typed and transport-scoped: attach-only
+    /// engines are not here; use `target` with `action=attach`.
     #[serde(default)]
     pub backend: Option<Known<BackendParam>>,
+    /// Attach engine selector (`action=attach`), separate from spawn.
+    #[serde(default)]
+    pub attach_backend: Option<Known<AttachBackendParam>>,
     /// Isolation profile (Wave G item 77): `local` | `clean` | `strict`.
-    /// Typed as Known<IsolationParam> so an unknown name still reaches the
+    /// Typed as `Known<IsolationParam>` so an unknown name still reaches the
     /// envelope as invalid_request with the accepted list.
     #[serde(default)]
     pub isolation: Option<Known<IsolationParam>>,
@@ -80,13 +82,11 @@ pub enum BackendParam {
     LineCli,
     #[serde(rename = "pipe")]
     Pipe,
-    #[serde(rename = "tmux")]
-    Tmux,
 }
 
 impl EnumVariants for BackendParam {
     const VARIANTS: &'static [&'static str] =
-        &["auto", "portable_vt100", "cli", "line_cli", "pipe", "tmux"];
+        &["auto", "portable_vt100", "cli", "line_cli", "pipe"];
 }
 
 impl BackendParam {
@@ -97,11 +97,11 @@ impl BackendParam {
             BackendParam::Cli => "cli",
             BackendParam::LineCli => "line_cli",
             BackendParam::Pipe => "pipe",
-            BackendParam::Tmux => "tmux",
         }
     }
 
-    /// Resolve to the engine kind (`auto` → portable PTY).
+    /// Resolve to the engine kind (`auto` → portable PTY). Attach targets
+    /// use [`SessionAction::Attach`], not this spawn selector.
     pub fn to_kind(self) -> crate::session::state::BackendKind {
         match self {
             BackendParam::Auto | BackendParam::PortableVt100 => {
@@ -111,7 +111,6 @@ impl BackendParam {
                 crate::session::state::BackendKind::PtyLine
             }
             BackendParam::Pipe => crate::session::state::BackendKind::Pipe,
-            BackendParam::Tmux => crate::session::state::BackendKind::TmuxAttach,
         }
     }
 }
@@ -127,6 +126,40 @@ impl std::str::FromStr for BackendParam {
             "pipe" => Ok(BackendParam::Pipe),
             other => Err(format!(
                 "unknown backend '{}' (expected one of: {})",
+                other,
+                Self::VARIANTS.join(", ")
+            )),
+        }
+    }
+}
+
+/// Attach engine selector (`action=attach`). Kept separate so a spawn
+/// request cannot express an attach-only transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub enum AttachBackendParam {
+    #[serde(rename = "tmux")]
+    Tmux,
+}
+
+impl EnumVariants for AttachBackendParam {
+    const VARIANTS: &'static [&'static str] = &["tmux"];
+}
+
+impl AttachBackendParam {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttachBackendParam::Tmux => "tmux",
+        }
+    }
+}
+
+impl std::str::FromStr for AttachBackendParam {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tmux" => Ok(AttachBackendParam::Tmux),
+            other => Err(format!(
+                "unknown attach backend '{}' (expected one of: {})",
                 other,
                 Self::VARIANTS.join(", ")
             )),
@@ -165,6 +198,82 @@ impl From<IsolationParam> for crate::session::isolation::Isolation {
             IsolationParam::Local => crate::session::isolation::Isolation::Local,
             IsolationParam::Clean => crate::session::isolation::Isolation::Clean,
             IsolationParam::Strict => crate::session::isolation::Isolation::Strict,
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_param_parity_tests {
+    use super::*;
+
+    /// Beta-audit P1.6: the schema's VARIANTS, the wire names, and the
+    /// FromStr parser must agree — a name the schema advertises MUST
+    /// parse. The `tmux` gap (advertised, never parseable) is pinned
+    /// here forever.
+    #[test]
+    fn every_advertised_variant_parses() {
+        for v in BackendParam::VARIANTS {
+            let parsed: BackendParam = v.parse().unwrap_or_else(|e| panic!("{v} must parse: {e}"));
+            assert_eq!(parsed.as_str(), *v, "round-trip for {v}");
+        }
+    }
+
+    /// And every parseable name is advertised — no hidden vocabulary.
+    /// `tmux` must not be a spawn selector; it belongs to attach only.
+    #[test]
+    fn every_parseable_name_is_advertised() {
+        for name in ["auto", "portable_vt100", "cli", "line_cli", "pipe"] {
+            assert!(name.parse::<BackendParam>().is_ok(), "{name} must parse");
+            assert!(
+                BackendParam::VARIANTS.contains(&name),
+                "{name} must be advertised"
+            );
+        }
+        assert!("nonsense".parse::<BackendParam>().is_err());
+        assert!(
+            "tmux".parse::<BackendParam>().is_err(),
+            "tmux is attach-only"
+        );
+        let attach: AttachBackendParam = "tmux".parse().unwrap();
+        assert_eq!(attach.as_str(), "tmux");
+    }
+
+    /// P2 (reduce schema mirror duplication): `IsolationParam` is the
+    /// other hand-written VARIANTS list in this module. Its advertised
+    /// set must equal its serde wire names — a variant added to the enum
+    /// without updating VARIANTS (or vice versa) breaks the schema's
+    /// promise. (BackendParam needs the FromStr legs above because it
+    /// hand-parses; IsolationParam only round-trips through serde.)
+    #[test]
+    fn isolation_param_variants_match_serde_wire_names() {
+        let wire: Vec<String> = [
+            IsolationParam::Local,
+            IsolationParam::Clean,
+            IsolationParam::Strict,
+        ]
+        .iter()
+        .map(|v| {
+            serde_json::to_value(v)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+        let mut advertised: Vec<String> = IsolationParam::VARIANTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut sorted_wire = wire.clone();
+        advertised.sort();
+        sorted_wire.sort();
+        assert_eq!(advertised, sorted_wire, "VARIANTS == serde wire names");
+        // And every advertised name deserializes.
+        for name in IsolationParam::VARIANTS {
+            let v: IsolationParam =
+                serde_json::from_value(serde_json::Value::String(name.to_string()))
+                    .unwrap_or_else(|e| panic!("{name} must deserialize: {e}"));
+            assert_eq!(v.as_str(), *name);
         }
     }
 }

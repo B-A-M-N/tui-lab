@@ -26,12 +26,14 @@ pub mod protocol;
 pub mod raw_capture;
 pub mod tmux;
 pub mod trait_def;
+pub use trait_def::{StartupOutcome, StartupPhase};
+
 pub mod wait;
 
 pub use line_cli::PtyLineBackend;
 pub use pipe::PipeBackend;
 pub use portable_pty::PortablePtyBackend;
-pub use trait_def::TerminalBackend;
+pub use trait_def::{DispatchOutcome, TerminalBackend};
 
 /// Result of a single observation round-trip: the new screen plus how long the
 /// process took to settle (if a quiescence check was requested).
@@ -105,6 +107,9 @@ pub enum InputFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessOwnership {
+    /// No lifecycle authority claim has been made. Optional capabilities
+    /// and lifecycle authority fail closed rather than guessing.
+    Unknown,
     /// The backend launched the child. It is our direct child: signals are
     /// deliverable and `process()` returns the REAL exit code/signal.
     SpawnedChild,
@@ -181,6 +186,33 @@ pub struct Capabilities {
     pub supported_waits: Vec<WaitCapability>,
     /// Which [`Input`] families the backend's `send_input()` accepts.
     pub input_families: Vec<InputFamily>,
+    /// Declared lossiness for observability transports (P1-24). `None`
+    /// means lossless/not applicable; a backend that samples state must
+    /// expose its interval and known blind spots here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability_fidelity: Option<ObservabilityFidelity>,
+    /// Whether this backend's terminal persona contracts synchronized-update
+    /// protocol behavior (`CSI ? 2026 h/l`). A portable backend that declares
+    /// the feature must actually implement the mode handshake; sampling or
+    /// silent parsing is never enough.
+    #[serde(default)]
+    pub synchronized_updates: bool,
+    /// Whether this backend's terminal persona contracts OSC 8 hyperlink
+    /// handling. This is a behavior contract, not merely an emitted-env
+    /// declaration; the current persona can truthfully leave it false.
+    #[serde(default)]
+    pub osc8: bool,
+}
+
+/// How observable state is captured and what that loses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObservabilityFidelity {
+    /// "lossless", "sampled", "reconstructed".
+    pub mode: String,
+    /// Sampling interval in milliseconds; 0 for lossless/not sampled.
+    pub sampling_ms: u64,
+    /// Known events that sampling can coalesce or miss.
+    pub blind_spots: Vec<String>,
 }
 
 impl Default for Capabilities {
@@ -188,12 +220,12 @@ impl Default for Capabilities {
         Capabilities {
             mouse: false, // negotiated per application; promoted on first mouse mode
             kitty_keyboard: false,
-            colors: true,
-            cell_attributes: true,
+            colors: false,
+            cell_attributes: false,
             title: false,           // promoted when the first OSC title is observed
             scrollback: false,      // promoted only when scrollback rows are actually captured
             bracketed_paste: false, // reported true once we can see the negotiation
-            signals: cfg!(unix),    // arbitrary POSIX signals require killpg (Unix only)
+            signals: false,         // backends opt in when signal delivery is implemented
             // Conservative: promoted true only by backends that genuinely
             // retain the raw ring. The default profile makes no claim.
             protocol_capture: false,
@@ -211,15 +243,20 @@ impl Default for Capabilities {
             // any backend (the child is launched with the channel env pair),
             // so it is genuinely a session-provided capability — honest to
             // advertise once, for every backend, not a per-engine guess.
-            native_semantic: true,
+            // Session provisions the native side channel; a bare backend
+            // capability descriptor must not claim it before that happens.
+            native_semantic: false,
             attach: false,
             // The default profile claims nothing about lifecycle authority;
             // each backend states its own.
-            process_ownership: ProcessOwnership::SpawnedChild,
+            process_ownership: ProcessOwnership::Unknown,
             query_response: false,
             event_types: Vec::new(),
             supported_waits: Vec::new(),
             input_families: Vec::new(),
+            observability_fidelity: None,
+            synchronized_updates: false,
+            osc8: false,
         }
     }
 }
@@ -242,42 +279,26 @@ impl Capabilities {
     /// portable engine (title not yet observed, but genuinely watchable) is
     /// NOT blocked.
     pub fn require_wait(&self, cond: &WaitCond) -> Result<(), BackendError> {
-        let supported = &self.supported_waits;
-        let missing: Option<&'static str> = match cond {
-            WaitCond::Text(_) | WaitCond::TextAbsent(_) => None,
-            WaitCond::ScreenChange => None,
-            WaitCond::ScreenStable { .. } => None,
-            WaitCond::ProcessExit => None,
-            WaitCond::Title(_) => {
-                if supported.contains(&WaitCapability::Title) {
-                    None
-                } else {
-                    Some("title waits")
-                }
-            }
-            WaitCond::Bell { .. } => {
-                if supported.contains(&WaitCapability::Bell) {
-                    None
-                } else {
-                    Some("bell waits")
-                }
-            }
-            WaitCond::AnyActivity { .. } => None,
-            WaitCond::Idle { .. } => None,
+        let required = match cond {
+            WaitCond::Text(_) => WaitCapability::Text,
+            WaitCond::TextAbsent(_) => WaitCapability::TextAbsent,
+            WaitCond::ScreenChange => WaitCapability::ScreenChange,
+            WaitCond::ScreenStable { .. } => WaitCapability::ScreenStable,
+            WaitCond::ProcessExit => WaitCapability::ProcessExit,
+            WaitCond::Title(_) => WaitCapability::Title,
+            WaitCond::Bell { .. } => WaitCapability::Bell,
+            WaitCond::AnyActivity { .. } => WaitCapability::AnyActivity,
+            WaitCond::Idle { .. } => WaitCapability::Idle,
             WaitCond::CommandDone { .. } | WaitCond::CommandOutput { .. } => {
-                if supported.contains(&WaitCapability::CommandDone) {
-                    None
-                } else {
-                    Some("OSC 133 shell-integration (command) waits")
-                }
+                WaitCapability::CommandDone
             }
         };
-        match missing {
-            Some(what) => Err(BackendError::Unsupported(format!(
-                "{what} are unsupported on this backend; the wait was rejected instead of timing out"
-            ))),
-            None => Ok(()),
+        if !self.supported_waits.contains(&required) {
+            return Err(BackendError::Unsupported(format!(
+                "{required:?} waits are unsupported on this backend; the wait was rejected instead of timing out"
+            )));
         }
+        Ok(())
     }
 }
 
@@ -294,6 +315,18 @@ pub enum BackendError {
     Unsupported(String),
     #[error("no active session")]
     NoSession,
+}
+
+impl Clone for BackendError {
+    fn clone(&self) -> Self {
+        match self {
+            BackendError::Spawn(s) => BackendError::Spawn(s.clone()),
+            BackendError::Io(e) => BackendError::Io(std::io::Error::other(e.to_string())),
+            BackendError::Exited(s) => BackendError::Exited(s.clone()),
+            BackendError::Unsupported(s) => BackendError::Unsupported(s.clone()),
+            BackendError::NoSession => BackendError::NoSession,
+        }
+    }
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -788,10 +821,16 @@ pub enum WaitReason {
 /// `CaptureReason` directly. `From` conversions preserve compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureReason {
+    /// The action returned without testing settlement (`no_wait`).
+    Immediate,
     /// A screen settled to stable for the required quiet interval.
     Settled,
     /// A screen-change was detected.
     ScreenChanged,
+    /// A matching session event fired after the action anchor.
+    EventMatched,
+    /// The fused semantic identity changed after the action anchor.
+    SemanticChanged,
     /// The watched text appeared on screen.
     TextMatched,
     /// The watched text disappeared from screen.
@@ -831,6 +870,9 @@ impl From<WaitReason> for CaptureReason {
 impl From<CaptureReason> for WaitReason {
     fn from(c: CaptureReason) -> Self {
         match c {
+            CaptureReason::Immediate
+            | CaptureReason::EventMatched
+            | CaptureReason::SemanticChanged => WaitReason::ScreenChange,
             CaptureReason::TextMatched => WaitReason::Text,
             CaptureReason::TextAbsent => WaitReason::TextAbsent,
             CaptureReason::ScreenChanged => WaitReason::ScreenChange,
@@ -883,6 +925,13 @@ pub struct CaptureOutcome {
     /// `CaptureStrategy::Frames` must return every frame it collected, not
     /// only the last). `None` for single-frame captures.
     pub frames: Option<Vec<ScreenState>>,
+    /// Actual sampling offset from the capture operation's T0 (audit
+    /// finding 7). This is the evidence of what the strategy really did,
+    /// as distinct from the requested offset.
+    pub actual_sample_offset_ms: u64,
+    /// Monotonic per-edge timestamps for sequence captures (audit finding
+    /// 56). A monotonic timestamp, not Unix correlation time.
+    pub edge_at_monotonic_ms: Vec<u64>,
 }
 
 impl CaptureOutcome {
@@ -896,6 +945,8 @@ impl CaptureOutcome {
             frame: o.state,
             elapsed_ms: o.elapsed_ms,
             frames: None,
+            actual_sample_offset_ms: o.elapsed_ms,
+            edge_at_monotonic_ms: Vec::new(),
         }
     }
 }
@@ -1028,8 +1079,11 @@ mod tests {
     #[test]
     fn capture_reason_round_trips_through_wait_reason() {
         for r in [
+            CaptureReason::Immediate,
             CaptureReason::Settled,
             CaptureReason::ScreenChanged,
+            CaptureReason::EventMatched,
+            CaptureReason::SemanticChanged,
             CaptureReason::TextMatched,
             CaptureReason::TextAbsent,
             CaptureReason::ProcessExit,
@@ -1042,10 +1096,28 @@ mod tests {
         ] {
             let w: WaitReason = r.into();
             let back: CaptureReason = w.into();
-            // OutputClosed/Cancelled map to Idle on the WaitReason side;
-            // everything else is a stable round-trip.
-            if matches!(r, CaptureReason::OutputClosed | CaptureReason::Cancelled) {
-                assert!(matches!(back, CaptureReason::Idle));
+            // The legacy wait taxonomy has no Immediate/Event/Semantic
+            // variants; those map to ScreenChange when narrowed. Likewise,
+            // OutputClosed/Cancelled map to Idle.
+            if matches!(
+                r,
+                CaptureReason::OutputClosed
+                    | CaptureReason::Cancelled
+                    | CaptureReason::Immediate
+                    | CaptureReason::EventMatched
+                    | CaptureReason::SemanticChanged
+            ) {
+                let expected = if matches!(
+                    r,
+                    CaptureReason::Immediate
+                        | CaptureReason::EventMatched
+                        | CaptureReason::SemanticChanged
+                ) {
+                    CaptureReason::ScreenChanged
+                } else {
+                    CaptureReason::Idle
+                };
+                assert_eq!(back, expected, "narrowed reason for {:?}", r);
             } else {
                 assert_eq!(back, r, "round-trip for {:?}", r);
             }

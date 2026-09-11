@@ -31,6 +31,9 @@ async fn guard_refuses_act_on_structure_drift() {
             generation: None,
             structure_hash: Some("not-the-live-hash".to_string()),
             focus_control_id: None,
+            native_revision: None,
+            text_visible: None,
+            semantic_identity: None,
         };
         let err = tui_lab::execution::execute_act_with_guard(
             sess,
@@ -70,7 +73,11 @@ async fn guard_allows_act_when_state_matches() {
         .with_session(Some(&id), move |sess| {
             sess.observe(200).expect("baseline");
 
-            let guard = tui_lab::execution::MutationGuard::capture(sess);
+            let guard = tui_lab::execution::MutationGuard::capture(
+                sess.analyze_last().as_ref(),
+                sess,
+                sess.generation,
+            );
             let tx = tui_lab::execution::execute_act_with_guard(
                 sess,
                 &tui_lab::execution::CanonicalAction::Key {
@@ -266,6 +273,7 @@ fn bell_only_change_counts_as_material() {
     let after = tui_lab::screen::ScreenState::new(80, 24);
     let transition = tui_lab::screen::diff::diff(&before, &after);
     let event = TerminalEvent {
+        monotonic_ms: 0,
         seq: 1,
         at: 0,
         session: "s".into(),
@@ -302,6 +310,7 @@ fn native_only_change_counts_as_material() {
     let after = tui_lab::screen::ScreenState::new(80, 24);
     let transition = tui_lab::screen::diff::diff(&before, &after);
     let event = TerminalEvent {
+        monotonic_ms: 0,
         seq: 2,
         at: 0,
         session: "s".into(),

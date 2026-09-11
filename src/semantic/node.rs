@@ -86,7 +86,7 @@ impl Role {
     }
 
     /// The unified control projection (re-review item 36): every Role
-    /// projects onto exactly one [`ControlKind`] — or `None` for roles
+    /// projects onto exactly one `ControlKind` — or `None` for roles
     /// that are structure/annotation, not interactive controls. This is
     /// the ONE mapping; `kind_from_slug` on the native path, the intent
     /// resolver's `kind_role_slug`, and any future flat-shape consumer

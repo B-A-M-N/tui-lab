@@ -21,6 +21,13 @@ pub(crate) async fn new(
     s: &crate::mcp::tools::TuiLabServer,
     p: TuiRunParams,
 ) -> rmcp::model::CallToolResult {
+    // Beta-audit P0.1: the exclusive lifecycle lease spans the WHOLE
+    // transition — evidence accounting, swap, flush, rollback — so no
+    // ordinary operation can observe (or land evidence into) either run
+    // mid-transition. The old shape swapped first and rolled back on
+    // flush failure, leaving a window where the new run was live and
+    // mutable while the transition could still fail.
+    let _gate = s.lifecycle.exclusive("run-new").await;
     let (loss, loss_persistent) = {
         let guard = s.run.lock().unwrap();
         let l = guard.unsaved_evidence();
@@ -63,6 +70,7 @@ pub(crate) async fn new(
                 "previous_run": old.id(),
                 "previous_flushed": old.run_dir().is_some(),
                 "mode": "ephemeral",
+                "lifecycle_epoch": s.lifecycle.epoch(),
                 // Finding 33: name what a discard threw away, so a
                 // `discard=true` caller sees the accepted loss.
                 "discarded_evidence": if loss["lost_if_dropped"]
@@ -84,7 +92,9 @@ pub(crate) async fn new(
             *guard = old;
             err(
                 ErrorCategory::InternalError,
-                format!("run flush failed before starting a new run; the current run is UNCHANGED: {e}"),
+                format!(
+                    "run flush failed before starting a new run; the current run is UNCHANGED: {e}"
+                ),
             )
         }
     }
@@ -98,6 +108,11 @@ pub(crate) async fn close(
     s: &crate::mcp::tools::TuiLabServer,
     p: TuiRunParams,
 ) -> rmcp::model::CallToolResult {
+    // Beta-audit P0.1: exclusive across event drains, close flush, and
+    // the kill loop — a driving operation admitted mid-close could
+    // otherwise commit evidence into a run that close is about to seal
+    // (or land after the "final" summary was computed).
+    let _gate = s.lifecycle.exclusive("run-close").await;
     let run_id = s.run.lock().unwrap().id().to_string();
     let live = s.sessions.list();
     let owned: Vec<String> = s.session_owners.lock().unwrap().sessions_of(&live, &run_id);
@@ -186,6 +201,7 @@ pub(crate) async fn close(
     ok(json!({
         "closed": true,
         "already_closed": already,
+        "lifecycle_epoch": s.lifecycle.epoch(),
         "owned_sessions": owned,
         "foreign_live_sessions": foreign,
         "sessions_stopped": stopped,
@@ -208,6 +224,10 @@ pub(crate) async fn resume(
     s: &crate::mcp::tools::TuiLabServer,
     p: TuiRunParams,
 ) -> rmcp::model::CallToolResult {
+    // Beta-audit P0.1: exclusive across restore preflight, flush, detach,
+    // reopen, and the swap — the resume transaction is now all-or-nothing
+    // against ordinary operations, not just sequentially ordered.
+    let _gate = s.lifecycle.exclusive("run-resume").await;
     // Resolve the target directory: explicit run_dir wins, else
     // run_id under the resolved base.
     let run_dir: std::path::PathBuf = if let Some(d) = p.run_dir.clone() {
@@ -225,8 +245,7 @@ pub(crate) async fn resume(
                 }
             },
         };
-        let candidate =
-            crate::run::RunContext::resolve_run_dir(std::path::Path::new(&base), &rid);
+        let candidate = crate::run::RunContext::resolve_run_dir(std::path::Path::new(&base), &rid);
         match candidate {
             Some(d) => d,
             None => {
@@ -265,7 +284,7 @@ pub(crate) async fn resume(
     // DIFFERENT run must not survive into the resumed run — their
     // future traffic would land in the wrong evidence bundle. The
     // default refuses; `detach_existing_sessions=true` stops them
-    // later, after the flush. Sessions owned by the TARGET run
+    // after the transition commits. Sessions owned by the TARGET run
     // carry over (they already belong to the run being resumed).
     let target_run = running_id(&run_dir);
     let foreign: Vec<String> = {
@@ -286,6 +305,51 @@ pub(crate) async fn resume(
             ),
         );
     }
+    // Beta-audit P0.2: the human-lease preflight happens BEFORE the
+    // flush — while the transaction can still be refused with nothing
+    // disturbed. Every foreign session goes through the SAME lifecycle
+    // authorization `tui_session stop`/`restart` use (lease first, then
+    // ownership); resume never calls the raw stop path on an
+    // unauthorized session. A live human lease REFUSES the whole
+    // resume: the caller explicitly asked for detach, so silently
+    // skipping would detach less than promised, and continuing would
+    // kill a process a human is driving. (Third-run bindings are
+    // skipped rather than fatal: resume has no authority over them
+    // either way, and the response names them.)
+    let mut detach_refusals: Vec<serde_json::Value> = Vec::new();
+    if p.detach_existing_sessions.unwrap_or(false) {
+        for sid in &foreign {
+            // Preflight under the CURRENT run: these sessions are (or
+            // may be) bound to it, so the ownership check evaluates
+            // them as the live run's own — exactly the authority the
+            // post-transition stop will need.
+            if let Err(refusal) = s.preflight_lifecycle(sid, "resume detach").await {
+                match refusal {
+                    crate::mcp::tools::PreflightRefusal::Leased {
+                        session,
+                        holder,
+                        remaining_ms,
+                    } => {
+                        return crate::mcp::helpers::err_with_details(
+                            ErrorCategory::ControlLeased,
+                            format!(
+                                "resume detach refused: session '{session}' is leased to '{holder}' ({remaining_ms}ms remaining); release the lease or wait for expiry, then resume again"
+                            ),
+                            json!({
+                                "session": session,
+                                "holder": holder,
+                                "retry_after_ms": remaining_ms,
+                                "resume": "not_started",
+                            }),
+                        );
+                    }
+                    other => {
+                        detach_refusals.push(other.to_json());
+                    }
+                }
+            }
+        }
+    }
     // 2. FLUSH the live run (audit P0-7) — an ephemeral run with
     // nothing durable flushes trivially. On failure the current
     // run stays live and the restore is abandoned (the restored
@@ -300,45 +364,25 @@ pub(crate) async fn resume(
             format!("current run flush failed before resume; resume ABORTED and the current run is unchanged: {e}"),
         );
     }
-    // 3. DETACH foreign sessions (audit P0-8: only after the
-    // target proved restorable and the live run's evidence is
-    // safely persisted). Audit P0 (beta stability): a stop that
-    // FAILED does not unbind its session — unbinding would orphan a
-    // still-live process with no owner — and aborts the resume with
-    // the exact session named; nothing has been swapped yet, so the
-    // abort leaves both the live run and the target untouched.
-    let mut detached: Vec<String> = Vec::new();
-    for sid in &foreign {
-        match s.sessions.stop(sid).await {
-            Ok(()) => {
-                s.session_owners.lock().unwrap().unbind(sid);
-                detached.push(sid.clone());
-            }
-            Err(e) => {
-                return err(
-                    ErrorCategory::BackendError,
-                    format!(
-                        "resume ABORTED: session '{sid}' failed to stop during detach ({e}); the current run is unchanged and the target run was not opened"
-                    ),
-                );
-            }
-        }
-    }
-    let _ = detached;
-    // 4. REOPEN the candidate (the run's designated re-open operation,
+    // 3. REOPEN the candidate (the run's designated re-open operation,
     // review P0.1): bump the epoch and commit the manifest NOW — the
     // last fallible stage before the swap. On failure the target stays
     // closed at its previous epoch and the live run is unchanged.
+    // (Beta-audit P0.2: this moved BEFORE the detach. The old order
+    // destroyed foreign sessions first and could then fail reopening —
+    // an irreversible loss followed by a rollback the response implied
+    // had restored everything. Nothing destructive runs before the
+    // last fallible stage has succeeded.)
     if let Err(e) = restored.reopen() {
         return err(
             ErrorCategory::InternalError,
             format!(
-                "resume ABORTED: reopening the target failed ({e}); the current run is unchanged"
+                "resume ABORTED: reopening the target failed ({e}); the current run is unchanged and no session was touched"
             ),
         );
     }
-    // 5. ATOMIC swap under a short lock (never across an await).
-    let manifest_like = {
+    // 4. ATOMIC swap under a short lock (never across an await).
+    let (manifest_like, prev_id, detach_requested) = {
         let mut guard = s.run.lock().unwrap();
         let prev_id = guard.id().to_string();
         let restored_id = restored.id().to_string();
@@ -352,11 +396,12 @@ pub(crate) async fn resume(
         // agent must see the evidence is incomplete.
         let restore_health = restored.restore_health();
         *guard = std::mem::replace(&mut restored, crate::run::RunContext::ephemeral());
-        json!({
+        let body = json!({
             "resumed": true,
             "run_id": restored_id,
             "previous_run": prev_id,
             "flushed_previous": true,
+            "lifecycle_epoch": s.lifecycle.epoch(),
             "artifact_root": restored_dir,
             // Finding 32: the reopened run is a new epoch of the
             // persisted run — records written from here on are
@@ -365,7 +410,53 @@ pub(crate) async fn resume(
             "restore": restore_health,
             "status": summary,
             "note": "sessions are not restored; re-create them with tui_session start and the run will correlate them. history_complete=false runs replay only from their declared first_available_seq",
-        })
+        });
+        (body, prev_id, p.detach_existing_sessions.unwrap_or(false))
     };
-    ok(manifest_like)
+    // 5. POST-TRANSITION cleanup (beta-audit P0.2): the destructive
+    // detach runs AFTER the transition has committed — it is cleanup,
+    // not validation, and its failure can never roll the resume back
+    // (a stopped process does not un-stop). A failed stop does not
+    // unbind its session (an orphaned live process with no owner is
+    // worse than a stale binding); the response reports the resume as
+    // SUCCEEDED and the detach as PARTIAL, naming what still stands.
+    let mut detached: Vec<String> = Vec::new();
+    let mut detach_failures: Vec<serde_json::Value> = detach_refusals;
+    if detach_requested {
+        for sid in &foreign {
+            if detach_failures.iter().any(|f| f["session"] == **sid) {
+                continue; // skipped at preflight; already reported
+            }
+            match s.sessions.stop(sid).await {
+                Ok(()) => {
+                    s.session_owners.lock().unwrap().unbind(sid);
+                    detached.push(sid.clone());
+                }
+                Err(e) => {
+                    detach_failures.push(json!({
+                        "session": sid,
+                        "reason": format!("stop failed after the resume committed: {e}"),
+                    }));
+                }
+            }
+        }
+    }
+    let mut out = manifest_like;
+    if detach_requested {
+        out["detach"] = json!({
+            "requested": true,
+            "detached": detached,
+            "skipped_or_failed": detach_failures,
+            "complete": detach_failures.is_empty(),
+        });
+        out["previous_run_flushed"] = json!(true);
+        let _ = &prev_id;
+        if !detach_failures.is_empty() {
+            out["detach_status"] = json!("partial_failure");
+            out["note"] = json!(
+                "resume succeeded; detach was PARTIAL — the sessions in detach.skipped_or_failed are still live and still bound to their owning run"
+            );
+        }
+    }
+    ok(out)
 }

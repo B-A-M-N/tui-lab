@@ -1,5 +1,8 @@
-//! EventBus — one ordered timeline for events from every source (review P0:
-//! "a unified event bus").
+//! Event history projection — a converged view over events from every
+//! source. It is NOT the canonical append-only authority (P1-34): sessions
+//! own the authoritative [`crate::events::TerminalEventQueue`], native and
+//! coverage channels own their own evidence ledgers, and this type projects
+//! snapshots onto one ordered view for readers.
 //!
 //! The runtime distinguishes events by where they come from:
 //!
@@ -7,19 +10,20 @@
 //!   screen changes, cursor, bell, title, resize, process edges).
 //! * **Shell command** — OSC 133 shell-integration boundaries (prompt / output
 //!   / done) that a cooperative shell reports, surfaced by the backend's
-//!   [`CommandState`](crate::backend::CommandState).
+//!   `CommandState`.
 //! * **Native** — structural/UX signals a framework adapter already decoded
 //!   (focus moves, affordance changes) — the `native` half of the semantic
 //!   model, not re-inferred.
 //! * **Coverage** — `target` hits a cooperative app reports over the native
 //!   side channel (the coverage ledger's event feed).
 //!
-//! Before a bus these lived in separate cursors and callers had to stitch
-//! them. [`EventBus`] multiplexes every source onto a *single* total order
-//! (a global arrival seq over a bounded ring) so one consumer holds one
-//! cursor and reads one stream — the audit, run replay, and incremental
-//! observation all converge on it. A source keeps its own counter internally
-//! so a consumer can tell *which* event of that source it is looking at.
+//! Before a projection these lived in separate cursors and callers had to
+//! stitch them. This type multiplexes snapshots onto a *single* projected
+//! order (a bounded ring) so one consumer can read one stream. A source
+//! counter rides each row so a consumer can tell *which* event of that
+//! source it is looking at. Claiming one canonical bus while retaining
+//! independent source ledgers would be false authority; this name keeps the
+//! model honest.
 
 use crate::backend::CommandState;
 use crate::events::TerminalEventKind;
@@ -61,8 +65,11 @@ pub struct BusEvent {
     pub source: BusSource,
     /// That source's own 1-based counter (its Nth event).
     pub source_seq: u64,
-    /// Unix-millis timestamp.
+    /// Unix-millis timestamp (human correlation only).
     pub at: u64,
+    /// Monotonic milliseconds since process start (causal timing).
+    #[serde(default)]
+    pub monotonic_ms: u64,
     /// Session the event belongs to.
     pub session: String,
     /// What happened, per source.
@@ -115,10 +122,11 @@ impl BusEventKind {
     }
 }
 
-/// The batch handed to a subscriber by [`EventBus::since`].
+/// The batch handed to a projection reader by
+/// [`EventHistoryProjection::since`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BusBatch {
-    /// Events after the subscriber's cursor, in arrival order.
+    /// Events after the reader's cursor, in arrival order.
     pub events: Vec<BusEvent>,
     /// The cursor to hold for the next read.
     pub cursor: u64,
@@ -126,9 +134,10 @@ pub struct BusBatch {
     pub gap: bool,
 }
 
-/// The unified, bounded, multi-source event bus.
+/// The bounded, multi-source event history projection. Not the canonical
+/// event authority; see module docs.
 #[derive(Debug, Default)]
-pub struct EventBus {
+pub struct EventHistoryProjection {
     events: VecDeque<BusEvent>,
     next_seq: u64,
     evicted: u64,
@@ -146,9 +155,9 @@ fn source_index(s: BusSource) -> usize {
     }
 }
 
-impl EventBus {
+impl EventHistoryProjection {
     pub fn new() -> Self {
-        EventBus {
+        EventHistoryProjection {
             events: VecDeque::new(),
             next_seq: 1,
             evicted: 0,
@@ -177,6 +186,7 @@ impl EventBus {
             source,
             source_seq,
             at: now_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
             session: session.to_string(),
             kind,
         });
@@ -234,10 +244,13 @@ impl EventBus {
     }
 
     /// Everything after `cursor`, in arrival order. The cursor is owned by the
-    /// subscriber — this does not advance it.
+    /// reader — this does not advance it.
     pub fn since(&self, cursor: u64) -> BusBatch {
         let first = self.events.front().map(|e| e.seq);
-        let gap = cursor != 0 && first.map(|f| cursor + 1 < f).unwrap_or(true);
+        // Cursor 0 asks from the beginning. If the retained front is newer,
+        // the reader explicitly requested a history that is only partly
+        // available; do not suppress that fact.
+        let gap = first.map(|f| cursor + 1 < f).unwrap_or(false);
         let events: Vec<BusEvent> = self
             .events
             .iter()
@@ -252,8 +265,8 @@ impl EventBus {
         }
     }
 
-    /// Open a new subscriber cursor (oldest retained event; or the next seq if
-    /// the ring is empty).
+    /// Open a new projection reader cursor (oldest retained row; or the next
+    /// projected seq if the ring is empty).
     pub fn subscribe(&self) -> u64 {
         self.events
             .front()
@@ -291,6 +304,13 @@ impl EventBus {
     }
 }
 
+/// Compatibility alias for the projection's former name. New code should
+/// use [`EventHistoryProjection`] so the evidence model stays honest.
+#[deprecated(
+    note = "use EventHistoryProjection: this is a projection, not the canonical event authority"
+)]
+pub type EventBus = EventHistoryProjection;
+
 /// Project a terminal-queue event into the converged-timeline vocabulary
 /// (re-review item 16 — consolidation, not duplication): the session event
 /// queue remains the ONE store; this translation is how `tui_observe
@@ -307,6 +327,7 @@ impl BusEvent {
             },
             source_seq,
             at: ev.at,
+            monotonic_ms: ev.monotonic_ms,
             session: ev.session.clone(),
             kind: BusEventKind::Terminal(ev.kind.clone()),
         }
@@ -399,7 +420,7 @@ mod tests {
 
     #[test]
     fn sources_converge_onto_one_total_order() {
-        let mut bus = EventBus::new();
+        let mut bus = EventHistoryProjection::new();
         bus.publish(
             "s",
             BusSource::Terminal,
@@ -408,6 +429,13 @@ mod tests {
         bus.publish_native("s", "focus:list");
         bus.publish_coverage("s", "src/main.rs:42");
         assert_eq!(bus.total(), 3, "all sources share one timeline");
+        assert!(
+            bus.since(0)
+                .events
+                .windows(2)
+                .all(|w| w[0].monotonic_ms <= w[1].monotonic_ms),
+            "unified bus preserves monotonic causal stamps"
+        );
 
         let batch = bus.since(0);
         assert_eq!(batch.events.len(), 3);
@@ -423,7 +451,7 @@ mod tests {
 
     #[test]
     fn per_source_counters_reach_across_publishes() {
-        let mut bus = EventBus::new();
+        let mut bus = EventHistoryProjection::new();
         bus.publish_coverage("s", "a.rs:1");
         bus.publish_coverage("s", "a.rs:2");
         let hits = bus.of_source(0, BusSource::Coverage);
@@ -434,7 +462,7 @@ mod tests {
 
     #[test]
     fn subscriber_cursor_is_consumer_owned() {
-        let mut bus = EventBus::new();
+        let mut bus = EventHistoryProjection::new();
         let c0 = bus.subscribe();
         bus.publish_native("s", "menu:open");
         let first = bus.since(c0);
@@ -452,7 +480,7 @@ mod tests {
 
     #[test]
     fn ring_eviction_is_declared() {
-        let mut bus = EventBus::new();
+        let mut bus = EventHistoryProjection::new();
         for i in 0..(BUS_RING_CAPACITY + 5) {
             bus.publish(
                 "s",
@@ -469,7 +497,7 @@ mod tests {
 
     #[test]
     fn command_boundary_from_backend_state() {
-        let mut bus = EventBus::new();
+        let mut bus = EventHistoryProjection::new();
         let state = CommandState {
             command_seq: 1,
             running: true,

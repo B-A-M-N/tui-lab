@@ -18,20 +18,19 @@ impl ScenarioRecorder {
         }
     }
 
+    /// Set the replay failure policy before/while recording. Preserved by
+    /// all in-place appends (finding 58).
+    pub fn set_on_failure(&mut self, policy: super::model::FailurePolicy) {
+        self.scenario.on_failure = policy;
+    }
+
     /// Record an act step.
     pub fn record_act(&mut self, params: serde_json::Value) {
-        self.scenario = Scenario {
-            steps: {
-                let mut steps = self.scenario.steps.clone();
-                steps.push(super::model::ScenarioStep {
-                    kind: super::model::StepKind::Act,
-                    params,
-                    expect: None,
-                });
-                steps
-            },
-            ..self.scenario.clone()
-        };
+        self.scenario.steps.push(super::model::ScenarioStep {
+            kind: super::model::StepKind::Act,
+            params,
+            expect: None,
+        });
     }
 
     /// Record a first-class intent step (beta-audit P0-9): target + verb
@@ -98,25 +97,17 @@ impl ScenarioRecorder {
     pub fn record_act_with_expect(
         &mut self,
         params: serde_json::Value,
-        tx: &crate::execution::InteractionTransaction,
+        expect: &super::model::StepExpect,
     ) {
-        let expect = super::model::StepExpect {
-            structure_hash: Some(tx.before_frame.state.structure_hash.clone()),
-            focus_control_id: tx.focus_before.as_ref().and_then(|f| f.0.clone()),
-            text_present: None,
-        };
-        self.scenario = Scenario {
-            steps: {
-                let mut steps = self.scenario.steps.clone();
-                steps.push(super::model::ScenarioStep {
-                    kind: super::model::StepKind::Act,
-                    params,
-                    expect: Some(expect),
-                });
-                steps
-            },
-            ..self.scenario.clone()
-        };
+        let expect = expect.clone();
+        // Finding 58: append to the existing step list in place. The
+        // recorder is exclusively mutable; reconstructing the whole
+        // scenario made every appended step copy all prior steps.
+        self.scenario.steps.push(super::model::ScenarioStep {
+            kind: super::model::StepKind::Act,
+            params,
+            expect: Some(expect),
+        });
     }
 
     /// Record a SENSITIVE act step (re-review P0.3): the payload is stripped

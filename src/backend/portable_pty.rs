@@ -9,7 +9,7 @@
 //!   * `ScreenChange` resolves on the first post-baseline screen mutation;
 //!   * `resize()` resizes both the OS PTY and the `vt100` parser;
 //!   * paste / mouse / cursor-key encoding is mode-aware (reads negotiated state);
-//!   * Ctrl/Alt/Shift/Function keys are parsed into typed [`KeyEvent`]s;
+//!   * Ctrl/Alt/Shift/Function keys are parsed into typed `KeyEvent`s;
 //!   * signals are delivered to the child process group (Unix), not silently
 //!     mapped to `kill`;
 //!   * title and bell are tracked via parser callbacks;
@@ -18,9 +18,12 @@
 use std::time::{Duration, Instant};
 
 use crate::backend::{
-    new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
-    Input, InputModes, MouseEvent, MouseMode, ObserveResult, RecordingHook, RecordingHookSlot,
-    TerminalEventState, WaitCond, WaitOutcome, WaitReason,
+    new_recording_hook_slot,
+    trait_def::TerminalBackend,
+    trait_def::{StartupOutcome, StartupPhase},
+    BackendError, BackendResult, Capabilities, DispatchOutcome, Input, InputModes, MouseEvent,
+    MouseMode, ObserveResult, RecordingHook, RecordingHookSlot, TerminalEventState, WaitCond,
+    WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -74,6 +77,15 @@ impl PortablePtyBackend {
         policy: std::sync::Arc<crate::screen::NormalizationPolicy>,
     ) {
         self.emulator.set_normalization_policy(policy);
+    }
+
+    /// Finding 49: install a persona's emulator behavior contract before the
+    /// target starts. The persona controls the query responder here; env is
+    /// only the child-visible declaration of that contract.
+    pub fn apply_terminal_persona(&mut self, persona: &crate::terminal::TerminalPersona) {
+        self.emulator.set_synchronized_updates(
+            persona.declares(crate::terminal::TerminalPersonaFeature::SynchronizedUpdates),
+        );
     }
 
     /// Drain buffered PTY bytes, feed the parser, and bump `screen_seq` on
@@ -223,6 +235,12 @@ impl PortablePtyBackend {
         self.events.changes_since(after_seq)
     }
 
+    /// Audit finding 45: monotonic per-change log for latency math.
+    pub fn screen_monotonic_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        let _ = self.pump();
+        self.events.monotonic_changes_since(after_seq)
+    }
+
     /// Item 22: measured conformance probe. Feed `query` through the SAME
     /// parser the child's output flows through (so the same responder
     /// handles it), then return the exact answer bytes the responder
@@ -351,6 +369,10 @@ impl TerminalBackend for PortablePtyBackend {
         PortablePtyBackend::screen_changes_since(self, after_seq)
     }
 
+    fn screen_monotonic_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        PortablePtyBackend::screen_monotonic_changes_since(self, after_seq)
+    }
+
     fn start(
         &mut self,
         command: &str,
@@ -374,10 +396,18 @@ impl TerminalBackend for PortablePtyBackend {
         self.raw.clear();
         self.emulator.callbacks_mut().query_responses.clear();
 
-        // give the process a moment to emit initial frame
-        std::thread::sleep(Duration::from_millis(150));
-        // initial pump so state() is immediately meaningful
+        // Readiness is observable, not a fixed sleep: pump immediately, then
+        // give the child a bounded chance to emit first output/frame. A blank
+        // first frame remains valid; deadline only means "not stronger yet".
+        let deadline = Instant::now() + Duration::from_millis(250);
         let _ = self.pump();
+        while Instant::now() < deadline
+            && self.events.output_seq() == 0
+            && self.process_pty.has_session()
+        {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = self.pump();
+        }
         Ok(())
     }
 
@@ -387,6 +417,30 @@ impl TerminalBackend for PortablePtyBackend {
         self.process_pty.terminate();
         self.reader_recording_hook = None;
         Ok(())
+    }
+
+    fn startup_outcome(&mut self) -> StartupOutcome {
+        let render_observed = self.events.screen_seq() > 0;
+        let phase = if !self.process().running {
+            StartupPhase::ProcessExited
+        } else if render_observed {
+            if self.events.screen_seq() > 1 {
+                StartupPhase::StableFrame
+            } else {
+                StartupPhase::FirstRender
+            }
+        } else if self.events.output_seq() > 0 {
+            StartupPhase::FirstOutput
+        } else {
+            StartupPhase::Spawned
+        };
+        StartupOutcome {
+            phase,
+            at_unix_ms: crate::events::unix_ms(),
+            monotonic_ms: crate::events::monotonic_ms(),
+            elapsed_ms: 0,
+            render_observed,
+        }
     }
 
     fn state(&mut self) -> BackendResult<ScreenState> {
@@ -439,11 +493,13 @@ impl TerminalBackend for PortablePtyBackend {
                 self.write_input(&bytes)?;
             }
             Input::Keys(keys) => {
-                // Execute the complete sequence (spec section 32).
+                // Execute the complete sequence (spec section 32) without
+                // partial delivery: encode every key before the first write.
+                let mut payload: Vec<u8> = Vec::new();
                 for kev in keys {
-                    let bytes = encode_key(&kev, &modes)?;
-                    self.write_input(&bytes)?;
+                    payload.extend(encode_key(&kev, &modes)?);
                 }
+                self.write_input(&payload)?;
             }
             Input::Text(t) => {
                 let bytes = t.into_bytes();
@@ -465,36 +521,30 @@ impl TerminalBackend for PortablePtyBackend {
                 self.write_input(&b)?;
             }
             Input::MouseClick { button, x, y } => {
-                // Enforce mouse mode gating for press.
+                // A click is press + release back-to-back (audit item 8).
+                // Encode and validate the complete click BEFORE the press:
+                // Press-only mode cannot represent a complete click, and
+                // writing the press first would leave a half mutation.
                 match modes.mouse_mode {
                     MouseMode::None => {
                         return Err(BackendError::Unsupported(
                             "mouse reporting is not enabled by the application".into(),
                         ));
                     }
-                    MouseMode::Press
-                    | MouseMode::PressRelease
-                    | MouseMode::ButtonMotion
-                    | MouseMode::AnyMotion => {} // press is allowed
+                    MouseMode::Press => {
+                        return Err(BackendError::Unsupported(
+                            "mouse release not supported in Press-only mode; a complete click is unrepresentable".into(),
+                        ));
+                    }
+                    MouseMode::PressRelease | MouseMode::ButtonMotion | MouseMode::AnyMotion => {}
                 }
-                // A click is press + release back-to-back (audit item 8).
-                let press =
+                let mut payload =
                     encode_mouse_event(&MouseEvent::Press { button, x, y }, modes.mouse_encoding)?;
-                self.write_input(&press)?;
-                // Enforce mouse mode gating for release. Release is only
-                // rejected in the most minimal mode (Press / 1000); even
-                // 1002 (ButtonMotion) requires a release event so the
-                // application can distinguish it from a button-held drag.
-                if modes.mouse_mode == MouseMode::Press {
-                    return Err(BackendError::Unsupported(
-                        "mouse release not supported in Press-only mode".into(),
-                    ));
-                } // release allowed (PressRelease, ButtonMotion, AnyMotion)
-                let release = encode_mouse_event(
+                payload.extend(encode_mouse_event(
                     &MouseEvent::Release { button, x, y },
                     modes.mouse_encoding,
-                )?;
-                self.write_input(&release)?;
+                )?);
+                self.write_input(&payload)?;
             }
             Input::Mouse(ev) => {
                 // Enforce mouse mode gating.
@@ -538,6 +588,124 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(())
     }
 
+    fn dispatch(&mut self, input: Input) -> DispatchOutcome {
+        // The write boundary for this engine: everything before the
+        // `write_input` calls is preflight (pump, mode resolution, key
+        // encoding, mouse-mode gating, session presence); the first
+        // `write_input` call enters the transport. To keep the guard
+        // atomic with the physical write, the executor calls this after
+        // its own final pump — the internal pump here is idempotent and
+        // narrows nothing further.
+        let _ = self.pump();
+        self.sync_parser_counters();
+        let modes = self.current_modes();
+        if !self.process_pty.has_session() {
+            return DispatchOutcome::failed_before_write(BackendError::NoSession);
+        }
+        // Write helper: returns the classification of a transport write.
+        // A `write_input` failure is surfaced at the write boundary —
+        // partial delivery cannot be ruled out.
+        let write = |this: &mut Self, bytes: &[u8]| -> DispatchOutcome {
+            match this.write_input(bytes) {
+                Ok(()) => DispatchOutcome::ok(),
+                Err(e) => DispatchOutcome::failed_in_write(e),
+            }
+        };
+        match input {
+            Input::Key(kev) => match encode_key(&kev, &modes) {
+                Ok(bytes) => write(self, &bytes),
+                Err(e) => return DispatchOutcome::failed_before_write(e),
+            },
+            Input::Keys(keys) => {
+                let mut payload: Vec<u8> = Vec::new();
+                for kev in keys {
+                    match encode_key(&kev, &modes) {
+                        Ok(b) => payload.extend(b),
+                        Err(e) => return DispatchOutcome::failed_before_write(e),
+                    }
+                }
+                write(self, &payload)
+            }
+            Input::Text(t) => write(self, t.as_bytes()),
+            Input::Paste(p) => {
+                if modes.bracketed_paste {
+                    let mut v = b"\x1b[200~".to_vec();
+                    v.extend_from_slice(p.as_bytes());
+                    v.extend_from_slice(b"\x1b[201~");
+                    write(self, &v)
+                } else {
+                    write(self, p.as_bytes())
+                }
+            }
+            Input::Raw(b) => write(self, &b),
+            Input::MouseClick { button, x, y } => {
+                match modes.mouse_mode {
+                    MouseMode::None | MouseMode::Press => {
+                        return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                            "complete click unrepresentable in negotiated mouse mode".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+                let press = match encode_mouse_event(
+                    &MouseEvent::Press { button, x, y },
+                    modes.mouse_encoding,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return DispatchOutcome::failed_before_write(e),
+                };
+                let release = match encode_mouse_event(
+                    &MouseEvent::Release { button, x, y },
+                    modes.mouse_encoding,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return DispatchOutcome::failed_before_write(e),
+                };
+                let mut payload = press;
+                payload.extend(release);
+                write(self, &payload)
+            }
+            Input::Mouse(ev) => {
+                let is_press = matches!(ev, MouseEvent::Press { .. });
+                let is_release = matches!(ev, MouseEvent::Release { .. });
+                let is_scroll = matches!(ev, MouseEvent::Scroll { .. });
+                let is_drag = matches!(ev, MouseEvent::Drag { .. });
+                if modes.mouse_mode == MouseMode::None {
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                        "mouse reporting is not enabled by the application".into(),
+                    ));
+                }
+                let allowed = match modes.mouse_mode {
+                    MouseMode::Press => is_press || is_scroll,
+                    MouseMode::PressRelease => is_press || is_release || is_scroll,
+                    MouseMode::ButtonMotion => is_press || is_release || is_scroll || is_drag,
+                    MouseMode::AnyMotion => true,
+                    _ => false,
+                };
+                if !allowed {
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                        format!(
+                            "{ev:?} not supported in negotiated mouse mode {:?}",
+                            modes.mouse_mode
+                        ),
+                    ));
+                }
+                match encode_mouse_event(&ev, modes.mouse_encoding) {
+                    Ok(b) => write(self, &b),
+                    Err(e) => return DispatchOutcome::failed_before_write(e),
+                }
+            }
+            Input::Resize { cols, rows } => match self.resize(cols, rows) {
+                Ok(()) => DispatchOutcome::ok(),
+                Err(e) => DispatchOutcome::failed_in_write(e),
+            },
+            Input::Signal(sig) => match self.process_pty.signal_group(sig) {
+                Ok(()) => DispatchOutcome::ok(),
+                Err(e) => DispatchOutcome::failed_in_write(e),
+            },
+        }
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) -> BackendResult<()> {
         self.cols = cols;
         self.rows = rows;
@@ -558,7 +726,7 @@ impl TerminalBackend for PortablePtyBackend {
             bell_seq: match &cond {
                 WaitCond::Bell {
                     after_bell_seq: Some(seq),
-                } => seq.saturating_sub(1),
+                } => *seq,
                 _ => self.events.bell_seq(),
             },
             interaction_seq: self.interaction_seq(),
@@ -669,6 +837,15 @@ impl TerminalBackend for PortablePtyBackend {
         // This engine retains the raw PTY byte ring (`recent_raw_output`),
         // so protocol capture is genuinely available.
         caps.protocol_capture = true;
+        // Deliberate opt-ins: the vt100 emulator supplies real color/cell
+        // attributes, killpg supplies Unix signals, the session provisions
+        // the native side channel, and this backend spawns the child.
+        caps.colors = true;
+        caps.cell_attributes = true;
+        caps.signals = cfg!(unix);
+        // Session overlays native_semantic after it proves the channel.
+        // (capability intentionally not claimed here)
+        caps.process_ownership = super::ProcessOwnership::SpawnedChild;
         // --- audit finding 37: the portable engine is the reference backend —
         //     every operation-oriented capability it advertises is backed by a
         //     real implementation the conformance suite exercises (finding 61).
@@ -680,6 +857,8 @@ impl TerminalBackend for PortablePtyBackend {
         caps.recording = true; // recording hook delivered on output/input
         caps.attach = false; // we spawn the child; we do not attach one
         caps.query_response = true; // the device-query responder answers CSI queries
+        caps.synchronized_updates = self.emulator.callbacks().synchronized_updates;
+        caps.osc8 = !self.emulator.callbacks().links.is_empty();
         caps.event_types = vec![
             EventCapability::Output,
             EventCapability::Bell,
@@ -809,11 +988,10 @@ mod osc8_tests {
     #[test]
     fn osc8_hyperlink_captured_in_screen_state() {
         let mut b = PortablePtyBackend::new(40, 5);
-        let fixture = std::env::temp_dir().join("osc8_fixture.py");
-        std::fs::write(&fixture, include_str!("/tmp/osc8_fixture.py")).unwrap();
+        let code = "import sys,time; sys.stdout.write('\\x1b[H\\x1b[2J'); sys.stdout.write('before '); sys.stdout.write('\\x1b]8;;https://example.com/docs\\x1b\\\\docs\\x1b]8;;\\x1b\\\\'); sys.stdout.write(' after\\n'); sys.stdout.flush(); time.sleep(30)";
         b.start(
             "python3",
-            &[fixture.to_string_lossy().to_string()],
+            &["-c".to_string(), code.to_string()],
             None,
             &[],
             40,

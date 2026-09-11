@@ -1,7 +1,7 @@
 //! Terminal protocol observation + device-query responder state
 //! (god-object round 2, G2).
 //!
-//! [`BackendCallbacks`] — the vt100 parser callbacks that record
+//! `BackendCallbacks` — the vt100 parser callbacks that record
 //! host-observable terminal metadata (title, bells, OSC8 hyperlinks,
 //! kitty keyboard flags, OSC 133 shell-integration edges) and compose
 //! the device-query answers (DA1/DA2/DA3, DSR, DECRQM, kitty `?u`, OSC
@@ -53,6 +53,10 @@ pub(super) struct BackendCallbacks {
     /// diff "answers since last observe" into terminal events.
     pub(super) answered_seq: u64,
     pub(super) pending_class: Option<QueryClass>,
+    /// Persona-backed behavior contract for synchronized updates. vt100's
+    /// grid parser has no visible synchronized mode state, so the persona
+    /// owns the DECRQM answer while normal output processing remains lossless.
+    pub(super) synchronized_updates: bool,
 }
 
 impl BackendCallbacks {
@@ -66,6 +70,14 @@ impl BackendCallbacks {
     fn note_answer(&mut self, class: QueryClass) {
         self.answered_seq += 1;
         self.pending_class = Some(class);
+    }
+}
+
+impl BackendCallbacks {
+    /// Configure the persona's synchronized-update behavior contract before
+    /// any application query can observe it.
+    pub(super) fn set_synchronized_updates(&mut self, yes: bool) {
+        self.synchronized_updates = yes;
     }
 }
 
@@ -263,10 +275,16 @@ impl vt100::Callbacks for BackendCallbacks {
                     }
                     1006 => _screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
                     2004 => _screen.bracketed_paste(),
+                    2026 => self.synchronized_updates,
                     1049 => _screen.alternate_screen(),
                     _ => false,
                 };
-                self.note_answer(QueryClass::Decrqm);
+                let class = if mode == 2026 {
+                    QueryClass::SynchronizedUpdates
+                } else {
+                    QueryClass::Decrqm
+                };
+                self.note_answer(class);
                 self.queue_response(format!("\x1b[?{};{}$y", mode, set as u8).as_bytes());
             }
             _ => {}
@@ -295,6 +313,8 @@ pub enum QueryClass {
     KittyFlags,
     /// OSC 10/11 dynamic color query → `OSC n ; rgb:…`.
     OscColor,
+    /// Synchronized-update mode report (`CSI ? 2026 $ p`).
+    SynchronizedUpdates,
 }
 
 impl QueryClass {
@@ -312,6 +332,7 @@ impl QueryClass {
             QueryClass::Decrqm => "decrqm",
             QueryClass::KittyFlags => "kitty_flags",
             QueryClass::OscColor => "osc_color",
+            QueryClass::SynchronizedUpdates => "synchronized_updates",
         }
     }
 }
@@ -323,6 +344,18 @@ mod tests {
     /// The stable strings are a wire/persistence contract (invariant 13):
     /// the audit driver compares `QueryAnswered` classes against
     /// `"dsr_cpr"`, so a rename here would silently corrupt evidence.
+    #[test]
+    fn synchronized_update_contract_is_reported_not_sampled() {
+        let mut cb = BackendCallbacks::default();
+        assert!(!cb.synchronized_updates);
+        cb.set_synchronized_updates(true);
+        assert!(cb.synchronized_updates);
+        assert_eq!(
+            QueryClass::SynchronizedUpdates.as_str(),
+            "synchronized_updates"
+        );
+    }
+
     #[test]
     fn query_class_strings_are_stable() {
         assert_eq!(QueryClass::Da1.as_str(), "da1");

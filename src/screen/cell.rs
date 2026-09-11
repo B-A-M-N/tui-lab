@@ -171,7 +171,7 @@ impl ScreenState {
     /// Review P0.6: does `text` render at terminal column `x`, row `y`?
     ///
     /// Coordinates are CELLS, never byte offsets: the row's cells are
-    /// addressed through [`CellString`] (wide CJK/emoji glyphs own their
+    /// addressed through `CellString` (wide CJK/emoji glyphs own their
     /// continuation column, combining marks ride their base cell), so a
     /// match against `界` at column 10 or `🙂` at the last column is a
     /// column question with a column answer. A text whose glyphs need more

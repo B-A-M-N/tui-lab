@@ -27,16 +27,16 @@ MCP server for agent-native TUI instrumentation, testing, exploration, and UX ev
 - `tui_audit` — Deterministic UX audits returning evidence-backed findings; `full` is the composite of every non-process-consuming family. label=/compare_to= diff findings across runs. Safe-only default: invasive profiles are withheld (ORCH-GATED) until allow_mutation=true; restart_between_mutations=true restart-replays between mutating drivers (with allow_mutation=true; not an external-side-effect boundary). Driving profiles are blocked while a human lease is live; observational readers stay allowed. lifecycle_exit consumes the target and needs allow_process_restart=true.
   - profile: full, keyboard, focus, resize, layout, clipping, discoverability, navigation, contract, color, performance, mouse, states, errors, unicode, controls, terminal_modes, rendering, input_protocol, shell_cli, lifecycle, lifecycle_exit, query_response
 - `tui_coverage` — Coverage: native NSP coverage-event ledger plus the optional tuicov executable (honest Unsupported when absent).
-  - action: detect, summary, collect, delta, uncovered, ledger, snapshot
+  - action: detect, summary, collect, delta, ledger, snapshot
 - `tui_framework` — Framework detection, capability probes, and NativeSemanticProtocol adapter snippets (Ratatui/Textual/Python).
   - action: detect, capabilities, adapter_snippet
 - `tui_run` — Run lifecycle: status, persist (ephemeral→durable, same identity), close, list persisted runs, resume one as the live run, diagnose (or its alias repair): diagnostic evidence contexts per finding — provenance-tiered source loci, verification plan (targeted checks, replay only with a reproduction), observation-shaped next steps — never edit prescriptions, bundle for ONE finding (context + before/after regression diff), and context (this registry as JSON).
-  - action: status, persist, close, context, list, resume, diagnose, repair, new, bundle
+  - action: status, persist, close, context, list, resume, diagnose, new, bundle
 - `tui_contract` — Design contracts: load, validate, conformance status, baseline compare (regressions become findings), and scaffold — generate a starter contract from the LIVE observed frame (scaffold_mode=current) or from a bounded SAFE multi-state pass — initial screen, Tab focus walk, Escape, viewport probes (scaffold_mode=explore; lease-gated; every state cited in the scaffold.inferred extension; edit from observation toward intent).
   - action: load, validate, status, compare, scaffold, baseline
 - `tui_explain` — Explain an audit finding: trace each evidence ref to its source and flag terminal capabilities (via the live profile) the finding is conditional on.
 - `tui_workflow` — Construction workflow per finding (one object, no autonomy): inspect assembles finding → component identity → source loci → framework context → contract expectation → minimal reproduction → targeted validation; verify runs that verification plan live (replay + re-checks; lease-gated) and reports whether the finding still reproduces; diagnose lists every finding's chain.
-  - action: inspect, verify, diagnose
+  - action: construct, inspect, verify, diagnose
 ## Core principle: OBSERVE BEFORE ACTING, DIFF AFTER
 
 - Prefer `tui_observe` modes `summary` and `semantic` over `screen`. Never ask
@@ -97,10 +97,14 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 ## Resources (tui://)
 
 - `tui://runs/{run_id}` — Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).
+- `tui://runs/{run_id}/timeline` — First-class causal timeline over the retained transaction window: dispatch provenance, generation, event anchors, before/after frame references, settlement, and render citations joined per transaction.
+- `tui://runs/{run_id}/timeline/{seq}` — One joined causal timeline entry by transaction seq: the primary debugging artifact for a single interaction.
 - `tui://runs/{run_id}/scenarios` — Saved scenarios in a run (review P1 evidence-addressability): ids, names, step counts, and the per-scenario URI. Live runs read memory+disk; persisted runs are restored read-only.
 - `tui://runs/{run_id}/scenarios/{scenario_id}` — One scenario by id (or unambiguous name) — the full recorded step list, addressable as evidence.
 - `tui://runs/{run_id}/transactions` — The declared-replay transaction ledger (bounded retained window + lifetime count). Citable as the run's interaction history.
 - `tui://runs/{run_id}/transactions/{seq}` — One transaction by ledger seq: action, settle verdict, before/after structure, changed cells, render evidence.
+- `tui://runs/{run_id}/frames` — Committed frame records in the hot ring (audit P0-11): every `frame:N` cited by timeline entries is a registered, resolvable resource. Evicted ids resolve through frames.jsonl on persistent runs.
+- `tui://runs/{run_id}/frames/{frame_id}` — One frame record by citable id (hot ring first, then frames.jsonl): frame_id, session/generation provenance, screen/output seqs, structure/visual/semantic identity, commit time.
 - `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
 - `tui://sessions/{session_id}/screen` — Live screen text + geometry.
 - `tui://sessions/{session_id}/terminal-profile` — Evidence-backed terminal capability report (review §12): reads the live backend capabilities without forcing a screen settle — observationally pure, unlike the screen-backed views.

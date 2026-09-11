@@ -49,16 +49,6 @@ impl From<ScrollDirectionParam> for crate::backend::ScrollDirection {
 // One enum per stringly selector. The wire names are the exact historical
 // strings the handlers matched before, so existing callers keep working.
 
-/// Schema wrapper for [`TuiActRequest`]: re-roots the enum's natural `oneOf`
-/// schema as `{"type":"object","oneOf":[...]}` so the MCP inputSchema passes
-/// rmcp's root-object validation. The variant list is generated from a
-/// *mirror* enum that derives the same serde/schemars attributes, so the
-/// custom `schema_with` is not re-entered (that would recurse forever).
-///
-/// Serde deserialization of `TuiActRequest` is untouched.
-#[doc(hidden)]
-pub struct TuiActRequestSchema;
-
 /// Agent-facing expected-state guard (re-review P0.9): the state the caller
 /// observed when it decided to act. The executor validates it atomically
 /// with the send; on drift the action is refused with a structured
@@ -75,6 +65,14 @@ pub struct MutationGuardParam {
     /// Focused control id at decision time (fused semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_control_id: Option<String>,
+    /// Native semantic channel revision (beta rereview P0-1). A native-only
+    /// focus/state update can change the UI without changing the grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_revision: Option<u64>,
+    /// Required visible text predicate, checked in the same pre-dispatch
+    /// fused frame as the rest of the guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_visible: Option<String>,
 }
 
 impl MutationGuardParam {
@@ -84,18 +82,10 @@ impl MutationGuardParam {
             generation: self.generation,
             structure_hash: self.structure_hash.clone(),
             focus_control_id: self.focus_control_id.clone(),
+            native_revision: self.native_revision,
+            text_visible: self.text_visible.clone(),
+            semantic_identity: None,
         }
-    }
-}
-
-impl TuiActRequestSchema {
-    pub fn wrapped(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        use schemars::json_schema;
-        let variants = <TuiActRequestVariants as schemars::JsonSchema>::json_schema(gen);
-        json_schema!({
-            "type": "object",
-            "oneOf": variants,
-        })
     }
 }
 
@@ -163,7 +153,7 @@ impl CompletionName {
         }
     }
 
-    /// The runtime [`CompletionPolicy`] this name stands for.
+    /// The runtime `CompletionPolicy` this name stands for.
     pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
         use crate::capture::CompletionPolicy as P;
         match self {
@@ -209,7 +199,7 @@ pub enum CompletionSpec {
 }
 
 impl CompletionSpec {
-    /// The runtime [`CompletionPolicy`] this spec stands for. The text
+    /// The runtime `CompletionPolicy` this spec stands for. The text
     /// variants carry their payload through; `StableScreen` maps to the
     /// ordinary settle policy (its optional `quiet_ms` reaches the executor
     /// through [`CompletionSpec::quiet_ms`], since the runtime policy keeps
@@ -233,11 +223,24 @@ impl CompletionSpec {
 }
 
 impl TuiCompletionParam {
-    /// The runtime [`CompletionPolicy`] this wire value stands for.
+    /// The runtime `CompletionPolicy` this wire value stands for.
     pub fn to_policy(&self) -> crate::capture::CompletionPolicy {
         match self {
             TuiCompletionParam::Name(n) => n.to_policy(),
             TuiCompletionParam::Spec(s) => s.to_policy(),
+        }
+    }
+
+    /// The canonical wire name for this completion, so recorded scenarios
+    /// can persist it losslessly.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TuiCompletionParam::Name(n) => n.as_str(),
+            TuiCompletionParam::Spec(s) => match s {
+                CompletionSpec::StableScreen { .. } => "stable_screen",
+                CompletionSpec::TextAppears { .. } => "text_appears",
+                CompletionSpec::TextDisappears { .. } => "text_disappears",
+            },
         }
     }
 
@@ -249,234 +252,208 @@ impl TuiCompletionParam {
             TuiCompletionParam::Name(_) => None,
         }
     }
+
+    /// The FULL serialized wire value (audit finding 15): scenario intent
+    /// steps persist the complete `TuiCompletionParam`, not just
+    /// `name()`, so a recorded `text_appears: "Saved"` replays with the
+    /// exact text — the old name-only recording reconstructed
+    /// `TextAppears("")` on replay because the text lived in the spec
+    /// object, not in a top-level `text` property.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!(self.name()))
+    }
+
+    /// Rebuild the wire value from a persisted scenario step (audit
+    /// finding 15 with backward compatibility): a serialized object
+    /// restores exactly; a legacy bare name string migrates through the
+    /// parameterless shorthand.
+    pub fn from_recorded(v: &serde_json::Value) -> Option<TuiCompletionParam> {
+        serde_json::from_value(v.clone()).ok().or_else(|| {
+            v.as_str().map(|s| {
+                serde_json::from_value(serde_json::json!(s))
+                    .unwrap_or(TuiCompletionParam::Name(CompletionName::StableScreen))
+            })
+        })
+    }
 }
 
-/// Mirror of [`TuiActRequest`] for schema generation only. Keep field-for-field
-/// identical; `doc(hidden)` so it never appears in the public API story.
+/// Beta-audit P0.9: the per-action payloads are the SINGLE source of
+/// truth. [`TuiActRequest`] wraps them as newtype variants (the serde
+/// wire format is unchanged — internally-tagged with `flatten`), and the
+/// schema is composed from the SAME structs, so a field added to a
+/// payload appears in both the parser and the advertised schema or
+/// compilation fails. The old hand-maintained mirror enum drifted within
+/// weeks: its `resize`/`signal` variants lacked the `guard` field the
+/// real request accepted, so the advertised API rejected calls the
+/// server actually supported.
+///
+/// Shared transport fields on every action: how to observe completion,
+/// which session, and the expected-state guard.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ActCommon {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_wait: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TuiCompletionParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    /// Explicit completion budget ceiling (beta audit P0.6). Omitted means
+    /// the historical default (`wait_ms + 1000ms`). It is never silently
+    /// expanded; call it through the canonical executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_budget_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Re-review P0.9: expected-state guard. Validated atomically with
+    /// the send; on drift the action is refused (`stale_state`), never
+    /// misdirected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<MutationGuardParam>,
+}
+
+impl ActCommon {
+    /// All transport fields absent — the ordinary action.
+    pub fn none() -> Self {
+        ActCommon {
+            no_wait: None,
+            completion: None,
+            wait_ms: None,
+            settle_budget_ms: None,
+            id: None,
+            guard: None,
+        }
+    }
+}
+
+macro_rules! act_payload {
+    ($(#[$meta:meta])* $name:ident { $($rest:tt)* }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+        pub struct $name {
+            #[serde(flatten)]
+            pub common: ActCommon,
+            $($rest)*
+        }
+    };
+}
+
+act_payload!(
+    /// `{"action":"key","key":"tab"}` — one key event.
+    KeyPayload {
+        pub key: String,
+    }
+);
+act_payload!(
+    /// `{"action":"keys","keys":["ctrl+a","x"]}` — a key sequence.
+    KeysPayload {
+        pub keys: Vec<String>,
+    }
+);
+act_payload!(
+    /// `{"action":"type","text":"..."}` — type text. `sensitive` marks
+    /// the payload for redaction downstream (audit item 28).
+    TypePayload {
+        pub text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sensitive: Option<bool>,
+    }
+);
+act_payload!(
+    /// `{"action":"paste","paste":"..."}` — paste text (bracketed when
+    /// negotiated).
+    PastePayload {
+        pub paste: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sensitive: Option<bool>,
+    }
+);
+act_payload!(
+    /// `{"action":"raw","raw":[..]}` — raw bytes.
+    RawPayload {
+        pub raw: Vec<u8>,
+    }
+);
+act_payload!(
+    /// Mouse payloads share position + optional button.
+    MouseClickPayload {
+        pub x: u16,
+        pub y: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub button: Option<MouseButtonParam>,
+    }
+);
+act_payload!(
+    MousePressPayload {
+        pub x: u16,
+        pub y: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub button: Option<MouseButtonParam>,
+    }
+);
+act_payload!(
+    MouseReleasePayload {
+        pub x: u16,
+        pub y: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub button: Option<MouseButtonParam>,
+    }
+);
+act_payload!(
+    MouseMovePayload {
+        pub x: u16,
+        pub y: u16,
+    }
+);
+act_payload!(
+    MouseDragPayload {
+        pub x: u16,
+        pub y: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub button: Option<MouseButtonParam>,
+    }
+);
+act_payload!(
+    MouseScrollPayload {
+        pub x: u16,
+        pub y: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direction: Option<ScrollDirectionParam>,
+    }
+);
+act_payload!(
+    /// `{"action":"resize","cols":..,"rows":..}`.
+    ResizePayload {
+        pub cols: u16,
+        pub rows: u16,
+    }
+);
+act_payload!(
+    /// `{"action":"signal","signal":15}` — signal the child's process
+    /// group.
+    SignalPayload {
+        pub signal: i32,
+    }
+);
+
+/// Schema wrapper for [`TuiActRequest`]: re-roots the enum's natural
+/// `oneOf` schema as `{"type":"object","oneOf":[...]}` so the MCP
+/// inputSchema passes rmcp's root-object validation (MCP spec). The
+/// variant list is composed from the SAME payload structs the enum wraps
+/// (beta-audit P0.9) — the old hand-maintained mirror enum is gone.
+///
+/// Serde deserialization of `TuiActRequest` is untouched.
 #[doc(hidden)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum TuiActRequestVariants {
-    Key {
-        key: String,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    Keys {
-        keys: Vec<String>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    Type {
-        text: String,
-        #[serde(default)]
-        sensitive: Option<bool>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    Paste {
-        paste: String,
-        #[serde(default)]
-        sensitive: Option<bool>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    Raw {
-        raw: Vec<u8>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    MouseClick {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    MousePress {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    MouseRelease {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    MouseMove {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    MouseDrag {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    MouseScroll {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        direction: Option<ScrollDirectionParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-    },
-    Signal {
-        signal: i32,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-    },
+pub struct TuiActRequestSchema;
+
+impl TuiActRequestSchema {
+    pub fn wrapped(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        use schemars::json_schema;
+        let variants = <TuiActRequest as schemars::JsonSchema>::json_schema(gen);
+        json_schema!({
+            "type": "object",
+            "oneOf": variants,
+        })
+    }
 }
 
 /// Tagged enum for `tui_act` requests (spec item 30).
@@ -485,291 +462,221 @@ pub enum TuiActRequestVariants {
 /// no less. This gives Hermes a meaningful schema instead of one giant struct
 /// where any field can appear with any action.
 ///
+/// Beta-audit P0.9: every variant is a newtype over a payload struct that
+/// also generates the schema, so parser and advertised schema cannot drift.
+/// The wire format is the historical internally-tagged shape
+/// (`{"action":"key","key":"tab",...}`) — `flatten` preserves it exactly.
+///
 /// The MCP inputSchema root is wrapped as `type: object` (see
 /// `TuiActRequestSchema`) because rmcp 3.1.4 requires root `type: object`
 /// (MCP spec); serde's internally-tagged enum alone generates a bare `oneOf`
 /// there, which panicked the tool router on every stdio `tools/list` /
 /// `tools/call`.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-#[schemars(schema_with = "TuiActRequestSchema::wrapped")]
 pub enum TuiActRequest {
     /// Send a single key event (e.g. "enter", "ctrl+c", "tab").
-    Key {
-        key: String,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Key(KeyPayload),
     /// Send a sequence of key events.
-    Keys {
-        keys: Vec<String>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Keys(KeysPayload),
     /// Type text into the terminal.
-    Type {
-        text: String,
-        /// Audit item 28: mark this payload as sensitive so downstream
-        /// recording/logging hooks can redact it.
-        #[serde(default)]
-        sensitive: Option<bool>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Type(TypePayload),
     /// Paste text (with bracketed paste escape if negotiated).
-    Paste {
-        paste: String,
-        #[serde(default)]
-        sensitive: Option<bool>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Paste(PastePayload),
     /// Send raw bytes.
-    Raw {
-        raw: Vec<u8>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Raw(RawPayload),
     /// Mouse click (press + release).
-    MouseClick {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    MouseClick(MouseClickPayload),
     /// Mouse press only.
-    MousePress {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    MousePress(MousePressPayload),
     /// Mouse release only.
-    MouseRelease {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    MouseRelease(MouseReleasePayload),
     /// Mouse move (no button).
-    MouseMove {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    MouseMove(MouseMovePayload),
     /// Mouse drag.
-    MouseDrag {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        button: Option<MouseButtonParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    MouseDrag(MouseDragPayload),
     /// Mouse scroll.
-    MouseScroll {
-        x: u16,
-        y: u16,
-        #[serde(default)]
-        direction: Option<ScrollDirectionParam>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        id: Option<String>,
-        /// Re-review P0.9: expected-state guard. Validated atomically with
-        /// the send; on drift the action is refused (`stale_state`), never
-        /// misdirected.
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    MouseScroll(MouseScrollPayload),
     /// Resize the terminal.
-    Resize {
-        cols: u16,
-        rows: u16,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Resize(ResizePayload),
     /// Send a signal to the child process group.
-    Signal {
-        signal: i32,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        no_wait: Option<bool>,
-        #[serde(default)]
-        completion: Option<TuiCompletionParam>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        guard: Option<MutationGuardParam>,
-    },
+    Signal(SignalPayload),
+}
+
+impl schemars::JsonSchema for TuiActRequest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("TuiActRequest")
+    }
+
+    fn json_schema(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // The inputSchema ROOT is this schema (rmcp takes the parameter
+        // type's schema verbatim), so the historical root wrapping
+        // (`type: object` around the oneOf — rmcp 3.1.4 panics on a bare
+        // oneOf root) happens here, in one place.
+        use schemars::json_schema;
+        // One object schema per payload: the `action` tag const + the
+        // payload's flattened properties, all composed from the payload
+        // structs themselves. A field added to a payload (like the guard
+        // the old mirror dropped from resize/signal) lands here by
+        // construction.
+        let variant = |tag: &'static str, payload: schemars::Schema| {
+            let mut obj = json_schema!({ "type": "object" });
+            let map = obj.ensure_object();
+            let inner = payload.to_value();
+            // A payload struct's schema is a flat object schema (its fields
+            // are flattened in), so its entries merge directly; the type
+            // wrapper's own "type" wins.
+            if let Some(inner_obj) = inner.as_object() {
+                for (k, v) in inner_obj {
+                    if k == "$ref" || k == "title" {
+                        continue; // no refs: payloads are inline objects
+                    }
+                    if k == "type" {
+                        continue; // our object type wins
+                    }
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+            let props = map
+                .entry("properties")
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if let Some(p) = props.as_object_mut() {
+                p.insert(
+                    "action".to_string(),
+                    serde_json::json!({ "const": tag, "type": "string" }),
+                );
+            }
+            let req = map
+                .entry("required")
+                .or_insert_with(|| serde_json::Value::Array(Default::default()));
+            if let Some(r) = req.as_array_mut() {
+                if !r.iter().any(|v| v == "action") {
+                    r.push(serde_json::json!("action"));
+                }
+            }
+            obj
+        };
+        let one_of = vec![
+            variant(
+                "key",
+                <KeyPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "keys",
+                <KeysPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "type",
+                <TypePayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "paste",
+                <PastePayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "raw",
+                <RawPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "mouse_click",
+                <MouseClickPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "mouse_press",
+                <MousePressPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "mouse_release",
+                <MouseReleasePayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "mouse_move",
+                <MouseMovePayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "mouse_drag",
+                <MouseDragPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "mouse_scroll",
+                <MouseScrollPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "resize",
+                <ResizePayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+            variant(
+                "signal",
+                <SignalPayload as schemars::JsonSchema>::json_schema(gen),
+            ),
+        ];
+        json_schema!({
+            "type": "object",
+            "oneOf": one_of,
+        })
+    }
 }
 
 /// Helper to extract common fields from any act variant.
 impl TuiActRequest {
     pub fn no_wait(&self) -> bool {
         match self {
-            TuiActRequest::Key { no_wait, .. } => *no_wait,
-            TuiActRequest::Keys { no_wait, .. } => *no_wait,
-            TuiActRequest::Type { no_wait, .. } => *no_wait,
-            TuiActRequest::Paste { no_wait, .. } => *no_wait,
-            TuiActRequest::Raw { no_wait, .. } => *no_wait,
-            TuiActRequest::MouseClick { no_wait, .. } => *no_wait,
-            TuiActRequest::MousePress { no_wait, .. } => *no_wait,
-            TuiActRequest::MouseRelease { no_wait, .. } => *no_wait,
-            TuiActRequest::MouseMove { no_wait, .. } => *no_wait,
-            TuiActRequest::MouseDrag { no_wait, .. } => *no_wait,
-            TuiActRequest::MouseScroll { no_wait, .. } => *no_wait,
-            TuiActRequest::Resize { no_wait, .. } => *no_wait,
-            TuiActRequest::Signal { no_wait, .. } => *no_wait,
+            TuiActRequest::Key(p) => p.common.no_wait,
+            TuiActRequest::Keys(p) => p.common.no_wait,
+            TuiActRequest::Type(p) => p.common.no_wait,
+            TuiActRequest::Paste(p) => p.common.no_wait,
+            TuiActRequest::Raw(p) => p.common.no_wait,
+            TuiActRequest::MouseClick(p) => p.common.no_wait,
+            TuiActRequest::MousePress(p) => p.common.no_wait,
+            TuiActRequest::MouseRelease(p) => p.common.no_wait,
+            TuiActRequest::MouseMove(p) => p.common.no_wait,
+            TuiActRequest::MouseDrag(p) => p.common.no_wait,
+            TuiActRequest::MouseScroll(p) => p.common.no_wait,
+            TuiActRequest::Resize(p) => p.common.no_wait,
+            TuiActRequest::Signal(p) => p.common.no_wait,
         }
         .unwrap_or(false)
     }
 
+    /// Shared transport fields, regardless of action variant.
+    pub fn common(&self) -> &ActCommon {
+        match self {
+            TuiActRequest::Key(p) => &p.common,
+            TuiActRequest::Keys(p) => &p.common,
+            TuiActRequest::Type(p) => &p.common,
+            TuiActRequest::Paste(p) => &p.common,
+            TuiActRequest::Raw(p) => &p.common,
+            TuiActRequest::MouseClick(p) => &p.common,
+            TuiActRequest::MousePress(p) => &p.common,
+            TuiActRequest::MouseRelease(p) => &p.common,
+            TuiActRequest::MouseMove(p) => &p.common,
+            TuiActRequest::MouseDrag(p) => &p.common,
+            TuiActRequest::MouseScroll(p) => &p.common,
+            TuiActRequest::Resize(p) => &p.common,
+            TuiActRequest::Signal(p) => &p.common,
+        }
+    }
+
+    /// Caller-supplied completion ceiling, when declared.
+    pub fn settle_budget_ms(&self) -> Option<u64> {
+        self.common().settle_budget_ms
+    }
+
     pub fn wait_ms(&self) -> Option<u64> {
         match self {
-            TuiActRequest::Key { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Keys { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Type { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Paste { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Raw { wait_ms, .. } => *wait_ms,
-            TuiActRequest::MouseClick { wait_ms, .. } => *wait_ms,
-            TuiActRequest::MousePress { wait_ms, .. } => *wait_ms,
-            TuiActRequest::MouseRelease { wait_ms, .. } => *wait_ms,
-            TuiActRequest::MouseMove { wait_ms, .. } => *wait_ms,
-            TuiActRequest::MouseDrag { wait_ms, .. } => *wait_ms,
-            TuiActRequest::MouseScroll { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Resize { wait_ms, .. } => *wait_ms,
-            TuiActRequest::Signal { wait_ms, .. } => *wait_ms,
+            TuiActRequest::Key(p) => p.common.wait_ms,
+            TuiActRequest::Keys(p) => p.common.wait_ms,
+            TuiActRequest::Type(p) => p.common.wait_ms,
+            TuiActRequest::Paste(p) => p.common.wait_ms,
+            TuiActRequest::Raw(p) => p.common.wait_ms,
+            TuiActRequest::MouseClick(p) => p.common.wait_ms,
+            TuiActRequest::MousePress(p) => p.common.wait_ms,
+            TuiActRequest::MouseRelease(p) => p.common.wait_ms,
+            TuiActRequest::MouseMove(p) => p.common.wait_ms,
+            TuiActRequest::MouseDrag(p) => p.common.wait_ms,
+            TuiActRequest::MouseScroll(p) => p.common.wait_ms,
+            TuiActRequest::Resize(p) => p.common.wait_ms,
+            TuiActRequest::Signal(p) => p.common.wait_ms,
         }
     }
 
@@ -779,21 +686,39 @@ impl TuiActRequest {
     /// ordinary way to express "kill and wait for exit"; `resize` +
     /// `{"type":"stable_screen","quiet_ms":400}` waits out reflow. The
     /// completion spec is self-contained, so the conversion is lossless.
+    pub fn completion_param(&self) -> Option<TuiCompletionParam> {
+        match self {
+            TuiActRequest::Key(p) => p.common.completion.clone(),
+            TuiActRequest::Keys(p) => p.common.completion.clone(),
+            TuiActRequest::Type(p) => p.common.completion.clone(),
+            TuiActRequest::Paste(p) => p.common.completion.clone(),
+            TuiActRequest::Raw(p) => p.common.completion.clone(),
+            TuiActRequest::MouseClick(p) => p.common.completion.clone(),
+            TuiActRequest::MousePress(p) => p.common.completion.clone(),
+            TuiActRequest::MouseRelease(p) => p.common.completion.clone(),
+            TuiActRequest::MouseMove(p) => p.common.completion.clone(),
+            TuiActRequest::MouseDrag(p) => p.common.completion.clone(),
+            TuiActRequest::MouseScroll(p) => p.common.completion.clone(),
+            TuiActRequest::Resize(p) => p.common.completion.clone(),
+            TuiActRequest::Signal(p) => p.common.completion.clone(),
+        }
+    }
+
     pub fn completion(&self) -> Option<crate::capture::CompletionPolicy> {
         match self {
-            TuiActRequest::Key { completion, .. } => completion.clone(),
-            TuiActRequest::Keys { completion, .. } => completion.clone(),
-            TuiActRequest::Type { completion, .. } => completion.clone(),
-            TuiActRequest::Paste { completion, .. } => completion.clone(),
-            TuiActRequest::Raw { completion, .. } => completion.clone(),
-            TuiActRequest::MouseClick { completion, .. } => completion.clone(),
-            TuiActRequest::MousePress { completion, .. } => completion.clone(),
-            TuiActRequest::MouseRelease { completion, .. } => completion.clone(),
-            TuiActRequest::MouseMove { completion, .. } => completion.clone(),
-            TuiActRequest::MouseDrag { completion, .. } => completion.clone(),
-            TuiActRequest::MouseScroll { completion, .. } => completion.clone(),
-            TuiActRequest::Resize { completion, .. } => completion.clone(),
-            TuiActRequest::Signal { completion, .. } => completion.clone(),
+            TuiActRequest::Key(p) => p.common.completion.clone(),
+            TuiActRequest::Keys(p) => p.common.completion.clone(),
+            TuiActRequest::Type(p) => p.common.completion.clone(),
+            TuiActRequest::Paste(p) => p.common.completion.clone(),
+            TuiActRequest::Raw(p) => p.common.completion.clone(),
+            TuiActRequest::MouseClick(p) => p.common.completion.clone(),
+            TuiActRequest::MousePress(p) => p.common.completion.clone(),
+            TuiActRequest::MouseRelease(p) => p.common.completion.clone(),
+            TuiActRequest::MouseMove(p) => p.common.completion.clone(),
+            TuiActRequest::MouseDrag(p) => p.common.completion.clone(),
+            TuiActRequest::MouseScroll(p) => p.common.completion.clone(),
+            TuiActRequest::Resize(p) => p.common.completion.clone(),
+            TuiActRequest::Signal(p) => p.common.completion.clone(),
         }
         .map(|c| c.to_policy())
     }
@@ -804,21 +729,23 @@ impl TuiActRequest {
     /// travels with the completion.
     pub fn completion_quiet_ms(&self) -> Option<u64> {
         match self {
-            TuiActRequest::Key { completion, .. }
-            | TuiActRequest::Keys { completion, .. }
-            | TuiActRequest::Type { completion, .. }
-            | TuiActRequest::Paste { completion, .. }
-            | TuiActRequest::Raw { completion, .. }
-            | TuiActRequest::MouseClick { completion, .. }
-            | TuiActRequest::MousePress { completion, .. }
-            | TuiActRequest::MouseRelease { completion, .. }
-            | TuiActRequest::MouseMove { completion, .. }
-            | TuiActRequest::MouseDrag { completion, .. }
-            | TuiActRequest::MouseScroll { completion, .. }
-            | TuiActRequest::Resize { completion, .. }
-            | TuiActRequest::Signal { completion, .. } => {
-                completion.as_ref().and_then(|c| c.quiet_ms())
+            TuiActRequest::Key(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::Keys(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::Type(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::Paste(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::Raw(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::MouseClick(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::MousePress(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::MouseRelease(p) => {
+                p.common.completion.as_ref().and_then(|c| c.quiet_ms())
             }
+            TuiActRequest::MouseMove(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::MouseDrag(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::MouseScroll(p) => {
+                p.common.completion.as_ref().and_then(|c| c.quiet_ms())
+            }
+            TuiActRequest::Resize(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
+            TuiActRequest::Signal(p) => p.common.completion.as_ref().and_then(|c| c.quiet_ms()),
         }
     }
 
@@ -826,37 +753,37 @@ impl TuiActRequest {
     /// field on every canonical action.
     pub fn guard(&self) -> Option<&MutationGuardParam> {
         match self {
-            TuiActRequest::Key { guard, .. }
-            | TuiActRequest::Keys { guard, .. }
-            | TuiActRequest::Type { guard, .. }
-            | TuiActRequest::Paste { guard, .. }
-            | TuiActRequest::Raw { guard, .. }
-            | TuiActRequest::MouseClick { guard, .. }
-            | TuiActRequest::MousePress { guard, .. }
-            | TuiActRequest::MouseRelease { guard, .. }
-            | TuiActRequest::MouseMove { guard, .. }
-            | TuiActRequest::MouseDrag { guard, .. }
-            | TuiActRequest::MouseScroll { guard, .. }
-            | TuiActRequest::Resize { guard, .. }
-            | TuiActRequest::Signal { guard, .. } => guard.as_ref(),
+            TuiActRequest::Key(p) => p.common.guard.as_ref(),
+            TuiActRequest::Keys(p) => p.common.guard.as_ref(),
+            TuiActRequest::Type(p) => p.common.guard.as_ref(),
+            TuiActRequest::Paste(p) => p.common.guard.as_ref(),
+            TuiActRequest::Raw(p) => p.common.guard.as_ref(),
+            TuiActRequest::MouseClick(p) => p.common.guard.as_ref(),
+            TuiActRequest::MousePress(p) => p.common.guard.as_ref(),
+            TuiActRequest::MouseRelease(p) => p.common.guard.as_ref(),
+            TuiActRequest::MouseMove(p) => p.common.guard.as_ref(),
+            TuiActRequest::MouseDrag(p) => p.common.guard.as_ref(),
+            TuiActRequest::MouseScroll(p) => p.common.guard.as_ref(),
+            TuiActRequest::Resize(p) => p.common.guard.as_ref(),
+            TuiActRequest::Signal(p) => p.common.guard.as_ref(),
         }
     }
 
     pub fn id(&self) -> Option<&str> {
         match self {
-            TuiActRequest::Key { id, .. } => id.as_deref(),
-            TuiActRequest::Keys { id, .. } => id.as_deref(),
-            TuiActRequest::Type { id, .. } => id.as_deref(),
-            TuiActRequest::Paste { id, .. } => id.as_deref(),
-            TuiActRequest::Raw { id, .. } => id.as_deref(),
-            TuiActRequest::MouseClick { id, .. } => id.as_deref(),
-            TuiActRequest::MousePress { id, .. } => id.as_deref(),
-            TuiActRequest::MouseRelease { id, .. } => id.as_deref(),
-            TuiActRequest::MouseMove { id, .. } => id.as_deref(),
-            TuiActRequest::MouseDrag { id, .. } => id.as_deref(),
-            TuiActRequest::MouseScroll { id, .. } => id.as_deref(),
-            TuiActRequest::Resize { id, .. } => id.as_deref(),
-            TuiActRequest::Signal { id, .. } => id.as_deref(),
+            TuiActRequest::Key(p) => p.common.id.as_deref(),
+            TuiActRequest::Keys(p) => p.common.id.as_deref(),
+            TuiActRequest::Type(p) => p.common.id.as_deref(),
+            TuiActRequest::Paste(p) => p.common.id.as_deref(),
+            TuiActRequest::Raw(p) => p.common.id.as_deref(),
+            TuiActRequest::MouseClick(p) => p.common.id.as_deref(),
+            TuiActRequest::MousePress(p) => p.common.id.as_deref(),
+            TuiActRequest::MouseRelease(p) => p.common.id.as_deref(),
+            TuiActRequest::MouseMove(p) => p.common.id.as_deref(),
+            TuiActRequest::MouseDrag(p) => p.common.id.as_deref(),
+            TuiActRequest::MouseScroll(p) => p.common.id.as_deref(),
+            TuiActRequest::Resize(p) => p.common.id.as_deref(),
+            TuiActRequest::Signal(p) => p.common.id.as_deref(),
         }
     }
 
@@ -883,9 +810,8 @@ impl TuiActRequest {
     /// text-carrying actions can be sensitive; everything else is not.
     pub fn sensitive(&self) -> bool {
         match self {
-            TuiActRequest::Type { sensitive, .. } | TuiActRequest::Paste { sensitive, .. } => {
-                sensitive.unwrap_or(false)
-            }
+            TuiActRequest::Type(p) => p.sensitive.unwrap_or(false),
+            TuiActRequest::Paste(p) => p.sensitive.unwrap_or(false),
             _ => false,
         }
     }

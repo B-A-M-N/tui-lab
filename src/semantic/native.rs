@@ -479,7 +479,7 @@ impl NativeChannel {
     }
 
     /// Fused merge (re-review Wave-4): resolve each native node ONCE and
-    /// write it into both shapes — the [`SemanticTree`] (nodes mode) and the
+    /// write it into both shapes — the `SemanticTree` (nodes mode) and the
     /// flat [`crate::semantic::SemanticScreen`] (semantic/summary/tree modes)
     /// — so every observe mode reports the same truth. A native node that
     /// matches a tree node derived from a `Control` also fixes up that
@@ -677,6 +677,14 @@ impl NativeChannel {
     /// ingested yet).
     pub fn last_native_seq(&self) -> u64 {
         self.native_seq
+    }
+
+    /// Monotonic channel revision for stale-state guards: the latest
+    /// native sequence when the channel exists, otherwise `None`. A guard
+    /// can therefore distinguish "no native channel" from "no native
+    /// update yet" without treating zero as a live revision.
+    pub fn revision(&self) -> Option<u64> {
+        self.path.as_ref().map(|_| self.native_seq)
     }
 
     /// Reset (session restart): keep the path, drop the state.
@@ -2229,5 +2237,44 @@ mod tests {
         // Re-reading from the same cursor yields the same batch (idempotent).
         assert_eq!(ch.events_since(cursor).len(), 2);
         std::fs::remove_file(&path).ok();
+    }
+}
+
+impl NativeChannel {
+    /// Drift fixture seam (audit finding 1 test): declare the same visual
+    /// screen with a different focused control, advancing the native
+    /// revision. Test-only and intentionally `pub(crate)`.
+    pub fn test_declare_focus_for_drift_fixture(&mut self, control_id: &str) {
+        let root = self
+            .latest
+            .get_or_insert_with(|| crate::semantic::native::NativeNode {
+                id: "screen".into(),
+                role: String::new(),
+                label: None,
+                value: None,
+                bounds: None,
+                actions: Vec::new(),
+                focusable: None,
+                focused: None,
+                enabled: None,
+                source: None,
+                children: Vec::new(),
+            });
+        root.id = "screen".into();
+        root.children.clear();
+        root.children.push(crate::semantic::native::NativeNode {
+            id: control_id.to_string(),
+            role: String::new(),
+            label: None,
+            value: None,
+            bounds: None,
+            actions: vec!["activate".into()],
+            focusable: Some(true),
+            focused: Some(true),
+            enabled: Some(true),
+            source: None,
+            children: Vec::new(),
+        });
+        self.native_seq += 1;
     }
 }

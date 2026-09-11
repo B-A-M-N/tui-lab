@@ -381,14 +381,7 @@ impl RunContext {
                 }
                 match std::fs::read(&path) {
                     Ok(bytes) => {
-                        match crate::run::formats::Envelope::unwrap(
-                            &bytes,
-                            crate::run::formats::tags::SCENARIO,
-                        )
-                        .and_then(|v| {
-                            serde_json::from_value::<crate::scenario::model::Scenario>(v)
-                                .map_err(anyhow::Error::from)
-                        }) {
+                        match crate::run::scenario_impl::read_scenario_bytes(&bytes, &path) {
                             Ok(sc) => {
                                 run.scenarios.insert_loaded(sc);
                             }
@@ -520,7 +513,9 @@ impl RunContext {
             // Roll back: the run was never observably reopened.
             self.identity.set_resume_epoch(new_epoch - 1);
             self.identity.set_closed(true);
-            return Err(e.context("reopen: manifest write failed; the run remains closed at its previous epoch"));
+            return Err(e.context(
+                "reopen: manifest write failed; the run remains closed at its previous epoch",
+            ));
         }
         Ok(())
     }
@@ -737,7 +732,7 @@ impl RunContext {
         if let Some(existing) = &self.run_dir {
             return Ok(existing.clone());
         }
-        let root = Self::runs_dir_for(base, &self.id());
+        let root = Self::runs_dir_for(base, self.id());
         std::fs::create_dir_all(root.join("checkpoints"))?;
         std::fs::create_dir_all(root.join("scenarios"))?;
         std::fs::create_dir_all(root.join("recordings"))?;
