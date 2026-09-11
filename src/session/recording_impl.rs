@@ -35,15 +35,52 @@ impl Session {
     pub fn enable_recording(&mut self, record_input: bool) {
         let cols = self.cols();
         let rows = self.rows();
-        let sink = std::sync::Arc::new(std::sync::Mutex::new(AsciicastRecorder::new(
+        let (boundary, fidelity, lossy, loss_reason): (
+            &'static str,
+            &'static str,
+            bool,
+            Option<&'static str>,
+        ) = match self.backend_kind {
+            crate::session::state::BackendKind::PortableVt
+            | crate::session::state::BackendKind::PtyLine => {
+                ("pty-bytes", "raw_pty_stream", false, None)
+            }
+            crate::session::state::BackendKind::Pipe => (
+                "separated-streams",
+                "separated_streams",
+                false,
+                None,
+            ),
+            crate::session::state::BackendKind::TmuxAttach => (
+                "rendered-pane-snapshots",
+                "rendered_snapshots",
+                true,
+                Some(
+                    "pane state is sampled/reconstructed; protocol bytes and exact event timing are not retained",
+                ),
+            ),
+        };
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(AsciicastRecorder::with_fidelity(
             cols,
             rows,
             record_input,
+            boundary,
+            fidelity,
+            lossy,
+            loss_reason,
         )));
         self.recording.install(sink.clone(), record_input);
         // The session hook is permanent; swap the recorder INSIDE it so the
         // reader thread's event ingestion is never interrupted.
         self.set_hook_recorder(Some(sink));
+    }
+
+    /// Transport provenance of the active recording (audit finding 57).
+    /// Start and stop responses both read this one authority, so metadata
+    /// cannot drift between lifecycle phases.
+    pub fn recording_fidelity(&self) -> Option<serde_json::Value> {
+        self.recorder()
+            .and_then(|rec| rec.lock().ok().map(|r| r.fidelity_metadata()))
     }
 
     /// Detach recording (stop capturing further bytes; existing events remain).

@@ -40,10 +40,40 @@ pub struct AsciicastRecorder {
     /// streams are suppressed; the application's own (masked) rendering
     /// resumes after.
     suppress_output: bool,
+    /// Recording provenance (audit finding 57): survives the start
+    /// response and lands in the `.cast` extension header.
+    boundary: &'static str,
+    fidelity: &'static str,
+    lossy: bool,
+    /// Why this recording is lossy when applicable.
+    loss_reason: Option<&'static str>,
 }
 
 impl AsciicastRecorder {
     pub fn new(cols: u16, rows: u16, record_input: bool) -> Self {
+        Self::with_fidelity(
+            cols,
+            rows,
+            record_input,
+            "pty-bytes",
+            "raw_pty_stream",
+            false,
+            None,
+        )
+    }
+
+    /// Construct with explicit transport provenance (audit finding 57).
+    /// `loss_reason` explains what a sampled/reconstructed transport cannot
+    /// prove; `None` means lossless at the stated boundary.
+    pub fn with_fidelity(
+        cols: u16,
+        rows: u16,
+        record_input: bool,
+        boundary: &'static str,
+        fidelity: &'static str,
+        lossy: bool,
+        loss_reason: Option<&'static str>,
+    ) -> Self {
         AsciicastRecorder {
             cols,
             rows,
@@ -52,7 +82,22 @@ impl AsciicastRecorder {
             record_input,
             suppress_input: false,
             suppress_output: false,
+            boundary,
+            fidelity,
+            lossy,
+            loss_reason,
         }
+    }
+
+    /// Recording transport provenance for artifact metadata and stop
+    /// responses.
+    pub fn fidelity_metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "boundary": self.boundary,
+            "fidelity": self.fidelity,
+            "lossy": self.lossy,
+            "loss_reason": self.loss_reason,
+        })
     }
 
     /// Raise/lower the input-recording suppression gate (leak fix).
@@ -132,11 +177,15 @@ impl AsciicastRecorder {
     pub fn to_ndjson(&self) -> Vec<String> {
         let mut lines = Vec::new();
         // Header
+        // Asciinema permits arbitrary header metadata; keep fidelity in the
+        // artifact itself so later consumers need not trust the original
+        // start response (audit finding 57).
         let header = serde_json::json!({
             "version": 3,
             "width": self.cols,
             "height": self.rows,
             "timestamp": 0,
+            "tui_lab": self.fidelity_metadata(),
         });
         lines.push(header.to_string());
 
@@ -234,6 +283,30 @@ impl RecordingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fidelity_metadata_survives_cast_header() {
+        let mut sampled = AsciicastRecorder::with_fidelity(
+            40,
+            10,
+            false,
+            "rendered-pane-snapshots",
+            "rendered_snapshots",
+            true,
+            Some("sampled"),
+        );
+        sampled.record_output(b"hello");
+        let lines = sampled.to_ndjson();
+        let header: serde_json::Value =
+            serde_json::from_str(lines.first().expect("header")).expect("json");
+        assert_eq!(header["tui_lab"]["boundary"], "rendered-pane-snapshots");
+        assert_eq!(header["tui_lab"]["fidelity"], "rendered_snapshots");
+        assert_eq!(header["tui_lab"]["lossy"], true);
+        assert_eq!(header["tui_lab"]["loss_reason"], "sampled");
+
+        let raw = AsciicastRecorder::new(80, 24, false);
+        assert_eq!(raw.fidelity_metadata()["lossy"], false);
+    }
 
     #[test]
     fn test_recorder_basic() {

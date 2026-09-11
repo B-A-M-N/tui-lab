@@ -49,6 +49,7 @@ print('\nRECEIVED',repr(data),flush=True)
             focus_control_id: None,
             native_revision: None,
             text_visible: None,
+            semantic_identity: None,
         };
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let err = tui_lab::execution::execute_act_with_guard(

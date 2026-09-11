@@ -37,6 +37,12 @@ pub struct MutationGuard {
     /// advances, the guarded belief is stale even when the grid is equal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_revision: Option<u64>,
+    /// Fused semantic identity at decision time (strongest "same world"
+    /// statement the capture can make). `validate_analysis` treats a
+    /// mismatch as stale state — native-only identity drift cannot slip
+    /// through a structure-hash check anymore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_identity: Option<String>,
     /// Text that must remain visible in the CURRENT viewport. This is a
     /// separate predicate because normalization can mask content changes
     /// in the structural identity.
@@ -49,17 +55,41 @@ impl MutationGuard {
     /// caller sends when it wants "act only if the world hasn't moved
     /// since right now" (racy-read protection for the executor's own
     /// window).
+    ///
+    /// Audit finding 3: the capture helper now populates the same
+    /// native/semantic revision fields the executor's `validate_analysis`
+    /// checks, so a guard created through the canonical helper protects
+    /// against exactly the native-only drift (focus moved, pixels
+    /// unchanged) the `native_revision` field exists to catch. The fused
+    /// semantic identity is carried too — it is the strongest "the world
+    /// is the world I observed" statement the analysis can make.
     pub fn capture(
         analysis: Option<&crate::session::state::FrameAnalysis>,
+        session: &crate::session::state::Session,
         generation: u32,
     ) -> Self {
-        MutationGuard {
+        let mut g = MutationGuard {
             generation: Some(generation),
             structure_hash: analysis.map(|a| a.frame.structure_hash.clone()),
             focus_control_id: analysis.and_then(|a| a.semantic.focus.control_id.clone()),
             native_revision: None,
             text_visible: None,
+            semantic_identity: None,
+        };
+        if let Some(a) = analysis {
+            // Audit finding 3: canonical guard capture pins the observed
+            // native revision as well as the fused semantic identity. The
+            // identity catches a semantic-only overlay change; the explicit
+            // revision makes the exact native timestamp citable and keeps
+            // validation meaningful even when a future identity projection
+            // intentionally omits revision.
+            g.native_revision = session.native_revision();
+            g.structure_hash = Some(a.frame.structure_hash.clone());
+            if !a.semantic_identity.is_empty() {
+                g.semantic_identity = Some(a.semantic_identity.clone());
+            }
         }
+        g
     }
 
     /// Validate against live state. `Ok(())` means every declared
@@ -104,6 +134,22 @@ impl MutationGuard {
                     "summary": format!(
                         "session restarted since the guard was captured (generation {want_gen} -> {generation})"
                     ),
+                }));
+            }
+        }
+        // Fused semantic identity drift invalidates the guard even when
+        // every component check passes — the strongest statement first
+        // (audit finding 3: a guard captured through `capture()` carries
+        // this identity, so native-only semantic drift is caught here,
+        // not only at the native_revision check).
+        if let Some(want_identity) = &self.semantic_identity {
+            if &analysis.semantic_identity != want_identity {
+                return Err(json!({
+                    "category": "stale_state",
+                    "check": "semantic_identity",
+                    "expected": want_identity,
+                    "actual": analysis.semantic_identity,
+                    "summary": "fused semantic state changed since the guard was captured",
                 }));
             }
         }
@@ -190,6 +236,7 @@ mod tests {
             focus_control_id: Some("button/save".into()),
             native_revision: Some(7),
             text_visible: Some("[ Save ]".into()),
+            semantic_identity: Some("identity-7".into()),
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("button/save"));

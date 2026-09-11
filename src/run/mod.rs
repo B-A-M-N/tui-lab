@@ -45,6 +45,8 @@ mod persistence_impl;
 pub(crate) mod scenario_impl;
 mod scenario_store;
 
+pub use scenario_impl::ScenarioPersist;
+
 pub use artifacts::{ArtifactKind, ArtifactRef};
 pub use formats::StreamHeader;
 pub use journal::JournalHandle;
@@ -179,9 +181,27 @@ pub struct TransactionRecord {
     pub event_seq_before: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_seq_after: Option<u64>,
+    /// Native semantic revision at the dispatch boundary (audit finding 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_revision_before: Option<u64>,
+    /// Fused semantic identity at the dispatch boundary (audit finding 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_semantic_identity: Option<String>,
+    /// Stable row-kind discriminator (audit finding 47): every row is
+    /// either a real interaction transaction or a non-frame activity/event
+    /// record. Older persisted rows read as `interaction`, preserving
+    /// legacy behavior.
+    #[serde(default)]
+    pub record_kind: Option<String>,
     /// Exact write-boundary outcome for the logical dispatch.
     #[serde(default)]
     pub dispatch: Option<String>,
+    /// Typed dispatch failure evidence (audit finding 4): present exactly
+    /// when the write did not succeed — status (`failed_before_write` /
+    /// `partial_or_unknown` / `refused_before_write`) plus the backend's
+    /// original error verbatim. `null` for successful dispatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_failure: Option<serde_json::Value>,
 }
 
 /// Ledger-sized summary of a [`crate::execution::RenderTransaction`].
@@ -218,14 +238,13 @@ impl TransactionRecord {
         generation: u32,
         before_frame_id: Option<u64>,
         after_frame_id: Option<u64>,
-        event_seq_before: u64,
-        event_seq_after: Option<u64>,
         tx: &crate::execution::InteractionTransaction,
     ) -> Self {
         let settle = match tx.settle {
             crate::execution::SettleStatus::Met => "met",
             crate::execution::SettleStatus::TimedOut => "timed_out",
             crate::execution::SettleStatus::Skipped => "skipped",
+            crate::execution::SettleStatus::NotAttempted => "not_attempted",
         };
         let persisted_action = Some(crate::execution::PersistedAction::project(
             tx.canonical(),
@@ -261,9 +280,18 @@ impl TransactionRecord {
             generation: Some(generation),
             before_frame_id,
             after_frame_id,
-            event_seq_before: Some(event_seq_before),
-            event_seq_after,
+            event_seq_before: Some(tx.event_seq_before),
+            event_seq_after: tx.event_seq_after,
+            native_revision_before: tx.native_revision_before,
+            before_semantic_identity: tx.before_frame.semantic_identity.clone(),
+            record_kind: Some("interaction".to_string()),
             dispatch: Some(tx.dispatch.name().to_string()),
+            dispatch_failure: tx.dispatch_failure.as_ref().map(|f| {
+                serde_json::json!({
+                    "status": f.status.name(),
+                    "message": f.message,
+                })
+            }),
         }
     }
 }
@@ -706,15 +734,7 @@ mod tests {
         )
         .expect("execute");
 
-        let _ = run.record_interaction(
-            "ledger-sess",
-            1,
-            None,
-            None,
-            tx.anchor.state.output_seq,
-            None,
-            &tx,
-        );
+        let _ = run.record_interaction("ledger-sess", 1, None, None, &tx);
         let _ = run.record_event("ledger-sess", "wait");
 
         assert_eq!(run.transaction_total(), 2);
@@ -771,10 +791,15 @@ mod tests {
             transition_capture: None,
             origin: Some(crate::execution::DriveOrigin::Audit),
             dispatch: crate::execution::DispatchStatus::Sent,
+            dispatch_failure: None,
+            event_seq_before: 0,
+            event_seq_after: None,
+            native_revision_before: None,
+            dispatch_reason: None,
         };
         tx.before_frame.state.structure_hash = "b".into();
         tx.after_frame.state.structure_hash = "a".into();
-        let _ = run.record_interaction("origin-sess", 1, None, None, 0, None, &tx);
+        let _ = run.record_interaction("origin-sess", 1, None, None, &tx);
         let _ = run.record_event("origin-sess", "wait");
         let ledger = run.transactions();
         assert_eq!(ledger[0].origin.as_deref(), Some("audit"));
@@ -1133,7 +1158,9 @@ mod tests {
             .act(serde_json::json!({"action": "key", "key": "enter"}))
             .wait(serde_json::json!({"condition": "text", "text": "SAVED"}));
         let scenario_id = scenario.id.clone();
-        let path = run.save_scenario(scenario).expect("save");
+        let ScenarioPersist::Persisted(path) = run.save_scenario(scenario) else {
+            panic!("persistent run saves")
+        };
         assert!(path.exists());
 
         let ids = run.list_saved_scenarios().expect("list");
@@ -1160,7 +1187,9 @@ mod tests {
         let sc = crate::scenario::model::Scenario::new("versioned")
             .act(serde_json::json!({"action": "key", "key": "enter"}));
         let sc_id = sc.id.clone();
-        let path = run.save_scenario(sc).expect("save");
+        let ScenarioPersist::Persisted(path) = run.save_scenario(sc) else {
+            panic!("persistent run saves")
+        };
         let _ = run.record_event("v-sess", "wait");
         run.wait_for_journal(std::time::Duration::from_secs(2));
 
@@ -1281,8 +1310,14 @@ mod tests {
         let id_a = a.id.clone();
         let id_b = b.id.clone();
         assert_ne!(id_a, id_b);
-        run.save_scenario(a).expect("save a");
-        run.save_scenario(b).expect("save b");
+        assert!(
+            matches!(run.save_scenario(a), ScenarioPersist::Persisted(_)),
+            "save a"
+        );
+        assert!(
+            matches!(run.save_scenario(b), ScenarioPersist::Persisted(_)),
+            "save b"
+        );
 
         assert_eq!(run.scenarios.len(), 2, "both scenarios kept");
         // Ambiguous name resolves through neither…
@@ -1435,7 +1470,7 @@ mod tests {
             false,
         )
         .expect("execute");
-        let _ = run.record_interaction("fg-tx", 1, None, None, 0, None, &tx);
+        let _ = run.record_interaction("fg-tx", 1, None, None, &tx);
 
         // The graph has at least one driven edge tagged with the EXACT
         // action identity (re-review P0): a Right keypress reads `right`,
@@ -1479,6 +1514,7 @@ mod tests {
         );
         let _ = run.record_event("sess-fix", "wait");
         let _ = run.extend_findings(vec![crate::audit::Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RESTORE-ME".into(),
             rule_id: None,
             severity: crate::audit::Severity::Warn,
@@ -1800,10 +1836,13 @@ mod tests {
             transition_capture: None,
             origin: None,
             dispatch: crate::execution::DispatchStatus::Sent,
+            dispatch_failure: None,
+            event_seq_before: 0,
+            event_seq_after: None,
+            native_revision_before: None,
+            dispatch_reason: None,
         };
-        assert!(run
-            .record_interaction("s", 1, None, None, 0, None, &tx)
-            .is_err());
+        assert!(run.record_interaction("s", 1, None, None, &tx).is_err());
         assert!(run.record_event("s", "wait").is_err());
         assert!(run.commit_frame(&mut frame, Some("s")).is_err());
         assert!(run
@@ -2001,6 +2040,7 @@ mod source_ref_tests {
 
     fn finding_pointing_at(control_id: &str) -> Finding {
         Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "TEST-001".into(),
             rule_id: None,
             severity: crate::audit::Severity::Error,
@@ -2068,6 +2108,7 @@ mod source_ref_tests {
 
     fn compare_test_finding(id: &str, category: &str, target: &str) -> crate::audit::Finding {
         Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: id.into(),
             rule_id: None,
             severity: crate::audit::Severity::Warn,

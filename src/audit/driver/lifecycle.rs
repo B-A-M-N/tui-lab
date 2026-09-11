@@ -40,6 +40,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
 
     let Some((trace, nbytes, dropped)) = decode_raw(session) else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LC-NOSRC".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -96,6 +97,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
 
     if !dangling.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LC-DANGLING".into(),
             rule_id: None,
             severity: sev_dangling,
@@ -129,6 +131,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
         });
     } else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LC-CLEAN".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -150,6 +153,7 @@ pub fn lifecycle_audit(session: &mut Session) -> Vec<Finding> {
     // MISS a DECSET from before the window — say so next to any conclusion.
     if dropped > 0 {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LC-WINDOW".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -201,6 +205,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
     // ── Phase 1: the running app's engaged modes ──────────────────────────
     let Some((baseline_trace, _n, _d)) = decode_raw(session) else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LCX-NOSRC".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -239,6 +244,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
     let exited = exit_wait.map(|o| o.met).unwrap_or(false);
     if !exited {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LCX-NOEXIT".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -269,6 +275,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             Ok(w) => w,
             Err(e) => {
                 findings.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "TEARDOWN-WINDOW-UNREADABLE".into(),
                     rule_id: None,
                     severity: Severity::Warn,
@@ -321,6 +328,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
 
     if !unrestored.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LCX-TEARDOWN-MISSING".into(),
             rule_id: None,
             severity: Severity::Error,
@@ -348,6 +356,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         });
     } else if !engaged.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LCX-TEARDOWN-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -373,6 +382,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         });
     } else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LCX-NOTHING-ENGAGED".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -400,6 +410,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
     for sig in [2, 15] {
         if session.restart().is_err() {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "LCX-NORESTART".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -427,6 +438,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
             .unwrap_or(false);
         if !died {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "LCX-SIGNAL-IGNORED".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -456,6 +468,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
                 Ok(w) => w,
                 Err(e) => {
                     findings.push(Finding {
+                        kind: crate::audit::FindingKind::Defect,
                         id: "LCX-SIGNAL-WINDOW-UNREADABLE".into(),
                         rule_id: None,
                         severity: Severity::Warn,
@@ -480,6 +493,7 @@ pub fn lifecycle_exit_audit(session: &mut Session) -> Vec<Finding> {
         let trace_s = crate::protocol::ProtocolTrace::decode(&bytes_s);
         let resets = trace_s.modes.iter().filter(|m| !m.set).count();
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "LCX-SIGNAL-EXIT".into(),
             rule_id: None,
             severity: Severity::Info,

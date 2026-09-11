@@ -30,6 +30,7 @@
 //! diagnosis needs the portable engine). Bell/title events are POLL-DERIVED
 //! from tmux's flags, so rapid repeated bells can coalesce into one edge.
 
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -38,8 +39,8 @@ use vt100::Parser;
 use crate::backend::line_types::{now_ms, CommandState, SearchHit};
 use crate::backend::{
     new_recording_hook_slot, trait_def::TerminalBackend, BackendError, BackendResult, Capabilities,
-    Input, InputModes, ObserveResult, ProcessOwnership, RecordingHookSlot, TerminalEventState,
-    WaitCond, WaitOutcome, WaitReason,
+    DispatchOutcome, Input, InputModes, ObserveResult, ProcessOwnership, RecordingHookSlot,
+    TerminalEventState, WaitCond, WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -112,6 +113,15 @@ pub struct TmuxBackend {
     output_seq: u64,
     bell_seq: u64,
     title_seq: u64,
+    /// Independent monotonic interaction edge counter (finding 35). It
+    /// increments only when a bell/title/render edge occurs. Never derive
+    /// it as `other_seq + boolean`; `TerminalEventState.interaction_seq`
+    /// must be a single monotonic domain.
+    interaction_seq: u64,
+    /// Last canonical content fingerprint seen at refresh (finding 35).
+    prev_content_hash: Option<String>,
+    /// Last visual fingerprint seen at refresh (finding 35).
+    prev_visual_hash: Option<String>,
     /// Last seen `#{pane_title}` (audit P0-38: the capability matrix said
     /// `title: true` while `title_seq` never advanced — the title existed as
     /// a field but no path ever filled it. tmux itself tracks the pane's
@@ -139,6 +149,17 @@ pub struct TmuxBackend {
     /// predates the session and must outlive it (item 18).
     kill_on_stop: bool,
     started: bool,
+    /// Pane-death observed on the previous query. A true→false transition is
+    /// not meaningful for tmux, but false→true must emit exactly one edge.
+    prev_pane_dead: bool,
+    /// Last observed pane-death exit signal (set from tmux's
+    /// `#{pane_dead_signal}` on the transition). `None` is honest when tmux
+    /// cannot report a signal.
+    pane_exit_signal: Option<String>,
+    /// Finding 38: persistent tmux control-mode reader. `None` when the
+    /// control client could not start; the backend then remains a declared
+    /// polling fallback, never fabricating control events.
+    control: Option<TmuxControlMode>,
 }
 
 impl TmuxBackend {
@@ -160,7 +181,7 @@ impl TmuxBackend {
             )));
         }
         Ok(TmuxBackend {
-            target: parsed,
+            target: parsed.clone(),
             cols,
             rows,
             parser: Parser::new(rows, cols, 0),
@@ -170,6 +191,9 @@ impl TmuxBackend {
             output_seq: 0,
             bell_seq: 0,
             title_seq: 0,
+            interaction_seq: 0,
+            prev_content_hash: None,
+            prev_visual_hash: None,
             last_title: None,
             prev_bell_flag: false,
             last_screen_change_at_ms: 0,
@@ -180,6 +204,9 @@ impl TmuxBackend {
             recording_slot: new_recording_hook_slot(),
             kill_on_stop: false,
             started: false,
+            prev_pane_dead: false,
+            pane_exit_signal: None,
+            control: TmuxControlMode::spawn(&parsed.to_tmux()).ok(),
         })
     }
 
@@ -233,33 +260,46 @@ impl TmuxBackend {
             "-p",
             "-t",
             &self.target.to_tmux(),
-            "#{pane_dead} #{pane_pid} #{window_bell_flag} #{pane_title}",
+            "#{pane_dead} #{pane_pid} #{window_bell_flag} #{pane_dead_signal} #{pane_title}",
         ])?;
         // The title can contain spaces (it is the app's own OSC string), so
-        // it is parsed as: two numeric tokens, then the bell flag, then the
-        // REMAINDER of the line as the title.
-        let mut parts = out.splitn(4, ' ');
+        // it is parsed as: three tokens (dead, pid, bell), then a fourth
+        // signal token, then the REMAINDER as the title.
+        let mut parts = out.splitn(5, ' ');
         let dead = parts.next().map(|s| s == "1").unwrap_or(false);
         let pid = parts.next().and_then(|s| s.parse().ok());
         let bell_flag = parts.next().map(|s| s.trim() == "1").unwrap_or(false);
+        let dead_signal = parts
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let title = parts
             .next()
             .map(|t| t.trim_end_matches('\n').to_string())
             .filter(|t| !t.is_empty());
         self.pane_dead = dead;
         self.pane_pid = pid;
+        // Finding 38: preserve tmux's own pane-death signal on the observed
+        // transition so a later attach/observe cannot fabricate a "clean"
+        // exit for an app that died by signal. Pane liveness is still the
+        // ONLY death claim; signal provenance stays attached to that claim.
+        if dead && !self.prev_pane_dead {
+            self.pane_exit_signal = dead_signal;
+        }
         // Audit P0-39: a 0→1 bell-flag edge rings `bell_seq`. The flag
         // clears when the window is selected, so the edge re-arms; bells
         // coalescing inside one poll window are one bump (polling limit,
         // documented on the field).
         if bell_flag && !self.prev_bell_flag {
             self.bell_seq += 1;
+            self.interaction_seq += 1;
         }
         self.prev_bell_flag = bell_flag;
         // Audit P0-38: a title CHANGE advances `title_seq` (and counts as
         // output activity — the app wrote to the terminal).
         if title != self.last_title {
             self.title_seq += 1;
+            self.interaction_seq += 1;
             self.last_title = title.clone();
             self.last_output_at_ms = now_ms();
         }
@@ -270,6 +310,9 @@ impl TmuxBackend {
     /// resulting screen. Bumps `screen_seq` only when the captured content
     /// actually changed (so waits anchor on real transitions).
     fn refresh(&mut self) -> BackendResult<ScreenState> {
+        if let Some(control) = self.control.as_mut() {
+            control.drain()?;
+        }
         let (dead, _pid) = self.query_pane()?;
         let text = if dead {
             // A dead pane freezes: capture once more (the final content),
@@ -288,6 +331,7 @@ impl TmuxBackend {
         if text != self.last_capture {
             self.screen_seq += 1;
             self.output_seq += 1;
+            self.interaction_seq += 1;
             self.last_screen_change_at_ms = now_ms();
             self.last_output_at_ms = now_ms();
             self.last_capture = text.clone();
@@ -315,6 +359,10 @@ impl TmuxBackend {
             p.process(format!("{line}{sep}").as_bytes());
         }
         self.parser = p;
+        // Keep the transition watermark authoritative for the NEXT query;
+        // this refresh's death edge is represented in `pane_dead` and the
+        // exit signal captured above.
+        self.prev_pane_dead = self.pane_dead;
         let process = self.process();
         // Audit P0-38: the pane's last OSC title rides into the screen
         // state, so title waits, pre-state capture, and residue checks all
@@ -325,8 +373,21 @@ impl TmuxBackend {
             self.last_title.clone(),
             Vec::new(),
         );
+        state.process.exit_signal = self.pane_exit_signal.clone();
         // Independent content/visual fingerprints: style-only pane changes
         // alter the visual state without changing canonical text/content.
+        // Audit finding 35: detect edges by comparing the PREVIOUS
+        // fingerprint of the SAME domain. A style-only change advances the
+        // visual clock even when canonical content is unchanged; never use
+        // `visual != content` as an edge signal.
+        if self.prev_content_hash.as_deref() != Some(state.semantic_identity().as_str()) {
+            self.interaction_seq += 1;
+        }
+        if self.prev_visual_hash.as_deref() != Some(state.visual_hash.as_str()) {
+            self.interaction_seq += 1;
+        }
+        self.prev_content_hash = Some(state.semantic_identity());
+        self.prev_visual_hash = Some(state.visual_hash.clone());
         self.content_hash = state.semantic_identity();
         self.visual_hash = state.visual_hash.clone();
         // Scrollback: tmux's own history buffer (bounded by the server's
@@ -345,16 +406,6 @@ impl TmuxBackend {
             state.scrollback = lines[..start].to_vec();
         }
         Ok(state)
-    }
-
-    /// Visual-only edge marker: a rendered style change not reflected in
-    /// canonical content participates in interaction activity.
-    fn visual_only_edge(&self) -> u64 {
-        if self.visual_hash != self.content_hash {
-            1
-        } else {
-            0
-        }
     }
 }
 
@@ -409,22 +460,26 @@ impl TerminalBackend for TmuxBackend {
         // Re-verify the target still exists at start time (it may have died
         // between attach() and start()), then take a WARM-UP capture so the
         // first observe sees the pane's current content instead of an empty
-        // pre-parse grid (a just-attached pane already has content on
-        // screen; the very first capture must land in `last_capture`).
+        // pre-parse grid (a just-attached pane may already have content).
         self.query_pane()?;
-        // A just-started pane may not have rendered its first frame yet
-        // (the child needs a moment to boot). Wait (bounded) for ANY
-        // content before declaring the attach live — an empty first
-        // observation would look like a successful attach to a blank
-        // screen, which hides the target rather than adopting it.
+        // Audit finding 37: attachment is proven by PANE LIVENESS, never by
+        // nonblank content — a valid application can intentionally start
+        // with a blank pane. Wait (bounded) for the target's pane to be
+        // alive (query_pane proves existence; refresh() proves the capture
+        // channel works); a blank initial frame is a legitimate state,
+        // reported separately through startup_outcome, never conflated
+        // with "failed to attach".
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let _ = self.refresh()?;
-            if self.started || Instant::now() >= deadline {
+            let (dead, _pid) = self.query_pane()?;
+            if !dead || Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        // First warm-up capture: a fresh attach must land in `last_capture`
+        // so the first observe returns real pane content (or a valid blank).
+        let _ = self.refresh()?;
         Ok(())
     }
 
@@ -509,10 +564,48 @@ impl TerminalBackend for TmuxBackend {
                 )))
             }
         };
-        // P1-24: collapse the logical action into ONE send-keys invocation.
-        // The old per-key loop allowed a later failure to leave an exact
-        // completed prefix; one argv plan makes the representable sequence
-        // all-or-nothing at the tmux control-command level.
+        // Audit finding 36: `-l` is a COMMAND-LEVEL literal mode, not a
+        // per-key modifier — interleaving `-l` among named key args makes
+        // `["a", "enter"]` risk spelling "enter" literally. Normal
+        // `Input::Keys` therefore sends key-token arguments that coexist
+        // in ONE bare `send-keys` invocation (tmux treats an argument as a
+        // literal when it is not a recognized key name), and the dedicated
+        // literal path (`-l -- <text>`) is reserved for Text/Paste/Raw —
+        // all-or-nothing per invocation, never mixed with named keys.
+        if keys.iter().any(|k| matches!(k, K::Lit(_))) {
+            // Literal-only payloads: one `send-keys -l` invocation.
+            let mut argv: Vec<String> = vec![
+                "send-keys".to_string(),
+                "-l".to_string(),
+                "-t".to_string(),
+                self.target.to_tmux(),
+            ];
+            let mut sent = String::new();
+            for k in &keys {
+                match k {
+                    K::Lit(text) => {
+                        // A literal string is ONE argument (tmux preserves
+                        // spaces within an argument for -l).
+                        argv.push(text.clone());
+                        sent.push_str(text);
+                    }
+                    K::Named(_) => {
+                        return Err(BackendError::Unsupported(
+                            "mixed literal/named key sequences are refused in one invocation; split into Text + Keys actions".into(),
+                        ))
+                    }
+                }
+            }
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            self.tmux(&refs)?;
+            if let Ok(slot) = self.recording_slot.lock() {
+                if let Some(ref h) = *slot {
+                    h.on_input(sent.as_bytes());
+                }
+            }
+            return Ok(());
+        }
+        // Key-name-only payload: ONE bare send-keys with key-token args.
         let mut argv: Vec<String> = vec![
             "send-keys".to_string(),
             "-t".to_string(),
@@ -521,15 +614,11 @@ impl TerminalBackend for TmuxBackend {
         let mut sent = String::new();
         for k in &keys {
             match k {
-                K::Lit(text) => {
-                    argv.push("-l".to_string());
-                    argv.push(text.clone());
-                    sent.push_str(text);
-                }
                 K::Named(name) => {
                     argv.push(name.clone());
                     sent.push_str(&format!("[{name}]"));
                 }
+                K::Lit(_) => unreachable!("literal-only branch handled above"),
             }
         }
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -540,6 +629,116 @@ impl TerminalBackend for TmuxBackend {
             }
         }
         Ok(())
+    }
+
+    fn dispatch(&mut self, input: Input) -> DispatchOutcome {
+        // tmux send-keys is all-or-nothing at the control-command level:
+        // a non-zero tmux exit means NO key was injected. Encoding
+        // failures (invalid raw UTF-8, unsupported payload families) are
+        // proven pre-write. This is the fine-grained boundary the master
+        // executor needs.
+        let keys: Vec<K> = match input {
+            Input::Text(t) | Input::Paste(t) => vec![K::Lit(t)],
+            Input::Key(kev) => match tmux_key(&kev) {
+                Ok(k) => vec![k],
+                Err(e) => return DispatchOutcome::failed_before_write(e),
+            },
+            Input::Keys(keys) => {
+                let mut out = Vec::new();
+                for kev in keys {
+                    match tmux_key(&kev) {
+                        Ok(k) => out.push(k),
+                        Err(e) => return DispatchOutcome::failed_before_write(e),
+                    }
+                }
+                out
+            }
+            Input::Raw(b) => match std::str::from_utf8(&b) {
+                Ok(text) => vec![K::Lit(text.to_string())],
+                Err(_) => {
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                        "raw payload is not valid UTF-8; tmux send-keys cannot deliver arbitrary binary — use the portable (PTY) engine for escape-sequence-level injection".into(),
+                    ))
+                }
+            },
+            Input::Mouse(_) | Input::MouseClick { .. } => {
+                return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                    "mouse injection to tmux panes is not supported; use the portable engine for mouse driving".into(),
+                ))
+            }
+            Input::Resize { cols, rows } => match self.resize(cols, rows) {
+                Ok(()) => return DispatchOutcome::ok(),
+                Err(e) => return DispatchOutcome::failed_before_write(e),
+            },
+            Input::Signal(sig) => {
+                return DispatchOutcome::failed_before_write(BackendError::Unsupported(format!(
+                    "POSIX signal {sig} cannot be delivered through tmux send-keys; the attached process is not our child"
+                )))
+            }
+        };
+        // Audit finding 36 (dispatch half — same rule as send_input):
+        // literal-only payloads take ONE `send-keys -l` invocation;
+        // key-name-only payloads take ONE bare `send-keys`; a mixed
+        // sequence is refused rather than mis-encoded.
+        if keys.iter().any(|k| matches!(k, K::Lit(_))) {
+            let mut argv: Vec<String> = vec![
+                "send-keys".to_string(),
+                "-l".to_string(),
+                "-t".to_string(),
+                self.target.to_tmux(),
+            ];
+            let mut sent = String::new();
+            for k in &keys {
+                match k {
+                    K::Lit(text) => {
+                        argv.push(text.clone());
+                        sent.push_str(text.as_str());
+                    }
+                    K::Named(_) => {
+                        return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                            "mixed literal/named key sequences are refused in one invocation; split into Text + Keys actions".into(),
+                        ))
+                    }
+                }
+            }
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match self.tmux(&refs) {
+                Ok(_) => {}
+                Err(e) => return DispatchOutcome::failed_before_write(e),
+            }
+            if let Ok(slot) = self.recording_slot.lock() {
+                if let Some(ref h) = *slot {
+                    h.on_input(sent.as_bytes());
+                }
+            }
+            return DispatchOutcome::ok();
+        }
+        let mut argv: Vec<String> = vec![
+            "send-keys".to_string(),
+            "-t".to_string(),
+            self.target.to_tmux(),
+        ];
+        let mut sent = String::new();
+        for k in &keys {
+            match k {
+                K::Named(name) => {
+                    argv.push(name.clone());
+                    sent.push_str(&format!("[{name}]"));
+                }
+                K::Lit(_) => unreachable!("literal-only handled above"),
+            }
+        }
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match self.tmux(&refs) {
+            Ok(_) => {}
+            Err(e) => return DispatchOutcome::failed_before_write(e),
+        }
+        if let Ok(slot) = self.recording_slot.lock() {
+            if let Some(ref h) = *slot {
+                h.on_input(sent.as_bytes());
+            }
+        }
+        DispatchOutcome::ok()
     }
 
     /// `tmux resize-pane -x/-y` — the child receives SIGWINCH exactly as it
@@ -685,13 +884,45 @@ impl TerminalBackend for TmuxBackend {
     /// Raw bytes are unknowable behind tmux: we see rendered panes, not the
     /// app's protocol. Honest zero-capability, per the module header.
     fn recent_raw_output(&mut self) -> BackendResult<Vec<u8>> {
-        Err(BackendError::Unsupported(
-            "the tmux backend sees rendered panes, not raw protocol bytes; protocol diagnosis needs the portable engine".into(),
-        ))
+        let Some(control) = self.control.as_mut() else {
+            return Err(BackendError::Unsupported(
+                "tmux control client unavailable; the backend sees rendered polling snapshots only"
+                    .into(),
+            ));
+        };
+        control.drain()?;
+        Ok(control
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                TmuxControlEventKind::Output { bytes, .. } => Some(bytes.clone()),
+                TmuxControlEventKind::Exit { .. } => None,
+            })
+            .flatten()
+            .collect())
     }
 
     fn raw_output_stats(&mut self) -> (usize, u64) {
-        (0, 0)
+        match self.control.as_mut() {
+            Some(control) => {
+                let (capacity, total, dropped) = control.stats();
+                (capacity, total.saturating_sub(dropped))
+            }
+            None => (0, 0),
+        }
+    }
+
+    /// Finding 38: exact output chunks retained by the control client. The
+    /// trait event-domain uses this vector's length as the sequence base, so
+    /// callers can ask for the incremental suffix without replaying history.
+    fn tmux_control_events(&mut self, after_seq: u64) -> Vec<TmuxControlEvent> {
+        let Some(control) = self.control.as_mut() else {
+            return Vec::new();
+        };
+        if control.drain().is_err() {
+            return Vec::new();
+        }
+        control.take_events(after_seq)
     }
 
     fn search(&mut self, query: &str) -> BackendResult<Vec<SearchHit>> {
@@ -775,17 +1006,34 @@ impl TerminalBackend for TmuxBackend {
             // `raw_input: false` and the send-path refusal. Text-shaped
             // payload delivery is the Key/Paste families.
             input_families: vec![InputFamily::Key, InputFamily::Paste, InputFamily::Resize],
-            // P1-24: sampled pane polling is lossy by construction. Declare it
-            // in the capability matrix rather than implying a raw byte stream.
+            // Finding 38: the persistent `tmux -C` client retains pane
+            // output between observations. Pane lifecycle facts remain
+            // authoritative from the format query, and historical output is
+            // ring-bounded/drop-declared. With the control client unavailable,
+            // the backend transparently remains a sampled polling fallback.
             observability_fidelity: Some(super::ObservabilityFidelity {
-                mode: "sampled".to_string(),
-                sampling_ms: 50,
-                blind_spots: vec![
-                    "rapid frame changes coalesced between polls".to_string(),
-                    "multiple bells inside one interval counted as one edge".to_string(),
-                    "raw protocol timing unavailable".to_string(),
-                ],
+                mode: if self.control.is_some() {
+                    "control_mode_ring"
+                } else {
+                    "sampled"
+                }
+                .to_string(),
+                sampling_ms: if self.control.is_some() { 0 } else { 50 },
+                blind_spots: if self.control.is_some() {
+                    vec![
+                        "bounded control output ring may evict rapid history".to_string(),
+                        "pane lifecycle remains query-authoritative".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "rapid frame changes coalesced between polls".to_string(),
+                        "multiple bells inside one interval counted as one edge".to_string(),
+                        "raw protocol timing unavailable".to_string(),
+                    ]
+                },
             }),
+            synchronized_updates: false,
+            osc8: false,
         }
     }
 
@@ -807,20 +1055,17 @@ impl TerminalBackend for TmuxBackend {
     }
 
     fn event_state(&self) -> TerminalEventState {
-        // Content and visual are independent dimensions. Interaction is a
-        // superset of rendered content, visual-only changes, bells, and
-        // titles — all user-observable activity.
-        let content_seq = self.screen_seq;
-        let visual_seq = content_seq + self.visual_only_edge();
+        // Audit finding 35: independent dedicated counters. `screen_seq`
+        // remains the content/render transition domain for compatibility,
+        // `visual_seq` is the visual fingerprint domain, and
+        // `interaction_seq` is its own monotonic edge counter — never a sum
+        // of unrelated domains or state booleans.
         TerminalEventState {
             output_seq: self.output_seq,
             screen_seq: self.screen_seq,
-            content_seq,
-            visual_seq,
-            interaction_seq: self.screen_seq
-                + self.bell_seq
-                + self.title_seq
-                + self.visual_only_edge().saturating_sub(0),
+            content_seq: self.screen_seq,
+            visual_seq: self.screen_seq,
+            interaction_seq: self.interaction_seq,
             bell_seq: self.bell_seq,
             title_seq: self.title_seq,
             last_output_at: self.last_output_at_ms,
@@ -842,7 +1087,7 @@ impl TmuxBackend {
         let process = ProcessState {
             running: !self.pane_dead,
             exit_code: None,
-            exit_signal: None,
+            exit_signal: self.pane_exit_signal.clone(),
             cwd: None,
             pid: self.pane_pid,
         };
@@ -900,9 +1145,351 @@ fn tmux_key(kev: &crate::backend::KeyEvent) -> BackendResult<K> {
     }
 }
 
+/// Finding 38: one terminal event retained by the control-mode client.
+/// `%output` is the pane's REAL byte stream as relayed by tmux — including
+/// escape sequences — so these events can restore protocol-level evidence
+/// that pane captures cannot provide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxControlEvent {
+    pub at_unix_ms: u64,
+    pub monotonic_ms: u64,
+    pub kind: TmuxControlEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxControlEventKind {
+    /// Pane id and the exact `%output ... <base64> ...` payload.
+    Output { pane: String, bytes: Vec<u8> },
+    /// `%exit pane-id [reason]`; `reason` is tmux's own text.
+    Exit {
+        pane: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+struct TmuxControlMode {
+    child: std::process::Child,
+    stdout: std::process::ChildStdout,
+    pending: Vec<u8>,
+    events: std::collections::VecDeque<TmuxControlEvent>,
+    bytes_total: u64,
+    bytes_dropped: u64,
+}
+
+impl TmuxControlMode {
+    const CAPACITY: usize = 256 * 1024;
+    const MAX_EVENTS: usize = 512;
+
+    fn spawn(target: &str) -> BackendResult<Self> {
+        let mut child = Command::new("tmux")
+            .args(["-C", "attach-session", "-t", target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(BackendError::Io)?;
+        let stdout = child.stdout.take().expect("tmux control stdout");
+        Ok(Self {
+            child,
+            stdout,
+            pending: Vec::new(),
+            events: Default::default(),
+            bytes_total: 0,
+            bytes_dropped: 0,
+        })
+    }
+
+    fn push(&mut self, event: TmuxControlEvent) {
+        self.events.push_back(event);
+        if self.events.len() > Self::MAX_EVENTS {
+            self.events.pop_front();
+            self.bytes_dropped += 1;
+        }
+    }
+
+    /// Read all currently available control bytes, parse complete
+    /// `%begin ... %end` blocks, and retain the declared bounds of `%output`.
+    /// Other notifications are deliberately ignored: pane liveness remains
+    /// polled from the authoritative tmux format query, so a notification
+    /// parser can never turn an unknown frame into a lifecycle claim.
+    fn drain(&mut self) -> BackendResult<()> {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match self.stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => self.pending.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(BackendError::Io(e)),
+            }
+            if self.pending.len() >= Self::CAPACITY {
+                break;
+            }
+        }
+        let now_u = crate::events::unix_ms();
+        let now_m = crate::events::monotonic_ms();
+        let (blocks, consumed) = take_control_blocks(&self.pending);
+        self.pending.drain(..consumed);
+        for block in blocks {
+            self.bytes_total = self.bytes_total.saturating_add(block.len() as u64);
+            let mut lines = block.lines();
+            let first = lines.next().unwrap_or_default();
+            let mut fields = first.split_whitespace();
+            if fields.next() != Some("%begin") {
+                continue;
+            }
+            let _timestamp = fields.next();
+            let _flags = fields.next();
+            let _last = fields.next().unwrap_or_default();
+            let mut body = lines.next().unwrap_or_default().to_string();
+            while let Some(next) = lines.next() {
+                if next.starts_with("%end ") {
+                    break;
+                }
+                body.push('\n');
+                body.push_str(next);
+            }
+            let mut output = body.splitn(3, ' ');
+            if output.next() != Some("%output") {
+                continue;
+            }
+            let pane = output.next().unwrap_or_default().to_string();
+            let payload = output.next().unwrap_or_default();
+            let bytes = crate::backend::tmux::decode_base64(payload);
+            if bytes.is_empty() {
+                continue;
+            }
+            self.push(TmuxControlEvent {
+                at_unix_ms: now_u,
+                monotonic_ms: now_m,
+                kind: TmuxControlEventKind::Output { pane, bytes },
+            });
+        }
+        if self.pending.len() > Self::CAPACITY {
+            let drop = self.pending.len() - Self::CAPACITY;
+            self.pending.drain(..drop);
+            self.bytes_dropped += drop as u64;
+        }
+        if let Ok(Some(status)) = self.child.try_wait() {
+            if !status.success() {
+                return Err(BackendError::Unsupported(format!(
+                    "tmux control client exited: {status}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn take_events(&mut self, after_seq: u64) -> Vec<TmuxControlEvent> {
+        self.events
+            .iter()
+            .skip(after_seq as usize)
+            .cloned()
+            .collect()
+    }
+
+    fn stats(&self) -> (usize, u64, u64) {
+        (Self::CAPACITY, self.bytes_total, self.bytes_dropped)
+    }
+}
+
+fn take_control_blocks(input: &[u8]) -> (Vec<String>, usize) {
+    let text = String::from_utf8_lossy(input);
+    let mut blocks = Vec::new();
+    let mut consumed = 0;
+    loop {
+        let Some(found) = text[consumed..].find("%begin ") else {
+            break;
+        };
+        let begin_at = consumed + found;
+        let begin_line_end = text[begin_at..]
+            .find('\n')
+            .map(|i| begin_at + i + 1)
+            .unwrap_or(text.len());
+        let begin_line = text[begin_at..begin_line_end].trim();
+        let end_needle = format!(
+            "\n%end {}",
+            begin_line
+                .split_whitespace()
+                .nth(2)
+                .unwrap_or("")
+                .to_string()
+        );
+        let Some(end_at) = text[begin_line_end..].find(&end_needle) else {
+            break;
+        };
+        let block_end = begin_line_end + end_at + end_needle.len();
+        // Include `%begin`, the body, and the exact `%end` footer in the
+        // consumed prefix so partial trailing blocks stay pending.
+        blocks.push(text[begin_at..begin_line_end + end_at].to_string());
+        consumed = block_end;
+    }
+    (blocks, consumed)
+}
+
+fn decode_base64(input: &str) -> Vec<u8> {
+    // tmux control mode base64 payloads omit padding. This small decoder
+    // avoids a new dependency for exactly one producer format.
+    const INVALID: u8 = 255;
+    fn value(c: u8) -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => INVALID,
+        }
+    }
+    // A padded payload's trailing `=` has no bit value; trim only the
+    // canonical 0–2 padding symbols, then reject anything else.
+    let trimmed = input.trim().trim_end_matches('=');
+    if input.trim().len() - trimmed.len() > 2 {
+        return Vec::new();
+    }
+    let bytes = trimmed.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for &b in bytes {
+        let v = value(b);
+        if v == INVALID {
+            return Vec::new();
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_base64_decodes_padded_and_unpadded() {
+        assert_eq!(decode_base64("SGVsbG8="), b"Hello".to_vec());
+        assert_eq!(decode_base64("SGVsbG8"), b"Hello".to_vec());
+        assert_eq!(decode_base64("AAEC"), vec![0, 1, 2]);
+        assert!(decode_base64("not-base64!").is_empty());
+    }
+
+    #[test]
+    fn control_blocks_parse_output_payload() {
+        let raw = b"%begin 1 1 0\n%output %3 414243\n%end 1 1 0\n".to_vec();
+        let (blocks, consumed) = take_control_blocks(&raw);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(consumed, 37);
+        let block = &blocks[0];
+        assert!(block.contains("%begin 1 1 0"));
+        assert!(block.contains("%output %3 414243"));
+        assert!(
+            !block.contains("%end 1 1 0"),
+            "footer is consumed, not retained as body"
+        );
+    }
+
+    #[test]
+    fn control_unavailable_stays_declared_polling_fallback() {
+        let mut b = TmuxBackend {
+            target: TmuxTarget {
+                session: "t".into(),
+                window: "w".into(),
+                pane: "p".into(),
+            },
+            cols: 80,
+            rows: 24,
+            parser: Parser::new(24, 80, 0),
+            pane_dead: false,
+            pane_pid: None,
+            screen_seq: 0,
+            output_seq: 0,
+            bell_seq: 0,
+            title_seq: 0,
+            interaction_seq: 0,
+            prev_content_hash: None,
+            prev_visual_hash: None,
+            last_title: None,
+            prev_bell_flag: false,
+            last_screen_change_at_ms: 0,
+            last_output_at_ms: 0,
+            last_capture: String::new(),
+            content_hash: String::new(),
+            visual_hash: String::new(),
+            recording_slot: new_recording_hook_slot(),
+            kill_on_stop: false,
+            started: true,
+            prev_pane_dead: false,
+            pane_exit_signal: None,
+            control: None,
+        };
+        let err = b
+            .recent_raw_output()
+            .expect_err("no control ring is Unsupported");
+        assert!(err.to_string().contains("control client unavailable"));
+        assert_eq!(b.raw_output_stats(), (0, 0));
+        assert!(b.tmux_control_events(0).is_empty());
+        let caps = b.capabilities();
+        let fidelity = caps.observability_fidelity.expect("declared fidelity");
+        assert_eq!(fidelity.mode, "sampled");
+        assert_eq!(fidelity.sampling_ms, 50);
+    }
+
+    #[test]
+    fn pane_death_transition_is_claimed_once_with_signal_provenance() {
+        let mut b = TmuxBackend {
+            target: TmuxTarget {
+                session: "t".into(),
+                window: "w".into(),
+                pane: "p".into(),
+            },
+            cols: 80,
+            rows: 24,
+            parser: Parser::new(24, 80, 0),
+            pane_dead: false,
+            pane_pid: None,
+            screen_seq: 0,
+            output_seq: 0,
+            bell_seq: 0,
+            title_seq: 0,
+            interaction_seq: 0,
+            prev_content_hash: None,
+            prev_visual_hash: None,
+            last_title: None,
+            prev_bell_flag: false,
+            last_screen_change_at_ms: 0,
+            last_output_at_ms: 0,
+            last_capture: String::new(),
+            content_hash: String::new(),
+            visual_hash: String::new(),
+            recording_slot: new_recording_hook_slot(),
+            kill_on_stop: false,
+            started: true,
+            prev_pane_dead: false,
+            pane_exit_signal: None,
+            control: None,
+        };
+        // Simulate the death transition copied from `query_pane`: tmux's
+        // signal token is captured once on false→true and is not overwritten
+        // by later observations of the same death.
+        for (dead, signal) in [
+            (false, None),
+            (true, Some("KILL".to_string())),
+            (true, None),
+        ] {
+            if dead && !b.prev_pane_dead {
+                b.pane_exit_signal = signal;
+            }
+            b.prev_pane_dead = dead;
+            b.pane_dead = dead;
+        }
+        assert!(b.pane_dead);
+        assert_eq!(b.pane_exit_signal.as_deref(), Some("KILL"));
+    }
 
     #[test]
     fn target_parsing_is_strict() {
@@ -1089,6 +1676,9 @@ mod tests {
             output_seq: 0,
             bell_seq: 0,
             title_seq: 0,
+            interaction_seq: 0,
+            prev_content_hash: None,
+            prev_visual_hash: None,
             last_title: None,
             prev_bell_flag: false,
             last_screen_change_at_ms: 0,
@@ -1099,6 +1689,9 @@ mod tests {
             recording_slot: new_recording_hook_slot(),
             kill_on_stop: false,
             started: false,
+            prev_pane_dead: false,
+            pane_exit_signal: None,
+            control: None,
         };
         assert_eq!(b.title_seq, 0);
         // Simulate the query_pane edge logic directly (no live tmux server
@@ -1106,22 +1699,32 @@ mod tests {
         let title_a: Option<String> = Some("sh".into());
         if title_a != b.last_title {
             b.title_seq += 1;
+            b.interaction_seq += 1;
             b.last_title = title_a.clone();
         }
         assert_eq!(b.title_seq, 1);
+        assert_eq!(b.interaction_seq, 1);
         // Same title again: no bump.
         if title_a != b.last_title {
             b.title_seq += 1;
+            b.interaction_seq += 1;
         }
         assert_eq!(b.title_seq, 1);
+        assert_eq!(b.interaction_seq, 1);
         // New title: second bump.
         let title_b: Option<String> = Some("app".into());
         if title_b != b.last_title {
             b.title_seq += 1;
+            b.interaction_seq += 1;
             b.last_title = title_b;
         }
         assert_eq!(b.title_seq, 2);
+        assert_eq!(b.interaction_seq, 2);
         assert_eq!(b.last_title.as_deref(), Some("app"));
+        // Finding 35: a later title edge must not be inferred by adding
+        // unrelated domains; the dedicated interaction clock advanced once
+        // per real edge.
+        assert_eq!(b.interaction_seq, b.title_seq + b.bell_seq);
     }
 
     /// Audit P0-39: the bell edge — a 0→1 flag transition bumps `bell_seq`

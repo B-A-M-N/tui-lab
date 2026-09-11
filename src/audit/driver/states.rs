@@ -24,6 +24,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         Ok(t) => t,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "STATES-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -50,6 +51,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
 
     if !disabled.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "STATES-DISABLED".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -83,6 +85,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
     }
     if !empty_like.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "STATES-EMPTY-CONTROLS".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -143,6 +146,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
         }
         if !focused_disabled.is_empty() {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "STATES-DISABLED-FOCUSABLE".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -169,6 +173,7 @@ pub fn states_audit(session: &mut Session, max_tabs: u32) -> Vec<Finding> {
 
     if findings.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "STATES-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -205,6 +210,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
         Ok(s) => s.process.running,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "ERR-AUDIT-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -270,6 +276,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
     };
     if was_running && !still_running {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "ERR-CRASH".into(),
             rule_id: None,
             severity: Severity::Error,
@@ -337,6 +344,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
                 .cloned()
                 .collect();
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "ERR-ON-SCREEN".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -362,6 +370,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
             });
         } else if !weak.is_empty() {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "ERR-TEXT-HINT".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -387,6 +396,7 @@ pub fn errors_audit(session: &mut Session, burst: u32) -> Vec<Finding> {
             });
         } else {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "ERR-OK".into(),
                 rule_id: None,
                 severity: Severity::Info,

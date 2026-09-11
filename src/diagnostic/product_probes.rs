@@ -209,17 +209,26 @@ pub async fn scenario_record_replay() -> ProductProbe {
         let _ = server.sessions.stop(&sid).await;
         return ProductProbe::fail(name, e);
     }
-    // Replay through the same canonical executor.
+    // Replay through the same canonical executor. Use repeat=2 as the
+    // explicit reset contract: a scenario-owned relaunch is not available
+    // here, so the second pass would otherwise start from accumulated UI
+    // state (finding 18). The refusal is the honest doctor result.
     let replay = data_of(
         &server
             .tui_scenario(params(json!({
-                "action": "run", "name": "doctor-probe", "id": sid,
+                "action": "run", "name": "doctor-probe", "id": sid, "repeat": 2,
             })))
             .await,
         "scenario run",
     );
     let _ = server.sessions.stop(&sid).await;
     match replay {
+        Ok(v) if v.get("repeat_verdict").and_then(|x| x.as_str()) == Some("no_reset_contract") => {
+            ProductProbe::fail(
+                name,
+                "repeat replay was refused without a reset contract; run once without repeat or record with launch ownership",
+            )
+        }
         Ok(v) => {
             let steps = v["executed"]
                 .as_u64()

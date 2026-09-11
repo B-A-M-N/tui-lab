@@ -603,6 +603,22 @@ pub struct ProfileReport {
 /// `contract` feeds `profile=contract` (Wave E item 49); other profiles
 /// ignore it.
 pub fn run_profile(session: &mut Session, profile_name: &str) -> Result<ProfileReport, String> {
+    // Audit finding 40: the OBVIOUS/default API is SAFE. An internal or
+    // library caller using the plain helper gets observational-only
+    // behavior (invasive profiles withheld as ORCH-GATED); mutation
+    // requires an explicit `run_profile_checked(..., AllowMutation)` (or
+    // the unmistakably-named `run_profile_allow_mutation` alias below).
+    run_profile_checked(session, profile_name, None, SafetyPolicy::SafeOnly)
+}
+
+/// The explicitly-permissive entry: mutation-capable profiles with the
+/// exact name that cannot be mistaken for the default. Prefer
+/// `run_profile_checked` with an explicit policy at call sites that must
+/// be auditable.
+pub fn run_profile_allow_mutation(
+    session: &mut Session,
+    profile_name: &str,
+) -> Result<ProfileReport, String> {
     run_profile_checked(session, profile_name, None, SafetyPolicy::AllowMutation)
 }
 
@@ -690,6 +706,7 @@ pub fn run_profile_checked(
                 })
                 .collect();
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Gate,
                 id: "ORCH-GATED".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -733,6 +750,7 @@ pub fn run_profile_checked(
             profile: profile.clone(),
             mode: AuditExecutionMode::Withheld,
             findings: vec![Finding {
+                kind: crate::audit::FindingKind::Gate,
                 id: "ORCH-GATED".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -787,8 +805,22 @@ fn run_profile_inner(
     run_profile_with_contract_impl(session, profile, contract, policy)
 }
 
-/// Contract-armed variant with the default (permissive-for-launched) policy.
+/// Contract-armed variant with the SAFE default policy (audit finding 40).
+/// Mutation must be requested through `run_profile_checked(...,
+/// AllowMutation)` or the explicitly named permissive helper — never by an
+/// "obvious" API that happens to carry a contract.
 pub fn run_profile_with_contract(
+    session: &mut Session,
+    profile_name: &str,
+    contract: Option<&crate::design::ProjectContract>,
+) -> Result<ProfileReport, String> {
+    let profile = AuditProfile::parse(profile_name)?;
+    run_profile_with_contract_impl(session, profile, contract, SafetyPolicy::SafeOnly)
+}
+
+/// Explicitly permissive contract-armed helper: the name states what it
+/// does. The obvious contract entry point stays SafeOnly (finding 40).
+pub fn run_profile_with_contract_allow_mutation(
     session: &mut Session,
     profile_name: &str,
     contract: Option<&crate::design::ProjectContract>,
@@ -865,6 +897,7 @@ fn run_profile_with_contract_impl(
             let (fs, m) = run_verified(s, profile.name(), |sess| f(sess)).unwrap_or_else(|e| {
                 (
                     vec![Finding {
+                        kind: crate::audit::FindingKind::Defect,
                         id: "AUDIT-TX-ERR".into(),
                         rule_id: None,
                         severity: Severity::Error,
@@ -916,6 +949,7 @@ fn run_profile_with_contract_impl(
                 profile,
                 mode: AuditExecutionMode::Refused,
                 findings: vec![Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-DEEP-REFUSED".into(),
                     rule_id: None,
                     severity: Severity::Warn,
@@ -937,6 +971,7 @@ fn run_profile_with_contract_impl(
             });
         }
         orchestration_notes.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "ORCH-NO-RESTART".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -967,6 +1002,7 @@ fn run_profile_with_contract_impl(
                 // Give the fresh process a moment to render its first frame.
                 let _ = session.observe(150);
                 Some(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-RESTART".into(),
                     rule_id: None,
                     severity: Severity::Info,
@@ -991,6 +1027,7 @@ fn run_profile_with_contract_impl(
                 })
             }
             Err(e) => Some(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "ORCH-RESTART-FAILED".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -1055,6 +1092,7 @@ fn run_profile_with_contract_impl(
         if restarts > 0 {
             if aborted {
                 fs.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-DEEP-ABORTED".into(),
                     rule_id: None,
                     severity: Severity::Warn,
@@ -1075,6 +1113,7 @@ fn run_profile_with_contract_impl(
                 });
             } else {
                 fs.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "ORCH-DEEP-SUMMARY".into(),
                     rule_id: None,
                     severity: Severity::Info,
@@ -1137,6 +1176,7 @@ fn run_profile_with_contract_impl(
 #[allow(dead_code)]
 fn orchestration_error(profile: &str, summary: String) -> Finding {
     Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: format!("AUDIT-ERR-{}", profile.to_uppercase()),
         rule_id: None,
         severity: Severity::Error,
@@ -1353,7 +1393,7 @@ mod tests {
             .await
             .expect("start");
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "full"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "full"))
             .await
             .expect("actor run")
             .expect("run full");
@@ -1395,7 +1435,7 @@ mod tests {
             .expect("start");
         for name in ["unicode", "controls"] {
             let report = pool
-                .with_session(Some(&id), |s| run_profile(s, name))
+                .with_session(Some(&id), |s| run_profile_allow_mutation(s, name))
                 .await
                 .expect("actor run")
                 .unwrap_or_else(|e| panic!("{name} must run: {e}"));
@@ -1459,7 +1499,9 @@ mod tests {
                 .await;
         }
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "terminal_modes"))
+            .with_session(Some(&id), |s| {
+                run_profile_allow_mutation(s, "terminal_modes")
+            })
             .await
             .expect("actor run")
             .expect("run terminal_modes");
@@ -1486,10 +1528,12 @@ mod tests {
                         let _ = s.observe(300);
                     })
                     .await;
-                pool.with_session(Some(&id), |s| run_profile(s, "terminal_modes"))
-                    .await
-                    .expect("actor run")
-                    .expect("terminal_modes retry")
+                pool.with_session(Some(&id), |s| {
+                    run_profile_allow_mutation(s, "terminal_modes")
+                })
+                .await
+                .expect("actor run")
+                .expect("terminal_modes retry")
             }
         };
         let inv = report
@@ -1553,7 +1597,7 @@ mod tests {
         // still be arriving. Re-run the audit once when a scheduling race
         // leaves the renderer without its startup signature.
         let mut render = pool
-            .with_session(Some(&id), |s| run_profile(s, "rendering"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "rendering"))
             .await
             .expect("actor run")
             .expect("rendering");
@@ -1573,7 +1617,7 @@ mod tests {
                 })
                 .await;
             render = pool
-                .with_session(Some(&id), |s| run_profile(s, "rendering"))
+                .with_session(Some(&id), |s| run_profile_allow_mutation(s, "rendering"))
                 .await
                 .expect("actor run")
                 .expect("rendering retry");
@@ -1590,7 +1634,9 @@ mod tests {
         );
 
         let inp = pool
-            .with_session(Some(&id), |s| run_profile(s, "input_protocol"))
+            .with_session(Some(&id), |s| {
+                run_profile_allow_mutation(s, "input_protocol")
+            })
             .await
             .expect("actor run")
             .expect("input_protocol");
@@ -1600,7 +1646,7 @@ mod tests {
         );
 
         let lc = pool
-            .with_session(Some(&id), |s| run_profile(s, "lifecycle"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "lifecycle"))
             .await
             .expect("actor run")
             .expect("lifecycle");
@@ -1611,7 +1657,7 @@ mod tests {
         );
 
         let sh = pool
-            .with_session(Some(&id), |s| run_profile(s, "shell_cli"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "shell_cli"))
             .await
             .expect("actor run")
             .expect("shell_cli");
@@ -1660,7 +1706,9 @@ mod tests {
                 .await;
         }
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "query_response"))
+            .with_session(Some(&id), |s| {
+                run_profile_allow_mutation(s, "query_response")
+            })
             .await
             .expect("actor run")
             .expect("query_response");
@@ -1698,7 +1746,9 @@ mod tests {
             .await
             .expect("start pipe");
         let report2 = pool2
-            .with_session(Some(&id2), |s| run_profile(s, "query_response"))
+            .with_session(Some(&id2), |s| {
+                run_profile_allow_mutation(s, "query_response")
+            })
             .await
             .expect("actor run")
             .expect("query_response pipe");
@@ -1929,7 +1979,7 @@ mod tests {
             .await
             .expect("start");
         let report = pool
-            .with_session(Some(&id), |s| run_profile(s, "keyboard"))
+            .with_session(Some(&id), |s| run_profile_allow_mutation(s, "keyboard"))
             .await
             .expect("actor run")
             .expect("run keyboard");

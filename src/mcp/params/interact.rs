@@ -84,6 +84,7 @@ impl MutationGuardParam {
             focus_control_id: self.focus_control_id.clone(),
             native_revision: self.native_revision,
             text_visible: self.text_visible.clone(),
+            semantic_identity: None,
         }
     }
 }
@@ -250,6 +251,29 @@ impl TuiCompletionParam {
             TuiCompletionParam::Spec(s) => s.quiet_ms(),
             TuiCompletionParam::Name(_) => None,
         }
+    }
+
+    /// The FULL serialized wire value (audit finding 15): scenario intent
+    /// steps persist the complete `TuiCompletionParam`, not just
+    /// `name()`, so a recorded `text_appears: "Saved"` replays with the
+    /// exact text — the old name-only recording reconstructed
+    /// `TextAppears("")` on replay because the text lived in the spec
+    /// object, not in a top-level `text` property.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!(self.name()))
+    }
+
+    /// Rebuild the wire value from a persisted scenario step (audit
+    /// finding 15 with backward compatibility): a serialized object
+    /// restores exactly; a legacy bare name string migrates through the
+    /// parameterless shorthand.
+    pub fn from_recorded(v: &serde_json::Value) -> Option<TuiCompletionParam> {
+        serde_json::from_value(v.clone()).ok().or_else(|| {
+            v.as_str().map(|s| {
+                serde_json::from_value(serde_json::json!(s))
+                    .unwrap_or(TuiCompletionParam::Name(CompletionName::StableScreen))
+            })
+        })
     }
 }
 
@@ -662,6 +686,24 @@ impl TuiActRequest {
     /// ordinary way to express "kill and wait for exit"; `resize` +
     /// `{"type":"stable_screen","quiet_ms":400}` waits out reflow. The
     /// completion spec is self-contained, so the conversion is lossless.
+    pub fn completion_param(&self) -> Option<TuiCompletionParam> {
+        match self {
+            TuiActRequest::Key(p) => p.common.completion.clone(),
+            TuiActRequest::Keys(p) => p.common.completion.clone(),
+            TuiActRequest::Type(p) => p.common.completion.clone(),
+            TuiActRequest::Paste(p) => p.common.completion.clone(),
+            TuiActRequest::Raw(p) => p.common.completion.clone(),
+            TuiActRequest::MouseClick(p) => p.common.completion.clone(),
+            TuiActRequest::MousePress(p) => p.common.completion.clone(),
+            TuiActRequest::MouseRelease(p) => p.common.completion.clone(),
+            TuiActRequest::MouseMove(p) => p.common.completion.clone(),
+            TuiActRequest::MouseDrag(p) => p.common.completion.clone(),
+            TuiActRequest::MouseScroll(p) => p.common.completion.clone(),
+            TuiActRequest::Resize(p) => p.common.completion.clone(),
+            TuiActRequest::Signal(p) => p.common.completion.clone(),
+        }
+    }
+
     pub fn completion(&self) -> Option<crate::capture::CompletionPolicy> {
         match self {
             TuiActRequest::Key(p) => p.common.completion.clone(),

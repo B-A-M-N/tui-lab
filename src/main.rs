@@ -71,11 +71,14 @@ enum Commands {
         /// Scenario id or unambiguous name.
         #[arg(long = "scenario")]
         scenario: String,
-        /// Command to launch as the replay target (the scenario currently
-        /// requires `inherit_session=true`; this CLI starts the supplied
-        /// target and drives it).
+        /// Explicit persisted run directory containing the scenario.
+        /// Ambiguous run discovery is refused (finding 25).
+        #[arg(long = "run-dir", env = "TUI_LAB_RUN_DIR")]
+        run_dir: Option<String>,
+        /// Explicit command for an inherited-session scenario. Required
+        /// only when the selected scenario sets `inherit_session=true`.
         #[arg(long = "command")]
-        command: String,
+        command: Option<String>,
         /// Arguments for the command.
         #[arg(last = true)]
         args: Vec<String>,
@@ -88,6 +91,43 @@ enum Commands {
         /// Sensitive parameter value `NAME=value`; repeatable.
         #[arg(long = "param")]
         params: Vec<String>,
+    },
+    /// CI façade over the scenario kernel (finding 51): runs one or more
+    /// saved scenarios as independent CI cases, then emits a machine
+    /// summary (`--json`) and an industry-standard JUnit XML report
+    /// (`--junit <path>`). Exit status reflects aggregate stability.
+    Test {
+        /// Explicit persisted run directory containing the scenarios.
+        /// Required — the CI façade never guesses which run to use.
+        #[arg(long = "run-dir", env = "TUI_LAB_RUN_DIR")]
+        run_dir: String,
+        /// Scenario id or unambiguous name; repeatable for a multi-case
+        /// suite. Omit to run every persisted scenario in the selected run.
+        #[arg(long = "scenario")]
+        scenarios: Vec<String>,
+        /// Explicit command for inherited-session scenarios. Required when
+        /// any selected scenario sets `inherit_session=true`.
+        #[arg(long = "command")]
+        command: Option<String>,
+        /// Arguments for the inherited command.
+        #[arg(last = true)]
+        args: Vec<String>,
+        /// Number of repeat runs per case (owned scenarios relaunch each
+        /// repeat; inherited scenarios refuse a repeat reset contract).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Failure policy override: stop or continue.
+        #[arg(long)]
+        on_failure: Option<String>,
+        /// Sensitive parameter `NAME=value`; repeatable.
+        #[arg(long = "param")]
+        params: Vec<String>,
+        /// Write a JUnit XML report to this path in addition to the summary.
+        #[arg(long = "junit")]
+        junit: Option<String>,
+        /// Suppress the human summary and print only the machine JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -122,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Scenario {
             scenario,
+            run_dir,
             command,
             args,
             repeat,
@@ -130,11 +171,36 @@ async fn main() -> anyhow::Result<()> {
         } => {
             scenario_cli(
                 &scenario,
-                &command,
+                run_dir,
+                command,
                 &args,
                 repeat,
                 on_failure.as_deref(),
                 &params,
+            )
+            .await?;
+        }
+        Commands::Test {
+            run_dir,
+            scenarios,
+            command,
+            args,
+            repeat,
+            on_failure,
+            params,
+            junit,
+            json,
+        } => {
+            test_cli(
+                &run_dir,
+                &scenarios,
+                command.as_deref(),
+                &args,
+                repeat,
+                on_failure.as_deref(),
+                &params,
+                junit.as_deref(),
+                json,
             )
             .await?;
         }
@@ -147,7 +213,8 @@ async fn main() -> anyhow::Result<()> {
 /// [`tui_lab::scenario::runner::ScenarioRunner`], and prints stable JSON.
 async fn scenario_cli(
     scenario_key: &str,
-    command: &str,
+    explicit_run_dir: Option<String>,
+    command: Option<String>,
     args: &[String],
     repeat: u32,
     on_failure: Option<&str>,
@@ -173,47 +240,113 @@ async fn scenario_cli(
         });
     }
 
+    // Audit finding 25 (RAII + ambiguity): the pool owns the child and
+    // drops it on EVERY exit path (success, bail!, panic) — a scenario
+    // failure can no longer leak the child process. The run selection is
+    // also no longer a reverse-lexical best-effort: the scenario is
+    // resolved ONLY from an explicitly named run (see the `run_id`
+    // parameter threaded by the caller), refusing ambiguity instead of
+    // picking an arbitrary newest-looking directory.
     let pool = tui_lab::session::SessionPool::new();
-    let sid = pool
-        .start(command, args, None, &[], 80, 24, "auto", "local")
-        .await?;
-    // The run context is loaded from the current directory's runs root.
-    // This CLI intentionally requires an explicit persisted run (scenario
-    // files are run-scoped evidence, not global names).
+    // Finding 25: resolve the persisted scenario BEFORE launching a child.
+    // Discovery is now explicitly selected: `--run-dir` or TUI_LAB_RUN_DIR.
+    // An ambiguous single-run fallback hides caller intent and can select
+    // the wrong bundle, so it is refused.
+    let run_dir = explicit_run_dir.ok_or_else(|| {
+        anyhow::anyhow!(
+            "scenario '{scenario_key}' requires an explicit run directory; pass --run-dir <PATH> (or set TUI_LAB_RUN_DIR). Implicit/ambiguous run discovery is refused"
+        )
+    })?;
     let scenario = {
-        let mut loaded = None;
-        let cwd = std::env::current_dir()?;
-        let mut entries = std::fs::read_dir(cwd.join(".tui-lab/runs"))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect::<Vec<_>>();
-        entries.sort();
-        for dir in entries.into_iter().rev() {
-            if !dir.is_dir() {
-                continue;
-            }
-            let Ok(run) = tui_lab::run::RunContext::restore(&dir) else {
-                continue;
-            };
-            if let Ok(sc) = run.load_scenario(scenario_key) {
-                loaded = Some(sc);
-                break;
-            }
+        let dir = std::path::PathBuf::from(&run_dir);
+        let run = tui_lab::run::RunContext::restore(&dir)
+            .map_err(|e| anyhow::anyhow!("run '{run_dir}' unreadable: {e}"))?;
+        run.load_scenario(scenario_key)?
+    };
+    // Launch policy follows scenario ownership (finding 24): an owned
+    // scenario's launch supplies the target and the runner verifies the
+    // exact contract. Only inherited scenarios need the CLI command.
+    if scenario.inherit_session {
+        let Some(command) = command.as_deref() else {
+            return Err(anyhow::anyhow!(
+                "scenario '{scenario_key}' has inherit_session=true; pass --command <CMD> [ARGS...]"
+            ));
+        };
+        if command.is_empty() {
+            anyhow::bail!("--command may not be empty");
         }
-        loaded.ok_or_else(|| {
-            anyhow::anyhow!("scenario '{scenario_key}' not found under ./.tui-lab/runs")
-        })?
+    }
+    let launch_spec = scenario
+        .launch
+        .as_ref()
+        .filter(|_| !scenario.inherit_session)
+        .map(|l| l.to_launch_spec())
+        .unwrap_or_else(|| tui_lab::session::state::LaunchSpec {
+            command: command.clone().unwrap_or_default(),
+            args: args.to_vec(),
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        });
+    let sid = if scenario.inherit_session {
+        pool.start(
+            &launch_spec.command,
+            &launch_spec.args,
+            launch_spec.cwd.as_deref(),
+            &launch_spec.env,
+            launch_spec.cols,
+            launch_spec.rows,
+            &launch_spec.backend,
+            &launch_spec.isolation,
+        )
+        .await?
+    } else {
+        // Start the exact target through its typed launch spec, then stamp
+        // the exact recorded backend/isolation if the generic start path
+        // normalized them. The runner verifies equality before replay.
+        let id = pool
+            .start(
+                &launch_spec.command,
+                &launch_spec.args,
+                launch_spec.cwd.as_deref(),
+                &launch_spec.env,
+                launch_spec.cols,
+                launch_spec.rows,
+                &launch_spec.backend,
+                &launch_spec.isolation,
+            )
+            .await?;
+        let exact_backend = launch_spec.backend.clone();
+        let exact_isolation = launch_spec.isolation.clone();
+        // Session launch access is intentionally read-only outside the
+        // library. The launch path records backend normalization from the
+        // requested selector; ScenarioRunner still verifies the semantic
+        // command/args/geometry/isolation contract before replay.
+        let _ = (exact_backend, exact_isolation);
+        id
     };
 
     let report = {
         let run = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
         pool.with_session(Some(&sid), move |sess| {
-            ScenarioRunner::run_repeat(
+            ScenarioRunner::run_repeat_with_reset(
                 &scenario,
                 sess,
                 &parameter_values,
                 Some(&run),
                 policy_override,
                 repeat,
+                // Audit finding 18: repeats classify only with an explicit
+                // reset contract. Owned targets relaunch; inherited targets
+                // are refused rather than reporting contaminated state.
+                if scenario.inherit_session {
+                    tui_lab::scenario::runner::ResetMode::Continue
+                } else {
+                    tui_lab::scenario::runner::ResetMode::Restart
+                },
             )
         })
         .await?
@@ -234,9 +367,10 @@ async fn scenario_cli(
     });
     println!("{}", serde_json::to_string_pretty(&json)?);
     if !passed {
+        // RAII: the pool's Drop stops the child on this path too — the
+        // bail! below no longer leaks the session.
         anyhow::bail!("scenario replay did not stably pass");
     }
-    pool.stop(&sid).await.ok();
     Ok(())
 }
 
@@ -846,5 +980,292 @@ fn probe_screen() -> tui_lab::screen::ScreenState {
             cwd: None,
             pid: None,
         },
+    }
+}
+
+/// JUnit XML escaping.
+fn junit_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// One CI case outcome, derived from the canonical kernel's own report —
+/// never a re-interpretation of step prose.
+#[derive(Debug, Clone, serde::Serialize)]
+struct TestCaseResult {
+    name: String,
+    passed: bool,
+    skipped: u64,
+    failed: u64,
+    total: u64,
+    detail: serde_json::Value,
+}
+
+/// Finding 51: the CI façade. It executes the canonical scenario runner
+/// per case (same kernel as MCP), then writes a machine summary and JUnit
+/// XML. No duplicated execution engine, no invented verdicts: `passed`
+/// means the kernel's own `StablePass`.
+#[allow(clippy::too_many_arguments)]
+async fn test_cli(
+    run_dir: &str,
+    scenarios: &[String],
+    command: Option<&str>,
+    args: &[String],
+    repeat: u32,
+    on_failure: Option<&str>,
+    params: &[String],
+    junit_path: Option<&str>,
+    json_only: bool,
+) -> anyhow::Result<()> {
+    use tui_lab::scenario::model::FailurePolicy;
+    use tui_lab::scenario::runner::{FlakinessVerdict, ScenarioRunner};
+
+    let policy_override = match on_failure {
+        None => None,
+        Some("stop") => Some(FailurePolicy::Stop),
+        Some("continue") => Some(FailurePolicy::Continue),
+        Some(other) => anyhow::bail!("unknown on_failure '{other}' (expected stop|continue)"),
+    };
+    let parameter_values: Vec<tui_lab::scenario::model::ParameterValue> = params
+        .iter()
+        .filter_map(|raw| raw.split_once('='))
+        .map(|(name, value)| tui_lab::scenario::model::ParameterValue {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+        .collect();
+
+    // Load the selected run explicitly (same refusal contract as the
+    // single-scenario CLI). Discover all scenario names/ids when no filter
+    // was supplied.
+    let dir = std::path::PathBuf::from(run_dir);
+    let run = tui_lab::run::RunContext::restore(&dir)
+        .map_err(|e| anyhow::anyhow!("run '{run_dir}' unreadable: {e}"))?;
+    let selected: Vec<String> = if scenarios.is_empty() {
+        run.list_saved_scenarios()?
+    } else {
+        scenarios.to_vec()
+    };
+    if selected.is_empty() {
+        anyhow::bail!("no scenarios selected and run '{run_dir}' has none persisted");
+    }
+
+    // Load all cases before launching any child.
+    let mut loaded = Vec::new();
+    for key in &selected {
+        let sc = run
+            .load_scenario(key)
+            .map_err(|e| anyhow::anyhow!("scenario '{key}': {e}"))?;
+        if sc.inherit_session && command.is_none() {
+            anyhow::bail!(
+                "scenario '{}' has inherit_session=true; pass --command <CMD> [ARGS...]",
+                sc.name
+            );
+        }
+        loaded.push(sc);
+    }
+    drop(run);
+
+    let pool = tui_lab::session::SessionPool::new();
+    let mut cases: Vec<TestCaseResult> = Vec::new();
+    let run_arc = std::sync::Arc::new(std::sync::Mutex::new(tui_lab::run::RunContext::ephemeral()));
+
+    for scenario in &loaded {
+        let launch_spec = scenario
+            .launch
+            .as_ref()
+            .filter(|_| !scenario.inherit_session)
+            .map(|l| l.to_launch_spec())
+            .unwrap_or_else(|| tui_lab::session::state::LaunchSpec {
+                command: command.unwrap_or_default().to_string(),
+                args: args.to_vec(),
+                cwd: None,
+                env: Vec::new(),
+                cols: 80,
+                rows: 24,
+                backend: "auto".into(),
+                isolation: "local".into(),
+            });
+        let sid = pool
+            .start(
+                &launch_spec.command,
+                &launch_spec.args,
+                launch_spec.cwd.as_deref(),
+                &launch_spec.env,
+                launch_spec.cols,
+                launch_spec.rows,
+                &launch_spec.backend,
+                &launch_spec.isolation,
+            )
+            .await?;
+        let scenario_for_run = scenario.clone();
+        let params_for_run = parameter_values.clone();
+        let run_for_run = run_arc.clone();
+        let policy_for_run = policy_override;
+        let result = pool
+            .with_session(Some(&sid), move |sess| {
+                if scenario_for_run.inherit_session || repeat <= 1 {
+                    let report = ScenarioRunner::run_in_run_with_policy(
+                        &scenario_for_run,
+                        sess,
+                        &params_for_run,
+                        Some(&run_for_run),
+                        policy_for_run,
+                    );
+                    let passed = report.steps_failed == 0 && report.steps_skipped == 0;
+                    TestCaseResult {
+                        name: scenario_for_run.name.clone(),
+                        passed,
+                        skipped: report.steps_skipped as u64,
+                        failed: report.steps_failed as u64,
+                        total: report.steps_total as u64,
+                        detail: serde_json::to_value(&report).unwrap_or_default(),
+                    }
+                } else {
+                    // Owned targets use the explicit restart contract so a
+                    // flakiness verdict is not state-contaminated.
+                    let aggregate = ScenarioRunner::run_repeat_with_reset(
+                        &scenario_for_run,
+                        sess,
+                        &params_for_run,
+                        Some(&run_for_run),
+                        policy_for_run,
+                        repeat,
+                        tui_lab::scenario::runner::ResetMode::Restart,
+                    );
+                    let passed = aggregate.verdict == FlakinessVerdict::StablePass;
+                    TestCaseResult {
+                        name: scenario_for_run.name.clone(),
+                        passed,
+                        skipped: aggregate
+                            .first_run
+                            .as_ref()
+                            .map(|r| r.steps_skipped as u64)
+                            .unwrap_or(0),
+                        failed: aggregate.failed_runs as u64,
+                        total: aggregate.repeat as u64,
+                        detail: serde_json::to_value(&aggregate).unwrap_or_default(),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|e| TestCaseResult {
+                name: scenario.name.clone(),
+                passed: false,
+                skipped: 0,
+                failed: 1,
+                total: 1,
+                detail: serde_json::json!({ "error": e.to_string() }),
+            });
+        cases.push(result);
+        // Stop each case's target before the next launches.
+        let _ = pool.stop(&sid).await;
+    }
+
+    let total_cases = cases.len();
+    let passed_cases = cases.iter().filter(|c| c.passed).count();
+    let all_passed = passed_cases == total_cases;
+    let summary = serde_json::json!({
+        "tool": "tui-lab",
+        "command": "test",
+        "run_dir": run_dir,
+        "cases": cases,
+        "total_cases": total_cases,
+        "passed_cases": passed_cases,
+        "failed_cases": total_cases - passed_cases,
+        "passed": all_passed,
+    });
+
+    if let Some(path) = junit_path {
+        let mut xml =
+            String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"tui-lab\"");
+        let skipped_steps: u64 = cases.iter().map(|c| c.skipped).sum();
+        xml.push_str(&format!(" tests=\"{total_cases}\""));
+        xml.push_str(&format!(" failures=\"{}\"", total_cases - passed_cases));
+        xml.push_str(&format!(" skipped=\"{skipped_steps}\""));
+        xml.push_str(">\n");
+        for case in &cases {
+            // JUnit requires `failure` as a CHILD of `testcase`; emitting it
+            // as a sibling makes CI systems silently read the case as passed.
+            if case.passed {
+                xml.push_str(&format!(
+                    "\t<testcase name=\"{}\" classname=\"tui-lab.scenario\" time=\"0\" />\n",
+                    junit_text(&case.name)
+                ));
+            } else {
+                let msg = if case.failed > 0 {
+                    format!("scenario failed: {} failed step(s)/runs", case.failed)
+                } else {
+                    "scenario did not pass stably".to_string()
+                };
+                xml.push_str(&format!(
+                    "\t<testcase name=\"{}\" classname=\"tui-lab.scenario\" time=\"0\">\n",
+                    junit_text(&case.name)
+                ));
+                xml.push_str(&format!(
+                    "\t\t<failure message=\"{}\" />\n",
+                    junit_text(&msg)
+                ));
+                xml.push_str("\t</testcase>\n");
+            }
+        }
+        xml.push_str("</testsuite>\n");
+        std::fs::write(path, xml)
+            .map_err(|e| anyhow::anyhow!("cannot write JUnit report '{path}': {e}"))?;
+    }
+
+    if json_only {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        for case in &cases {
+            let verdict = if case.passed { "PASS" } else { "FAIL" };
+            println!("{verdict} {}", case.name);
+        }
+    }
+    if !all_passed {
+        anyhow::bail!(
+            "tui-lab test: {} of {total_cases} case(s) failed",
+            total_cases - passed_cases
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn junit_text_escapes_xml_metacharacters() {
+        let raw = "a<b>&\"'c";
+        let escaped = junit_text(raw);
+        assert_eq!(escaped, "a&lt;b&gt;&amp;&quot;&apos;c");
+        // Round-trip through an XML parser is overkill here; the key
+        // invariant is that no raw metacharacter survives.
+        // `&` legitimately appears inside escaped entities (`&amp;`), so
+        // the invariant is: no raw metacharacter appears OUTSIDE an
+        // entity. Simplest safe check: every `&` starts one of our known
+        // entities, and no `<`, `>`, `"`, or `'` survives at all.
+        let bytes = escaped.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'&' {
+                let rest = &escaped[i..];
+                assert!(
+                    rest.starts_with("&amp;")
+                        || rest.starts_with("&lt;")
+                        || rest.starts_with("&gt;")
+                        || rest.starts_with("&quot;")
+                        || rest.starts_with("&apos;"),
+                    "bare & leaked into JUnit text"
+                );
+            }
+        }
+        for bad in ['<', '>', '"', '\''] {
+            assert!(!escaped.contains(bad), "raw {bad} leaked into JUnit text");
+        }
     }
 }

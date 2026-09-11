@@ -236,6 +236,13 @@ pub fn run_probe_with_guard(
     let t0 = Instant::now();
     let (tx, events) = match stimulus {
         Some(act) => {
+            // Audit finding 10: the probe's causal event window is the
+            // TRANSACTION's own `event_seq_before..event_seq_after` (the
+            // executor's final dispatch boundary and post-ingest fold) —
+            // NOT `pre_seq` captured before invoking the executor, because
+            // executor preflight pumps output that would otherwise land
+            // inside the probe's "stimulus" window (screen bytes that
+            // arrived before the send, misattributed to the action).
             let tx = crate::execution::execute_act_with_guard_and_origin(
                 session,
                 crate::execution::DriveOrigin::Probe,
@@ -247,10 +254,25 @@ pub fn run_probe_with_guard(
                 completion,
                 guard,
             )?;
-            let batch = session.events_since(pre_seq);
-            (Some(tx), batch.events)
+            let from = tx.event_seq_before;
+            let to = tx.event_seq_after.unwrap_or(from);
+            let batch = session.events_since(from);
+            if batch.gap {
+                return Err(anyhow::anyhow!(
+                    "probe_event_window_incomplete: the terminal event ring evicted events                      between the dispatch anchor and the oldest retained seq                      (first_available={:?}); no causal stimulus window can be proven",
+                    batch.first_available
+                ));
+            }
+            let windowed = batch
+                .events
+                .into_iter()
+                .filter(|e| e.seq <= to)
+                .collect::<Vec<_>>();
+            (Some(tx), windowed)
         }
         None => {
+            // Drift probes retain their independently established event
+            // window (no executor preflight involved).
             let after = session.observe(quiet_ms.min(budget_ms.max(1)))?;
             let _ = after;
             let batch = session.events_since(pre_seq);
@@ -311,11 +333,22 @@ pub fn run_probe_with_guard(
                 if !sd.controls_removed.is_empty() {
                     material_changes.push(format!("controls removed: {:?}", sd.controls_removed));
                 }
+                // Finding 55: modified controls are material even when the
+                // control set membership is unchanged.
+                if sd.controls_changed_count > 0 {
+                    material_changes.push(format!(
+                        "controls changed: {} {:?}",
+                        sd.controls_changed_count, sd.control_deltas
+                    ));
+                }
             }
             ProbeWatch::Regions => {
                 let sd = &transition.semantic_diff;
                 if !sd.regions_added.is_empty() {
                     material_changes.push(format!("regions added: {:?}", sd.regions_added));
+                }
+                if !sd.regions_removed.is_empty() {
+                    material_changes.push(format!("regions removed: {:?}", sd.regions_removed));
                 }
             }
             ProbeWatch::Style => {
@@ -394,45 +427,26 @@ pub fn run_probe_with_guard(
                     }),
                 }
             }
-            (Some((count, _)), Some(ev)) if count > 0 => Some(TransitionCapture {
-                strategy: "frames".to_string(),
-                frames: ev
-                    .get("frames")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|f| TransitionFrame {
-                                at_ms: 0,
-                                structure_hash: f
-                                    .get("structure_hash")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                visual_hash: f
-                                    .get("visual_hash")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                viewport_text: f
-                                    .get("viewport_text")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|r| r.as_str().map(str::to_string))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                completed: ev.get("completed").and_then(|v| v.as_bool()).unwrap_or(false),
-                reason: ev
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            }),
+            (Some((count, _)), Some(seq)) if count > 0 => {
+                let completed = seq.completed;
+                let reason = seq.reason.name().to_string();
+                Some(TransitionCapture {
+                    strategy: "frames".to_string(),
+                    frames: seq
+                        .frames
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| TransitionFrame {
+                            at_ms: seq.edge_at_monotonic_ms.get(i).copied().unwrap_or(0),
+                            structure_hash: f.structure_hash.clone(),
+                            visual_hash: f.visual_hash.clone(),
+                            viewport_text: f.viewport_text.clone(),
+                        })
+                        .collect(),
+                    completed,
+                    reason,
+                })
+            }
             (Some((count, _)), None) if count > 0 => Some(TransitionCapture {
                 strategy: "frames".to_string(),
                 frames: Vec::new(),

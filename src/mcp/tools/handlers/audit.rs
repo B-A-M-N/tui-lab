@@ -228,11 +228,15 @@ pub(crate) async fn tui_audit(
                             // this baseline but seen in an EARLIER pass is a
                             // regression, not a first-seen new defect (review
                             // P1 item 12).
-                            let resolved = crate::audit::compare::Resolved(
+                            let _resolved = crate::audit::compare::Resolved(
                                 run.resolved_finding_fingerprints(cmp_label),
                             );
+                            // Audit finding 48: MCP baseline diffs compare
+                            // DEFECTS by default. Gates/metrics/observations
+                            // remain in the audit record but do not produce
+                            // product-regression verdicts.
                             let compared =
-                                crate::audit::compare::compare_with_resolved(baseline, &report.findings, &resolved);
+                                crate::audit::compare::compare_defects(baseline, &report.findings);
                             compare_block = json!({
                                 "baseline": cmp_label,
                                 "available": true,

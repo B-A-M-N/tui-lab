@@ -408,6 +408,7 @@ mod tests {
 
     fn finding() -> Finding {
         Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "EXPL-1".into(),
             rule_id: None,
             severity: Severity::Warn,

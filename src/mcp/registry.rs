@@ -169,6 +169,16 @@ pub const RESOURCES: &[ResourceCapability] = &[
             "One transaction by ledger seq: action, settle verdict, before/after structure, changed cells, render evidence.",
     },
     ResourceCapability {
+        uri: "tui://runs/{run_id}/frames",
+        description:
+            "Committed frame records in the hot ring (audit P0-11): every `frame:N` cited by timeline entries is a registered, resolvable resource. Evicted ids resolve through frames.jsonl on persistent runs.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/frames/{frame_id}",
+        description:
+            "One frame record by citable id (hot ring first, then frames.jsonl): frame_id, session/generation provenance, screen/output seqs, structure/visual/semantic identity, commit time.",
+    },
+    ResourceCapability {
         uri: "tui://sessions/{session_id}/semantic",
         description: "Live semantic screen: regions, controls, focus, affordances, components.",
     },
@@ -375,7 +385,13 @@ fn flow_regression_test_tui() -> serde_json::Value {
                      name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
                      recording_id: None, steps: None, parameters: None,
                      repeat: None,
-                     on_failure: None, finding_id: None, asset_type: None,
+                     on_failure: Some("continue".into()), finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_wait", "drive at least one deterministic step into the recording",
+                 serde_json::to_value(TuiWaitParams {
+                     condition: Known::Known(WaitCondition::ScreenStable),
+                     text: None, title: None, budget_ms: Some(2000),
+                     quiet_ms: None, event: None, id: Some(SESSION_PLACEHOLDER.into()),
                  }).unwrap()),
             step("tui_scenario", "finish the recorded flow after driving/assertions; the recorder owns the nonempty step set",
                  serde_json::to_value(TuiScenarioParams {
@@ -1052,6 +1068,15 @@ mod tests {
                 }
                 "tui_workflow" => {
                     serde_json::from_value::<crate::mcp::params::TuiWorkflowParams>(v).map(|_| ())
+                }
+                "tui_wait" => {
+                    serde_json::from_value::<crate::mcp::params::TuiWaitParams>(v).map(|_| ())
+                }
+                "tui_act" => {
+                    serde_json::from_value::<crate::mcp::params::TuiActRequest>(v).map(|_| ())
+                }
+                "tui_assert" => {
+                    serde_json::from_value::<crate::mcp::params::TuiAssertParams>(v).map(|_| ())
                 }
                 "tui_probe" => {
                     serde_json::from_value::<crate::mcp::params::TuiProbeParams>(v).map(|_| ())

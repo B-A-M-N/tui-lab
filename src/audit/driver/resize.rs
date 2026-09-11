@@ -22,6 +22,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
     for &(cols, rows) in RESIZE_MATRIX {
         if let Err(e) = session.resize(cols, rows) {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RESZ-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -51,6 +52,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
             Ok(t) => t,
             Err(e) => {
                 findings.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "RESZ-ERR".into(),
                     rule_id: None,
                     severity: Severity::Error,
@@ -79,6 +81,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
 
         if !clipped_regions.is_empty() {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RESZ-CLIP".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -105,6 +108,7 @@ pub fn resize_audit(session: &mut Session) -> Vec<Finding> {
             });
         } else {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RESZ-OK".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -163,6 +167,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
     // below ~10 columns semantic analysis is noise. Report honestly.
     if w < 20 || h < 8 {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-TOO-SMALL".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -197,6 +202,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         Ok((s, sem, _, _)) => (s, sem),
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RFLW-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -225,6 +231,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
     let (sw, sh) = (w / 2, h / 2);
     if let Err(e) = session.resize(sw, sh) {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-ERR".into(),
             rule_id: None,
             severity: Severity::Error,
@@ -249,6 +256,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         Some(t) => (t.0, t.1),
         None => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RFLW-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -275,6 +283,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         .collect();
     if !clipped_at_shrink.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-SHRINK-CLIP".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -304,6 +313,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         Ok(t) => (t.0, t.1),
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RFLW-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -342,6 +352,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
     }
     if !lost_rows.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-CONTENT-LOST".into(),
             rule_id: None,
             severity: Severity::Error,
@@ -367,6 +378,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         });
     } else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-CONTENT-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -393,6 +405,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
     if let (Some(before), Some(after)) = (&base_focus, &grw_sem.focus.control_id) {
         if before != after {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "RFLW-FOCUS-MOVED".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -413,6 +426,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         }
     } else if base_focus.is_some() && grw_sem.focus.control_id.is_none() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-FOCUS-LOST".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -430,6 +444,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         });
     } else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-FOCUS-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -480,6 +495,7 @@ pub fn resize_reflow_audit(session: &mut Session) -> Vec<Finding> {
         .count();
     if ghost_rows.len() > base_ghostish {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "RFLW-GHOST-CELLS".into(),
             rule_id: None,
             severity: Severity::Info,

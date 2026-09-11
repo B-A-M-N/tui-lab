@@ -28,6 +28,7 @@ pub fn keyboard_audit(
         Ok((_, sem, _, _)) => sem,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "KB-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -74,6 +75,7 @@ pub fn keyboard_audit(
             Ok(tx) => tx,
             Err(_e) => {
                 findings.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "KB-ERR".into(),
                     rule_id: None,
                     severity: Severity::Error,
@@ -116,6 +118,7 @@ pub fn keyboard_audit(
             let focusable_count = sem_before.controls.iter().filter(|c| c.focusable).count();
             if focusable_count > 1 {
                 findings.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "KB-TRAP".into(),
                     rule_id: None,
                     severity: Severity::Warn,
@@ -141,6 +144,7 @@ pub fn keyboard_audit(
                 });
             } else {
                 findings.push(Finding {
+                    kind: crate::audit::FindingKind::Defect,
                     id: "KB-SINGLE-FOCUSABLE".into(),
                     rule_id: None,
                     severity: Severity::Info,
@@ -169,6 +173,7 @@ pub fn keyboard_audit(
         let state_key = format!("{:?}-{}", focus_after, after.structure_hash);
         if visited_states.contains(&state_key) {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "KB-CYCLE".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -237,6 +242,7 @@ pub fn keyboard_audit(
         // defect: Shift+Tab must truly reverse Tab.
         if reverse_ok && !gaps.is_empty() {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "KB-REVERSE-GAP".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -261,6 +267,7 @@ pub fn keyboard_audit(
         }
         if successful_tabs > 0 && reverse_ok {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "KB-OK".into(),
                 rule_id: None,
                 severity: Severity::Info,
@@ -309,6 +316,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
         Ok(t) => t,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "FOCUS-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -333,6 +341,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
 
     if !has_focus {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "FOCUS-001".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -373,6 +382,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
 
         if sem_after.focus.control.as_ref() == Some(&focus_before) {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "FOCUS-002".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -393,6 +403,7 @@ pub fn focus_audit(session: &mut Session) -> Vec<Finding> {
             });
         } else {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "FOCUS-OK".into(),
                 rule_id: None,
                 severity: Severity::Info,

@@ -41,13 +41,32 @@ impl ScenarioStore {
     /// Start recording a scenario bound to one session generation. Returns
     /// the recording id. Names are display labels, not identities —
     /// parallel recordings may share a name.
+    #[allow(dead_code)]
     pub(super) fn begin_recording(
         &mut self,
         name: &str,
         session_id: &str,
         generation: u32,
     ) -> super::recording_scope::ScenarioRecordingId {
-        let rec = super::recording_scope::ScenarioRecording::new(name, session_id, generation);
+        Self::begin_recording_with_policy(
+            self,
+            name,
+            session_id,
+            generation,
+            crate::scenario::model::FailurePolicy::Stop,
+        )
+    }
+
+    pub(super) fn begin_recording_with_policy(
+        &mut self,
+        name: &str,
+        session_id: &str,
+        generation: u32,
+        on_failure: crate::scenario::model::FailurePolicy,
+    ) -> super::recording_scope::ScenarioRecordingId {
+        let rec = super::recording_scope::ScenarioRecording::with_policy(
+            name, session_id, generation, on_failure,
+        );
         let id = rec.id.clone();
         self.recorders.insert(id.as_str().to_string(), rec);
         id
@@ -130,7 +149,7 @@ impl ScenarioStore {
     /// sessions coexist. The name index is rebuilt after every mutation.
     pub(super) fn save(&mut self, scenario: crate::scenario::model::Scenario) {
         self.names.remove(&scenario.name);
-        self.saved.insert(scenario.id.clone(), scenario.clone());
+        self.saved.insert(scenario.id.clone(), scenario);
         self.rebuild_name_index();
     }
 

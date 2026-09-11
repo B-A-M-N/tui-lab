@@ -27,30 +27,30 @@ impl RunContext {
     /// evicted, and the eviction is *declared* — `dropped_records` grows
     /// and `first_available_seq` moves, so a later flush/promotion can
     /// never present the run as replay-complete.
-    #[allow(clippy::too_many_arguments)]
+    // Audit finding 9: the causal event range comes from the TRANSACTION
+    // itself (`tx.event_seq_before` / `tx.event_seq_after`, captured at the
+    // final dispatch boundary and after the final ingest/native fold in the
+    // executor) — callers cannot accidentally supply the backend's
+    // `output_seq` counter family anymore. The old separate parameters are
+    // gone; the sink copies the transaction's own fields.
     pub fn record_interaction(
         &mut self,
         session: &str,
         generation: u32,
         before_frame_id: Option<u64>,
         after_frame_id: Option<u64>,
-        event_seq_before: u64,
-        event_seq_after: Option<u64>,
         tx: &crate::execution::InteractionTransaction,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
         let seq = self.evidence.transactions.bump();
-        let mut record = TransactionRecord::from_interaction(
+        let record = TransactionRecord::from_interaction(
             seq,
             session,
             generation,
             before_frame_id,
             after_frame_id,
-            event_seq_before,
-            event_seq_after,
             tx,
         );
-        record.seq = seq;
         self.push_ledger(record);
         // Focus graph from transactions (audit item): every driving path
         // lands here with before/after frames, so the ID-keyed graph gets
@@ -87,6 +87,13 @@ impl RunContext {
         Ok(())
     }
 
+    /// The sequence assigned to the most recent accepted ledger entry.
+    /// Interaction callers should capture this return value (via the
+    /// evidence sink) rather than matching rows backward.
+    pub fn last_transaction_seq(&self) -> Option<u64> {
+        self.evidence.transactions.records().last().map(|r| r.seq)
+    }
+
     /// Record a non-frame interaction (wait/observe) at evidence level.
     ///
     /// Settlement is honestly `skipped`: no settle wait ran for this entry,
@@ -117,7 +124,11 @@ impl RunContext {
             after_frame_id: None,
             event_seq_before: None,
             event_seq_after: None,
+            native_revision_before: None,
+            before_semantic_identity: None,
+            record_kind: Some("event".to_string()),
             dispatch: None,
+            dispatch_failure: None,
         });
         Ok(())
     }
@@ -250,7 +261,10 @@ impl RunContext {
     /// Counts for `tui_run status`.
     pub fn counts(&self) -> serde_json::Value {
         json!({
-            "transactions": self.evidence.transactions.total(),
+            "transactions": self.transactions().iter().filter(|r| r.record_kind.as_deref() == Some("interaction")).count() as u64,
+            "transaction_records": self.evidence.transactions.total(),
+            "event_records": self.transactions().iter().filter(|r| r.record_kind.as_deref() == Some("event")).count() as u64,
+            "legacy_unclassified_records": self.transactions().iter().filter(|r| r.record_kind.is_none()).count() as u64,
             "transactions_in_ledger": self.transactions().len(),
             "history_complete": self.history_complete(),
             "dropped_records": self.evidence.transactions.dropped_records(),
@@ -258,6 +272,11 @@ impl RunContext {
             "events": self.evidence.events.count(),
             "events_persisted_incrementally": self.evidence.events.flushed_total(),
             "events_held_for_flush": self.evidence.events.held_count(),
+            "event_history_incomplete": self.event_history_incomplete(),
+            "event_gaps": self.event_gaps().iter().map(|(consumer, first)| json!({
+                "consumer": consumer,
+                "first_available_seq": first,
+            })).collect::<Vec<_>>(),
             "checkpoints": self.checkpoints.count(),
             "scenarios": self.scenarios.len(),
             "findings": self.findings.len(),
@@ -269,5 +288,93 @@ impl RunContext {
             "frames": self.evidence.frames.next_id(),
             "artifacts": self.artifacts_store.artifacts().len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod event_gap_tests {
+    use super::*;
+
+    #[test]
+    fn event_ring_gap_is_declared_and_status_becomes_incomplete() {
+        let mut run = RunContext::ephemeral();
+        assert!(!run.event_history_incomplete());
+        assert!(run.event_gaps().is_empty());
+
+        // A fold consumer that crossed an evicted prefix records the
+        // available tail but cannot claim exhaustive evidence.
+        run.note_event_gap("persistence:sess-gap", Some(17));
+        assert!(run.event_history_incomplete());
+        assert_eq!(run.event_gaps().len(), 1);
+        assert_eq!(run.event_gaps()[0].0, "persistence:sess-gap");
+        assert_eq!(run.event_gaps()[0].1, Some(17));
+
+        let status = run.counts();
+        assert_eq!(status["event_history_incomplete"], true);
+        assert_eq!(status["event_gaps"][0]["consumer"], "persistence:sess-gap");
+        assert_eq!(status["event_gaps"][0]["first_available_seq"], 17);
+    }
+}
+
+#[cfg(test)]
+mod record_kind_tests {
+    use super::*;
+
+    #[test]
+    fn ledger_records_are_explicitly_typed_and_counted() {
+        let mut run = RunContext::ephemeral();
+        let tx = crate::execution::InteractionTransaction {
+            action: crate::execution::ActionEnvelope::new(
+                crate::execution::CanonicalAction::Key {
+                    key: crate::backend::KeyEvent::new(crate::backend::KeyCode::Char('x')),
+                },
+                crate::execution::InputVisibility::Normal,
+            ),
+            anchor: Default::default(),
+            before_frame: crate::backend::CanonicalFrame::new(
+                crate::screen::ScreenState::new(2, 1),
+                1,
+                1,
+            ),
+            after_frame: crate::backend::CanonicalFrame::new(
+                crate::screen::ScreenState::new(2, 1),
+                1,
+                2,
+            ),
+            settle: crate::execution::SettleStatus::Met,
+            transition: crate::screen::diff::diff(
+                &crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(2, 1), 1, 1)
+                    .state,
+                &crate::backend::CanonicalFrame::new(crate::screen::ScreenState::new(2, 1), 1, 2)
+                    .state,
+            ),
+            capture: None,
+            focus_before: None,
+            focus_after: None,
+            elapsed_ms: 1,
+            send_ms: 1,
+            settle_ms: 0,
+            render: None,
+            transition_capture: None,
+            origin: Some(crate::execution::DriveOrigin::Act),
+            dispatch: crate::execution::DispatchStatus::Sent,
+            dispatch_failure: None,
+            event_seq_before: 0,
+            event_seq_after: Some(1),
+            native_revision_before: None,
+            dispatch_reason: None,
+        };
+        run.record_interaction("s", 1, None, None, &tx).unwrap();
+        run.record_event("s", "wait").unwrap();
+        run.record_event("s", "observe").unwrap();
+        let rows = run.transactions();
+        assert_eq!(rows[0].record_kind.as_deref(), Some("interaction"));
+        assert_eq!(rows[1].record_kind.as_deref(), Some("event"));
+        assert_eq!(rows[2].record_kind.as_deref(), Some("event"));
+        let counts = run.counts();
+        assert_eq!(counts["transactions"], 1);
+        assert_eq!(counts["transaction_records"], 3);
+        assert_eq!(counts["event_records"], 2);
+        assert_eq!(counts["legacy_unclassified_records"], 0);
     }
 }

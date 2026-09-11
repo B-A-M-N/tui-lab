@@ -71,9 +71,12 @@ async fn performance_audit_reports_measured_percentiles() {
             .find(|f| f.id == "PERF-OK" || f.id == "PERF-OBSERVE-SLOW")
             .expect("percentile finding present");
         let detail = &f.evidence[0].detail;
+        // Finding 44 renamed harness-cost fields so they are never mistaken
+        // for app interaction latency; this test intentionally checks the
+        // renamed evidence path.
         assert!(
-            detail["observe_ms"]["p50"].is_u64(),
-            "observe p50 must be a measured number: {detail}"
+            detail["harness_observe_ms"]["p50"].is_u64(),
+            "harness observe p50 must be a measured number: {detail}"
         );
         assert!(
             detail["samples"].as_u64().unwrap() == 5,
@@ -402,7 +405,8 @@ async fn full_audit_leaves_no_state_residue() {
         .await
         .expect("start");
     pool.with_session(Some(&id), |sess| {
-        let report = tui_lab::audit::orchestrator::run_profile(sess, "full").expect("full runs");
+        let report = tui_lab::audit::orchestrator::run_profile_allow_mutation(sess, "full")
+            .expect("full runs");
         // The last driver restores what it changed; the transaction verify
         // pass must find focus/size/cursor/title unchanged, so NO genuine
         // (WARN) residue finding appears. Audit P1 (finding 15): a

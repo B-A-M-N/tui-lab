@@ -67,6 +67,20 @@ pub fn compare(baseline: &[Finding], current: &[Finding]) -> Vec<ComparedFinding
     compare_impl(baseline, current, &std::collections::HashSet::new())
 }
 
+/// Default-finding comparison: audit finding 48. Baselines compare DEFECTS
+/// by default. Observations, metrics, and gates are telemetry; they must
+/// not become FIXED/NEW/PERSISTING product verdicts merely because their
+/// IDs or evidence changed between runs.
+pub fn compare_defects(baseline: &[Finding], current: &[Finding]) -> Vec<ComparedFinding> {
+    let defects = |v: &[Finding]| {
+        v.iter()
+            .filter(|f| f.kind == crate::audit::FindingKind::Defect)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    compare(&defects(baseline), &defects(current))
+}
+
 fn compare_impl(
     baseline: &[Finding],
     current: &[Finding],
@@ -129,6 +143,7 @@ mod tests {
 
     fn finding(id: &str, category: &str, target: &str) -> Finding {
         Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: id.into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -140,6 +155,47 @@ mod tests {
             source_refs: Vec::new(),
             occurrence_id: None,
         }
+    }
+
+    fn metric(id: &str, target: &str) -> Finding {
+        Finding {
+            kind: crate::audit::FindingKind::Metric,
+            id: id.into(),
+            rule_id: None,
+            severity: Severity::Info,
+            category: crate::audit::Category::Performance,
+            summary: "telemetry".into(),
+            evidence: vec![EvidenceRef::point(EvidenceKind::Other, target, "evidence")],
+            confidence: 1.0,
+            reproduction: None,
+            source_refs: Vec::new(),
+            occurrence_id: None,
+        }
+    }
+
+    #[test]
+    fn compare_defects_excludes_telemetry_and_gate_changes() {
+        let baseline = vec![
+            finding("KB-TRAP", "keyboard", "tab_trap"),
+            metric("PERF-OK", "observe_p95"),
+        ];
+        let current = vec![
+            metric("PERF-OK", "observe_p95_changed"),
+            finding("FOCUS-001", "focus", "focus_missing"),
+        ];
+        let compared = compare_defects(&baseline, &current);
+        let get = |fid: &str| {
+            compared
+                .iter()
+                .find(|c| c.finding.id == fid)
+                .expect("verdict present")
+        };
+        assert_eq!(get("KB-TRAP").verdict, "fixed");
+        assert_eq!(get("FOCUS-001").verdict, "new");
+        assert!(
+            !compared.iter().any(|c| c.finding.id == "PERF-OK"),
+            "metric telemetry must not create baseline verdicts"
+        );
     }
 
     #[test]

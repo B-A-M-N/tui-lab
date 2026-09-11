@@ -206,6 +206,7 @@ impl ContractReport {
                 }
             );
             out.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: id.to_string(),
                 rule_id: None,
                 severity,

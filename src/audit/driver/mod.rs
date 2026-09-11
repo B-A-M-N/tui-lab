@@ -19,7 +19,7 @@ mod shell_cli;
 mod states;
 mod visual;
 
-pub use interaction::{mouse_audit, performance_audit};
+pub use interaction::{interaction_performance_from_transactions, mouse_audit, performance_audit};
 pub use keyboard::{focus_audit, keyboard_audit};
 pub use layout::{clipping_audit, navigation_audit, navigation_keys_audit};
 pub use lifecycle::{lifecycle_audit, lifecycle_exit_audit};

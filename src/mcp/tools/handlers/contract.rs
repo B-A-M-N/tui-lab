@@ -18,6 +18,23 @@ fn write_contract_atomically(
     yaml: &str,
 ) -> Result<ScaffoldWriteMeta, anyhow::Error> {
     use std::io::Write;
+    // Audit finding 52: never create a file the loader cannot read. JSON
+    // extensions get JSON here; YAML extensions get YAML; anything else is
+    // rejected before mutation.
+    let serialised = match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => {
+            serde_json::to_string_pretty(
+                &serde_yaml::from_str::<crate::design::ProjectContract>(yaml).map_err(|e| {
+                    anyhow::anyhow!("contract scaffold YAML conversion failed: {e}")
+                })?,
+            )? + "\n"
+        }
+        Some("yaml" | "yml") => yaml.to_string(),
+        _ => anyhow::bail!(
+            "unsupported contract scaffold extension {:?}; use .json, .yaml, or .yml",
+            path.extension()
+        ),
+    };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -27,15 +44,15 @@ fn write_contract_atomically(
     let tmp = path.with_extension("yaml.tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(yaml.as_bytes())?;
+        f.write_all(serialised.as_bytes())?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    let bytes = yaml.len();
+    let bytes = serialised.len();
     Ok(ScaffoldWriteMeta {
         path: path.display().to_string(),
         bytes,
-        hash: blake3::hash(yaml.as_bytes()).to_string(),
+        hash: blake3::hash(serialised.as_bytes()).to_string(),
         created: !existed,
     })
 }
@@ -303,6 +320,7 @@ pub(crate) async fn tui_contract(
                         let findings: Vec<crate::audit::Finding> = regressions
                             .iter()
                             .map(|(name, before, after)| crate::audit::Finding {
+                                kind: crate::audit::FindingKind::Defect,
                                 id: "CONTRACT-REGRESSION".into(),
                                 rule_id: None,
                                 severity: Severity::Error,
@@ -477,7 +495,7 @@ pub(crate) async fn tui_contract(
                     json!({
                         "path": m.path,
                         "bytes": m.bytes,
-                        "sha256": m.hash,
+                        "digest": {"algorithm": "blake3", "value": m.hash},
                         "created": m.created,
                     })
                 });
@@ -540,7 +558,7 @@ pub(crate) async fn tui_contract(
                     json!({
                         "path": m.path,
                         "bytes": m.bytes,
-                        "sha256": m.hash,
+                        "digest": {"algorithm": "blake3", "value": m.hash},
                         "created": m.created,
                     })
                 });
@@ -615,5 +633,29 @@ pub(crate) async fn tui_contract(
                 ),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod scaffold_write_tests {
+    use super::*;
+
+    #[test]
+    fn json_path_gets_parseable_json_and_blake3_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract.json");
+        let meta = write_contract_atomically(&path, "").expect("json write");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: crate::design::ProjectContract = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, crate::design::ProjectContract::default());
+        assert_eq!(meta.hash, blake3::hash(raw.as_bytes()).to_string());
+    }
+
+    #[test]
+    fn unsupported_extension_is_refused_without_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contract.toml");
+        assert!(write_contract_atomically(&path, "").is_err());
+        assert!(!path.exists());
     }
 }

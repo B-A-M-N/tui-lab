@@ -100,7 +100,7 @@ impl BackendKind {
 ///
 /// Stored permanently on the session. Every restart/reproduction uses the same
 /// spec unless explicitly overridden.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchSpec {
     pub command: String,
     pub args: Vec<String>,
@@ -280,6 +280,11 @@ pub struct Session {
     /// shares ONE commit pipeline instead of each remembering a subset.
     /// Set/cleared per authorized job; never serialized.
     evidence_sink: Option<std::sync::Arc<crate::execution::RunEvidenceSink>>,
+    /// Pre-stop process state retained by the centralized lifecycle
+    /// primitive (audit finding 39): lets the post-stop exit record decide
+    /// whether the process was running before termination, even after the
+    /// backend stopped. Not serialized.
+    last_process_state: Option<ProcessState>,
 }
 
 /// Bridge that feeds raw PTY bytes into the session's [`AsciicastRecorder`]
@@ -368,6 +373,7 @@ impl Session {
             lease: crate::session::lease::LeaseState::default(),
             isolation_evidence: None,
             evidence_sink: None,
+            last_process_state: None,
         };
         s.attach_session_hook();
         s

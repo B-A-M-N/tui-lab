@@ -38,11 +38,10 @@ impl Session {
         kind: BackendKind,
         cols: u16,
         rows: u16,
-        spec: LaunchSpec,
+        _spec: LaunchSpec,
     ) {
         self.backend = backend;
         self.backend_kind = kind;
-        self.launch = Some(spec);
         self.caps_at_start = self.backend.capabilities();
         // The session hook must ride the NEW backend (the default hook was
         // attached to the placeholder engine in `new`).
@@ -67,6 +66,27 @@ impl Session {
         if requested != self.backend_kind {
             self.backend = requested.build(spec.cols, spec.rows)?;
             self.backend_kind = requested;
+        }
+        // Finding 49: install the terminal behavior contract before any
+        // child traffic. A persona-supported portable backend changes query
+        // responses here; environment declarations never substitute for it.
+        if requested == BackendKind::PortableVt {
+            let persona_id = spec
+                .env
+                .iter()
+                .find(|(k, _)| k == "TUI_LAB_PERSONA")
+                .map(|(_, v)| v.clone());
+            if let Some(id) = persona_id {
+                let persona = crate::terminal::TerminalPersona::builtin()
+                    .into_iter()
+                    .find(|p| p.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown terminal persona '{id}'"))?;
+                let any: &mut dyn std::any::Any = self.backend.as_any_mut();
+                let portable = any
+                    .downcast_mut::<crate::backend::PortablePtyBackend>()
+                    .expect("PortableVt backend kind must downcast to PortablePtyBackend");
+                portable.apply_terminal_persona(&persona);
+            }
         }
         // THIS generation is now the live one — everything below keys on it.
         self.generation = generation;
@@ -165,46 +185,13 @@ impl Session {
                 ))
             }
         };
-        // Record the old generation's death BEFORE the backend drops the
-        // child: without this, a process killed by a restart vanishes from
-        // the event ledger with no death record — indistinguishable from
-        // "still running" and a provenance gap exactly like the un-recorded
-        // failed-launch case this function already guards against. If the
-        // process was already dead, `process()` carries its real code or
-        // signal; if it was alive, the stop below terminates it (SIGTERM is
-        // stop()'s mechanism), and the record says so.
-        //
-        // Finding 6 (ownership truth): the "we terminated it" claim is only
-        // legal for a SPAWNED child. An ATTACHED target (tmux pane) is not
-        // ours to signal — unless the operator explicitly asked for
-        // kill-on-stop, the detach leaves it running, and the ledger must
-        // not say "Terminated" about a process that is still alive.
-        let old_state = self.backend.process();
-        let ownership = self.backend.capabilities().process_ownership;
-        let kill_on_stop = self.backend.kill_on_stop();
-        self.backend.stop().ok();
-        if ownership == crate::backend::ProcessOwnership::Attached && !kill_on_stop {
-            if old_state.running {
-                // Detached from a live pane: NO exit event — the process
-                // outlives the session and its true exit is unobservable
-                // from here.
-            } else {
-                self.push_event(crate::events::TerminalEventKind::ProcessExited {
-                    exit_code: None,
-                    exit_signal: old_state.exit_signal,
-                });
-            }
-        } else if old_state.running {
-            self.push_event(crate::events::TerminalEventKind::ProcessExited {
-                exit_code: None,
-                exit_signal: Some("Terminated".to_string()),
-            });
-        } else {
-            self.push_event(crate::events::TerminalEventKind::ProcessExited {
-                exit_code: old_state.exit_code,
-                exit_signal: old_state.exit_signal,
-            });
-        }
+        // Finding 39: restart consumes the SAME centralized stop lifecycle
+        // as direct stop, so exit evidence and post-stop verification do
+        // not depend on which caller killed the old generation. This
+        // primitive already refuses to emit `ProcessExited` unless the
+        // backend's post-stop state proves the owned child is gone (or the
+        // attached detach is explicitly documented as leaving it alive).
+        self.stop_lifecycle()?;
         // Reserve the NEW generation BEFORE the launch: scratch dirs, the
         // native channel reset, ProcessStarted, and isolation evidence are
         // all keyed on generation at start time. The old order launched N+1
@@ -212,21 +199,52 @@ impl Session {
         let next = self.generation.checked_add(1).ok_or_else(|| {
             anyhow::anyhow!("generation counter exhausted for session '{}'", self.id)
         })?;
-        match self.start_generation(spec, next) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // The failed launch is recorded as history: generation `next`
-                // was consumed by a launch that did not come up. Do NOT
-                // silently retry under the old number (evidence would collide).
-                Err(e)
-            }
-        }
+        // A failed launch is history: generation `next` was consumed by a
+        // launch that did not come up. Do not silently retry under the old
+        // number — evidence would collide.
+        self.start_generation(spec, next)
     }
 
-    pub fn stop(&mut self) -> anyhow::Result<()> {
+    /// THE lifecycle stop primitive (audit finding 39): stop, verify the
+    /// post-stop process truth, emit the observed `ProcessExited` (or the
+    /// documented attached-detach no-event case), then clear observation.
+    /// Restart calls this BEFORE advancing generations; direct stop calls
+    /// get the same lifecycle evidence regardless of caller.
+    pub fn stop_lifecycle(&mut self) -> anyhow::Result<()> {
         self.backend.stop()?;
+        let old_state = self
+            .last_process_state
+            .take()
+            .unwrap_or_else(|| self.process());
+        let post_state = self.process();
+        let ownership = self.caps_at_start.process_ownership;
+        let kill_on_stop = self.backend.kill_on_stop();
+        if ownership == crate::backend::ProcessOwnership::Attached && !kill_on_stop {
+            // Documented detach: a live pane outlives the session, and its
+            // true exit is unobservable. Emit NO exit event.
+            let _ = old_state;
+        } else if post_state.running {
+            // Never fabricate an exit for a stop that failed to terminate.
+            return Err(anyhow::anyhow!(
+                "cannot stop session '{}': stop() reported success but the child is still running",
+                self.id
+            ));
+        } else {
+            self.push_event(crate::events::TerminalEventKind::ProcessExited {
+                exit_code: post_state.exit_code,
+                exit_signal: post_state
+                    .exit_signal
+                    .or_else(|| old_state.running.then(|| "Terminated".to_string())),
+            });
+        }
         self.observation.clear();
         Ok(())
+    }
+
+    /// Direct stop. Uses the centralized lifecycle primitive so plain
+    /// stop and restart share the same exit-evidence contract (finding 39).
+    pub fn stop(&mut self) -> anyhow::Result<()> {
+        self.stop_lifecycle()
     }
 
     /// Mutable backend access for capture-layer callers (frame-sequence
@@ -243,6 +261,29 @@ impl Session {
     pub fn send(&mut self, input: crate::backend::Input) -> anyhow::Result<()> {
         self.backend.send_input(input)?;
         Ok(())
+    }
+
+    /// Typed transport dispatch (audit findings 1/4): the ONE boundary the
+    /// executor uses. The backend classifies whether the transport write was
+    /// entered; the executor maps that onto [`DispatchStatus`] without
+    /// re-inferring. `send()` remains for audit drivers that intentionally
+    /// discard the classification.
+    pub fn dispatch(
+        &mut self,
+        input: crate::backend::Input,
+    ) -> crate::execution::DispatchResult<()> {
+        let outcome = self.backend.dispatch(input);
+        match outcome.result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(crate::execution::DispatchError::from_backend(
+                if outcome.write_entered {
+                    crate::execution::DispatchStatus::PartialOrUnknown
+                } else {
+                    crate::execution::DispatchStatus::FailedBeforeWrite
+                },
+                e.to_string(),
+            )),
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {

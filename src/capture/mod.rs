@@ -158,6 +158,13 @@ pub struct CaptureSequenceOutcome {
     /// Screen sequence at the last captured frame (or the anchor when none).
     pub last_screen_seq: u64,
     pub elapsed_ms: u64,
+    /// Monotonic instant (ms since process start) at which each captured
+    /// frame EDGE landed, in capture order (audit P1-56: timestamps were
+    /// previously discarded; the wire shape now carries them).
+    pub edge_at_monotonic_ms: Vec<u64>,
+    /// Update of frame sequence per captured edge, parallel to
+    /// `edge_at_monotonic_ms`.
+    pub edge_screen_seqs: Vec<u64>,
 }
 
 /// A *compiled* completion plan — the single representation both the act
@@ -322,9 +329,30 @@ pub fn capture_by_strategy(
             },
             budget,
         ),
+        // Audit finding 7: `AfterDuration` must respect the OVERALL
+        // budget. A requested sample offset beyond what remains is
+        // rejected/reported as an unfulfilled deadline (honest), and the
+        // actual sleep never exceeds `deadline.remaining()`.
         CaptureStrategy::AfterDuration { ms } => {
-            let dur = Duration::from_millis(*ms);
-            if dur == Duration::ZERO {
+            let requested = Duration::from_millis(*ms);
+            if requested > budget {
+                // The caller's requested sample instant cannot be reached
+                // inside the operation budget: sample now (the earliest
+                // honest frame) and report the deadline miss.
+                let frame = backend.state()?;
+                return Ok(CaptureOutcome {
+                    reason: crate::backend::CaptureReason::Deadline,
+                    met: false,
+                    screen_seq: backend.event_state().screen_seq,
+                    output_seq: backend.event_state().output_seq,
+                    frame,
+                    elapsed_ms: 0,
+                    frames: None,
+                    actual_sample_offset_ms: 0,
+                    edge_at_monotonic_ms: Vec::new(),
+});
+            }
+            if requested == Duration::ZERO {
                 let frame = backend.state()?;
                 return Ok(CaptureOutcome {
                     reason: crate::backend::CaptureReason::Deadline,
@@ -334,19 +362,26 @@ pub fn capture_by_strategy(
                     frame,
                     elapsed_ms: 0,
                     frames: None,
-                });
+                    actual_sample_offset_ms: 0,
+                    edge_at_monotonic_ms: Vec::new(),
+});
             }
-            std::thread::sleep(dur);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let sleep_for = requested.min(remaining);
+            std::thread::sleep(sleep_for);
             let frame = backend.state()?;
+            let met = sleep_for == requested && sleep_for <= remaining;
             Ok(CaptureOutcome {
                 reason: crate::backend::CaptureReason::Deadline,
-                met: true,
+                met,
                 screen_seq: backend.event_state().screen_seq,
                 output_seq: backend.event_state().output_seq,
                 frame,
-                elapsed_ms: dur.as_millis() as u64,
+                elapsed_ms: sleep_for.as_millis() as u64,
                 frames: None,
-            })
+                actual_sample_offset_ms: 0,
+                edge_at_monotonic_ms: Vec::new(),
+})
         }
         CaptureStrategy::Frames { count } => {
             // Re-review P0: collect ALL `count` frames and return the whole
@@ -376,6 +411,8 @@ pub fn capture_by_strategy(
                 // The sequence survives: this is the debugging payload the
                 // caller asked for.
                 frames: Some(seq.frames),
+                actual_sample_offset_ms: seq.elapsed_ms,
+                edge_at_monotonic_ms: seq.edge_at_monotonic_ms,
             })
         }
         CaptureStrategy::UntilText(t) => wait_capture(backend, WaitCond::Text(t.clone()), budget),
@@ -383,25 +420,20 @@ pub fn capture_by_strategy(
             wait_capture(backend, WaitCond::TextAbsent(t.clone()), budget)
         }
         CaptureStrategy::UntilExit => wait_capture(backend, WaitCond::ProcessExit, budget),
-        CaptureStrategy::UntilEvent(_matcher) => {
-            // Route through the backend's event-aware wait loop so pending
-            // PTY/pipe bytes are pumped while waiting. The backend cannot
-            // match event kinds; it proves the next observable edge, and a
-            // session-level matcher narrows the kind.
-            let baseline = backend.event_state();
-            let out = backend.wait(
-                WaitCond::AnyActivity {
-                    after_interaction_seq: Some(baseline.interaction_seq),
-                },
-                budget,
-            )?;
-            let mut capture = CaptureOutcome::from_wait(out);
-            capture.reason = if capture.met {
-                crate::backend::CaptureReason::ScreenChanged
-            } else {
-                crate::backend::CaptureReason::Deadline
-            };
-            Ok(capture)
+        // Audit finding 8: `UntilEvent` cannot be evaluated correctly at
+        // the BACKEND level — a backend has no event-kind vocabulary, so
+        // the old code silently waited for AnyActivity and ignored the
+        // matcher (a Bell matcher could complete on ordinary output).
+        // Evaluation lives on the SESSION event queue; the backend-level
+        // API refuses the variant instead of lying. Callers that need the
+        // matcher use `capture_by_strategy_session` (or the executor's
+        // CompletionPolicy::Event, which is the canonical path and does
+        // evaluate against the event queue).
+        CaptureStrategy::UntilEvent(_) => {
+            return Err(crate::backend::BackendError::Unsupported(
+                "CaptureStrategy::UntilEvent must run against a Session event queue (see capture_by_strategy_session); a bare backend cannot evaluate event matchers"
+                    .into(),
+            ))
         }
         CaptureStrategy::DeadlineSnapshot { ms } => {
             let dur = Duration::from_millis(*ms).min(budget);
@@ -416,7 +448,9 @@ pub fn capture_by_strategy(
                 frame,
                 elapsed_ms: dur.as_millis() as u64,
                 frames: None,
-            })
+                actual_sample_offset_ms: 0,
+                edge_at_monotonic_ms: Vec::new(),
+})
         }
     }
 }
@@ -427,6 +461,68 @@ pub fn capture_by_strategy(
 /// count is reached, the budget elapses, or the child exits/closes — never
 /// on a single quiet interval (a flicker/spin can stall one edge interval
 /// well past a naive quiet window).
+/// Session-aware strategy capture (audit finding 8): the ONE variant the
+/// backend cannot evaluate — [`CaptureStrategy::UntilEvent`] — runs here,
+/// against the session's real event queue with an incremental cursor, so
+/// a Bell matcher can never be satisfied by ordinary output. All other
+/// variants delegate to [`capture_by_strategy`].
+pub fn capture_by_strategy_session(
+    session: &mut crate::session::state::Session,
+    strategy: &CaptureStrategy,
+    anchor_screen_seq: u64,
+    budget: Duration,
+) -> anyhow::Result<CaptureOutcome> {
+    match strategy {
+        CaptureStrategy::UntilEvent(matcher) => {
+            let pre_event_seq = session.event_queue_last_seq();
+            let start = std::time::Instant::now();
+            let deadline = start + budget;
+            loop {
+                // Observe with a bounded idle window so the backend pumps
+                // and the session queue advances; then scan NEW events only.
+                let _ = session.observe(30)?;
+                let batch = session.events_since(pre_event_seq);
+                if batch.events.iter().any(|ev| matcher.matches(&ev.kind)) {
+                    let frame = session.peek_fresh()?.frame;
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::EventMatched,
+                        met: true,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
+                        edge_at_monotonic_ms: Vec::new(),
+                    });
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    let frame = session.peek_fresh()?.frame;
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::Deadline,
+                        met: false,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                        actual_sample_offset_ms: 0,
+                        edge_at_monotonic_ms: Vec::new(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        other => Ok(capture_by_strategy(
+            session.backend_mut(),
+            other,
+            anchor_screen_seq,
+            budget,
+        )?),
+    }
+}
+
 pub fn capture_frame_sequence(
     backend: &mut dyn TerminalBackend,
     count: usize,
@@ -434,14 +530,24 @@ pub fn capture_frame_sequence(
     budget: Duration,
 ) -> CaptureSequenceOutcome {
     let start = std::time::Instant::now();
+    let deadline = start + budget;
     let mut frames: Vec<ScreenState> = Vec::new();
+    let mut edge_at_monotonic_ms: Vec<u64> = Vec::new();
+    let mut edge_screen_seqs: Vec<u64> = Vec::new();
     let mut seen_upto = anchor_screen_seq;
-    // A per-edge wait ceiling strictly shorter than the overall budget so a
-    // genuinely-quiet child cannot stall the whole capture; the loop
-    // re-checks `start.elapsed()` and exits on budget.
-    let edge_budget = budget.min(Duration::from_millis(300));
+    // Audit P1-56: each edge wait consumes only what remains of the ONE
+    // deadline (never a fixed `budget.min(300)` that could let a quiet
+    // child stall past the caller's wall clock); the loop re-checks
+    // `start.elapsed()` and exits on budget.
     let mut reason = CaptureSequenceReason::BudgetExpired;
-    while frames.len() < count && start.elapsed() < budget {
+    while frames.len() < count {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            reason = CaptureSequenceReason::BudgetExpired;
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let edge_budget = remaining.min(Duration::from_millis(300));
         let out = backend.wait(
             WaitCond::ScreenStable {
                 quiet_for: Duration::from_millis(0),
@@ -464,6 +570,8 @@ pub fn capture_frame_sequence(
         };
         if out.screen_seq > seen_upto {
             frames.push(out.state.clone());
+            edge_at_monotonic_ms.push(crate::events::monotonic_ms());
+            edge_screen_seqs.push(out.screen_seq);
             seen_upto = out.screen_seq;
             if frames.len() == count {
                 reason = CaptureSequenceReason::CountReached;
@@ -491,6 +599,8 @@ pub fn capture_frame_sequence(
         reason,
         last_screen_seq,
         elapsed_ms: start.elapsed().as_millis() as u64,
+        edge_at_monotonic_ms,
+        edge_screen_seqs,
     }
 }
 
@@ -678,6 +788,47 @@ mod tests {
     }
 
     #[test]
+    fn frame_sequence_preserves_actual_monotonic_edge_offsets() {
+        let mut b = sleepy(
+            "import sys,time\n\
+             input()\n\
+             print('EDGE-A')\n\
+             sys.stdout.flush()\n\
+             time.sleep(0.15)\n\
+             print('EDGE-B')\n\
+             sys.stdout.flush()\n\
+             time.sleep(1)",
+        );
+        let pre = b.event_state().screen_seq;
+        b.send_input(crate::backend::Input::Text("GO\n".into()))
+            .expect("gate");
+        let echo = b
+            .wait(
+                crate::backend::WaitCond::ScreenStable {
+                    quiet_for: Duration::from_millis(0),
+                    after_screen_seq: Some(pre),
+                },
+                Duration::from_secs(5),
+            )
+            .expect("echo");
+        let out = capture_by_strategy(
+            &mut b,
+            &CaptureStrategy::Frames { count: 2 },
+            echo.screen_seq,
+            Duration::from_secs(5),
+        )
+        .expect("sequence");
+        assert_eq!(out.frames.as_ref().map(Vec::len), Some(2));
+        assert_eq!(out.edge_at_monotonic_ms.len(), 2);
+        // Edge stamps are monotonic process timestamps and therefore
+        // ordered. The child sleeps ~150ms between frames, but a coarse
+        // monotonic clock under load may land both within the same
+        // millisecond; ordering must never regress.
+        assert!(out.edge_at_monotonic_ms[0] <= out.edge_at_monotonic_ms[1]);
+        b.stop().ok();
+    }
+
+    #[test]
     fn until_text_honors_appearance_condition() {
         let mut b = sleepy(
             "import time\nprint('HELLO-MARK')\nimport sys; sys.stdout.flush()\ntime.sleep(1)",
@@ -692,5 +843,33 @@ mod tests {
         .expect("capture");
         assert!(out.met);
         b.stop().ok();
+    }
+}
+
+#[cfg(test)]
+mod transition_sequence_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_is_cloneable_and_counts_are_exact() {
+        let screen = crate::screen::ScreenState::new(2, 1);
+        let outcome = CaptureSequenceOutcome {
+            requested: 2,
+            captured: 1,
+            frames: vec![screen.clone()],
+            completed: false,
+            reason: CaptureSequenceReason::BudgetExpired,
+            last_screen_seq: 4,
+            elapsed_ms: 17,
+            edge_at_monotonic_ms: vec![12],
+            edge_screen_seqs: vec![4],
+        };
+        let clone = outcome.clone();
+        assert_eq!(clone.requested, 2);
+        assert_eq!(clone.captured, 1);
+        assert!(!clone.completed);
+        assert_eq!(clone.reason.name(), "budget_expired");
+        assert_eq!(clone.edge_at_monotonic_ms, vec![12]);
+        assert_eq!(clone.edge_screen_seqs, vec![4]);
     }
 }

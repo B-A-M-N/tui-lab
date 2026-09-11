@@ -160,6 +160,7 @@ where
         // never checked.
         None => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "AUDIT-UNVERIFIED".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -251,6 +252,7 @@ pub fn residue_finding(profile: &str, pre: &PreState, residue: &StateResidue) ->
     }
     let structure_only = residue.structure_changed && !residue.has_residue();
     Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "AUDIT-RESIDUE".into(),
         rule_id: None,
         severity: if structure_only {
