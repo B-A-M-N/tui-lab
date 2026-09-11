@@ -140,15 +140,29 @@ pub(crate) async fn tui_audit(
                  explicit, never implied by the isolation-like name",
             );
         }
-        crate::audit::orchestrator::SafetyPolicy::DeepIsolation
+        crate::audit::orchestrator::SafetyPolicy::RestartBetweenMutations
     } else if p.allow_mutation.unwrap_or(false) {
         crate::audit::orchestrator::SafetyPolicy::AllowMutation
     } else {
         crate::audit::orchestrator::SafetyPolicy::SafeOnly
     };
-    let risk = crate::audit::orchestrator::AuditProfile::parse(&profile)
-        .map(|ap| ap.risk().name().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let risk_obj = crate::audit::orchestrator::AuditProfile::parse(&profile)
+        .map(|ap| {
+            let risk = ap.risk();
+            serde_json::json!({
+                "name": risk.name(),
+                "side_effect_class": risk.side_effect_class(),
+                "recovery_guarantee": risk.recovery_guarantee(),
+            })
+        })
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "name": "unknown",
+                "side_effect_class": "unknown",
+                "recovery_guarantee": "unknown",
+            })
+        });
+    let risk = risk_obj["name"].as_str().unwrap_or("unknown").to_string();
 
     // The audit ENGINE owns the static-vs-active decision (re-review
     // P0 fix 2): `full` is the composite (static + every non-
@@ -202,6 +216,11 @@ pub(crate) async fn tui_audit(
                 // W2.10: attach app-declared source loci where coverage
                 // evidence can name the finding's control.
                 let _ = run.extend_findings_with_source_refs(report.findings.clone());
+                // Beta-audit P0.10: the completed pass becomes THE current
+                // snapshot, so regression comparisons ask "fixed or
+                // persisting in the newest audit" — never "still somewhere
+                // in the cumulative ledger".
+                run.record_audit_pass(report.findings.clone());
                 if let Some(cmp_label) = compare_to.as_deref() {
                     match run.finding_baseline(cmp_label) {
                         Some(baseline) => {
@@ -209,11 +228,15 @@ pub(crate) async fn tui_audit(
                             // this baseline but seen in an EARLIER pass is a
                             // regression, not a first-seen new defect (review
                             // P1 item 12).
-                            let resolved = crate::audit::compare::Resolved(
+                            let _resolved = crate::audit::compare::Resolved(
                                 run.resolved_finding_fingerprints(cmp_label),
                             );
+                            // Audit finding 48: MCP baseline diffs compare
+                            // DEFECTS by default. Gates/metrics/observations
+                            // remain in the audit record but do not produce
+                            // product-regression verdicts.
                             let compared =
-                                crate::audit::compare::compare_with_resolved(baseline, &report.findings, &resolved);
+                                crate::audit::compare::compare_defects(baseline, &report.findings);
                             compare_block = json!({
                                 "baseline": cmp_label,
                                 "available": true,
@@ -247,12 +270,13 @@ pub(crate) async fn tui_audit(
             };
             ok(json!({
                 "profile": profile_wire,
-                "mode": report.mode,
+                "mode": report.mode.name(),
                 "risk": risk,
+                "risk_effects": risk_obj,
                 "policy": match policy {
                     crate::audit::orchestrator::SafetyPolicy::SafeOnly => "safe_only",
                     crate::audit::orchestrator::SafetyPolicy::AllowMutation => "allow_mutation",
-                    crate::audit::orchestrator::SafetyPolicy::DeepIsolation => {
+                    crate::audit::orchestrator::SafetyPolicy::RestartBetweenMutations => {
                         "restart_between_mutations"
                     }
                 },

@@ -17,13 +17,13 @@ selector_enum!(
     [
         Status => "status", Persist => "persist", Close => "close",
         Context => "context", List => "list", Resume => "resume",
-        // Review §2: diagnosis, not repair — the contexts carry evidence,
-        // provenance-tiered loci, verification plans, and next
-        // observations; they never prescribe edits. `repair` remains an
-        // accepted alias for the same arm (pre-beta callers keep working;
-        // the response's `contract` field names the recontracted meaning).
+        // Review §2 / beta-audit P1.6: diagnosis, not repair — the
+        // contexts carry evidence, provenance-tiered loci, verification
+        // plans, and next observations; they never prescribe edits. The
+        // pre-beta `repair` alias is GONE: carrying a name whose meaning
+        // reversed ("repair" that does not repair) would confuse agents
+        // forever.
         Diagnose => "diagnose",
-        Repair => "repair",
         // Review P0.1/2: begin a fresh ephemeral run — the clean "next run"
         // operation. Starts a new evidence bundle; any live sessions from
         // the prior run become foreign owners (refused until stopped).

@@ -47,7 +47,7 @@ pub fn from_vt(
 }
 
 /// Item 48: the contract's `volatile_patterns` are part of the structure
-/// hash's identity. This variant takes the caller's [`NormalizationPolicy`]
+/// hash's identity. This variant takes the caller's `NormalizationPolicy`
 /// — the default conservative policy when no contract is loaded.
 pub fn from_vt_with_policy(
     screen: &VtScreen,

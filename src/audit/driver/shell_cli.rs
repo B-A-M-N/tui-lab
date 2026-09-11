@@ -22,6 +22,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
         Ok(s) => s,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "SH-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -48,6 +49,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
     if has_osc133 {
         let cs = cmd_state.unwrap();
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "SH-CMDSTATE".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -91,6 +93,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
 
     if !has_osc133 {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "SH-NOMARKS".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -119,6 +122,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
     // Exit-status honesty: has the process ended, and is a code visible?
     if !proc_state.running {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "SH-EXIT".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -154,6 +158,7 @@ pub fn shell_cli_audit(session: &mut Session) -> Vec<Finding> {
             .unwrap_or(false);
         if alt_screen {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "SH-ALTSCREEN".into(),
                 rule_id: None,
                 severity: Severity::Info,

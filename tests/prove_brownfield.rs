@@ -183,7 +183,7 @@ async fn brownfield_deep_isolation_contract_is_declared() {
             sess,
             "states",
             None,
-            tui_lab::audit::orchestrator::SafetyPolicy::DeepIsolation,
+            tui_lab::audit::orchestrator::SafetyPolicy::RestartBetweenMutations,
         )
         .expect("states under deep isolation");
         assert!(

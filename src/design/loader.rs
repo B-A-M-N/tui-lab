@@ -183,10 +183,19 @@ oracles:
 
     #[test]
     fn json_also_loads() {
+        // Beta-audit P0.5: Default is the neutral document, so it must
+        // round-trip losslessly — and the opinionated baseline lives
+        // behind recommended_policy(), which also round-trips.
         let c = default_contract();
         let json = serde_json::to_string_pretty(&c).unwrap();
         let parsed = parse_json(&json).expect("round-trips");
-        assert_eq!(parsed.viewports.len(), 3);
+        assert_eq!(parsed, c, "blank contract round-trips losslessly");
+
+        let rec = crate::design::ProjectContract::recommended_policy();
+        let rec_json = serde_json::to_string_pretty(&rec).unwrap();
+        let rec_parsed = parse_json(&rec_json).expect("recommended_policy round-trips");
+        assert_eq!(rec_parsed, rec, "recommended_policy round-trips losslessly");
+        assert_eq!(rec_parsed.viewports.len(), 3);
     }
 
     #[test]

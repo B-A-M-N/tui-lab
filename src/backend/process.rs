@@ -10,7 +10,7 @@
 //!
 //! No terminal semantics: the emulator grid, the event clock, the raw
 //! ring, and the protocol callbacks all live elsewhere. The backend
-//! calls [`PtyProcess::spawn`] from `start()`, [`PtyProcess::drain`]
+//! calls `PtyProcess::spawn` from `start()`, `PtyProcess::drain`
 //! from its single canonical `pump()`, and routes writes/resizes/
 //! signals through the matching methods.
 

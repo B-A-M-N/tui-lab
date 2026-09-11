@@ -887,6 +887,7 @@ fn audit_transaction_reports_timing_metrics() {
     // metrics ride beside them.
     let (findings, m) = tui_lab::audit::transaction::run_verified(&mut s, "probe", |_sess| {
         vec![tui_lab::audit::Finding {
+            kind: tui_lab::audit::FindingKind::Defect,
             id: "PROBE-1".into(),
             rule_id: None,
             severity: tui_lab::audit::Severity::Info,
@@ -972,7 +973,11 @@ fn clean_audit_run_has_no_fake_metrics_finding() {
     // clean run are structure-only AUDIT-RESIDUE rows at INFO (contextual
     // evidence; this echo child shows the drivers' own control bytes).
     // Any WARN/ERROR AUDIT-* row on a clean run is a synthetic masquerade.
-    for f in report.findings.iter().filter(|f| f.id.starts_with("AUDIT-")) {
+    for f in report
+        .findings
+        .iter()
+        .filter(|f| f.id.starts_with("AUDIT-"))
+    {
         assert!(
             f.id == "AUDIT-RESIDUE" && f.severity == tui_lab::audit::Severity::Info,
             "timing must not masquerade as an audit finding, and only \

@@ -12,8 +12,8 @@
 //! screen actually settled (re-review items 8/9).
 //!
 //! Split into family files (review §15 god-object residue): the action
-//! vocabulary in [`record`], the transaction record in [`transaction`], the
-//! executor + its tests in [`executor`], waits/asserts in [`wait`].
+//! vocabulary in `record`, the transaction record in `transaction`, the
+//! executor + its tests in `executor`, waits/asserts in `wait`.
 
 mod executor;
 mod record;
@@ -26,9 +26,13 @@ pub use executor::{
     execute_act_with_guard_and_origin, execute_act_with_visibility,
 };
 pub use record::{
-    CanonicalAction, DriveOrigin, InputVisibility, ObservationAnchor, PersistedAction, SettleStatus,
+    CanonicalAction, DispatchError, DispatchResult, DispatchStatus, DriveOrigin, InputVisibility,
+    ObservationAnchor, PersistedAction, SettleStatus,
 };
-pub use transaction::{ActionEnvelope, InteractionTransaction, RenderOp, RenderTransaction};
+pub use transaction::{
+    cell_dirty_metrics, ActionEnvelope, EraseDisplayKind, InteractionTransaction, RenderOp,
+    RenderTransaction,
+};
 pub use wait::{execute_assert, execute_wait, execute_wait_event, WaitEventOutcome};
 
 pub mod guard;

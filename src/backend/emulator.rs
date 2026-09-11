@@ -9,7 +9,7 @@
 //! ignore.
 //!
 //! The backend keeps its single canonical `pump()`; it calls
-//! [`TerminalEmulator::feed`] at the one ingestion point and reads
+//! `TerminalEmulator::feed` at the one ingestion point and reads
 //! snapshots/modes through the emulator's accessors. Protocol state
 //! (callbacks' fields) stays in [`super::protocol`]; the emulator holds
 //! the parser that carries it and hands out callbacks access.
@@ -95,6 +95,13 @@ impl TerminalEmulator {
     /// Mutable callback state (response draining, counter sync).
     pub(super) fn callbacks_mut(&mut self) -> &mut BackendCallbacks {
         self.parser.callbacks_mut()
+    }
+
+    /// Install the terminal persona's synchronized-update behavior contract.
+    /// Must be called before launch/query traffic; this changes how the
+    /// emulator responds to applications, not merely what it records.
+    pub(super) fn set_synchronized_updates(&mut self, yes: bool) {
+        self.parser.callbacks_mut().set_synchronized_updates(yes);
     }
 
     /// Wave F item 53: the scrollback materialized at the last refresh.

@@ -12,6 +12,7 @@ pub mod driver;
 pub mod orchestrator;
 pub mod repair;
 pub mod transaction;
+pub mod verification;
 pub use driver::*;
 
 /// What kind of artifact an [`EvidenceRef`] points at.
@@ -291,10 +292,57 @@ impl<'de> serde::Deserialize<'de> for Category {
     }
 }
 
+/// What kind of audit record this is (audit finding 48). A `Finding` is a
+/// DEFECT claim; observations/metrics/gates are telemetry and must not
+/// become product regressions in baseline comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// A product defect claim (the default for ordinary findings).
+    Defect,
+    /// Evidence that something was/wasn't exercised; not a defect.
+    Observation,
+    /// Measured telemetry (latencies, counters, coverage).
+    Metric,
+    /// Orchestration/gating state (e.g. safe-only withheld a profile).
+    Gate,
+}
+
+impl Default for FindingKind {
+    fn default() -> Self {
+        FindingKind::Defect
+    }
+}
+
+impl FindingKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FindingKind::Defect => "defect",
+            FindingKind::Observation => "observation",
+            FindingKind::Metric => "metric",
+            FindingKind::Gate => "gate",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "observation" => FindingKind::Observation,
+            "metric" => FindingKind::Metric,
+            "gate" => FindingKind::Gate,
+            _ => FindingKind::Defect,
+        }
+    }
+}
+
 /// One audit finding. `evidence` is a list of [`EvidenceRef`]s (re-review
 /// Part XV) — a Finding can carry many citations, not just one inline blob.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
+    /// Record kind (audit finding 48): defaults to Defect for older
+    /// serialized findings. Baseline comparison compares defects unless a
+    /// consumer explicitly asks for telemetry/gates.
+    #[serde(default)]
+    pub kind: FindingKind,
     /// Instance-unique id (re-review P1: three clipped regions used to all
     /// read `CLIP-001`, making every downstream citation ambiguous). The
     /// rule is preserved in [`Self::rule_id`]; the instance id is the
@@ -342,7 +390,7 @@ impl Finding {
     ///
     /// Finding 21: this is also where the typed `occurrence_id` is
     /// assigned — the canonical, versioned occurrence identity (sorted
-    /// key material, see [`occurrence_id`]) that baselines compare on.
+    /// key material, see `occurrence_id`) that baselines compare on.
     pub fn instance(mut self) -> Self {
         let rule = self.rule_id.clone().unwrap_or_else(|| self.id.clone());
         // Discriminator: the first evidence target (region/control id,
@@ -441,6 +489,7 @@ impl Finding {
         let s: String = summary.into();
         let hash: String = screen_hash.into();
         Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: id.into(),
             rule_id: None,
             severity,
@@ -528,6 +577,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
     if sem.focus.control.is_none() && reverse_count == 0 {
         let summary = "No detectable focus target on this screen.".to_string();
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "FOCUS-001".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -550,6 +600,7 @@ fn static_focus_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding
             ctrl, sem.focus.confidence
         );
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "FOCUS-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -576,6 +627,7 @@ fn static_clipping_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
         if (b.x + b.width) > screen.cols || (b.y + b.height) > screen.rows {
             let summary = format!("Region '{}' extends beyond terminal bounds.", rg.id);
             out.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CLIP-001".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -617,6 +669,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
     if keybinds.is_empty() {
         let summary = "No keyboard affordances detected on this screen.".to_string();
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "DISC-001".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -640,6 +693,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
         labeled.len()
     );
     out.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "DISC-OK".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -682,6 +736,7 @@ fn discoverability_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Find
                 verb
             );
             out.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: format!("DISC-HIDDEN-{}", verb.to_uppercase()),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -747,6 +802,7 @@ fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
             wide_overlaps.len()
         );
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "UNI-WIDE".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -782,6 +838,7 @@ fn unicode_audit(screen: &ScreenState) -> Vec<Finding> {
             leaked.len()
         );
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "UNI-CTRL".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -844,6 +901,7 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
             labels.join(", ")
         );
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "CTRL-ORPHAN".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -880,6 +938,7 @@ fn controls_audit(screen: &ScreenState, sem: &SemanticScreen) -> Vec<Finding> {
                 ids.join(", ")
             );
             out.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CTRL-AMBIG".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -919,6 +978,7 @@ fn static_keyboard_audit(sem: &SemanticScreen) -> Vec<Finding> {
         );
         let button_labels: Vec<String> = buttons.iter().map(|b| b.label.clone()).collect();
         out.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "KB-INFO".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -990,6 +1050,7 @@ mod tests {
     #[test]
     fn occurrence_id_is_order_insensitive_and_discriminating() {
         let mk = |targets: Vec<&str>| Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "CLIP-001".into(),
             rule_id: Some("CLIP-001".into()),
             severity: Severity::Warn,

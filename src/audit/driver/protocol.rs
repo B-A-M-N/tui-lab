@@ -33,6 +33,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         Ok(w) => w,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "MODE-RDFAIL".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -53,6 +54,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
     };
     if cap == 0 {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "MODE-NOSRC".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -81,6 +83,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         Ok(s) => s,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "MODE-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -120,6 +123,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         },
     );
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "MODE-INVENTORY".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -152,6 +156,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
         .any(|a| matches!(a.invocation, crate::semantic::Invocation::Mouse { .. }));
     if mouse_on && !mouse_visible {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "MODE-MOUSE-HIDDEN".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -175,6 +180,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
     // clicks will not be reported (the app never sees them).
     if !mouse_on && mouse_visible {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "MODE-MOUSE-INERT".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -207,6 +213,7 @@ pub fn terminal_modes_audit(session: &mut Session) -> Vec<Finding> {
                 .any(|r| r.contains('>') || r.contains('$'));
         if multiline_input {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "MODE-PASTE-RAW".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -245,6 +252,7 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
     let mut findings = Vec::new();
     let Some((trace, nbytes, dropped)) = decode_raw(session) else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "INP-NOSRC".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -271,6 +279,7 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
     let get = |k: &str| state.get(k).copied();
 
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "INP-ENCODING".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -305,6 +314,7 @@ pub fn input_protocol_audit(session: &mut Session) -> Vec<Finding> {
     let modes = session.input_modes();
     if modes.kitty_flags != 0 {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "INP-KITTY".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -352,6 +362,7 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
 
     let Some((trace, nbytes, dropped)) = decode_raw(session) else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "QR-NOSRC".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -462,6 +473,7 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
     // intermediate byte we do not re-derive here); report it as untracked
     // rather than zero.
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "QR-INVENTORY".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -565,6 +577,7 @@ pub fn query_response_audit(session: &mut Session) -> Vec<Finding> {
         "probe `CSI 6n` got no measured answer — this engine has no device-query responder; apps that block on cursor position would hang under it.".to_string()
     };
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: id.into(),
         rule_id: None,
         severity: sev,

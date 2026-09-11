@@ -276,12 +276,17 @@ pub(crate) async fn tui_explore(
                     Ok(r) => r,
                     Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
                 };
-                // Merge what actually happened into the run's graphs.
-                {
-                    let mut run = run.lock().unwrap();
-                    run.graphs_mut().state_graph.merge(&local_graph);
-                    run.graphs_mut().focus_graph.merge(&focus_graph);
-                }
+                // Merge what actually happened into the run's graphs —
+                // through the ticket-verified sink (beta-audit P0.3): an
+                // exploration authorized under run A cannot leave its
+                // graph edges in run B, and a run switch drops the merge
+                // (the local graphs still land in the response) instead
+                // of misattributing it.
+                let sink = sess
+                    .evidence_sink()
+                    .expect("authorized dispatch installs the evidence sink");
+                sink.merge_state_graph(&local_graph);
+                sink.merge_focus_graph(&focus_graph);
                 ok(json!({
                     "mode": "semantic",
                     "max_risk": max_risk.name(),

@@ -101,7 +101,9 @@ async fn foreign_leased_stop_refuses() {
     // reading the lease; the old handler discarded that refusal and
     // stopped the process anyway. Stop must refuse on the LEASE.
     let stop = server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
         .await;
     let e = unwrap_err(&stop, "foreign+leased stop");
     assert_eq!(e["category"], "control_leased", "{e:?}");
@@ -130,7 +132,9 @@ async fn closed_run_leased_stop_refuses() {
         "close",
     );
     let stop = server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
         .await;
     let e = unwrap_err(&stop, "closed+leased stop");
     assert_eq!(e["category"], "control_leased", "{e:?}");
@@ -152,7 +156,9 @@ async fn expired_lease_allows_stop() {
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let stop = unwrap_ok(
         &server
-            .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "stop", "id": id }),
+            ))
             .await,
         "stop after expiry",
     );
@@ -163,7 +169,7 @@ async fn expired_lease_allows_stop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_run_unleased_cleanup_after_close_succeeds() {
     let server = tui_lab::mcp::tools::TuiLabServer::new();
-    let guard = PoolGuard::new(&server);
+    let _guard = PoolGuard::new(&server);
     let id = start_session(&server, "print('cu'); import sys; sys.stdin.read(1)").await;
     // Close WITHOUT kill_sessions: the owned session survives, still
     // owned by the (now closed) run.
@@ -177,7 +183,9 @@ async fn same_run_unleased_cleanup_after_close_succeeds() {
     // the current (closed) run.
     let stop = unwrap_ok(
         &server
-            .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+            .tui_session(params_typed(
+                serde_json::json!({ "action": "stop", "id": id }),
+            ))
             .await,
         "same-run unleased stop after close",
     );
@@ -198,7 +206,9 @@ async fn foreign_unleased_stop_refuses() {
     // No lease this time: the refusal is OWNERSHIP — the current run must
     // not manage another run's session lifecycle.
     let stop = server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
         .await;
     let e = unwrap_err(&stop, "foreign unleased stop");
     assert_eq!(e["category"], "no_session", "{e:?}");

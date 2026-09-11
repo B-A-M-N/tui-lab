@@ -15,9 +15,7 @@ use tui_lab::session::SessionPool;
 fn raw_ready_args(marker: &str) -> Vec<String> {
     vec![
         "-c".into(),
-        format!(
-            "import sys,tty; tty.setraw(0); print('{marker}'); sys.stdin.buffer.read(1)"
-        ),
+        format!("import sys,tty; tty.setraw(0); print('{marker}'); sys.stdin.buffer.read(1)"),
     ]
 }
 
@@ -67,7 +65,7 @@ async fn every_origin_gets_the_full_evidence_contract() {
         pool.with_session(Some(&id), move |sess| {
             let run = Arc::new(Mutex::new(RunContext::ephemeral()));
             let sink = RunEvidenceSink::capture(&run);
-            let ticket = sink.ticket().clone();
+            let _ticket = sink.ticket().clone();
 
             // Drive one act through the canonical executor with the sink
             // installed — what every unified driver path now does.

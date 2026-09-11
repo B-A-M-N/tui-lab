@@ -236,6 +236,17 @@ impl CanonicalAction {
         }
     }
 
+    /// Replay-safe payload text for a Type action: the text is itself
+    /// semantic input, so a recorded precondition should require its
+    /// presence rather than pin the volatile fused identity it changes.
+    /// `None` for non-Type actions.
+    pub fn payload_text(&self) -> Option<String> {
+        match self {
+            CanonicalAction::Type { text } => Some(text.clone()),
+            _ => None,
+        }
+    }
+
     /// Byte length of the payload this action carries (leak-fix support for
     /// redacted persistence: the length is replay-relevant metadata and is
     /// safe to keep; the bytes are not).
@@ -256,10 +267,11 @@ impl CanonicalAction {
         let btn =
             |b: &Option<crate::mcp::params::MouseButtonParam>| b.map(MB::from).unwrap_or(MB::Left);
         match req {
-            R::Key { key, .. } => Ok(CanonicalAction::Key {
-                key: crate::mcp::helpers::parse_key_public(key)?,
+            R::Key(p) => Ok(CanonicalAction::Key {
+                key: crate::mcp::helpers::parse_key_public(&p.key)?,
             }),
-            R::Keys { keys, .. } => {
+            R::Keys(p) => {
+                let keys = &p.keys;
                 if keys.is_empty() {
                     return Err("empty keys".into());
                 }
@@ -269,49 +281,50 @@ impl CanonicalAction {
                 }
                 Ok(CanonicalAction::Keys { keys: out })
             }
-            R::Type { text, .. } => Ok(CanonicalAction::Type { text: text.clone() }),
-            R::Paste { paste, .. } => Ok(CanonicalAction::Paste {
-                text: paste.clone(),
+            R::Type(p) => Ok(CanonicalAction::Type {
+                text: p.text.clone(),
             }),
-            R::Raw { raw, .. } => {
+            R::Paste(p) => Ok(CanonicalAction::Paste {
+                text: p.paste.clone(),
+            }),
+            R::Raw(p) => {
+                let raw = &p.raw;
                 if raw.is_empty() {
                     return Err("empty raw payload".into());
                 }
                 Ok(CanonicalAction::Raw { bytes: raw.clone() })
             }
-            R::MouseClick { x, y, button, .. } => Ok(CanonicalAction::MouseClick {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MouseClick(p) => Ok(CanonicalAction::MouseClick {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MousePress { x, y, button, .. } => Ok(CanonicalAction::MousePress {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MousePress(p) => Ok(CanonicalAction::MousePress {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MouseRelease { x, y, button, .. } => Ok(CanonicalAction::MouseRelease {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MouseRelease(p) => Ok(CanonicalAction::MouseRelease {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MouseMove { x, y, .. } => Ok(CanonicalAction::MouseMove { x: *x, y: *y }),
-            R::MouseDrag { x, y, button, .. } => Ok(CanonicalAction::MouseDrag {
-                button: btn(button),
-                x: *x,
-                y: *y,
+            R::MouseMove(p) => Ok(CanonicalAction::MouseMove { x: p.x, y: p.y }),
+            R::MouseDrag(p) => Ok(CanonicalAction::MouseDrag {
+                button: btn(&p.button),
+                x: p.x,
+                y: p.y,
             }),
-            R::MouseScroll {
-                x, y, direction, ..
-            } => Ok(CanonicalAction::MouseScroll {
-                direction: direction.map(SD::from).unwrap_or(SD::Down),
-                x: *x,
-                y: *y,
+            R::MouseScroll(p) => Ok(CanonicalAction::MouseScroll {
+                direction: p.direction.map(SD::from).unwrap_or(SD::Down),
+                x: p.x,
+                y: p.y,
             }),
-            R::Resize { cols, rows, .. } => Ok(CanonicalAction::Resize {
-                cols: *cols,
-                rows: *rows,
+            R::Resize(p) => Ok(CanonicalAction::Resize {
+                cols: p.cols,
+                rows: p.rows,
             }),
-            R::Signal { signal, .. } => Ok(CanonicalAction::Signal { signal: *signal }),
+            R::Signal(p) => Ok(CanonicalAction::Signal { signal: p.signal }),
         }
     }
 }
@@ -369,6 +382,77 @@ impl DriveOrigin {
     }
 }
 
+/// Exact write-boundary state for one logical dispatch. A guard refusal
+/// never reaches the transport; a transport failure after bytes are known
+/// representable is at least unknown-partial and must be evidenced rather
+/// than disappearing through `?`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchStatus {
+    /// The action was refused before any transport write.
+    RefusedBeforeWrite,
+    /// The backend reported success after its complete payload write.
+    Sent,
+    /// The transport failed before any bytes were known to be written.
+    FailedBeforeWrite,
+    /// The transport failed at a point where partial delivery cannot be
+    /// ruled out. Evidence must record this explicitly.
+    PartialOrUnknown,
+}
+
+impl DispatchStatus {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::RefusedBeforeWrite => "refused_before_write",
+            Self::Sent => "sent",
+            Self::FailedBeforeWrite => "failed_before_write",
+            Self::PartialOrUnknown => "partial_or_unknown",
+        }
+    }
+
+    /// Whether a write was attempted for this status. `Sent` and
+    /// `PartialOrUnknown` both imply the transport write was entered;
+    /// the two pre-write statuses prove no bytes could have landed.
+    pub fn write_attempted(&self) -> bool {
+        matches!(self, Self::Sent | Self::PartialOrUnknown)
+    }
+}
+
+/// The typed outcome of one transport dispatch (audit finding 4): the
+/// backend's original error is preserved, plus the exact classification of
+/// whether the write was attempted. The executor maps this onto
+/// [`DispatchStatus`] without collapsing distinct failure classes into
+/// `PartialOrUnknown`.
+#[derive(Debug, Clone)]
+pub struct DispatchError {
+    pub status: DispatchStatus,
+    /// The backend's original error string (BackendError or resize error),
+    /// preserved verbatim for evidence.
+    pub message: String,
+}
+
+impl DispatchError {
+    /// Classify a send/resize failure by what the backend proved. A
+    /// preflight/encoding/unsupported failure proves no bytes were written;
+    /// anything observed only as a transport I/O error after the write
+    /// boundary is entered is `PartialOrUnknown` unless the backend proved
+    /// otherwise.
+    pub fn from_backend(status: DispatchStatus, message: String) -> Self {
+        DispatchError { status, message }
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status.name(), self.message)
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+/// A typed [`Result`] for transport dispatch.
+pub type DispatchResult<T> = Result<T, DispatchError>;
+
 /// Settlement outcome for one interaction (re-review P1: `no_wait` must not
 /// report `settled` — "I did not test settlement" is not "it settled").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -380,6 +464,12 @@ pub enum SettleStatus {
     TimedOut,
     /// Settlement was not tested (`no_wait=true`).
     Skipped,
+    /// No settle wait was attempted — the dispatch failed before (or
+    /// with unknown) delivery, so settlement is not merely untested, it
+    /// was never reachable. Distinct from `Skipped` (`no_wait`: we
+    /// CHOSE not to wait on a sent input) and from `TimedOut` (a wait
+    /// ran and exhausted its budget).
+    NotAttempted,
 }
 
 impl SettleStatus {
@@ -388,6 +478,8 @@ impl SettleStatus {
     pub fn from_legacy(settled: bool, reason: &str) -> Self {
         if reason == "no_wait" {
             SettleStatus::Skipped
+        } else if reason == "dispatch_failed" {
+            SettleStatus::NotAttempted
         } else if settled {
             SettleStatus::Met
         } else {

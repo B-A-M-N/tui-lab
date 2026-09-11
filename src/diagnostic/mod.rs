@@ -4,7 +4,7 @@
 //! this small experiment and tell me EVERYTHING materially different."* That
 //! is a probe, distinct from `observe`/`act`/`wait`/`assert`/`scenario`/
 //! `audit`/`explore` because it *composes* a baseline capture, a stimulus, a
-//! generalized [`CaptureStrategy`], and a before/after diff into one result.
+//! generalized `CaptureStrategy`, and a before/after diff into one result.
 //!
 //! It never requires classification first (Raw-mode friendly) and never
 //! mandates a stable screen (the strategy decides "done"). It reports what
@@ -135,12 +135,12 @@ impl ProbeResult {
 /// Run one probe against a live session.
 ///
 /// Re-review Wave-2 (canonical diagnostics): the stimulus goes through the
-/// ONE canonical executor — [`execute_act_with_completion`] — so a probe
+/// ONE canonical executor — `execute_act_with_completion` — so a probe
 /// inherits everything an act gets: the pre-action causal anchor
-/// ([`TerminalEventState`]), completion compiled and evaluated by the one
+/// (`TerminalEventState`), completion compiled and evaluated by the one
 /// compiler/interpreter, event-queue events scoped to the probe window via a
 /// per-probe cursor (the old post-hoc `drain_events()` stole every other
-/// consumer's events), and a real [`InteractionTransaction`] carrying the
+/// consumer's events), and a real `InteractionTransaction` carrying the
 /// settled after-frame. A `None` stimulus still runs an observe-only drift
 /// probe (baseline → settle → diff), which is its own diagnostic.
 ///
@@ -214,14 +214,14 @@ pub fn run_probe_with_guard(
     // inside its own window and leaves the queue intact for every other
     // reader (re-review Wave-2: the queue is the authority; drains are gone).
 
-    // 1) Baseline — pure peek of the latest committed frame, cursor pinned
-    //    BEFORE any stimulus so the window is causal.
-    let before = session
-        .last()
-        .cloned()
-        .or_else(|| session.observe(0).ok())
-        .ok_or_else(|| anyhow::anyhow!("probe needs a baseline frame"))?;
+    // 1) Baseline. For a stimulated probe the canonical executor's exact
+    //    pre-dispatch frame is authoritative; for a drift probe use a pure
+    //    current snapshot. This prevents asynchronous drift between an
+    //    older cached observation and the actual stimulus from being
+    //    misattributed to the experiment.
+    let observed_before = session.snapshot_fresh()?.frame;
     let pre_seq = session.event_queue_last_seq();
+    let before = observed_before.clone();
 
     // 2+3) Apply the stimulus and decide "after" via the canonical
     //       executor's compiled completion plan. The transition-frame
@@ -236,6 +236,13 @@ pub fn run_probe_with_guard(
     let t0 = Instant::now();
     let (tx, events) = match stimulus {
         Some(act) => {
+            // Audit finding 10: the probe's causal event window is the
+            // TRANSACTION's own `event_seq_before..event_seq_after` (the
+            // executor's final dispatch boundary and post-ingest fold) —
+            // NOT `pre_seq` captured before invoking the executor, because
+            // executor preflight pumps output that would otherwise land
+            // inside the probe's "stimulus" window (screen bytes that
+            // arrived before the send, misattributed to the action).
             let tx = crate::execution::execute_act_with_guard_and_origin(
                 session,
                 crate::execution::DriveOrigin::Probe,
@@ -247,10 +254,25 @@ pub fn run_probe_with_guard(
                 completion,
                 guard,
             )?;
-            let batch = session.events_since(pre_seq);
-            (Some(tx), batch.events)
+            let from = tx.event_seq_before;
+            let to = tx.event_seq_after.unwrap_or(from);
+            let batch = session.events_since(from);
+            if batch.gap {
+                return Err(anyhow::anyhow!(
+                    "probe_event_window_incomplete: the terminal event ring evicted events                      between the dispatch anchor and the oldest retained seq                      (first_available={:?}); no causal stimulus window can be proven",
+                    batch.first_available
+                ));
+            }
+            let windowed = batch
+                .events
+                .into_iter()
+                .filter(|e| e.seq <= to)
+                .collect::<Vec<_>>();
+            (Some(tx), windowed)
         }
         None => {
+            // Drift probes retain their independently established event
+            // window (no executor preflight involved).
             let after = session.observe(quiet_ms.min(budget_ms.max(1)))?;
             let _ = after;
             let batch = session.events_since(pre_seq);
@@ -264,6 +286,13 @@ pub fn run_probe_with_guard(
         Some(tx) => tx.after_frame.state.clone(),
         None => session.last().cloned().unwrap_or(before.clone()),
     };
+    // Stimulated probe causality: the public baseline is the executor's
+    // exact pre-send frame, so any drift observed before dispatch cannot
+    // be folded into the stimulus transition.
+    let before = tx
+        .as_ref()
+        .map(|tx| tx.before_frame.state.clone())
+        .unwrap_or(before);
 
     // 4) Diff.
     let transition = crate::screen::diff::diff(&before, &after);
@@ -304,11 +333,22 @@ pub fn run_probe_with_guard(
                 if !sd.controls_removed.is_empty() {
                     material_changes.push(format!("controls removed: {:?}", sd.controls_removed));
                 }
+                // Finding 55: modified controls are material even when the
+                // control set membership is unchanged.
+                if sd.controls_changed_count > 0 {
+                    material_changes.push(format!(
+                        "controls changed: {} {:?}",
+                        sd.controls_changed_count, sd.control_deltas
+                    ));
+                }
             }
             ProbeWatch::Regions => {
                 let sd = &transition.semantic_diff;
                 if !sd.regions_added.is_empty() {
                     material_changes.push(format!("regions added: {:?}", sd.regions_added));
+                }
+                if !sd.regions_removed.is_empty() {
+                    material_changes.push(format!("regions removed: {:?}", sd.regions_removed));
                 }
             }
             ProbeWatch::Style => {
@@ -387,45 +427,26 @@ pub fn run_probe_with_guard(
                     }),
                 }
             }
-            (Some((count, _)), Some(ev)) if count > 0 => Some(TransitionCapture {
-                strategy: "frames".to_string(),
-                frames: ev
-                    .get("frames")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|f| TransitionFrame {
-                                at_ms: 0,
-                                structure_hash: f
-                                    .get("structure_hash")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                visual_hash: f
-                                    .get("visual_hash")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                viewport_text: f
-                                    .get("viewport_text")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|r| r.as_str().map(str::to_string))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                completed: ev.get("completed").and_then(|v| v.as_bool()).unwrap_or(false),
-                reason: ev
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            }),
+            (Some((count, _)), Some(seq)) if count > 0 => {
+                let completed = seq.completed;
+                let reason = seq.reason.name().to_string();
+                Some(TransitionCapture {
+                    strategy: "frames".to_string(),
+                    frames: seq
+                        .frames
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| TransitionFrame {
+                            at_ms: seq.edge_at_monotonic_ms.get(i).copied().unwrap_or(0),
+                            structure_hash: f.structure_hash.clone(),
+                            visual_hash: f.visual_hash.clone(),
+                            viewport_text: f.viewport_text.clone(),
+                        })
+                        .collect(),
+                    completed,
+                    reason,
+                })
+            }
             (Some((count, _)), None) if count > 0 => Some(TransitionCapture {
                 strategy: "frames".to_string(),
                 frames: Vec::new(),
@@ -612,6 +633,8 @@ pub fn stable_or(_quiet_ms: u64) -> CompletionPolicy {
 
 /// Re-export the pieces a probe consumer needs to not reach into internals.
 pub use crate::screen::diff::{ScreenDiff, SemanticDiff};
+
+pub mod product_probes;
 
 #[cfg(test)]
 mod tests {

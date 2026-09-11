@@ -139,6 +139,16 @@ pub const RESOURCES: &[ResourceCapability] = &[
             "Run status + manifest. Live runs read live state; persisted runs are restored read-only from disk (live=false).",
     },
     ResourceCapability {
+        uri: "tui://runs/{run_id}/timeline",
+        description:
+            "First-class causal timeline over the retained transaction window: dispatch provenance, generation, event anchors, before/after frame references, settlement, and render citations joined per transaction.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/timeline/{seq}",
+        description:
+            "One joined causal timeline entry by transaction seq: the primary debugging artifact for a single interaction.",
+    },
+    ResourceCapability {
         uri: "tui://runs/{run_id}/scenarios",
         description:
             "Saved scenarios in a run (review P1 evidence-addressability): ids, names, step counts, and the per-scenario URI. Live runs read memory+disk; persisted runs are restored read-only.",
@@ -157,6 +167,16 @@ pub const RESOURCES: &[ResourceCapability] = &[
         uri: "tui://runs/{run_id}/transactions/{seq}",
         description:
             "One transaction by ledger seq: action, settle verdict, before/after structure, changed cells, render evidence.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/frames",
+        description:
+            "Committed frame records in the hot ring (audit P0-11): every `frame:N` cited by timeline entries is a registered, resolvable resource. Evicted ids resolve through frames.jsonl on persistent runs.",
+    },
+    ResourceCapability {
+        uri: "tui://runs/{run_id}/frames/{frame_id}",
+        description:
+            "One frame record by citable id (hot ring first, then frames.jsonl): frame_id, session/generation provenance, screen/output seqs, structure/visual/semantic identity, commit time.",
     },
     ResourceCapability {
         uri: "tui://sessions/{session_id}/semantic",
@@ -201,6 +221,231 @@ pub fn to_json() -> serde_json::Value {
     })
 }
 
+// ── Canonical flows (audit P1.8) ──
+//
+// `tui_run action=context` pairs the raw registry with task-oriented
+// routes through the machinery. Each step is a REAL tool invocation:
+// the arguments are built from the actual `mcp::params` types and
+// serialized, never handwritten JSON — the same P0.4 rule the
+// DiagnosticContexts follow. A request the params type cannot
+// represent cannot appear in a flow, so the flows cannot advertise a
+// grammar the server rejects.
+//
+// Session ids are left as placeholders (`$session`) because flows are
+// published before any session exists; every other field is a
+// genuine default the handler accepts.
+
+/// The placeholder token for "the session id you already hold or just
+/// started" — the only non-literal in any flow step.
+pub const SESSION_PLACEHOLDER: &str = "$session";
+
+fn step(tool: &str, why: &str, args: serde_json::Value) -> serde_json::Value {
+    json!({ "tool": tool, "why": why, "arguments": args })
+}
+
+/// debug_existing_tui: attach/observe → understand → diagnose →
+/// experiment → baseline → verify. Encodes the real policy: start
+/// observationally, only drive after a diagnosis, and always leave a
+/// labeled baseline behind for the fix verification.
+fn flow_debug_existing_tui() -> serde_json::Value {
+    use crate::mcp::params::*;
+    json!({
+        "name": "debug_existing_tui",
+        "description": "Investigate a misbehaving or unfamiliar TUI: observe first, diagnose from evidence, experiment causally, then keep a baseline so the fix can be proven.",
+        "steps": [
+            step("tui_session", "start a fixture/process; use action=attach target=... attach_backend=tmux for an existing pane",
+                 serde_json::to_value(TuiSessionParams {
+                     action: "start".into(), command: Some("<command>".into()),
+                     args: None, cwd: None, env: None, cols: Some(120), rows: Some(40),
+                     backend: None, isolation: None, id: None, holder: None,
+                     ttl_ms: None, lease_id: None, target: None,
+                     attach_backend: None,
+                 }).unwrap()),
+            step("tui_observe", "the one-call construction view: frame identity, semantic controls with stable ids, affordances, contract verdicts",
+                 serde_json::to_value(TuiObserveParams {
+                     mode: Some(Known::Known(ObserveMode::Inspect)),
+                     idle_ms: None, id: Some(SESSION_PLACEHOLDER.into()),
+                     consumer: None, query: None, text: None, since_seq: None,
+                     until_seq: None, limit: None, event_types: None, target: None,
+                 }).unwrap()),
+            step("tui_audit", "passive first: observational profiles only — mutating ones are withheld and reported ORCH-GATED",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: None, compare_to: None, allow_mutation: Some(false),
+                     restart_between_mutations: None, allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_workflow", "the evidence chain for any finding: root cause → minimal reproduction → targeted validation plan",
+                 serde_json::to_value(TuiWorkflowParams {
+                     action: Known::Known(WorkflowAction::Diagnose),
+                     finding_id: None, id: Some(SESSION_PLACEHOLDER.into()),
+                     cwd: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_probe", "causal experiment on ONE suspect stimulus — everything materially different, event-scoped",
+                 serde_json::to_value(TuiProbeParams {
+                     stimulus: None, completion: None, capture: None, text: None,
+                     watch: None, quiet_ms: None, budget_ms: None,
+                     id: Some(SESSION_PLACEHOLDER.into()),
+                 }).unwrap()),
+            step("tui_intent", "preview (plan-only) then execute the targeted semantic action the diagnosis pointed at",
+                 serde_json::to_value(TuiIntentParams {
+                     target: crate::intent::ActionTarget::Focused,
+                     verb: IntentVerbParam::Name("activate".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), execute: Some(false),
+                     sensitive: None, completion: None, plan_id: None, max_risk: None,
+                     no_wait: None, settle_budget_ms: None,
+                 }).unwrap()),
+            step("tui_audit", "record the pre-fix state under a label — the baseline the fix is diffed against",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: Some("baseline".into()), compare_to: None,
+                     allow_mutation: Some(false), restart_between_mutations: None,
+                     allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_workflow", "after the fix: replay + re-check the finding live and read the verdict against the baseline",
+                 serde_json::to_value(TuiWorkflowParams {
+                     action: Known::Known(WorkflowAction::Verify),
+                     finding_id: Some("$finding_id".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), cwd: None,
+                     allow_mutation: Some(false),
+                 }).unwrap()),
+        ],
+    })
+}
+
+/// construct_or_refine_tui: detect the framework → scaffold the
+/// contract from observation → load/validate → conformance-check
+/// (passive) → refine with targeted exploration.
+fn flow_construct_or_refine_tui() -> serde_json::Value {
+    use crate::mcp::params::*;
+    json!({
+        "name": "construct_or_refine_tui",
+        "description": "Build or refine a TUI against a contract: detect the framework, scaffold candidate invariants from observation, then conform — driving only with explicit authorization.",
+        "steps": [
+            step("tui_framework", "identify the TUI framework and its adapter/native-channel state (root from cwd)",
+                 serde_json::to_value(TuiFrameworkParams {
+                     action: Known::Known(FrameworkAction::Detect),
+                     cwd: Some("$project_dir".into()), source: None, id: None,
+                 }).unwrap()),
+            step("tui_contract", "scaffold a candidate contract from observed frames only (current mode drives nothing)",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Scaffold),
+                     scaffold_mode: Some(Known::Known(ScaffoldMode::Current)),
+                     path: Some("$contract.yaml".into()), id: None,
+                     baseline: None, label: None, mode: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_contract", "validate the document's structure and evidence claims before conformance",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Validate),
+                     scaffold_mode: None, path: Some("$contract.yaml".into()), id: None,
+                     baseline: None, label: None, mode: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_contract", "static/passive conformance first: driving checks are reported UNVERIFIED, not executed",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Status),
+                     scaffold_mode: None, path: Some("$contract.yaml".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), baseline: None,
+                     label: None, mode: None, allow_mutation: None,
+                 }).unwrap()),
+            step("tui_observe", "inspect the live frame against the loaded contract — per-control facts + violations",
+                 serde_json::to_value(TuiObserveParams {
+                     mode: Some(Known::Known(ObserveMode::Inspect)),
+                     idle_ms: None, id: Some(SESSION_PLACEHOLDER.into()),
+                     consumer: None, query: None, text: None, since_seq: None,
+                     until_seq: None, limit: None, event_types: None, target: None,
+                 }).unwrap()),
+            step("tui_contract", "after refining the app: full conformance at the chosen check mode (this DRIVES — explicit allow_mutation, the same authorization tui_audit requires)",
+                 serde_json::to_value(TuiContractParams {
+                     action: Known::Known(ContractAction::Status),
+                     scaffold_mode: None, path: Some("$contract.yaml".into()),
+                     id: Some(SESSION_PLACEHOLDER.into()), baseline: None,
+                     label: None, mode: Some("strict".into()), allow_mutation: Some(true),
+                 }).unwrap()),
+        ],
+    })
+}
+
+/// regression_test_tui: labeled audits → scenario capture → replay on
+/// every change → did-the-fix-hold bundle.
+fn flow_regression_test_tui() -> serde_json::Value {
+    use crate::mcp::params::*;
+    json!({
+        "name": "regression_test_tui",
+        "description": "Turn a verified-good state into a reusable regression gate: labeled baselines, recorded scenarios, replay diffs, and per-finding hold bundles.",
+        "steps": [
+            step("tui_audit", "record the known-good audit under a stable label",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: Some("baseline".into()), compare_to: None,
+                     allow_mutation: Some(false), restart_between_mutations: None,
+                     allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_scenario", "begin recording the interaction that must keep working",
+                 serde_json::to_value(TuiScenarioParams {
+                     action: Known::Known(ScenarioAction::RecordStart),
+                     name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     recording_id: None, steps: None, parameters: None,
+                     repeat: None,
+                     on_failure: Some("continue".into()), finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_wait", "drive at least one deterministic step into the recording",
+                 serde_json::to_value(TuiWaitParams {
+                     condition: Known::Known(WaitCondition::ScreenStable),
+                     text: None, title: None, budget_ms: Some(2000),
+                     quiet_ms: None, event: None, id: Some(SESSION_PLACEHOLDER.into()),
+                 }).unwrap()),
+            step("tui_scenario", "finish the recorded flow after driving/assertions; the recorder owns the nonempty step set",
+                 serde_json::to_value(TuiScenarioParams {
+                     action: Known::Known(ScenarioAction::RecordStop),
+                     name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     recording_id: Some("$recording_id".into()), steps: None, parameters: None,
+                     repeat: None,
+                     on_failure: None, finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_run", "persist the run so the baseline + scenario survive the session",
+                 serde_json::to_value(TuiRunParams {
+                     action: Known::Known(RunAction::Persist),
+                     root: None, kill_sessions: None, run_id: None, run_dir: None,
+                     finding_id: None, compare_to: None,
+                     detach_existing_sessions: None, discard: None,
+                 }).unwrap()),
+            step("tui_scenario", "after a change: run the recorded path against the new build",
+                 serde_json::to_value(TuiScenarioParams {
+                     action: Known::Known(ScenarioAction::Run),
+                     name: Some("critical-path".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     recording_id: None, steps: None, parameters: None,
+                     repeat: None,
+                     on_failure: None, finding_id: None, asset_type: None,
+                 }).unwrap()),
+            step("tui_audit", "re-audit and diff against the baseline: FIXED / NEW / PERSISTING per finding",
+                 serde_json::to_value(TuiAuditParams {
+                     profile: Some("full".into()), id: Some(SESSION_PLACEHOLDER.into()),
+                     label: Some("current".into()), compare_to: Some("baseline".into()),
+                     allow_mutation: Some(false), restart_between_mutations: None,
+                     allow_process_restart: None,
+                 }).unwrap()),
+            step("tui_run", "one finding's did-the-change-hold packet: context + verdict + side effects elsewhere",
+                 serde_json::to_value(TuiRunParams {
+                     action: Known::Known(RunAction::Bundle),
+                     root: None, kill_sessions: None, run_id: None, run_dir: None,
+                     finding_id: Some("$finding_id".into()),
+                     compare_to: Some("baseline".into()),
+                     detach_existing_sessions: None, discard: None,
+                 }).unwrap()),
+        ],
+    })
+}
+
+/// The canonical flows, in stable order. Each is built from typed
+/// request builders — see `flow_debug_existing_tui`.
+pub fn flows() -> serde_json::Value {
+    json!({
+        "debug_existing_tui": flow_debug_existing_tui(),
+        "construct_or_refine_tui": flow_construct_or_refine_tui(),
+        "regression_test_tui": flow_regression_test_tui(),
+        "note": "arguments are serialized from the real parameter types; '$session', '$recording_id', '$finding_id', '$project_dir', '$contract.yaml' are placeholders the caller fills with real ids/paths",
+    })
+}
+
 /// Render the SKILL.md tool section from the registry (item 69: generation,
 /// not hand-maintained prose). The output is stable and alphabetical like
 /// the old hand-written list, but it cannot drift from the handlers because
@@ -214,6 +459,58 @@ pub fn skill_tool_section() -> String {
         }
     }
     out
+}
+
+/// P1.9: the README's per-tool selector vocabulary, generated — one
+/// authoritative declaration (`TOOLS` + the dispatch enums), every doc
+/// derived from it. A README `**Actions:**` line that drifted from the
+/// enum the handler actually dispatches on is the P1.9 defect class;
+/// this generator closes it. Output: for every tool with a selector,
+/// `### <tool>` then `**<Field>:** v1, v2, …`.
+pub fn readme_selector_section() -> String {
+    let mut out = String::from("<!-- BEGIN GENERATED SELECTORS (registry.rs) — regenerate: cargo run -- skill --write-readme -->\n\n");
+    for t in TOOLS {
+        let Some((field, values)) = t.selector else {
+            continue;
+        };
+        out.push_str(&format!(
+            "### {}\n\n**{}:** {}\n\n",
+            t.name,
+            // Capitalize the selector field for the prose style the README
+            // already uses ("**Actions:**", "**Modes:**").
+            {
+                let mut c = field.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            },
+            values.join(", ")
+        ));
+    }
+    out.push_str("<!-- END GENERATED SELECTORS -->\n");
+    out
+}
+
+/// P1.9: splice [`readme_selector_section`] into a README, replacing
+/// whatever currently sits between the generated markers. Returns `None`
+/// when the markers are missing — the README must carry the empty
+/// generated block before this can maintain it (no inventing structure).
+pub fn splice_readme_selectors(doc: &str) -> Option<String> {
+    const BEGIN: &str =
+        "<!-- BEGIN GENERATED SELECTORS (registry.rs) — regenerate: cargo run -- skill --write-readme -->";
+    const END: &str = "<!-- END GENERATED SELECTORS -->";
+    let start = doc.find(BEGIN)?;
+    let end = doc.find(END)? + END.len();
+    if end <= start {
+        return None;
+    }
+    // The generated section ends with exactly one newline; trim it here
+    // so repeated runs cannot accumulate blank lines at the seam (the
+    // doc's own bytes after the END marker are preserved verbatim).
+    let section = readme_selector_section();
+    let section = section.trim_end_matches('\n');
+    Some(format!("{}{}{}", &doc[..start], section, &doc[end..]))
 }
 
 /// Render the SKILL.md resource section from the same RESOURCES table the
@@ -325,6 +622,177 @@ mod tests {
         served.sort();
         declared.sort();
         assert_eq!(declared, served, "registry TOOLS != router tools/list set");
+    }
+
+    /// Beta-audit P0.9: the ADVERTISED schema and the ACCEPTED wire shape
+    /// must agree per field. The old hand-maintained schema mirror drifted
+    /// within weeks (resize/signal lacked the guard field the parser
+    /// accepts), so this walks the tui_act oneOf and asserts, per action
+    /// variant, that every property the schema names deserializes and —
+    /// the drift that actually shipped — every field the PARSER accepts
+    /// on a payload is advertised.
+    #[test]
+    fn act_schema_advertises_every_field_the_parser_accepts() {
+        let router = crate::mcp::TuiLabServer::tool_router();
+        let tool = router.get("tui_act").unwrap();
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let one_of = schema
+            .get("oneOf")
+            .and_then(|v| v.as_array())
+            .expect("tui_act root is a wrapped oneOf");
+        assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
+
+        // Tag -> advertised property set.
+        let mut advertised: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for v in one_of {
+            let action = v["properties"]["action"]["const"]
+                .as_str()
+                .unwrap_or_else(|| panic!("variant missing action const: {v}"))
+                .to_string();
+            let props: Vec<String> = v["properties"]
+                .as_object()
+                .expect("variant properties")
+                .keys()
+                .cloned()
+                .collect();
+            advertised.insert(action, props);
+        }
+        let expected_actions: &[&str] = &[
+            "key",
+            "keys",
+            "type",
+            "paste",
+            "raw",
+            "mouse_click",
+            "mouse_press",
+            "mouse_release",
+            "mouse_move",
+            "mouse_drag",
+            "mouse_scroll",
+            "resize",
+            "signal",
+        ];
+        assert_eq!(advertised.len(), expected_actions.len(), "{advertised:?}");
+
+        // Every action accepts the shared transport fields; the schema
+        // must advertise them (guard included — the historical drift).
+        for action in expected_actions {
+            let props = &advertised[*action];
+            for shared in ["id", "no_wait", "completion", "wait_ms", "guard"] {
+                assert!(
+                    props.contains(&shared.to_string()),
+                    "{action}: schema must advertise '{shared}' (the mirror dropped guard from resize/signal): {props:?}"
+                );
+            }
+        }
+
+        // And the reverse direction: serialize a maxed request per action
+        // (every field set) and check the schema's properties cover every
+        // KEY it emits.
+        let full = |tag: &str, extra: serde_json::Value| {
+            serde_json::json!({
+                "action": tag,
+                "no_wait": false,
+                "completion": "stable_screen",
+                "wait_ms": 10,
+                "id": "s1",
+                "guard": {},
+            })
+            .as_object()
+            .unwrap()
+            .iter()
+            .chain(extra.as_object().unwrap())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        let samples = [
+            full("key", serde_json::json!({ "key": "tab" })),
+            full("keys", serde_json::json!({ "keys": ["tab"] })),
+            full(
+                "type",
+                serde_json::json!({ "text": "hi", "sensitive": false }),
+            ),
+            full(
+                "paste",
+                serde_json::json!({ "paste": "hi", "sensitive": false }),
+            ),
+            full("raw", serde_json::json!({ "raw": [1] })),
+            full(
+                "mouse_click",
+                serde_json::json!({ "x": 1, "y": 2, "button": "left" }),
+            ),
+            full("mouse_press", serde_json::json!({ "x": 1, "y": 2 })),
+            full("mouse_release", serde_json::json!({ "x": 1, "y": 2 })),
+            full("mouse_move", serde_json::json!({ "x": 1, "y": 2 })),
+            full("mouse_drag", serde_json::json!({ "x": 1, "y": 2 })),
+            full(
+                "mouse_scroll",
+                serde_json::json!({ "x": 1, "y": 2, "direction": "down" }),
+            ),
+            full("resize", serde_json::json!({ "cols": 80, "rows": 24 })),
+            full("signal", serde_json::json!({ "signal": 15 })),
+        ];
+        for s in samples {
+            // 1. The PARSER accepts it (schema-valid ⇒ wire-valid).
+            let req: crate::mcp::params::TuiActRequest =
+                serde_json::from_value(serde_json::Value::Object(s.clone()))
+                    .unwrap_or_else(|e| panic!("parser rejects its own maxed shape: {e}: {s:?}"));
+            // 2. The SCHEMA advertises every key it carries.
+            let action = s["action"].as_str().unwrap();
+            let props = &advertised[action];
+            for k in s.keys() {
+                assert!(
+                    props.contains(k),
+                    "{action}: parser accepts '{k}' but the schema omits it: {props:?}"
+                );
+            }
+            let _ = req;
+        }
+    }
+
+    /// Wire compatibility: the historical flat tagged shape still
+    /// deserializes identically after the payload-struct refactor — a
+    /// recorded scenario from before the refactor must replay.
+    #[test]
+    fn act_wire_shape_is_backward_compatible() {
+        let flat = serde_json::json!({
+            "action": "type", "text": "hello", "sensitive": true,
+            "no_wait": true, "id": "s9", "wait_ms": 25,
+            "completion": { "type": "text_appears", "text": "Saved" },
+            "guard": { "structure_hash": "abc", "focus_control_id": "#b/ok" },
+        });
+        let req: crate::mcp::params::TuiActRequest = serde_json::from_value(flat).unwrap();
+        match &req {
+            crate::mcp::params::TuiActRequest::Type(p) => {
+                assert_eq!(p.text, "hello");
+                assert_eq!(p.sensitive, Some(true));
+                assert_eq!(p.common.id.as_deref(), Some("s9"));
+                assert_eq!(p.common.wait_ms, Some(25));
+                assert_eq!(p.common.no_wait, Some(true));
+                let guard = p.common.guard.as_ref().expect("guard survives");
+                assert_eq!(guard.structure_hash.as_deref(), Some("abc"));
+                let completion = p.common.completion.as_ref().expect("completion survives");
+                assert!(
+                    matches!(
+                        completion.to_policy(),
+                        crate::capture::CompletionPolicy::TextAppears(ref t)
+                            if t == "Saved"
+                    ),
+                    "completion carries its payload through: {completion:?}"
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // And it round-trips back to the same flat shape.
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["action"], "type");
+        assert_eq!(back["text"], "hello");
+        assert_eq!(back["guard"]["structure_hash"], "abc");
+        // Accessors read through the payloads.
+        assert!(req.sensitive());
+        assert_eq!(req.id(), Some("s9"));
+        assert!(req.guard().is_some());
+        assert!(req.no_wait());
     }
 
     #[test]
@@ -514,16 +982,165 @@ mod tests {
                 .unwrap_or_else(|| panic!("tool {tool} missing from router"))
         };
         let coverage = desc("tui_coverage");
+        // P2-58: the safest contract is that `uncovered` is not a selector
+        // at all. The description must explain the missing denominator and
+        // point to delta.
         assert!(
-            coverage.contains("uncovered")
-                && (coverage.contains("explicitly unsupported")
-                    || coverage.contains("unsupported")),
-            "tui_coverage description must mark 'uncovered' unsupported up front: {coverage}"
+            coverage.to_lowercase().contains("no uncovered action")
+                && coverage.to_lowercase().contains("denominator")
+                && coverage.to_lowercase().contains("use delta"),
+            "tui_coverage must explain that uncovered is absent because there is no denominator: {coverage}"
         );
         let snapshot = desc("tui_coverage");
         assert!(
             snapshot.contains("snapshot") && snapshot.contains("tuicov"),
             "tui_coverage description must state snapshot's tuicov requirement: {snapshot}"
         );
+    }
+
+    /// P1.9: the README's generated selector block must be byte-equal to
+    /// what the generator produces right now — the README's public
+    /// selector tables are DERIVED (one authoritative declaration, every
+    /// doc derived), and a failure here means the registry changed
+    /// without `cargo run -- skill --write-readme`.
+    #[test]
+    fn readme_selector_block_matches_registry() {
+        let readme =
+            match std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")) {
+                Ok(r) => r,
+                // README absent in an exotic checkout: nothing to keep in parity.
+                Err(_) => return,
+            };
+        let section = readme_selector_section();
+        assert!(
+            readme.contains(&section),
+            "README's generated selector block drifted from the registry — regenerate: cargo run -- skill --write-readme"
+        );
+        // And no hand-written selector line may resurrect outside the
+        // generated block (that is the P1.9 drift class): the old
+        // `**Actions:**`-style lines now live only in the generated span.
+        let begin = readme
+            .find("<!-- BEGIN GENERATED SELECTORS")
+            .expect("begin marker");
+        let end = readme
+            .find("<!-- END GENERATED SELECTORS -->")
+            .expect("end marker");
+        for line in readme[..begin].lines().chain(readme[end..].lines()) {
+            for prefix in [
+                "**Actions:**",
+                "**Modes:**",
+                "**Conditions:**",
+                "**Assertions:**",
+                "**Profiles:**",
+            ] {
+                assert!(
+                    !line.trim_start().starts_with(prefix),
+                    "hand-written selector line outside the generated block: '{line}' — delete it, the registry generates these"
+                );
+            }
+        }
+    }
+
+    /// Audit P1.8: every flow step must round-trip — the arguments were
+    /// built from the real params types, so each must deserialize back
+    /// into THAT tool's params type, and the tool name must exist in the
+    /// registry. A flow that advertises a grammar the server rejects is a
+    /// bug caught at build time, not agent runtime.
+    #[test]
+    fn flow_steps_roundtrip_into_real_param_types() {
+        let flows = flows();
+        let registry_names: std::collections::BTreeSet<&str> =
+            TOOLS.iter().map(|t| t.name).collect();
+        // (tool -> params-parse closure): a tiny typed dispatch over the
+        // tools the flows reference. A flow step naming a tool not listed
+        // here fails the test until it is added — deliberate friction.
+        let parse: fn(&str, &serde_json::Value) -> Result<(), String> = |tool, args| {
+            let v = args.clone();
+            let parsed: Result<(), serde_json::Error> = match tool {
+                "tui_session" => {
+                    serde_json::from_value::<crate::mcp::params::TuiSessionParams>(v).map(|_| ())
+                }
+                "tui_observe" => {
+                    serde_json::from_value::<crate::mcp::params::TuiObserveParams>(v).map(|_| ())
+                }
+                "tui_audit" => {
+                    serde_json::from_value::<crate::mcp::params::TuiAuditParams>(v).map(|_| ())
+                }
+                "tui_workflow" => {
+                    serde_json::from_value::<crate::mcp::params::TuiWorkflowParams>(v).map(|_| ())
+                }
+                "tui_wait" => {
+                    serde_json::from_value::<crate::mcp::params::TuiWaitParams>(v).map(|_| ())
+                }
+                "tui_act" => {
+                    serde_json::from_value::<crate::mcp::params::TuiActRequest>(v).map(|_| ())
+                }
+                "tui_assert" => {
+                    serde_json::from_value::<crate::mcp::params::TuiAssertParams>(v).map(|_| ())
+                }
+                "tui_probe" => {
+                    serde_json::from_value::<crate::mcp::params::TuiProbeParams>(v).map(|_| ())
+                }
+                "tui_intent" => {
+                    serde_json::from_value::<crate::mcp::params::TuiIntentParams>(v).map(|_| ())
+                }
+                "tui_framework" => {
+                    serde_json::from_value::<crate::mcp::params::TuiFrameworkParams>(v).map(|_| ())
+                }
+                "tui_contract" => {
+                    serde_json::from_value::<crate::mcp::params::TuiContractParams>(v).map(|_| ())
+                }
+                "tui_scenario" => {
+                    serde_json::from_value::<crate::mcp::params::TuiScenarioParams>(v).map(|_| ())
+                }
+                "tui_run" => {
+                    serde_json::from_value::<crate::mcp::params::TuiRunParams>(v).map(|_| ())
+                }
+                _ => {
+                    return Err(format!(
+                    "flow references tool '{tool}' with no typed parser — add one or fix the flow"
+                ))
+                }
+            };
+            parsed.map_err(|e| format!("{tool}: {e}"))
+        };
+        for (name, flow) in flows.as_object().expect("flows object") {
+            if name == "note" {
+                continue;
+            }
+            let steps = flow["steps"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: steps array"));
+            assert!(!steps.is_empty(), "{name}: no steps");
+            for (i, s) in steps.iter().enumerate() {
+                let tool = s["tool"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}[{i}]: tool name"));
+                assert!(
+                    registry_names.contains(tool),
+                    "{name}[{i}]: tool '{tool}' not in the registry"
+                );
+                let args = &s["arguments"];
+                assert!(args.is_object(), "{name}[{i}]: arguments must be an object");
+                if let Err(e) = parse(tool, args) {
+                    panic!("{name}[{i}]: flow arguments do not deserialize into the real params type: {e}\nargs: {args}");
+                }
+                assert!(
+                    s["why"].as_str().is_some_and(|w| !w.is_empty()),
+                    "{name}[{i}]: every step carries a why"
+                );
+            }
+        }
+        // The audit's named flows all exist.
+        for required in [
+            "debug_existing_tui",
+            "construct_or_refine_tui",
+            "regression_test_tui",
+        ] {
+            assert!(
+                flows.get(required).is_some(),
+                "required flow '{required}' missing"
+            );
+        }
     }
 }

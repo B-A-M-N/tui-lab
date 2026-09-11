@@ -2,7 +2,7 @@
 //! round 2, G2).
 //!
 //! The giant `match &cond` inside the backend's polling `wait()` loop
-//! moves here as [`WaitEvaluator`]: given one condition, one snapshot of
+//! moves here as `WaitEvaluator`: given one condition, one snapshot of
 //! what the loop observed this tick, and the baselines captured at wait
 //! entry, decide whether the condition is met and which reason to
 //! report. The polling loop itself (pump → sync counters → snapshot →
@@ -16,7 +16,8 @@ use crate::backend::{WaitCond, WaitReason};
 use crate::screen::ScreenState;
 
 /// What one wait-loop tick observed — the inputs evaluation reads.
-pub(super) struct WaitTick<'a> {
+/// Exported for the causal-policy regression suite.
+pub struct WaitTick<'a> {
     /// The materialized screen snapshot for this tick (viewport +
     /// scrollback + process + title).
     pub screen: &'a ScreenState,
@@ -35,12 +36,13 @@ pub(super) struct WaitTick<'a> {
     pub command_running: bool,
 }
 
-/// Baselines captured at wait entry.
+/// Baselines captured at wait entry. Exported so regression tests can
+/// anchor edge conditions exactly.
 #[derive(Clone)]
-pub(super) struct WaitBaselines {
-    /// Review P0 (Bell race): an anchored Bell carries its own baseline
-    /// (`after_bell_seq - 1`); only an unanchored Bell falls back to
-    /// "captured at wait entry".
+pub struct WaitBaselines {
+    /// Review P0 (Bell race): an anchored Bell uses the supplied sequence
+    /// as its exact baseline (a bell must be strictly newer); only an
+    /// unanchored Bell falls back to "captured at wait entry".
     pub bell_seq: u64,
     /// Review P0 (AnyObservableChange): interaction counter at entry.
     pub interaction_seq: u64,
@@ -50,10 +52,11 @@ pub(super) struct WaitBaselines {
 }
 
 /// Evaluate one wait condition against one tick's observations.
-pub(super) struct WaitEvaluator;
+/// Exported so regression tests can prove exact anchor semantics.
+pub struct WaitEvaluator;
 
 impl WaitEvaluator {
-    pub(super) fn evaluate(
+    pub fn evaluate(
         cond: &WaitCond,
         tick: &WaitTick,
         baselines: &WaitBaselines,

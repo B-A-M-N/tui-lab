@@ -1,6 +1,8 @@
 // Tests for the scenario recorder/runner/replay system (spec item 39).
 
-use tui_lab::scenario::{Scenario, ScenarioMetadata, ScenarioRecorder, ScenarioRunner, StepKind};
+use tui_lab::scenario::{
+    model::ScenarioLaunch, Scenario, ScenarioMetadata, ScenarioRecorder, ScenarioRunner, StepKind,
+};
 
 #[test]
 fn scenario_model_new() {
@@ -221,6 +223,7 @@ async fn stale_guard_blocks_input_on_drift() {
             structure_hash: Some("definitely-not-the-live-hash".into()),
             focus_control_id: None,
             text_present: None,
+            ..Default::default()
         }),
     };
     let scenario = tui_lab::scenario::model::Scenario {
@@ -294,6 +297,7 @@ async fn satisfied_guard_lets_step_run() {
             structure_hash: Some(live_hash),
             focus_control_id: None,
             text_present: Some("OK-READY".into()),
+            ..Default::default()
         }),
     };
     let scenario = tui_lab::scenario::model::Scenario {
@@ -514,4 +518,197 @@ async fn continue_policy_runs_every_step() {
     assert_eq!(report.steps_failed, 2, "{:?}", report.step_results);
     assert_eq!(report.steps_skipped, 0, "{:?}", report.step_results);
     assert_eq!(report.steps_passed, 0, "{:?}", report.step_results);
+}
+
+// Audit findings 18/24: a scenario-owned target is launched exactly as
+// declared, replayed, cleaned up, and relaunchable by generation for
+// repeats. The runner refuses any launch-spec mismatch rather than
+// borrowing an inherited target.
+#[tokio::test]
+async fn scenario_owned_launch_replays_and_cleans_up() {
+    let scenario = Scenario {
+        inherit_session: false,
+        launch: Some(ScenarioLaunch {
+            command: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "print('OWNED'); import sys,time; sys.stdin.read(1)".into(),
+            ],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            backend: "auto".into(),
+            isolation: "local".into(),
+        }),
+        ..Scenario::new("owned-replay")
+    };
+    let scenario = scenario
+        .act(serde_json::json!({ "action": "type", "text": "A" }))
+        .assert(serde_json::json!({ "assertion": "text", "text": "A" }));
+    assert!(scenario.is_valid());
+
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
+        .start(
+            "python3",
+            &[
+                "-c".into(),
+                "print('OWNED'); import sys,time; sys.stdin.read(1)".into(),
+            ],
+            None,
+            &[],
+            80,
+            24,
+            "auto",
+            "local",
+        )
+        .await
+        .expect("owned launch");
+
+    let run = tui_lab::run::RunContext::ephemeral();
+    let run_ref = std::sync::Arc::new(std::sync::Mutex::new(run));
+    let owned_id = id.clone();
+    let scenario_for_run = scenario.clone();
+    let report = pool
+        .with_session(Some(&id), move |sess| {
+            let run = run_ref.clone();
+            tui_lab::scenario::runner::ScenarioRunner::run_in_run(
+                &scenario_for_run,
+                sess,
+                &[],
+                Some(&run),
+            )
+        })
+        .await
+        .expect("owned replay");
+    assert!(
+        report.steps_failed == 0 && report.steps_skipped == 0,
+        "{report:?}"
+    );
+
+    // The runner treats a different session as a contract mismatch; this
+    // is the guard that makes scenario ownership meaningful.
+    let wrong_id = pool
+        .start(
+            "python3",
+            &[
+                "-c".into(),
+                "print('OTHER'); import sys,time; sys.stdin.read(1)".into(),
+            ],
+            None,
+            &[],
+            80,
+            24,
+            "auto",
+            "local",
+        )
+        .await
+        .expect("other launch");
+    let scenario_wrong = scenario.clone();
+    let mismatch = pool
+        .with_session(Some(&wrong_id), move |sess| {
+            tui_lab::scenario::runner::ScenarioRunner::run(&scenario_wrong, sess)
+        })
+        .await
+        .expect("mismatch replay");
+    assert_eq!(mismatch.steps_skipped, mismatch.steps_total);
+    assert!(
+        mismatch
+            .step_results
+            .iter()
+            .all(|r| r.detail.contains("scenario_ownership_mismatch")),
+        "{mismatch:?}"
+    );
+
+    pool.stop(&owned_id).await.expect("owned cleanup");
+    pool.stop(&wrong_id).await.expect("other cleanup");
+}
+
+// Audit finding 18: restart-based repeats are valid only for scenario-owned
+// launches; inherited sessions cannot manufacture a reset contract.
+#[tokio::test]
+async fn inherited_repeat_without_reset_contract_is_refused() {
+    let scenario =
+        Scenario::new("repeat-inherited").act(serde_json::json!({ "action": "type", "text": "R" }));
+    let pool = tui_lab::session::SessionPool::new();
+    let id = pool
+        .start(
+            "python3",
+            &["-c".into(), "import sys,time; sys.stdin.read(1)".into()],
+            None,
+            &[],
+            80,
+            24,
+            "auto",
+            "local",
+        )
+        .await
+        .expect("session");
+    let aggregate = pool
+        .with_session(Some(&id), move |sess| {
+            tui_lab::scenario::runner::ScenarioRunner::run_repeat_with_reset(
+                &scenario,
+                sess,
+                &[],
+                None,
+                None,
+                2,
+                tui_lab::scenario::runner::ResetMode::Continue,
+            )
+        })
+        .await
+        .expect("repeat refusal");
+    assert_eq!(aggregate.passed_runs, 0);
+    assert_eq!(aggregate.failed_runs, 1);
+    assert_eq!(
+        aggregate.verdict,
+        tui_lab::scenario::runner::FlakinessVerdict::StableFailure
+    );
+    let first = aggregate.first_run.expect("refusal report");
+    assert_eq!(first.steps_skipped, first.steps_total);
+    assert!(
+        first
+            .step_results
+            .iter()
+            .all(|r| r.detail.contains("no reset contract")),
+        "{first:?}"
+    );
+    pool.stop(&id).await.expect("cleanup");
+}
+
+#[test]
+fn recording_fidelity_survives_stop_and_artifact_metadata() {
+    // Session-level recording lifecycle: provenance chosen at start is the
+    // same authority returned at stop and placed in the artifact summary.
+    let mut s = tui_lab::session::state::Session::new("fidelity".into(), "python3".into());
+    s.start_with_spec(tui_lab::session::state::LaunchSpec {
+        command: "python3".into(),
+        args: vec![
+            "-c".into(),
+            "print('REC'); import time; time.sleep(5)".into(),
+        ],
+        cwd: None,
+        env: vec![],
+        cols: 80,
+        rows: 24,
+        backend: "auto".into(),
+        isolation: "local".into(),
+    })
+    .expect("start");
+    s.enable_recording(false);
+    let start_meta = s.recording_fidelity().expect("recorder");
+    assert_eq!(start_meta["boundary"], "pty-bytes");
+    assert_eq!(start_meta["lossy"], false);
+    s.record_output(b"marker\n");
+    let rec = s.stop_recording().expect("recording");
+    let (ndjson, stop_meta) = {
+        let r = rec.lock().unwrap();
+        (r.to_ndjson(), r.fidelity_metadata())
+    };
+    let header: serde_json::Value =
+        serde_json::from_str(ndjson.first().unwrap()).expect("cast header");
+    assert_eq!(header["tui_lab"], start_meta);
+    assert_eq!(stop_meta, start_meta);
+    s.stop().ok();
 }

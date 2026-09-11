@@ -63,6 +63,13 @@ pub struct TuiScenarioParams {
     /// persisted into the scenario, the run ledger, or any artifact.
     #[serde(default)]
     pub parameters: Option<std::collections::BTreeMap<String, String>>,
+    /// Repeat count for `run` (P1-23). The scenario is replayed up to this
+    /// many times on the same session and classified as stable or flaky.
+    /// Default 1 (one-shot). Values >1 stop on the first stable verdict:
+    /// stable pass only after all runs pass, stable failure only after all
+    /// fail; otherwise the verdict is flaky.
+    #[serde(default)]
+    pub repeat: Option<u32>,
     /// Failure policy override for `run` (audit finding 5): `stop` (the
     /// default) halts at the first failed step and skips the rest;
     /// `continue` runs every step. Overrides the scenario's recorded

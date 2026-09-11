@@ -18,7 +18,7 @@
 //!   *following* columns the slot's glyph also occupies (1 for a wide glyph,
 //!   0 otherwise).
 //! * Extractors slice and index by **column** ([`CellString::slice_cells`],
-//!   [`char_at`]), never by byte offset. [`CellString::byte_to_cell`] maps a
+//!   `char_at`), never by byte offset. [`CellString::byte_to_cell`] maps a
 //!   byte offset in the rendered text back to its column for the rare legacy
 //!   path that starts from a `&str`.
 //! * A row is rendered to a `String` only at the output boundary

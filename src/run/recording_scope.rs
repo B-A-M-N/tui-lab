@@ -45,10 +45,29 @@ pub struct ScenarioRecording {
 
 impl ScenarioRecording {
     pub fn new(name: impl Into<String>, session_id: impl Into<String>, generation: u32) -> Self {
+        Self::with_policy(
+            name,
+            session_id,
+            generation,
+            crate::scenario::model::FailurePolicy::Stop,
+        )
+    }
+
+    /// Preserve the caller-selected replay failure policy on the recorded
+    /// scenario itself (golden-flow regression: a recorded Continue flow
+    /// must not silently revert to Stop).
+    pub fn with_policy(
+        name: impl Into<String>,
+        session_id: impl Into<String>,
+        generation: u32,
+        on_failure: crate::scenario::model::FailurePolicy,
+    ) -> Self {
         let name = name.into();
+        let mut recorder = ScenarioRecorder::new(name.clone());
+        recorder.set_on_failure(on_failure);
         ScenarioRecording {
             id: ScenarioRecordingId::generate(),
-            recorder: ScenarioRecorder::new(name.clone()),
+            recorder,
             name,
             session_id: session_id.into(),
             generation,
@@ -83,6 +102,15 @@ impl ScenarioRecording {
     ) {
         self.recorder
             .record_act_sensitive(action_params, payload_field, kind, byte_len);
+    }
+    /// Record an act step with a replay precondition derived by the
+    /// driving pipeline (ordinary live recording).
+    pub fn record_act_with_expect(
+        &mut self,
+        params: serde_json::Value,
+        expect: crate::scenario::model::StepExpect,
+    ) {
+        self.recorder.record_act_with_expect(params, &expect);
     }
     pub fn record_wait(&mut self, params: serde_json::Value) {
         self.recorder.record_wait(params);

@@ -13,7 +13,7 @@
 //! * every resolved action carries an [`ActionRisk`] class, so an explorer
 //!   can never treat "Next" and "Delete Database" the same way.
 //!
-//! The resolved form is a plain [`CanonicalAction`], so targeting composes
+//! The resolved form is a plain `CanonicalAction`, so targeting composes
 //! with the one canonical executor — settle waits, ledger, scenario capture —
 //! without a second execution path.
 

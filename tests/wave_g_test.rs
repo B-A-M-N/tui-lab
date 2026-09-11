@@ -71,9 +71,12 @@ async fn performance_audit_reports_measured_percentiles() {
             .find(|f| f.id == "PERF-OK" || f.id == "PERF-OBSERVE-SLOW")
             .expect("percentile finding present");
         let detail = &f.evidence[0].detail;
+        // Finding 44 renamed harness-cost fields so they are never mistaken
+        // for app interaction latency; this test intentionally checks the
+        // renamed evidence path.
         assert!(
-            detail["observe_ms"]["p50"].is_u64(),
-            "observe p50 must be a measured number: {detail}"
+            detail["harness_observe_ms"]["p50"].is_u64(),
+            "harness observe p50 must be a measured number: {detail}"
         );
         assert!(
             detail["samples"].as_u64().unwrap() == 5,
@@ -402,7 +405,8 @@ async fn full_audit_leaves_no_state_residue() {
         .await
         .expect("start");
     pool.with_session(Some(&id), |sess| {
-        let report = tui_lab::audit::orchestrator::run_profile(sess, "full").expect("full runs");
+        let report = tui_lab::audit::orchestrator::run_profile_allow_mutation(sess, "full")
+            .expect("full runs");
         // The last driver restores what it changed; the transaction verify
         // pass must find focus/size/cursor/title unchanged, so NO genuine
         // (WARN) residue finding appears. Audit P1 (finding 15): a
@@ -419,10 +423,7 @@ async fn full_audit_leaves_no_state_residue() {
         assert!(
             genuine.is_empty(),
             "full audit must restore the state it is responsible for: {:?}",
-            genuine
-                .iter()
-                .map(|f| &f.summary)
-                .collect::<Vec<_>>()
+            genuine.iter().map(|f| &f.summary).collect::<Vec<_>>()
         );
         for f in report.findings.iter().filter(|f| f.id == "AUDIT-RESIDUE") {
             assert_eq!(
@@ -642,7 +643,7 @@ async fn lease_blocks_driving_and_allows_observing() {
             .await,
         "static audit under lease",
     );
-    assert_eq!(static_audit["mode"], "static", "{static_audit}");
+    assert_eq!(static_audit["mode"], "static_frame", "{static_audit}");
 
     // Review §5: passive LIVE-SESSION audits observe the raw ring and fused
     // frame but send nothing — they must stay available under a human lease
@@ -667,7 +668,7 @@ async fn lease_blocks_driving_and_allows_observing() {
             &format!("{passive} audit under lease"),
         );
         assert_eq!(
-            run["mode"], "active",
+            run["mode"], "observational_live",
             "{passive} is a live-session reader; it must run under a human lease: {run}"
         );
         // And it produced a finding_count (the audit actually ran).
@@ -2040,8 +2041,20 @@ async fn workflow_inspect_diagnose_verify_construction_chain() {
         "workflow verify",
     );
     assert_eq!(verify["workflow"], "verify", "{verify}");
-    // recheck_profile selects the finding's category surface.
-    assert_eq!(verify["recheck_profile"], "discoverability", "{verify}");
+    // P1.2: the strategy names the surface explicitly (rule-prefix table,
+    // DISC → discoverability) and the fingerprint is citable.
+    assert_eq!(
+        verify["strategy"]["recheck_profile"], "discoverability",
+        "{verify}"
+    );
+    assert_eq!(
+        verify["strategy"]["matched_on"], "DISC (discoverability)",
+        "{verify}"
+    );
+    assert!(
+        verify["finding_fingerprint"].as_str().is_some(),
+        "verification is citable by fingerprint: {verify}"
+    );
     // The recheck leg actually ran (it is a live pass over the same frame).
     let recheck = verify["recheck"].as_object().expect("recheck ran");
     assert_eq!(recheck["profile"], "discoverability", "{recheck:?}");
@@ -2385,9 +2398,11 @@ async fn close_and_persist_responses_report_fresh_final_state() {
         "persist (already persistent)",
     );
     assert_eq!(again["already_persistent"], true, "{again}");
+    // P1.7: a failed flush is an InternalError envelope, never a success
+    // carrying `flush_error` — so a success here must not have the key.
     assert!(
-        again["flush_error"].is_null(),
-        "flush of an already-persistent run must succeed: {again}"
+        again.get("flush_error").is_none(),
+        "success envelope must not carry flush_error: {again}"
     );
     let final_again = &again["final"];
     assert!(
@@ -2407,10 +2422,7 @@ async fn close_and_persist_responses_report_fresh_final_state() {
     );
     assert_eq!(close["closed"], true, "{close}");
     let final_close = &close["final"];
-    assert!(
-        final_close.is_object(),
-        "final is present: {close}"
-    );
+    assert!(final_close.is_object(), "final is present: {close}");
     assert_eq!(
         final_close["closed"], true,
         "the final summary describes the run AFTER the close, not the \
@@ -2421,10 +2433,7 @@ async fn close_and_persist_responses_report_fresh_final_state() {
         Some(tx_at_persist),
         "final counts are the settled totals, not pre-flush values: {close}"
     );
-    assert_eq!(
-        final_close["run_id"], again["run_id"],
-        "{close}"
-    );
+    assert_eq!(final_close["run_id"], again["run_id"], "{close}");
 
     // Cross-check against a fresh status call: identical totals.
     let after = unwrap_ok(
@@ -2507,7 +2516,9 @@ async fn restart_between_mutations_requires_explicit_mutation_consent() {
     );
 
     server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": id })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
         .await;
 }
 
@@ -2567,7 +2578,8 @@ async fn workflow_framework_root_follows_recorded_launch_cwd() {
         "root comes from the recorded launch cwd, not the server cwd: {fw}"
     );
     assert_eq!(
-        fw["project_root"], base.to_string_lossy().as_ref(),
+        fw["project_root"],
+        base.to_string_lossy().as_ref(),
         "detection resolved against the app's own directory: {fw}"
     );
 
@@ -2587,7 +2599,204 @@ async fn workflow_framework_root_follows_recorded_launch_cwd() {
     );
 
     server
-        .tui_session(params_typed(serde_json::json!({ "action": "stop", "id": sid })))
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid }),
+        ))
         .await;
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Beta-audit P0.11: inspect's frame citation is a PROVENANCE citation —
+/// session-scoped and latest-wins — not a hash match. Two sessions run
+/// the SAME program (identical structure hashes); each session's inspect
+/// must cite its OWN frame. Then one session navigates A→B→A: its next
+/// inspect cites the second A (the higher frame id), never the first.
+#[tokio::test]
+async fn inspect_frame_citation_is_provenance_scoped() {
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let script = r#"print("== SAME =="); print("[ Save ]  [ Quit ]"); input()"#;
+
+    let a = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", script], "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start a",
+    );
+    let sid_a = a["session"].as_str().unwrap().to_string();
+    let b = unwrap_ok(
+        &server
+            .tui_session(params_typed(serde_json::json!({
+                "action": "start", "command": "python3",
+                "args": ["-c", script], "cols": 80, "rows": 24,
+            })))
+            .await,
+        "start b",
+    );
+    let sid_b = b["session"].as_str().unwrap().to_string();
+
+    // One committed frame per session, from the identical screens.
+    for sid in [&sid_a, &sid_b] {
+        unwrap_ok(
+            &server
+                .tui_act(params_typed(
+                    serde_json::json!({ "action": "key", "key": "tab", "id": sid }),
+                ))
+                .await,
+            "seed act",
+        );
+    }
+
+    let inspect = |sid: String| {
+        params_typed::<tui_lab::mcp::params::TuiObserveParams>(serde_json::json!({
+            "mode": "inspect", "id": sid,
+        }))
+    };
+    let frame_a = unwrap_ok(
+        &server.tui_observe(inspect(sid_a.clone())).await,
+        "inspect a",
+    )["frame"]
+        .clone();
+    let frame_b = unwrap_ok(
+        &server.tui_observe(inspect(sid_b.clone())).await,
+        "inspect b",
+    )["frame"]
+        .clone();
+    assert_eq!(
+        frame_a["session"], sid_a,
+        "session A cites ITS frame, not the identical-hash frame of B: {frame_a}"
+    );
+    assert_eq!(
+        frame_b["session"], sid_b,
+        "session B cites ITS frame: {frame_b}"
+    );
+    assert_ne!(
+        frame_a["ref"], frame_b["ref"],
+        "identical screens still hold distinct frame ids"
+    );
+
+    // A→B→A on session A: tab twice more (each act commits a frame; the
+    // final screen structurally matches the first). The citation must
+    // move to the LATEST commit.
+    for _ in 0..2 {
+        unwrap_ok(
+            &server
+                .tui_act(params_typed(
+                    serde_json::json!({ "action": "key", "key": "tab", "id": sid_a }),
+                ))
+                .await,
+            "nav act",
+        );
+    }
+    let frame_a2 = unwrap_ok(
+        &server.tui_observe(inspect(sid_a.clone())).await,
+        "inspect a again",
+    )["frame"]
+        .clone();
+    assert_eq!(
+        frame_a2["session"], sid_a,
+        "the A-return still cites session A: {frame_a2}"
+    );
+    let older = frame_a["ref"].as_str().unwrap().to_string();
+    let newer = frame_a2["ref"].as_str().unwrap().to_string();
+    assert_ne!(
+        older, newer,
+        "latest-wins: the second A cites the newer commit ({older} vs {newer})"
+    );
+
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid_a }),
+        ))
+        .await;
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": sid_b }),
+        ))
+        .await;
+}
+
+// ─────────────────────────── P1.7: persist flush failure is an error ───────────────────────────
+
+/// Audit P1.7: an already-persistent run whose flush FAILS must return
+/// an error envelope (InternalError), not a success carrying
+/// `flush_error` inside it. Injected deterministically: after the first
+/// persist, `state_graph.json` is replaced by a DIRECTORY, so the
+/// rename-based flush write cannot proceed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn already_persistent_run_with_failing_flush_is_an_error() {
+    use std::fs;
+    use std::path::PathBuf;
+    let server = tui_lab::mcp::tools::TuiLabServer::new();
+    let id = start_session(&server, "print('persist-me'); input()").await;
+
+    let root = std::env::temp_dir().join("tui-lab-p17-flush-fail");
+    let _ = fs::remove_dir_all(&root);
+    let first = unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "persist", "root": root.to_string_lossy() }),
+            ))
+            .await,
+        "persist",
+    );
+    let dir = PathBuf::from(first["artifact_root"].as_str().expect("artifact root"));
+    assert!(dir.join("run.json").exists(), "promoted run wrote run.json");
+
+    // Sabotage: a directory where the flush wants to write a file.
+    // (create_dir_all on the parent succeeds; the rename of
+    // state_graph.json.tmp onto a non-empty-looking path fails.)
+    fs::remove_file(dir.join("state_graph.json")).expect("remove graph file");
+    fs::create_dir_all(dir.join("state_graph.json")).expect("make dir blocker");
+
+    let failed = unwrap_err(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "persist", "root": root.to_string_lossy() }),
+            ))
+            .await,
+        "persist with sabotaged flush",
+    );
+    let text = failed["error"]
+        .as_str()
+        .or_else(|| failed["message"].as_str())
+        .unwrap_or_else(|| panic!("error message in envelope: {failed}"))
+        .to_string();
+    assert!(
+        text.contains("already persistent") && text.contains("flush"),
+        "error must name the run, its durability, and the flush failure: {text}"
+    );
+    assert!(
+        !text.contains("flush_error"),
+        "the old success-key must not leak into the error text: {text}"
+    );
+
+    // Repair the tree so close can settle cleanly, and confirm a healthy
+    // re-persist answers with the success envelope again.
+    fs::remove_dir(dir.join("state_graph.json")).expect("remove dir blocker");
+    let healed = unwrap_ok(
+        &server
+            .tui_run(params_typed(
+                serde_json::json!({ "action": "persist", "root": root.to_string_lossy() }),
+            ))
+            .await,
+        "persist after repair",
+    );
+    assert_eq!(healed["already_persistent"], true, "{healed}");
+    assert!(
+        healed.get("flush_error").is_none(),
+        "success envelope must not carry flush_error: {healed}"
+    );
+
+    let _ = server
+        .tui_run(params_typed(serde_json::json!({ "action": "close" })))
+        .await;
+    let _ = server
+        .tui_session(params_typed(
+            serde_json::json!({ "action": "stop", "id": id }),
+        ))
+        .await;
+    let _ = fs::remove_dir_all(&root);
 }
