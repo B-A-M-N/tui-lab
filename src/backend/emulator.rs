@@ -97,6 +97,13 @@ impl TerminalEmulator {
         self.parser.callbacks_mut()
     }
 
+    /// Install the terminal persona's synchronized-update behavior contract.
+    /// Must be called before launch/query traffic; this changes how the
+    /// emulator responds to applications, not merely what it records.
+    pub(super) fn set_synchronized_updates(&mut self, yes: bool) {
+        self.parser.callbacks_mut().set_synchronized_updates(yes);
+    }
+
     /// Wave F item 53: the scrollback materialized at the last refresh.
     pub(super) fn scrollback_cache(&self) -> &[String] {
         &self.scrollback_cache

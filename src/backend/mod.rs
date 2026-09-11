@@ -33,7 +33,7 @@ pub mod wait;
 pub use line_cli::PtyLineBackend;
 pub use pipe::PipeBackend;
 pub use portable_pty::PortablePtyBackend;
-pub use trait_def::TerminalBackend;
+pub use trait_def::{DispatchOutcome, TerminalBackend};
 
 /// Result of a single observation round-trip: the new screen plus how long the
 /// process took to settle (if a quiescence check was requested).
@@ -191,6 +191,17 @@ pub struct Capabilities {
     /// expose its interval and known blind spots here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability_fidelity: Option<ObservabilityFidelity>,
+    /// Whether this backend's terminal persona contracts synchronized-update
+    /// protocol behavior (`CSI ? 2026 h/l`). A portable backend that declares
+    /// the feature must actually implement the mode handshake; sampling or
+    /// silent parsing is never enough.
+    #[serde(default)]
+    pub synchronized_updates: bool,
+    /// Whether this backend's terminal persona contracts OSC 8 hyperlink
+    /// handling. This is a behavior contract, not merely an emitted-env
+    /// declaration; the current persona can truthfully leave it false.
+    #[serde(default)]
+    pub osc8: bool,
 }
 
 /// How observable state is captured and what that loses.
@@ -244,6 +255,8 @@ impl Default for Capabilities {
             supported_waits: Vec::new(),
             input_families: Vec::new(),
             observability_fidelity: None,
+            synchronized_updates: false,
+            osc8: false,
         }
     }
 }
@@ -302,6 +315,18 @@ pub enum BackendError {
     Unsupported(String),
     #[error("no active session")]
     NoSession,
+}
+
+impl Clone for BackendError {
+    fn clone(&self) -> Self {
+        match self {
+            BackendError::Spawn(s) => BackendError::Spawn(s.clone()),
+            BackendError::Io(e) => BackendError::Io(std::io::Error::other(e.to_string())),
+            BackendError::Exited(s) => BackendError::Exited(s.clone()),
+            BackendError::Unsupported(s) => BackendError::Unsupported(s.clone()),
+            BackendError::NoSession => BackendError::NoSession,
+        }
+    }
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -900,6 +925,13 @@ pub struct CaptureOutcome {
     /// `CaptureStrategy::Frames` must return every frame it collected, not
     /// only the last). `None` for single-frame captures.
     pub frames: Option<Vec<ScreenState>>,
+    /// Actual sampling offset from the capture operation's T0 (audit
+    /// finding 7). This is the evidence of what the strategy really did,
+    /// as distinct from the requested offset.
+    pub actual_sample_offset_ms: u64,
+    /// Monotonic per-edge timestamps for sequence captures (audit finding
+    /// 56). A monotonic timestamp, not Unix correlation time.
+    pub edge_at_monotonic_ms: Vec<u64>,
 }
 
 impl CaptureOutcome {
@@ -913,6 +945,8 @@ impl CaptureOutcome {
             frame: o.state,
             elapsed_ms: o.elapsed_ms,
             frames: None,
+            actual_sample_offset_ms: o.elapsed_ms,
+            edge_at_monotonic_ms: Vec::new(),
         }
     }
 }

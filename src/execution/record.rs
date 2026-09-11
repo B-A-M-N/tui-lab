@@ -236,6 +236,17 @@ impl CanonicalAction {
         }
     }
 
+    /// Replay-safe payload text for a Type action: the text is itself
+    /// semantic input, so a recorded precondition should require its
+    /// presence rather than pin the volatile fused identity it changes.
+    /// `None` for non-Type actions.
+    pub fn payload_text(&self) -> Option<String> {
+        match self {
+            CanonicalAction::Type { text } => Some(text.clone()),
+            _ => None,
+        }
+    }
+
     /// Byte length of the payload this action carries (leak-fix support for
     /// redacted persistence: the length is replay-relevant metadata and is
     /// safe to keep; the bytes are not).
@@ -375,7 +386,8 @@ impl DriveOrigin {
 /// never reaches the transport; a transport failure after bytes are known
 /// representable is at least unknown-partial and must be evidenced rather
 /// than disappearing through `?`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchStatus {
     /// The action was refused before any transport write.
     RefusedBeforeWrite,
@@ -397,7 +409,49 @@ impl DispatchStatus {
             Self::PartialOrUnknown => "partial_or_unknown",
         }
     }
+
+    /// Whether a write was attempted for this status. `Sent` and
+    /// `PartialOrUnknown` both imply the transport write was entered;
+    /// the two pre-write statuses prove no bytes could have landed.
+    pub fn write_attempted(&self) -> bool {
+        matches!(self, Self::Sent | Self::PartialOrUnknown)
+    }
 }
+
+/// The typed outcome of one transport dispatch (audit finding 4): the
+/// backend's original error is preserved, plus the exact classification of
+/// whether the write was attempted. The executor maps this onto
+/// [`DispatchStatus`] without collapsing distinct failure classes into
+/// `PartialOrUnknown`.
+#[derive(Debug, Clone)]
+pub struct DispatchError {
+    pub status: DispatchStatus,
+    /// The backend's original error string (BackendError or resize error),
+    /// preserved verbatim for evidence.
+    pub message: String,
+}
+
+impl DispatchError {
+    /// Classify a send/resize failure by what the backend proved. A
+    /// preflight/encoding/unsupported failure proves no bytes were written;
+    /// anything observed only as a transport I/O error after the write
+    /// boundary is entered is `PartialOrUnknown` unless the backend proved
+    /// otherwise.
+    pub fn from_backend(status: DispatchStatus, message: String) -> Self {
+        DispatchError { status, message }
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status.name(), self.message)
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+/// A typed [`Result`] for transport dispatch.
+pub type DispatchResult<T> = Result<T, DispatchError>;
 
 /// Settlement outcome for one interaction (re-review P1: `no_wait` must not
 /// report `settled` — "I did not test settlement" is not "it settled").
@@ -410,6 +464,12 @@ pub enum SettleStatus {
     TimedOut,
     /// Settlement was not tested (`no_wait=true`).
     Skipped,
+    /// No settle wait was attempted — the dispatch failed before (or
+    /// with unknown) delivery, so settlement is not merely untested, it
+    /// was never reachable. Distinct from `Skipped` (`no_wait`: we
+    /// CHOSE not to wait on a sent input) and from `TimedOut` (a wait
+    /// ran and exhausted its budget).
+    NotAttempted,
 }
 
 impl SettleStatus {
@@ -418,6 +478,8 @@ impl SettleStatus {
     pub fn from_legacy(settled: bool, reason: &str) -> Self {
         if reason == "no_wait" {
             SettleStatus::Skipped
+        } else if reason == "dispatch_failed" {
+            SettleStatus::NotAttempted
         } else if settled {
             SettleStatus::Met
         } else {

@@ -131,6 +131,7 @@ mod tests {
 
     fn finding(id: &str, rule_id: Option<&str>, category: &str) -> crate::audit::Finding {
         crate::audit::Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: id.into(),
             rule_id: rule_id.map(str::to_string),
             severity: crate::audit::Severity::Warn,

@@ -33,8 +33,8 @@ use crate::backend::line_types::{now_ms, CommandState, SearchHit};
 use crate::backend::{
     new_recording_hook_slot,
     trait_def::{StartupOutcome, StartupPhase, TerminalBackend},
-    BackendError, BackendResult, Capabilities, Input, InputModes, ObserveResult, RecordingHookSlot,
-    TerminalEventState, WaitCond, WaitOutcome, WaitReason,
+    BackendError, BackendResult, Capabilities, DispatchOutcome, Input, InputModes, ObserveResult,
+    RecordingHookSlot, TerminalEventState, WaitCond, WaitOutcome, WaitReason,
 };
 use crate::screen::{ProcessState, ScreenState};
 
@@ -617,6 +617,103 @@ impl TerminalBackend for PipeBackend {
         Ok(())
     }
 
+    fn dispatch(&mut self, input: Input) -> DispatchOutcome {
+        self.pump();
+        if self.stdin.is_none() {
+            return DispatchOutcome::failed_before_write(BackendError::NoSession);
+        }
+        let write =
+            |this: &mut Self, bytes: &[u8]| -> BackendResult<()> { this.write_input(bytes) };
+        let prepared = match input {
+            Input::Text(t) | Input::Paste(t) => Ok(t.into_bytes()),
+            Input::Key(kev) => {
+                if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(format!(
+                        "pipe backend cannot encode modified keys (got {kev:?}); use the portable engine for full key semantics"
+                    )));
+                }
+                match kev.code {
+                    crate::backend::KeyCode::Enter => Ok(b"\n".to_vec()),
+                    crate::backend::KeyCode::Char(c) => Ok(c.to_string().into_bytes()),
+                    _ => {
+                        return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                            "pipe backend supports Char/Enter keys only; no terminal grid exists"
+                                .into(),
+                        ))
+                    }
+                }
+            }
+            Input::Keys(keys) => {
+                let mut payload: Vec<u8> = Vec::new();
+                for kev in keys {
+                    if kev.modifiers != crate::backend::KeyModifiers::NONE {
+                        return DispatchOutcome::failed_before_write(BackendError::Unsupported(format!(
+                            "pipe backend cannot encode modified keys (got {kev:?}); use the portable engine for full key semantics"
+                        )));
+                    }
+                    match kev.code {
+                        crate::backend::KeyCode::Enter => payload.push(b'\n'),
+                        crate::backend::KeyCode::Char(c) => {
+                            let mut s = String::new();
+                            s.push(c);
+                            payload.extend_from_slice(s.as_bytes());
+                        }
+                        _ => {
+                            return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                                "pipe backend supports Char/Enter keys only".into(),
+                            ))
+                        }
+                    }
+                }
+                Ok(payload)
+            }
+            Input::Raw(b) => Ok(b),
+            Input::Mouse(_) | Input::MouseClick { .. } => {
+                return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                    "mouse is meaningless on a pipe backend (no terminal grid reports input)"
+                        .into(),
+                ))
+            }
+            Input::Resize { cols, rows } => {
+                self.cols = cols;
+                self.rows = rows;
+                if let Ok(slot) = self.recording_slot.lock() {
+                    if let Some(ref h) = *slot {
+                        h.on_resize(cols, rows);
+                    }
+                }
+                return DispatchOutcome::ok();
+            }
+            Input::Signal(sig) => {
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = self.child_pid {
+                        let r = unsafe { libc::kill(-(pid as i32), sig) };
+                        if r != 0 {
+                            let _ = unsafe { libc::kill(pid as i32, sig) };
+                        }
+                        return DispatchOutcome::ok();
+                    }
+                    return DispatchOutcome::failed_before_write(BackendError::NoSession);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = sig;
+                    return DispatchOutcome::failed_before_write(BackendError::Unsupported(
+                        "arbitrary POSIX signals are only available on Unix".into(),
+                    ));
+                }
+            }
+        };
+        match prepared {
+            Ok(bytes) => match write(self, &bytes) {
+                Ok(()) => DispatchOutcome::ok(),
+                Err(e) => DispatchOutcome::failed_in_write(e),
+            },
+            Err(e) => DispatchOutcome::failed_before_write(e),
+        }
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) -> BackendResult<()> {
         self.cols = cols;
         self.rows = rows;
@@ -795,6 +892,8 @@ impl TerminalBackend for PipeBackend {
                 WaitCapability::Idle,
             ],
             observability_fidelity: None,
+            synchronized_updates: false,
+            osc8: false,
             input_families: vec![
                 InputFamily::Key,
                 InputFamily::Paste,

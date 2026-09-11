@@ -33,6 +33,7 @@ async fn guard_refuses_act_on_structure_drift() {
             focus_control_id: None,
             native_revision: None,
             text_visible: None,
+            semantic_identity: None,
         };
         let err = tui_lab::execution::execute_act_with_guard(
             sess,
@@ -74,6 +75,7 @@ async fn guard_allows_act_when_state_matches() {
 
             let guard = tui_lab::execution::MutationGuard::capture(
                 sess.analyze_last().as_ref(),
+                sess,
                 sess.generation,
             );
             let tx = tui_lab::execution::execute_act_with_guard(

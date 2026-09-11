@@ -467,6 +467,7 @@ mod tests {
         refs: Vec<crate::semantic::source_ref::SourceRef>,
     ) -> crate::audit::Finding {
         crate::audit::Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "CLIP-001".into(),
             rule_id: None,
             severity: crate::audit::Severity::Error,

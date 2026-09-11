@@ -58,6 +58,17 @@ impl Session {
         self.evidence_sink = Some(std::sync::Arc::new(sink));
     }
 
+    /// Install an already-shared sink. Authorized dispatch uses this so
+    /// the exact captured ticket/run identity is reused everywhere (and a
+    /// second commit of an already-committed transaction can detect the
+    /// same sink).
+    pub fn install_evidence_sink_arc(
+        &mut self,
+        sink: std::sync::Arc<crate::execution::RunEvidenceSink>,
+    ) {
+        self.evidence_sink = Some(sink);
+    }
+
     /// Clear the sink (end of the authorized job). Returns what was
     /// installed, for the dispatcher's health reporting.
     pub fn take_evidence_sink(

@@ -2239,3 +2239,42 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 }
+
+impl NativeChannel {
+    /// Drift fixture seam (audit finding 1 test): declare the same visual
+    /// screen with a different focused control, advancing the native
+    /// revision. Test-only and intentionally `pub(crate)`.
+    pub fn test_declare_focus_for_drift_fixture(&mut self, control_id: &str) {
+        let root = self
+            .latest
+            .get_or_insert_with(|| crate::semantic::native::NativeNode {
+                id: "screen".into(),
+                role: String::new(),
+                label: None,
+                value: None,
+                bounds: None,
+                actions: Vec::new(),
+                focusable: None,
+                focused: None,
+                enabled: None,
+                source: None,
+                children: Vec::new(),
+            });
+        root.id = "screen".into();
+        root.children.clear();
+        root.children.push(crate::semantic::native::NativeNode {
+            id: control_id.to_string(),
+            role: String::new(),
+            label: None,
+            value: None,
+            bounds: None,
+            actions: vec!["activate".into()],
+            focusable: Some(true),
+            focused: Some(true),
+            enabled: Some(true),
+            source: None,
+            children: Vec::new(),
+        });
+        self.native_seq += 1;
+    }
+}

@@ -18,20 +18,19 @@ impl ScenarioRecorder {
         }
     }
 
+    /// Set the replay failure policy before/while recording. Preserved by
+    /// all in-place appends (finding 58).
+    pub fn set_on_failure(&mut self, policy: super::model::FailurePolicy) {
+        self.scenario.on_failure = policy;
+    }
+
     /// Record an act step.
     pub fn record_act(&mut self, params: serde_json::Value) {
-        self.scenario = Scenario {
-            steps: {
-                let mut steps = self.scenario.steps.clone();
-                steps.push(super::model::ScenarioStep {
-                    kind: super::model::StepKind::Act,
-                    params,
-                    expect: None,
-                });
-                steps
-            },
-            ..self.scenario.clone()
-        };
+        self.scenario.steps.push(super::model::ScenarioStep {
+            kind: super::model::StepKind::Act,
+            params,
+            expect: None,
+        });
     }
 
     /// Record a first-class intent step (beta-audit P0-9): target + verb
@@ -101,18 +100,14 @@ impl ScenarioRecorder {
         expect: &super::model::StepExpect,
     ) {
         let expect = expect.clone();
-        self.scenario = Scenario {
-            steps: {
-                let mut steps = self.scenario.steps.clone();
-                steps.push(super::model::ScenarioStep {
-                    kind: super::model::StepKind::Act,
-                    params,
-                    expect: Some(expect),
-                });
-                steps
-            },
-            ..self.scenario.clone()
-        };
+        // Finding 58: append to the existing step list in place. The
+        // recorder is exclusively mutable; reconstructing the whole
+        // scenario made every appended step copy all prior steps.
+        self.scenario.steps.push(super::model::ScenarioStep {
+            kind: super::model::StepKind::Act,
+            params,
+            expect: Some(expect),
+        });
     }
 
     /// Record a SENSITIVE act step (re-review P0.3): the payload is stripped

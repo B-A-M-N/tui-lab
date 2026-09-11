@@ -887,6 +887,7 @@ fn audit_transaction_reports_timing_metrics() {
     // metrics ride beside them.
     let (findings, m) = tui_lab::audit::transaction::run_verified(&mut s, "probe", |_sess| {
         vec![tui_lab::audit::Finding {
+            kind: tui_lab::audit::FindingKind::Defect,
             id: "PROBE-1".into(),
             rule_id: None,
             severity: tui_lab::audit::Severity::Info,

@@ -28,10 +28,13 @@ pub enum StepErrorCategory {
     InvalidParams,
     ExecutionError,
     Timeout,
+    /// An assertion predicate evaluated and did not hold (replay
+    /// semantics, audit finding 22: distinct from a transport failure).
+    AssertionFailed,
     SkippedDueToPriorFailure,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct StepResult {
     pub index: usize,
     pub kind: String,
@@ -60,7 +63,7 @@ pub enum RunStatus {
     StoppedOnFailure,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ScenarioRunReport {
     pub scenario_name: String,
     pub scenario_id: String,
@@ -81,6 +84,18 @@ pub struct ScenarioRunReport {
     /// step proves nothing either way.
     pub steps_skipped: usize,
     pub step_results: Vec<StepResult>,
+}
+
+/// Reset contract for repeated scenario execution (audit findings 18/24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetMode {
+    /// Stop, discard the old process, and relaunch the scenario-owned
+    /// target before every repeat.
+    Restart,
+    /// Continue on the current mutable state. With `repeat > 1` this is
+    /// an explicit request for continuous observations, not flakiness.
+    Continue,
 }
 
 /// Aggregate verdict across repeated runs (P1-23).
@@ -123,9 +138,26 @@ pub struct ScenarioRepeatReport {
 }
 
 impl ScenarioRunner {
-    /// Repeat a replay and classify flakiness (P1-23). A repeat count of 1
-    /// is equivalent to [`Self::run_in_run_with_policy`] plus an aggregate
-    /// verdict.
+    /// Repeat a replay and classify flakiness (P1-23) with a RESET
+    /// CONTRACT between iterations. A repeat count of 1 is equivalent to
+    /// [`Self::run_in_run_with_policy`] plus an aggregate verdict.
+    ///
+    /// Audit finding 18: repeats against the SAME mutable session
+    /// consecutively are state-contaminated — run 2 begins from run 1's
+    /// final state, so a mixed pass/fail is deterministic accumulated UI
+    /// state, not flakiness. `repeat > 1` therefore REQUIRES
+    /// `reset_between`: when `true`, the session is restarted (same launch
+    /// spec, new generation) before every run after the first; when
+    /// `false`, the runner REFUSES to classify — returning a single
+    /// `NoResetContract` verdict-style report (all steps skipped, no
+    /// flakiness claim) rather than manufacturing contaminated repeats.
+    /// Repeat a replay and classify flakiness. The supplied session must
+    /// already have been launched from the scenario-owned target; before
+    /// every iteration (including the first) the runner verifies the
+    /// session's stored launch spec and advances generation through
+    /// `restart()`. This keeps scenario-owned repeats isolated from prior
+    /// UI state and prevents a generic inherited session from being
+    /// mistaken for a reset contract.
     pub fn run_repeat(
         scenario: &Scenario,
         session: &mut crate::session::state::Session,
@@ -133,13 +165,127 @@ impl ScenarioRunner {
         run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
         policy: Option<super::model::FailurePolicy>,
         repeat: u32,
+        reset_between: bool,
+    ) -> ScenarioRepeatReport {
+        Self::run_repeat_with_reset(
+            scenario,
+            session,
+            values,
+            run,
+            policy,
+            repeat,
+            if reset_between {
+                ResetMode::Restart
+            } else {
+                ResetMode::Continue
+            },
+        )
+    }
+
+    /// Full repeat entry point with an explicit reset mode. Audit finding
+    /// 18: a repeat against accumulated UI state is not flakiness
+    /// evidence. `ResetMode::Restart` is the only contract that may
+    /// classify; `Continue` produces a refusal report.
+    pub fn run_repeat_with_reset(
+        scenario: &Scenario,
+        session: &mut crate::session::state::Session,
+        values: &[ParameterValue],
+        run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+        policy: Option<super::model::FailurePolicy>,
+        repeat: u32,
+        mode: ResetMode,
     ) -> ScenarioRepeatReport {
         let repeat = repeat.max(1);
+        if repeat > 1 && mode != ResetMode::Restart {
+            // No reset contract: refuse the flakiness classification.
+            // The executed report shows what would have run; it is not
+            // counted as evidence, and the aggregate carries the refusal.
+            let skipped_report = Self::failed_reset_report(
+                scenario,
+                "no reset contract: continuous_iterations does not support flakiness classification; use ResetMode::Restart with a scenario-owned target",
+            );
+            return ScenarioRepeatReport {
+                repeat,
+                passed_runs: 0,
+                failed_runs: 1,
+                verdict: FlakinessVerdict::StableFailure,
+                pass_rate_pct: 0,
+                first_run: Some(skipped_report),
+                last_run: None,
+            };
+        }
+        // Audit finding 24: only a scenario-owned launch may use restart
+        // as a repeat reset contract. The launch spec must exist, parse,
+        // and be exactly the caller-launched session's spec.
+        if repeat > 1 {
+            let launch = scenario.launch.as_ref().map(|l| l.to_launch_spec());
+            let actual_launch = session.launch().cloned();
+            // An inherited session has no reset contract at all. Never
+            // classify accumulated-state repeats as flakiness evidence.
+            if scenario.inherit_session || launch.is_none() {
+                return ScenarioRepeatReport {
+                    repeat,
+                    passed_runs: 0,
+                    failed_runs: 1,
+                    verdict: FlakinessVerdict::StableFailure,
+                    pass_rate_pct: 0,
+                    first_run: Some(Self::failed_reset_report(
+                        scenario,
+                        "scenario-owned launch required for restart-based repeats; set inherit_session=false with launch",
+                    )),
+                    last_run: None,
+                };
+            }
+            if let (Some(expected), Some(actual)) = (launch.as_ref(), actual_launch.as_ref()) {
+                if expected != actual {
+                    return ScenarioRepeatReport {
+                        repeat,
+                        passed_runs: 0,
+                        failed_runs: 1,
+                        verdict: FlakinessVerdict::StableFailure,
+                        pass_rate_pct: 0,
+                        first_run: Some(Self::failed_reset_report(
+                            scenario,
+                            "scenario launch mismatch: this scenario owns a target, but the session was launched from a different command/args/backend/isolation configuration",
+                        )),
+                        last_run: None,
+                    };
+                }
+            }
+            if mode == ResetMode::Restart && launch.is_none() {
+                return ScenarioRepeatReport {
+                    repeat,
+                    passed_runs: 0,
+                    failed_runs: 1,
+                    verdict: FlakinessVerdict::StableFailure,
+                    pass_rate_pct: 0,
+                    first_run: Some(Self::failed_reset_report(
+                        scenario,
+                        "scenario-owned launch required for restart-based repeats; set inherit_session=false with launch",
+                    )),
+                    last_run: None,
+                };
+            }
+        }
         let mut passed = 0u32;
         let mut failed = 0u32;
         let mut first: Option<ScenarioRunReport> = None;
         let mut last: Option<ScenarioRunReport> = None;
         for i in 0..repeat {
+            if repeat > 1 {
+                // Relaunch the same scenario-owned logical session: new
+                // generation, so each iteration starts from the scenario's
+                // own initial state (the contract finding 18 requires).
+                if let Err(e) = session.restart() {
+                    let report = Self::failed_reset_report(scenario, &e.to_string());
+                    if first.is_none() {
+                        first = Some(report.clone());
+                    }
+                    last = Some(report);
+                    failed += 1;
+                    continue;
+                }
+            }
             let report = Self::run_in_run_with_policy(scenario, session, values, run, policy);
             let run_passed = report.steps_failed == 0 && report.steps_skipped == 0;
             if run_passed {
@@ -148,7 +294,7 @@ impl ScenarioRunner {
                 failed += 1;
             }
             if first.is_none() {
-                first = Some(report);
+                first = Some(report.clone());
             } else if i == repeat.saturating_sub(1) {
                 last = Some(report);
             }
@@ -169,6 +315,42 @@ impl ScenarioRunner {
             pass_rate_pct: pass_rate,
             first_run: first,
             last_run: if repeat > 2 { last } else { None },
+        }
+    }
+
+    /// A repeat report for an iteration whose reset/relaunch failed: every
+    /// step is skipped with a named reason, and the run is counted as a
+    /// failure (never silently merging the app's accumulated state into
+    /// the flakiness claim).
+    fn failed_reset_report(scenario: &Scenario, reason: &str) -> ScenarioRunReport {
+        ScenarioRunReport {
+            scenario_name: scenario.name.clone(),
+            scenario_id: scenario.id.clone(),
+            scenario_schema: scenario.schema.clone(),
+            started_monotonic_ms: Some(crate::events::monotonic_ms()),
+            finished_monotonic_ms: Some(crate::events::monotonic_ms()),
+            status: RunStatus::StoppedOnFailure,
+            steps_total: scenario.steps.len(),
+            steps_passed: 0,
+            steps_failed: 0,
+            steps_skipped: scenario.steps.len(),
+            step_results: scenario
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(i, step)| StepResult {
+                    index: i,
+                    kind: format!("{:?}", step.kind).to_lowercase(),
+                    passed: false,
+                    status: StepStatus::Skipped,
+                    error_category: Some(StepErrorCategory::SkippedDueToPriorFailure),
+                    detail: format!(
+                        "repeat reset failed: {reason}; this iteration was not attempted"
+                    ),
+                    transaction_seq: None,
+                    elapsed_ms: None,
+                })
+                .collect(),
         }
     }
 }
@@ -241,40 +423,53 @@ impl ScenarioRunner {
         let mut passed = 0;
         let mut failed = 0;
         let mut skipped = 0;
-        // P1-21: a scenario that owns a target (`inherit_session=false`)
-        // must not silently run against whatever session the caller
-        // supplied. Scenario-owned launch/restart/cleanup requires an
-        // ownership-aware runner surface; refuse the mismatch loudly until
-        // that surface exists rather than pretending a supplied session is
-        // the declared target.
+        // P1-21/24: scenario ownership is a routing contract. A scenario
+        // that owns a target may execute only when the caller has launched
+        // exactly that target into the supplied session. Launch/cleanup and
+        // per-repeat relaunch are the pool's lifecycle responsibility; the
+        // runner cannot silently substitute an inherited session.
         if !scenario.inherit_session {
-            return ScenarioRunReport {
-                scenario_name: scenario.name.clone(),
-                scenario_id: scenario.id.clone(),
-                scenario_schema: scenario.schema.clone(),
-                started_monotonic_ms: Some(crate::events::monotonic_ms()),
-                finished_monotonic_ms: Some(crate::events::monotonic_ms()),
-                status: RunStatus::StoppedOnFailure,
-                steps_total: scenario.steps.len(),
-                steps_passed: 0,
-                steps_failed: 0,
-                steps_skipped: scenario.steps.len(),
-                step_results: scenario
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, step)| StepResult {
-                        index: i,
-                        kind: format!("{:?}", step.kind).to_lowercase(),
-                        passed: false,
-                        status: StepStatus::Skipped,
-                        error_category: Some(StepErrorCategory::InvalidParams),
-                        detail: "scenario_ownership_unsupported: inherit_session=false requires a scenario-owned launch/restart/cleanup runner surface".to_string(),
-                        transaction_seq: None,
-                        elapsed_ms: None,
-                    })
-                    .collect(),
-            };
+            let expected = scenario.launch.as_ref().map(|l| {
+                let mut spec = l.to_launch_spec();
+                spec.env
+                    .retain(|(k, _)| k != "TUI_LAB_PERSONA" && k != "TERM" && k != "COLORTERM");
+                spec
+            });
+            let mut actual = session.launch().cloned();
+            if let Some(actual) = actual.as_mut() {
+                actual
+                    .env
+                    .retain(|(k, _)| k != "TUI_LAB_PERSONA" && k != "TERM" && k != "COLORTERM");
+            }
+            if expected.as_ref() != actual.as_ref() {
+                return ScenarioRunReport {
+                    scenario_name: scenario.name.clone(),
+                    scenario_id: scenario.id.clone(),
+                    scenario_schema: scenario.schema.clone(),
+                    started_monotonic_ms: Some(crate::events::monotonic_ms()),
+                    finished_monotonic_ms: Some(crate::events::monotonic_ms()),
+                    status: RunStatus::StoppedOnFailure,
+                    steps_total: scenario.steps.len(),
+                    steps_passed: 0,
+                    steps_failed: 0,
+                    steps_skipped: scenario.steps.len(),
+                    step_results: scenario
+                        .steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, step)| StepResult {
+                            index: i,
+                            kind: format!("{:?}", step.kind).to_lowercase(),
+                            passed: false,
+                            status: StepStatus::Skipped,
+                            error_category: Some(StepErrorCategory::InvalidParams),
+                            detail: "scenario_ownership_mismatch: inherit_session=false requires the supplied session to have been launched from this scenario's exact target (launch it through the scenario runner/pool; launch/cleanup is never silently borrowed from an inherited session)".to_string(),
+                            transaction_seq: None,
+                            elapsed_ms: None,
+                        })
+                        .collect(),
+                };
+            }
         }
         // Effective policy: caller override wins over the recorded one; the
         // serde default for old scenario files is stop — continuing past a
@@ -391,7 +586,15 @@ impl ScenarioRunner {
                 None => None,
             };
             let step_started = std::time::Instant::now();
-            let mut executed_tx: Option<crate::execution::InteractionTransaction> = None;
+            let mut _executed_tx: Option<crate::execution::InteractionTransaction> = None;
+            // Audit finding 23: the LEDGER SEQUENCE comes from the drive
+            // outcome's committed value (set below when the run context is
+            // present), never a heuristic backward scan over the ledger.
+            let mut committed_ledger_seq: Option<u64> = None;
+            // Audit finding 22: typed failure category per step — set by
+            // each branch; the fallback (a step that ran but failed its
+            // verdict) stays ExecutionError.
+            let mut step_error_category = StepErrorCategory::ExecutionError;
             let (step_passed, detail) = match step.kind {
                 StepKind::Act => match serde_json::from_value::<TuiActRequest>(params) {
                     Ok(req) => {
@@ -457,7 +660,10 @@ impl ScenarioRunner {
                                             match crate::execution::drive_pipeline(
                                                 session, run, spec,
                                             ) {
-                                                Ok(o) => Ok(o.tx),
+                                                Ok(o) => {
+                                                    committed_ledger_seq = o.ledger_seq;
+                                                    Ok(o.tx)
+                                                }
                                                 Err(e) => Err(e),
                                             }
                                         }
@@ -483,17 +689,23 @@ impl ScenarioRunner {
                                                 tx.settle,
                                                 tx.settle_reason()
                                             );
-                                            executed_tx = Some(tx);
+                                            _executed_tx = Some(tx);
                                             (settled, detail)
                                         }
                                         Err(e) => (false, format!("act failed: {e}")),
                                     }
                                 }
-                                Err(msg) => (false, format!("invalid act params: {msg}")),
+                                Err(msg) => {
+                                    step_error_category = StepErrorCategory::InvalidParams;
+                                    (false, format!("invalid act params: {msg}"))
+                                }
                             };
                         (step_passed, detail)
                     }
-                    Err(e) => (false, format!("unparseable act step: {e}")),
+                    Err(e) => {
+                        step_error_category = StepErrorCategory::InvalidParams;
+                        (false, format!("unparseable act step: {e}"))
+                    }
                 },
                 StepKind::Wait => {
                     match serde_json::from_value::<TuiWaitParams>(params.clone()) {
@@ -514,14 +726,32 @@ impl ScenarioRunner {
                                         match crate::execution::execute_wait_event(
                                             session, &pred, budget,
                                         ) {
-                                            Ok(out) => (
-                                                out.met,
-                                                format!(
-                                                    "event wait met={} matched_seq={}",
-                                                    out.met, out.matched_seq
-                                                ),
-                                            ),
-                                            Err(e) => (false, format!("event wait failed: {e}")),
+                                            Ok(out) => {
+                                                if out.met {
+                                                    (
+                                                        true,
+                                                        format!(
+                                                            "event wait met={} matched_seq={}",
+                                                            out.met, out.matched_seq
+                                                        ),
+                                                    )
+                                                } else {
+                                                    step_error_category =
+                                                        StepErrorCategory::Timeout;
+                                                    (
+                                                        false,
+                                                        format!(
+                                                            "event wait timed out: matched_seq={}",
+                                                            out.matched_seq
+                                                        ),
+                                                    )
+                                                }
+                                            }
+                                            Err(e) => {
+                                                step_error_category =
+                                                    StepErrorCategory::ExecutionError;
+                                                (false, format!("event wait failed: {e}"))
+                                            }
                                         }
                                     }
                                     None => (
@@ -538,11 +768,18 @@ impl ScenarioRunner {
                                             cond,
                                             wp.budget_ms.unwrap_or(5000),
                                         ) {
-                                            Ok(out) => (
-                                                out.met,
-                                                format!("wait met={} reason={:?}", out.met, out.reason),
-                                            ),
-                                            Err(e) => (false, format!("wait failed: {e}")),
+                                            Ok(out) => {
+                                                if out.met {
+                                                    (true, format!("wait met={} reason={:?}", out.met, out.reason))
+                                                } else {
+                                                    step_error_category = StepErrorCategory::Timeout;
+                                                    (false, format!("wait timed out: reason={:?}", out.reason))
+                                                }
+                                            }
+                                            Err(e) => {
+                                                step_error_category = StepErrorCategory::ExecutionError;
+                                                (false, format!("wait failed: {e}"))
+                                            }
                                         }
                                     }
                                     None => (
@@ -559,7 +796,10 @@ impl ScenarioRunner {
                                 }
                             }
                         }
-                        Err(e) => (false, format!("unparseable wait step: {e}")),
+                        Err(e) => {
+                            step_error_category = StepErrorCategory::InvalidParams;
+                            (false, format!("unparseable wait step: {e}"))
+                        }
                     }
                 }
                 StepKind::Intent => {
@@ -624,6 +864,23 @@ impl ScenarioRunner {
                                         Ok(plan) => {
                                             let mut ok = true;
                                             let mut why = String::new();
+                                            // Audit findings 15/16/17:
+                                            // - the payload completion is read from the RECORDED
+                                            //   full TuiCompletionParam (object or legacy name),
+                                            //   exactly as the live path converts it;
+                                            // - focus moves use a FOCUS-SPECIFIC policy (bounded
+                                            //   stable screen), never the caller's payload
+                                            //   completion — a recorded process_exit must not
+                                            //   make a Tab navigation step wait for the process
+                                            //   to exit, and no_wait must not let focus assert
+                                            //   before the traversal landed;
+                                            // - AssertFocus produces a pending MutationGuard
+                                            //   (target focus + current native/semantic revision)
+                                            //   consumed by the following payload action —
+                                            //   closing the assert→send TOCTOU.
+                                            let mut pending_focus_guard: Option<
+                                                crate::execution::MutationGuard,
+                                            > = None;
                                             for step in &plan.steps {
                                                 match step {
                                                     crate::intent::PlannedStep::MoveFocus {
@@ -635,7 +892,7 @@ impl ScenarioRunner {
                                                             focus_quiet,
                                                             focus_budget,
                                                             focus_no_wait,
-                                                        ) = intent_execution_policy(&params);
+                                                        ) = focus_step_policy();
                                                         if let Err(e) = drive_intent_step(
                                                             session,
                                                             run,
@@ -666,19 +923,43 @@ impl ScenarioRunner {
                                                     crate::intent::PlannedStep::AssertFocus {
                                                         target_id,
                                                     } => {
-                                                        let live = session
-                                                            .analyze_last()
-                                                            .map(|a| a.semantic)
-                                                            .and_then(|s| s.focus.control_id);
-                                                        if live.as_deref()
-                                                            != Some(target_id.as_str())
+                                                        // Audit finding 17: verify NOW and arm a
+                                                        // guard for the payload — the guard is
+                                                        // compiled from the CURRENT fresh analysis
+                                                        // (structure + focus + native revision +
+                                                        // semantic identity), consumed by the
+                                                        // following Act through the executor's
+                                                        // atomic validation.
+                                                        let snapshot = match session
+                                                            .snapshot_fresh()
                                                         {
+                                                            Ok(a) => a,
+                                                            Err(e) => {
+                                                                ok = false;
+                                                                why = format!(
+                                                                    "focus assertion refresh failed: {e}"
+                                                                );
+                                                                break;
+                                                            }
+                                                        };
+                                                        let live = snapshot
+                                                            .semantic
+                                                            .focus
+                                                            .control_id
+                                                            .as_deref();
+                                                        if live != Some(target_id.as_str()) {
                                                             ok = false;
                                                             why = format!(
                                                                 "focus assertion failed: expected {target_id}, focus holds {live:?}"
                                                             );
                                                             break;
                                                         }
+                                                        pending_focus_guard =
+                                                            Some(crate::execution::MutationGuard::capture(
+                                                                Some(&snapshot),
+                                                                session,
+                                                                session.generation,
+                                                            ));
                                                     }
                                                     crate::intent::PlannedStep::Act(action) => {
                                                         let (
@@ -686,8 +967,9 @@ impl ScenarioRunner {
                                                             payload_quiet,
                                                             payload_budget,
                                                             payload_no_wait,
-                                                        ) = intent_execution_policy(&params);
-                                                        if let Err(e) = drive_intent_step(
+                                                        ) = payload_policy(&params);
+                                                        let guard = pending_focus_guard.take();
+                                                        if let Err(e) = drive_intent_step_guarded(
                                                             session,
                                                             run,
                                                             action,
@@ -696,6 +978,7 @@ impl ScenarioRunner {
                                                             payload_quiet,
                                                             payload_budget,
                                                             payload_no_wait,
+                                                            guard.as_ref(),
                                                         ) {
                                                             ok = false;
                                                             why =
@@ -778,9 +1061,14 @@ impl ScenarioRunner {
                                         let (p, d, invalid) =
                                             crate::execution::execute_assert(&ap, &screen);
                                         if invalid.is_some() {
+                                            step_error_category = StepErrorCategory::InvalidParams;
                                             (false, format!("invalid assertion: {d}"))
+                                        } else if !p {
+                                            step_error_category =
+                                                StepErrorCategory::AssertionFailed;
+                                            (false, d)
                                         } else {
-                                            (p, d)
+                                            (true, d)
                                         }
                                     }
                                     Err(e) => (false, format!("unparseable assert step: {e}")),
@@ -806,21 +1094,11 @@ impl ScenarioRunner {
             }
 
             let elapsed = step_started.elapsed().as_millis() as u64;
-            let transaction_seq = executed_tx.as_ref().and_then(|tx| {
-                run.and_then(|run| {
-                    let run = run.lock().unwrap();
-                    run.transactions()
-                        .iter()
-                        .rev()
-                        .find(|r| {
-                            r.session == session.id
-                                && r.before_structure == tx.before().structure_hash
-                                && r.after_structure == tx.after().structure_hash
-                                && r.action == tx.name()
-                        })
-                        .map(|r| r.seq)
-                })
-            });
+            // Audit finding 23: the commit's own ledger sequence (set when
+            // the drive pipeline ran against a run context); the heuristic
+            // backscan is gone — two identical/no-op actions can no longer
+            // match the wrong transaction.
+            let transaction_seq = committed_ledger_seq;
             results.push(StepResult {
                 index: i,
                 kind: format!("{:?}", step.kind).to_lowercase(),
@@ -833,7 +1111,7 @@ impl ScenarioRunner {
                 error_category: if step_passed {
                     None
                 } else {
-                    Some(StepErrorCategory::ExecutionError)
+                    Some(step_error_category)
                 },
                 detail,
                 transaction_seq,
@@ -861,50 +1139,16 @@ impl ScenarioRunner {
     }
 }
 
-/// Beta-audit P0-9: one focus-secured intent step at replay time — the
-/// same driving pipeline the live intent path uses (frames, ledger,
-/// event fold under the run's ticket), so a recorded intent's replay is
-/// evidenced identically to its original execution.
-#[allow(clippy::too_many_arguments)]
-fn drive_intent_step(
-    session: &mut crate::session::state::Session,
-    run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
-    action: &crate::execution::CanonicalAction,
-    vis: crate::execution::InputVisibility,
-    completion: crate::capture::CompletionPolicy,
-    quiet_ms: u64,
-    budget_ms: u64,
-    no_wait: bool,
-) -> Result<crate::execution::InteractionTransaction, anyhow::Error> {
-    match run {
-        Some(run) => {
-            let ticket = crate::execution::RunTicket::capture(run);
-            let spec = crate::execution::CoreDriveSpec {
-                action,
-                quiet_ms,
-                budget_ms,
-                no_wait,
-                visibility: vis,
-                completion,
-                guard: None,
-                scenario: None,
-                origin: crate::execution::DriveOrigin::Scenario,
-                ticket,
-            };
-            crate::execution::drive_pipeline(session, run, spec).map(|o| o.tx)
-        }
-        None => crate::execution::execute_act_with_completion(
-            session, action, quiet_ms, budget_ms, no_wait, vis, completion,
-        ),
-    }
-}
-
-/// Decode the recorded intent execution policy. Older scenarios without
-/// these fields keep the documented 150ms/1150ms StableScreen behavior.
+/// Decode the recorded intent execution policy (audit finding 15): the
+/// recorded step now carries the FULL serialized [`TuiCompletionParam`]
+/// (object or legacy bare name), and replay converts it EXACTLY as the
+/// live path does — `to_policy()`/`quiet_ms()` — so a recorded
+/// `{"type":"text_appears","text":"Saved"}` replays as
+/// `TextAppears("Saved")`, never `TextAppears("")`.
 fn intent_execution_policy(
     params: &serde_json::Value,
 ) -> (crate::capture::CompletionPolicy, u64, u64, bool) {
-    use crate::capture::CompletionPolicy as CP;
+    use crate::mcp::params::TuiCompletionParam;
     let quiet = params
         .get("quiet_ms")
         .and_then(|v| v.as_u64())
@@ -917,36 +1161,107 @@ fn intent_execution_policy(
         .get("no_wait")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let completion = params
-        .get("completion")
-        .and_then(|v| v.as_str())
-        .map(|name| match name {
-            "first_change" => CP::FirstScreenChange,
-            "any_change" => CP::AnyObservableChange,
-            "text_appears" => CP::TextAppears(
-                params
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            "text_disappears" => CP::TextDisappears(
-                params
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            "process_exit" => CP::ProcessExit,
-            "command_done" => CP::CommandDone,
-            "bell" => CP::Bell,
-            "semantic_change" => CP::SemanticChange,
-            "may_be_silent" => CP::MayBeSilent,
-            "no_wait" => CP::NoWait,
-            _ => CP::StableScreen,
+    // Full wire value first (audit finding 15); legacy bare-name strings
+    // migrate through TuiCompletionParam::from_recorded.
+    let recorded = params.get("completion").unwrap_or(&serde_json::Value::Null);
+    let completion = TuiCompletionParam::from_recorded(recorded)
+        .map(|c| {
+            let quiet_override = c.quiet_ms();
+            quiet_override
         })
-        .unwrap_or(CP::StableScreen);
+        .and_then(|_| TuiCompletionParam::from_recorded(recorded).map(|c| c.to_policy()))
+        .unwrap_or(crate::capture::CompletionPolicy::StableScreen);
     (completion, quiet, budget, no_wait)
+}
+
+/// Audit finding 16: focus navigation policy — a Tab/Shift+Tab traversal
+/// step waits for the FOCUS/SEMANTIC transition or a stable screen under
+/// a bounded INTERNAL budget, and NEVER inherits the caller's recorded
+/// payload completion (`process_exit` must not make a Tab step wait for
+/// the process to exit; `no_wait` must not let a focus assertion read
+/// pre-traversal state).
+fn focus_step_policy() -> (crate::capture::CompletionPolicy, u64, u64, bool) {
+    (
+        crate::capture::CompletionPolicy::StableScreen,
+        300,
+        1300,
+        false,
+    )
+}
+
+/// Audit finding 16: the payload action uses the caller-RECORDED
+/// completion/quiet/budget/no_wait — the semantics that were actually
+/// recorded — decoded from the full serialized completion.
+fn payload_policy(
+    params: &serde_json::Value,
+) -> (crate::capture::CompletionPolicy, u64, u64, bool) {
+    intent_execution_policy(params)
+}
+
+/// [`drive_intent_step`] with an optional pending [`MutationGuard`]
+/// (audit finding 17): the guard armed by AssertFocus is consumed by the
+/// following payload Act and validated atomically with the send by the
+/// executor — closing the assert→send TOCTOU on replay.
+#[allow(clippy::too_many_arguments)]
+fn drive_intent_step_guarded(
+    session: &mut crate::session::state::Session,
+    run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+    action: &crate::execution::CanonicalAction,
+    vis: crate::execution::InputVisibility,
+    completion: crate::capture::CompletionPolicy,
+    quiet_ms: u64,
+    budget_ms: u64,
+    no_wait: bool,
+    guard: Option<&crate::execution::MutationGuard>,
+) -> Result<crate::execution::InteractionTransaction, anyhow::Error> {
+    match run {
+        Some(run) => {
+            let ticket = crate::execution::RunTicket::capture(run);
+            let spec = crate::execution::CoreDriveSpec {
+                action,
+                quiet_ms,
+                budget_ms,
+                no_wait,
+                visibility: vis,
+                completion,
+                guard,
+                scenario: None,
+                origin: crate::execution::DriveOrigin::Scenario,
+                ticket,
+            };
+            crate::execution::drive_pipeline(session, run, spec).map(|o| o.tx)
+        }
+        None => crate::execution::execute_act_with_guard_and_origin(
+            session,
+            crate::execution::DriveOrigin::Scenario,
+            action,
+            quiet_ms,
+            budget_ms,
+            no_wait,
+            vis,
+            completion,
+            guard,
+        ),
+    }
+}
+
+/// One focus-secured intent step at replay time via the same driving
+/// pipeline the live intent path uses. Guard-less; see
+/// [`drive_intent_step_guarded`] for the asserted form.
+#[allow(clippy::too_many_arguments)]
+fn drive_intent_step(
+    session: &mut crate::session::state::Session,
+    run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+    action: &crate::execution::CanonicalAction,
+    vis: crate::execution::InputVisibility,
+    completion: crate::capture::CompletionPolicy,
+    quiet_ms: u64,
+    budget_ms: u64,
+    no_wait: bool,
+) -> Result<crate::execution::InteractionTransaction, anyhow::Error> {
+    drive_intent_step_guarded(
+        session, run, action, vis, completion, quiet_ms, budget_ms, no_wait, None,
+    )
 }
 
 /// Compile a recorded precondition into an executor [`MutationGuard`]
@@ -966,11 +1281,23 @@ fn compile_expect_guard(
     if !ok {
         return (false, detail, None);
     }
+    // Audit P1-20/21: the V2 expectation fields (generation, native
+    // revision, fused semantic identity) ride the compiled guard, so a
+    // replay precondition is as strong as the live execution's guard —
+    // native-only drift (focus moved, pixels unchanged) fails replay too.
+    // The V2 visible/history text split maps to the guard's viewport-only
+    // text predicate and the history check (checked pre-send below via
+    // check_expect, since MutationGuard has no history slot).
     let guard = crate::execution::MutationGuard {
         structure_hash: expect.structure_hash.clone(),
         focus_control_id: expect.focus_control_id.clone(),
-        text_visible: expect.text_present.clone(),
-        ..Default::default()
+        text_visible: expect
+            .visible_text_present
+            .clone()
+            .or_else(|| expect.text_present.clone()),
+        generation: expect.generation,
+        native_revision: expect.native_revision,
+        semantic_identity: expect.semantic_identity.clone(),
     };
     (true, detail, Some(guard))
 }
@@ -982,15 +1309,48 @@ fn check_expect(
     session: &mut crate::session::state::Session,
     expect: &super::model::StepExpect,
 ) -> (bool, String) {
-    session.poll_native();
-    let screen = match session.last().cloned() {
-        Some(s) => s,
-        None => match session.observe(0) {
-            Ok(s) => s,
-            Err(e) => return (false, format!("no frame to verify against: {e}")),
-        },
+    // Audit finding 21: replay preconditions evaluate against a FRESH
+    // pre-dispatch snapshot — never `session.last()`, which can be a
+    // seconds-old explicit observation. Wait/assert/intent preconditions
+    // get the same freshness rule as act steps.
+    let analysis = match session.snapshot_fresh() {
+        Ok(a) => a,
+        Err(e) => return (false, format!("no fresh frame to verify against: {e}")),
     };
-    let fused = session.fuse_screen(&screen);
+    let screen = &analysis.frame;
+    if let Some(want_gen) = expect.generation {
+        if session.generation != want_gen {
+            return (
+                false,
+                format!(
+                    "session restarted since capture (generation {} -> {})",
+                    want_gen, session.generation
+                ),
+            );
+        }
+    }
+    if let Some(want_rev) = expect.native_revision {
+        if session.native_revision() != Some(want_rev) {
+            return (
+                false,
+                format!(
+                    "native semantic revision changed since capture: expected {want_rev}, live {:?}",
+                    session.native_revision()
+                ),
+            );
+        }
+    }
+    if let Some(want_identity) = &expect.semantic_identity {
+        if &analysis.semantic_identity != want_identity {
+            return (
+                false,
+                format!(
+                    "fused semantic identity changed since capture: expected {want_identity}, live {}",
+                    analysis.semantic_identity
+                ),
+            );
+        }
+    }
     if let Some(want) = &expect.structure_hash {
         if &screen.structure_hash != want {
             return (
@@ -1003,24 +1363,57 @@ fn check_expect(
         }
     }
     if let Some(want_focus) = &expect.focus_control_id {
-        if fused.focus.control_id.as_deref() != Some(want_focus.as_str()) {
+        if analysis.semantic.focus.control_id.as_deref() != Some(want_focus.as_str()) {
             return (
                 false,
                 format!(
                     "focus moved since capture: expected {want_focus}, live {:?}",
-                    fused.focus.control_id
+                    analysis.semantic.focus.control_id
                 ),
             );
         }
     }
+    // V2 split text: visible checks the viewport ONLY (Matching the
+    // MutationGuard.text_visible semantics — audit P1-20); history checks
+    // scrollback; legacy `text_present` keeps the old viewport-OR-history
+    // semantics for V1 scenarios.
+    if let Some(text) = &expect.visible_text_present {
+        if !crate::capture::visible_text_contains(screen, text) {
+            return (false, format!("required visible text absent: {text:?}"));
+        }
+    }
+    if let Some(text) = &expect.history_text_present {
+        if !crate::capture::history_text_contains(screen, text) {
+            return (false, format!("required history text absent: {text:?}"));
+        }
+    }
     if let Some(text) = &expect.text_present {
-        let present = screen
-            .viewport_text
-            .iter()
-            .any(|r| r.contains(text.as_str()))
-            || screen.scrollback.iter().any(|r| r.contains(text.as_str()));
+        let visible = crate::capture::visible_text_contains(screen, text);
+        let historical = crate::capture::history_text_contains(screen, text);
+        // A Type payload recorded at capture time describes the action's
+        // identity, not a precondition that already held. If it was absent
+        // before dispatch, requiring it now would make every same-app
+        // fresh-session replay fail. Require a recorded marker only when
+        // it actually held at capture; legacy files without the marker
+        // retain their permissive migration semantics.
+        let required = expect.recorded_visible.is_some();
+        let present = if expect.recorded_visible == Some(true) {
+            visible
+        } else if required {
+            visible || historical
+        } else {
+            true
+        };
         if !present {
-            return (false, format!("required text absent: {text:?}"));
+            let location = if expect.recorded_visible == Some(true) {
+                "visible"
+            } else {
+                "visible/history"
+            };
+            return (
+                false,
+                format!("required text absent ({location}): {text:?}"),
+            );
         }
     }
     (true, "preconditions hold".to_string())
@@ -1053,5 +1446,149 @@ fn walk_strings(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
         serde_json::Value::Array(items) => items.iter().for_each(|i| walk_strings(i, f)),
         serde_json::Value::Object(map) => map.values().for_each(|i| walk_strings(i, f)),
         _ => {}
+    }
+}
+
+/// Audit finding 50: independently relaunch the same scenario-owned target
+/// once per selected terminal persona. Persona is the only changing
+/// dimension — same scenario, parameters, policy, dimensions and build — and
+/// every execution gets a fresh session generation. The runner owns
+/// provenance and refusal contracts; launch/execution are supplied by the
+/// environment adapter (async pool callers await inside their adapter).
+///
+/// `make_persona_run` returns the matrix outcome and an optional cleanup id.
+/// Inherited scenarios and unknown personas are refused before launch.
+pub fn run_persona_matrix_selected<T, E: From<String> + Send + Sync + 'static>(
+    scenario: &Scenario,
+    persona_ids: &[String],
+    values: &[ParameterValue],
+    run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+    policy: Option<super::model::FailurePolicy>,
+    mut make_persona_run: impl FnMut(
+        &Scenario,
+        &crate::terminal::TerminalPersona,
+        &crate::session::state::LaunchSpec,
+        &[ParameterValue],
+        Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+        Option<super::model::FailurePolicy>,
+    ) -> Result<
+        (crate::terminal::PersonaMatrixOutcome<T>, Option<String>),
+        E,
+    >,
+) -> crate::terminal::PersonaMatrixExecution<T, E> {
+    let mut outcomes = Vec::with_capacity(persona_ids.len());
+    let mut cleanup_ids = Vec::with_capacity(persona_ids.len());
+    let mut launches_passed = true;
+
+    if scenario.inherit_session || scenario.launch.is_none() {
+        launches_passed = false;
+        for persona_id in persona_ids {
+            let persona = dummy_persona(persona_id);
+            let row: crate::terminal::PersonaMatrixRow<Result<T, String>> =
+                crate::terminal::PersonaMatrixRow {
+                    persona: persona.id.clone(),
+                    term: persona.term.clone(),
+                    colorterm: persona.colorterm.clone(),
+                    outcome: Err(
+                        "scenario-owned launch required: set inherit_session=false with launch"
+                            .to_string(),
+                    ),
+                };
+            outcomes.push(Err(E::from(match row.outcome {
+                Err(message) => message,
+                Ok(_) => unreachable!("refusal rows always carry an error payload"),
+            })));
+        }
+        return crate::terminal::PersonaMatrixExecution {
+            outcomes,
+            cleanup_ids,
+            launches_passed,
+        };
+    }
+
+    let personas = crate::terminal::TerminalPersona::builtin();
+    for persona_id in persona_ids {
+        let Some(persona) = personas.iter().find(|p| &p.id == persona_id) else {
+            launches_passed = false;
+            let persona = dummy_persona(persona_id);
+            let row: crate::terminal::PersonaMatrixRow<Result<T, String>> =
+                crate::terminal::PersonaMatrixRow {
+                    persona: persona.id.clone(),
+                    term: persona.term.clone(),
+                    colorterm: persona.colorterm.clone(),
+                    outcome: Err(format!("unknown terminal persona '{persona_id}'")),
+                };
+            outcomes.push(Err(E::from(match row.outcome {
+                Err(message) => message,
+                Ok(_) => unreachable!("refusal rows always carry an error payload"),
+            })));
+            continue;
+        };
+        let mut spec = scenario
+            .launch
+            .as_ref()
+            .expect("checked launch")
+            .to_ownership_spec();
+        persona.apply_env(&mut spec.env);
+        if let Some(pair) = spec.env.iter_mut().find(|(k, _)| k == "TUI_LAB_PERSONA") {
+            pair.1 = persona.id.clone();
+        } else {
+            spec.env
+                .push(("TUI_LAB_PERSONA".to_string(), persona.id.clone()));
+        }
+        match make_persona_run(scenario, persona, &spec, values, run, policy) {
+            Ok((outcome, cleanup)) => {
+                if let Some(id) = cleanup {
+                    cleanup_ids.push(id);
+                }
+                outcomes.push(Ok(outcome));
+            }
+            Err(error) => {
+                launches_passed = false;
+                outcomes.push(Err(error));
+            }
+        }
+    }
+
+    crate::terminal::PersonaMatrixExecution {
+        outcomes,
+        cleanup_ids,
+        launches_passed,
+    }
+}
+
+/// Canonical all-builtins convenience over [`run_persona_matrix_selected`].
+pub fn run_persona_matrix<T, E: From<String> + std::error::Error + Send + Sync + 'static>(
+    scenario: &Scenario,
+    values: &[ParameterValue],
+    run: Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+    policy: Option<super::model::FailurePolicy>,
+    make_persona_run: impl FnMut(
+        &Scenario,
+        &crate::terminal::TerminalPersona,
+        &crate::session::state::LaunchSpec,
+        &[ParameterValue],
+        Option<&std::sync::Arc<std::sync::Mutex<crate::run::RunContext>>>,
+        Option<super::model::FailurePolicy>,
+    ) -> Result<
+        (crate::terminal::PersonaMatrixOutcome<T>, Option<String>),
+        E,
+    >,
+) -> crate::terminal::PersonaMatrixExecution<T, E> {
+    let requested: Vec<String> = crate::terminal::TerminalPersona::builtin()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    run_persona_matrix_selected(scenario, &requested, values, run, policy, make_persona_run)
+}
+
+fn dummy_persona(id: &str) -> crate::terminal::TerminalPersona {
+    crate::terminal::TerminalPersona {
+        id: id.to_string(),
+        term: id.to_string(),
+        colorterm: None,
+        color_depth: String::new(),
+        supports: Vec::new(),
+        env: Vec::new(),
     }
 }

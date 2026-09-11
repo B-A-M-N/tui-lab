@@ -22,6 +22,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         Ok(t) => t,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CLIP-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -50,6 +51,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         // Direct bounds check
         if b.x.saturating_add(b.width) > cols || b.y.saturating_add(b.height) > rows {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CLIP-001".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -74,6 +76,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         // Clipping state from border graph
         if !matches!(rg.clipping_state, semantic::ClippingState::None) {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CLIP-002".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -104,6 +107,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         // Top edge: look for border openings
         if has_incomplete_border(first_row) {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CLIP-003".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -124,6 +128,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
         // Bottom edge
         if has_incomplete_border(last_row) {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "CLIP-004".into(),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -144,6 +149,7 @@ pub fn clipping_audit(session: &mut Session) -> Vec<Finding> {
 
     if findings.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "CLIP-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -183,6 +189,7 @@ pub fn navigation_audit(
 
     if tab_edges.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "NAV-NO-TRAVERSAL".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -208,6 +215,7 @@ pub fn navigation_audit(
         .map(|e| format!("{} → {} (x{})", e.from, e.to, e.count))
         .collect();
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "NAV-ORDER".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -237,6 +245,7 @@ pub fn navigation_audit(
 
     if !gaps.is_empty() {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "NAV-REVERSE-GAP".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -257,6 +266,7 @@ pub fn navigation_audit(
         });
     } else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "NAV-REVERSE-OK".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -404,6 +414,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
         // Per-class findings.
         if moved == 0 {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: format!("NAV-{}-UNUSED", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
                 severity: Severity::Info,
@@ -427,6 +438,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
 
         if let Some(step) = trapped_at {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: format!("NAV-{}-TRAP", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -463,6 +475,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             .collect();
         if gaps.is_empty() {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: format!("NAV-{}-REVERSE-OK", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
                 severity: Severity::Info,
@@ -483,6 +496,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             });
         } else {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: format!("NAV-{}-REVERSE-GAP", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
                 severity: Severity::Warn,
@@ -523,6 +537,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
             .collect();
         if !unreachable.is_empty() && moved > 0 {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: format!("NAV-{}-UNREACHABLE", class.name.to_uppercase().replace('/', "-")),
                 rule_id: None,
                 severity: Severity::Info,
@@ -548,6 +563,7 @@ pub fn navigation_keys_audit(session: &mut Session, steps_per_class: u32) -> Vec
     // This driver owns a private graph because its via-names are class-
     // specific; return the merged view in evidence for cross-run queries.
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "NAV-KEYS-SUMMARY".into(),
         rule_id: None,
         severity: Severity::Info,

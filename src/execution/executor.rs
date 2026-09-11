@@ -10,7 +10,6 @@
 use crate::backend::{CanonicalFrame, CaptureOutcome, WaitCond};
 use crate::capture::CompletionPolicy;
 use crate::session::state::Session;
-use rmcp::serde_json::json;
 
 use super::guard::MutationGuard;
 use super::record::{CanonicalAction, InputVisibility, ObservationAnchor, SettleStatus};
@@ -209,6 +208,19 @@ pub fn execute_act_with_guard_and_origin(
 }
 
 /// The body of the canonical executor (was `execute_act_with_completion`).
+///
+/// Audit findings 1/2/4/5/6/9: one monotonic deadline at action entry;
+/// every sub-operation (snapshot, transition capture, completion) receives
+/// `deadline.remaining()`. The before-side of the transaction derives
+/// ENTIRELY from the pre-dispatch `snapshot_fresh()` analysis — there is no
+/// `fused_frame()` call for the before-side, so a transaction can never
+/// claim frame A with semantic/focus state from an older frame B (the old
+/// code ran `snapshot_fresh()` and then `fused_frame()` over `session.last()`).
+/// The guard is validated against that exact fresh analysis, and the only
+/// remaining pump between validation and the physical transport write is the
+/// backend's own idempotent pre-write drain INSIDE the typed `dispatch()`
+/// boundary — the `write_entered` classification proves whether any byte
+/// could have landed.
 #[allow(clippy::too_many_arguments)]
 fn execute_act_inner(
     session: &mut Session,
@@ -222,8 +234,14 @@ fn execute_act_inner(
     transition_capture_frames: Option<usize>,
     guard: Option<&MutationGuard>,
 ) -> Result<InteractionTransaction, anyhow::Error> {
-    // Transition-capture evidence lands on the transaction (audit P0-16).
-    let mut transition_frames_evidence: Option<serde_json::Value> = None;
+    // Finding 6: ONE monotonic deadline at action entry. Every sub-operation
+    // (transition capture, completion plan) consumes `deadline.remaining()`,
+    // so a nominal 1-second action cannot consume materially more than one
+    // second of wall clock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(settle_budget_ms);
+    // Transition-capture evidence lands on the transaction (audit P0-16,
+    // finding 54): keep the typed sequence; adapters project it.
+    let mut transition_frames_evidence: Option<crate::capture::CaptureSequenceOutcome> = None;
     // The ONLY pre-dispatch snapshot: taken immediately before the transport
     // write and guarded against that exact revision. This closes the old
     // validate→preflight→write race rather than narrowing it.
@@ -249,32 +267,23 @@ fn execute_act_inner(
         // Real monotonic per-session anchor index (re-review P1 fix 9).
         index: session.next_anchor(),
     };
-    // Pre-action fused semantic identity + focus, computed BEFORE the
-    // transaction guard so fused_frame(&self) can borrow_mut the cache
-    // without conflicts. The String is stored so the guard window doesn't
-    // hold it. Focus MUST be pinned here (re-review P0): the native
-    // channel's snapshot is LIVE state, and by settle time it describes
-    // the after-frame — fusing the before-frame against it then would read
-    // post-action focus on both sides and cancel every transition.
-    let (before_fused_identity, focus_before) = session
-        .fused_frame()
-        .map(|(sem, tree, _report)| {
-            let focus = if sem.focus.control_id.is_none() && sem.focus.control.is_none() {
-                None
-            } else {
-                Some((sem.focus.control_id.clone(), sem.focus.control.clone()))
-            };
-            (
-                crate::semantic::SemanticIdentityV2::from_fused(
-                    &sem,
-                    &tree,
-                    session.native_revision(),
-                )
-                .identity(),
-                focus,
-            )
-        })
-        .unwrap_or((Default::default(), None));
+    // Pre-action fused semantic identity + focus FROM THE PREFLIGHT ANALYSIS
+    // (audit finding 2): `snapshot_fresh()` deliberately does not advance
+    // `session.last()`, so `fused_frame()` would analyze an OLDER frame. The
+    // transaction's before-side must describe ONE revision — the preflight's.
+    // Focus is pinned here: the native channel's snapshot is LIVE state, and
+    // by settle time it describes the after-frame — fusing the before-frame
+    // against it then would read post-action focus on both sides and cancel
+    // every transition.
+    let (before_fused_identity, focus_before) = {
+        let sem = &preflight.semantic;
+        let focus = if sem.focus.control_id.is_none() && sem.focus.control.is_none() {
+            None
+        } else {
+            Some((sem.focus.control_id.clone(), sem.focus.control.clone()))
+        };
+        (preflight.semantic_identity.clone(), focus)
+    };
     // The ONE compiler runs on the pre-action frame before it moves into
     // the transaction evidence (re-review P0).
     let plan = crate::capture::compile_completion(
@@ -285,7 +294,7 @@ fn execute_act_inner(
         quiet_ms,
         Some(before_fused_identity.clone()),
     );
-    let mut before_frame = CanonicalFrame::new(before, 0, baseline.output_seq);
+    let mut before_frame = CanonicalFrame::new(before, baseline.screen_seq, baseline.output_seq);
     before_frame.session_id = Some(session.id.clone());
     before_frame.generation = Some(session.generation);
     // Carry the FUSED identity established at capture time (review P0.5):
@@ -313,61 +322,92 @@ fn execute_act_inner(
     );
     let mut window = ActTransactionGuard::begin(session, sensitive_window);
     let send_start = std::time::Instant::now();
+    let send_start_mono_ms = crate::events::monotonic_ms();
     // Causal render bracket (re-review item 19): the absolute output-stream
     // offset at send time — everything the child emits from here to the
     // matching offset after settle IS this action's protocol response.
     let protocol_offset_before = window.sess().raw_window_range().1;
-    let sent_at_unix_ms = crate::events::unix_ms();
-    // Canonical mutation dispatch (re-review P0): Resize is a SESSION
-    // mutation, not a byte write — it must go through Session::resize() so
-    // the stored LaunchSpec follows the real viewport and the Session resize
-    // event fires. Routing it through send()/Input::Resize silently left
-    // launch.cols/rows stale, so a restart resurrected the old size.
-    // Everything else is a transport write.
-    let dispatch = match action {
-        CanonicalAction::Resize { cols, rows } => match window.sess().resize(*cols, *rows) {
-            Ok(()) => crate::execution::DispatchStatus::Sent,
-            Err(_) => crate::execution::DispatchStatus::PartialOrUnknown,
-        },
-        _ => match window.sess().send(action.to_input()) {
-            Ok(()) => crate::execution::DispatchStatus::Sent,
-            Err(_) => crate::execution::DispatchStatus::PartialOrUnknown,
-        },
+    // Unix time is retained only for human correlation in the event
+    // queue; causal latency math below uses the monotonic send instant.
+    let _sent_at_unix_ms = crate::events::unix_ms();
+    let native_revision_before = window.sess().native_revision();
+    let event_seq_before = window.sess().event_queue_last_seq();
+    // Canonical mutation dispatch (re-review P0 + audit findings 1/4):
+    // Resize is a SESSION mutation, not a byte write — it must go through
+    // Session::resize() so the stored LaunchSpec follows the real viewport
+    // and the Session resize event fires. Everything else is a typed
+    // backend dispatch (`backend.dispatch()`), where the backend classifies
+    // whether the transport write was entered.
+    let dispatch = if matches!(action, CanonicalAction::Resize { .. }) {
+        let (cols, rows) = match action {
+            CanonicalAction::Resize { cols, rows } => (*cols, *rows),
+            _ => unreachable!(),
+        };
+        match window.sess().resize(cols, rows) {
+            Ok(()) => Ok((crate::execution::DispatchStatus::Sent, None)),
+            Err(e) => Err(crate::execution::DispatchError::from_backend(
+                crate::execution::DispatchStatus::PartialOrUnknown,
+                e.to_string(),
+            )),
+        }
+    } else {
+        let input = action.to_input();
+        match window.sess().dispatch(input) {
+            Ok(()) => Ok((
+                crate::execution::DispatchStatus::Sent,
+                None::<crate::execution::DispatchError>,
+            )),
+            Err(e) => Err(e),
+        }
     };
     let send_ms = send_start.elapsed().as_millis() as u64;
-    if dispatch == crate::execution::DispatchStatus::PartialOrUnknown {
-        window.commit();
-        let sid = session.id.clone();
-        let gen = session.generation;
-        let tx = InteractionTransaction {
-            action: ActionEnvelope::new(action.clone(), visibility),
-            anchor,
-            before_frame: before_frame.clone(),
-            after_frame: before_frame.clone(),
-            settle: SettleStatus::TimedOut,
-            transition: crate::screen::diff(&before_frame.state, &before_frame.state),
-            capture: None,
-            focus_before,
-            focus_after: None,
-            elapsed_ms: send_ms,
-            send_ms,
-            settle_ms: 0,
-            render: None,
-            transition_capture: Some(json!({
-                "dispatch": dispatch.name(),
-                "note": "transport reported failure after preflight; partial delivery cannot be ruled out"
-            })),
-            origin: Some(origin),
-            dispatch,
-        };
-        if let Some(sink) = session.evidence_sink() {
-            sink.commit(&sid, gen, &tx)?;
-            sink.fold(session);
+    let dispatch_failure = dispatch.as_ref().err().cloned();
+    let dispatch = match dispatch {
+        Ok((s, _)) => s,
+        Err(e) => {
+            // Finding 4: the typed dispatch failure is preserved and the
+            // status classification is exact (FailedBeforeWrite vs
+            // PartialOrUnknown).
+            let failure = e.clone();
+            let status = failure.status;
+            window.commit();
+            let sid = session.id.clone();
+            let gen = session.generation;
+            let settle = SettleStatus::NotAttempted;
+            let tx = InteractionTransaction {
+                action: ActionEnvelope::new(action.clone(), visibility),
+                anchor,
+                before_frame: before_frame.clone(),
+                after_frame: before_frame.clone(),
+                settle,
+                transition: crate::screen::diff(&before_frame.state, &before_frame.state),
+                capture: None,
+                focus_before,
+                focus_after: None,
+                elapsed_ms: send_ms,
+                send_ms,
+                settle_ms: 0,
+                render: None,
+                transition_capture: transition_frames_evidence,
+                origin: Some(origin),
+                dispatch: status,
+                dispatch_failure: Some(failure),
+                event_seq_before,
+                event_seq_after: None,
+                native_revision_before,
+                dispatch_reason: Some(status.name().to_string()),
+            };
+            if let Some(sink) = session.evidence_sink() {
+                let _ = sink.commit(&sid, gen, &tx)?;
+                sink.fold(session);
+            }
+            return Err(anyhow::anyhow!(
+                "{}: {}; before-frame and dispatch evidence retained",
+                status.name(),
+                e
+            ));
         }
-        return Err(anyhow::anyhow!(
-            "dispatch_partial_or_unknown: transport write failed; before-frame and dispatch evidence retained"
-        ));
-    }
+    };
 
     // A declared `NoWait` completion is equivalent to the transport's
     // no_wait flag: act, capture a fresh frame, report settlement as Skipped
@@ -381,46 +421,51 @@ fn execute_act_inner(
         let s = window.sess().peek_fresh()?.frame;
         (SettleStatus::Skipped, 0, s, None, None)
     } else {
-        let budget = settle_budget_ms;
         // Transition capture (audit P0-16): when armed, the FIRST distinct
         // screen edges after the send are collected HERE — at the
         // transition, before the settle wait — so the redraw/flicker frames
         // the capture exists to diagnose are in the evidence. Each edge
         // wait resolves quickly (quiet_for: 0), then the completion plan
-        // independently decides the settled after-frame.
+        // independently decides the settled after-frame. Finding 6: the
+        // capture consumes only what remains of the ONE deadline.
         if let Some(count) = transition_capture_frames {
             let anchor_seq = baseline.screen_seq;
             let t0 = std::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let outcome = crate::capture::capture_frame_sequence(
                 window.sess().backend_mut(),
                 count,
                 anchor_seq,
-                std::time::Duration::from_millis(budget.min(2000)),
+                remaining,
             );
-            let frames_json = outcome
-                .frames
-                .iter()
-                .map(|f| {
-                    json!({
-                        "structure_hash": f.structure_hash,
-                        "visual_hash": f.visual_hash,
-                        "viewport_text": f.viewport_text,
-                    })
-                })
-                .collect::<Vec<_>>();
-            transition_frames_evidence = Some(json!({
-                "requested": outcome.requested,
-                "captured": outcome.captured,
-                "completed": outcome.completed,
-                "reason": outcome.reason.name(),
-                "elapsed_ms": outcome.elapsed_ms,
-                "at_ms_from_send": t0.elapsed().as_millis() as u64,
-                "frames": frames_json,
-            }));
+            // Finding 54: preserve actual per-edge monotonic timestamps
+            // instead of rebuilding a JSON surrogate. Capture timestamps
+            // are absolute process-monotonic milliseconds; the transaction
+            // stores them relative to the send instant.
+            let outcome = crate::capture::CaptureSequenceOutcome {
+                edge_at_monotonic_ms: outcome
+                    .edge_at_monotonic_ms
+                    .into_iter()
+                    .map(|at| at.saturating_sub(send_start_mono_ms))
+                    .collect(),
+                ..outcome
+            };
+            transition_frames_evidence = Some(outcome);
+            let _ = t0;
         }
         // The ONE compiler (re-review P0): every policy becomes a
         // CompletionPlan here; there is no second interpretation anywhere.
-        let outcome = run_completion_plan(window.sess(), plan, &baseline, quiet_ms, budget)?;
+        // Finding 6: the completion receives only the REMAINING budget.
+        let remaining_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        let outcome = run_completion_plan(
+            window.sess(),
+            plan,
+            &baseline,
+            quiet_ms,
+            remaining_ms.max(1),
+        )?;
         let capture = outcome;
         // `MayBeSilent` is special: the action may legitimately produce no
         // observable change (clipboard copy, an invisible toggle). Silence
@@ -441,10 +486,10 @@ fn execute_act_inner(
         )
     };
     let settle_ms = settle_start.elapsed().as_millis() as u64;
-    // Input→first-byte latency (re-review item 26): the event queue records
-    // Output events with unix-ms timestamps (fed by the reader thread), so
-    // the first Output event at/after the pre-action cursor gives the
-    // measured reaction time. `None` when the action produced no output.
+    let sent_at_monotonic_ms = crate::events::monotonic_ms();
+    // Input→first-byte latency (audit finding 45): the causal duration is
+    // measured in MONOTONIC milliseconds from the send boundary. Events
+    // also carry `at` (unix-ms) for human correlation only.
     let first_byte_ms: Option<u64> = {
         let sess = window.sess();
         // Fold the reader thread's pending byte facts first — output that
@@ -456,9 +501,17 @@ fn execute_act_inner(
             .events
             .iter()
             .find(|ev| matches!(ev.kind, crate::events::TerminalEventKind::Output { .. }))
-            .map(|ev| ev.at.saturating_sub(sent_at_unix_ms))
+            .map(|ev| ev.monotonic_ms.saturating_sub(sent_at_monotonic_ms))
     };
     let protocol_offset_after = window.sess().raw_window_range().1;
+    // Finding 9: the AFTER event-queue sequence is captured after the final
+    // ingest/native fold — the causal end of the action's event window.
+    let event_seq_after = {
+        let sess = window.sess();
+        sess.absorb_ingest_now();
+        sess.poll_native();
+        sess.event_queue_last_seq()
+    };
 
     // Item 26: first-frame and first-semantic latencies. The frame figure
     // comes from the backend's measured screen-change log (the settle path
@@ -470,10 +523,12 @@ fn execute_act_inner(
         let sess = window.sess();
         sess.absorb_ingest_now();
         let pre_screen_seq = baseline.screen_seq;
+        // Audit finding 45: frame latency uses the backend's MONOTONIC
+        // per-change log, never the Unix-millisecond correlation log.
         let frame = sess
-            .screen_changes_since(pre_screen_seq)
+            .screen_monotonic_changes_since(pre_screen_seq)
             .first()
-            .map(|(_, at_ms)| at_ms.saturating_sub(sent_at_unix_ms));
+            .map(|(_, at_ms)| at_ms.saturating_sub(sent_at_monotonic_ms));
         let batch = sess.events_since(pre_event_seq);
         // Semantic change: an explicit SemanticChanged event, or a screen
         // change whose transition actually altered semantics (dirty rows
@@ -489,7 +544,7 @@ fn execute_act_inner(
                         | crate::events::TerminalEventKind::FocusChanged { .. }
                 )
             })
-            .map(|ev| ev.at.saturating_sub(sent_at_unix_ms));
+            .map(|ev| ev.monotonic_ms.saturating_sub(sent_at_monotonic_ms));
         (frame, semantic)
     };
 
@@ -514,12 +569,12 @@ fn execute_act_inner(
     after_frame.generation = Some(window.sess().generation);
 
     // Transaction-derived focus evidence (re-review P1): focus before was
-    // pinned at anchor time (see the fused_frame call above — the native
-    // snapshot is live state and cannot be replayed onto the before-frame
-    // after the fact); focus after comes from the FUSED analysis of the
-    // settled frame. Native self-reports participate on both sides — the
-    // old bare `semantic::analyze` silently dropped native focus facts.
-    // The run's focus graph consumes these in `record_interaction` —
+    // pinned at anchor time (see the preflight-derived identity above — the
+    // native snapshot is live state and cannot be replayed onto the
+    // before-frame after the fact); focus after comes from the FUSED
+    // analysis of the settled frame. Native self-reports participate on both
+    // sides — the old bare `semantic::analyze` silently dropped native focus
+    // facts. The run's focus graph consumes these in `record_interaction` —
     // summary/observe reads never create focus edges again. The drain is
     // required for the same reason: the settle's last observe can race the
     // app's post-action declare, and a non-polling read would fuse the
@@ -567,6 +622,11 @@ fn execute_act_inner(
         transition_capture: transition_frames_evidence,
         origin: Some(origin),
         dispatch,
+        dispatch_failure,
+        event_seq_before,
+        event_seq_after: Some(event_seq_after),
+        native_revision_before,
+        dispatch_reason: None,
     };
 
     // Beta-audit P0-7: when authorized dispatch installed the run evidence
@@ -580,7 +640,7 @@ fn execute_act_inner(
     // refusal (P0-6) propagates — the evidence is dropped, never spilled.
     if let Some(sink) = session.evidence_sink() {
         let (sid, gen) = (session.id.clone(), session.generation);
-        sink.commit(&sid, gen, &tx)?;
+        let _ = sink.commit(&sid, gen, &tx)?;
         // Idempotent with any outer fold (per-consumer cursors).
         sink.fold(session);
     }
@@ -694,19 +754,22 @@ fn run_completion_plan(
                 let batch = session
                     .observe(quiet_ms.min(30))
                     .map(|_| session.events_since(pre_event_seq))?;
-                for ev in &batch.events {
-                    if matcher.matches(&ev.kind) {
-                        let frame = session.observe(quiet_ms)?;
-                        return Ok(CaptureOutcome {
-                            reason: crate::backend::CaptureReason::EventMatched,
-                            met: true,
-                            screen_seq: session.event_state().screen_seq,
-                            output_seq: session.event_state().output_seq,
-                            frame,
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                            frames: None,
-                        });
-                    }
+                if let Some(ev) = batch.events.iter().find(|ev| matcher.matches(&ev.kind)) {
+                    let frame = session.observe(quiet_ms)?;
+                    return Ok(CaptureOutcome {
+                        reason: crate::backend::CaptureReason::EventMatched,
+                        met: true,
+                        screen_seq: session.event_state().screen_seq,
+                        output_seq: session.event_state().output_seq,
+                        frame,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: ev.monotonic_ms.saturating_sub(
+                            crate::events::monotonic_ms()
+                                .saturating_sub(start.elapsed().as_millis() as u64),
+                        ),
+                    });
                 }
                 if start.elapsed() >= budget {
                     let frame = session.observe(quiet_ms)?;
@@ -718,6 +781,8 @@ fn run_completion_plan(
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(15));
@@ -751,6 +816,8 @@ fn run_completion_plan(
                             frame,
                             elapsed_ms: start.elapsed().as_millis() as u64,
                             frames: None,
+                            edge_at_monotonic_ms: Vec::new(),
+                            actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                         });
                     }
                 }
@@ -764,6 +831,8 @@ fn run_completion_plan(
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(15));
@@ -788,6 +857,8 @@ fn run_completion_plan(
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                     });
                 }
                 if start.elapsed() >= budget {
@@ -799,6 +870,8 @@ fn run_completion_plan(
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(15));
@@ -819,6 +892,8 @@ fn run_completion_plan(
                     frame,
                     elapsed_ms: 0,
                     frames: None,
+                    edge_at_monotonic_ms: Vec::new(),
+                    actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                 });
             }
             loop {
@@ -832,6 +907,8 @@ fn run_completion_plan(
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                     });
                 }
                 if start.elapsed() >= budget {
@@ -843,6 +920,8 @@ fn run_completion_plan(
                         frame,
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         frames: None,
+                        edge_at_monotonic_ms: Vec::new(),
+                        actual_sample_offset_ms: start.elapsed().as_millis() as u64,
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(15));
@@ -858,6 +937,8 @@ fn run_completion_plan(
                 frame,
                 elapsed_ms: 0,
                 frames: None,
+                edge_at_monotonic_ms: Vec::new(),
+                actual_sample_offset_ms: 0,
             })
         }
     }

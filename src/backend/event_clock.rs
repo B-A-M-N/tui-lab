@@ -40,7 +40,11 @@ pub struct BackendEventClock {
     last_query_answered_seq: u64,
     last_output_at_ms: u64,
     last_screen_change_at_ms: u64,
+    /// Monotonic stamps authoritative for latency (audit finding 45).
+    last_output_monotonic_ms: u64,
+    last_screen_change_monotonic_ms: u64,
     screen_change_log: Vec<(u64, u64)>,
+    screen_change_monotonic_log: Vec<(u64, u64)>,
     // Monotonic Instants for fine-grained wait timing (monotonic clock,
     // unlike SystemTime which can jump). These are updated whenever the
     // corresponding event is recorded.
@@ -63,7 +67,10 @@ impl BackendEventClock {
             last_query_answered_seq: 0,
             last_output_at_ms: 0,
             last_screen_change_at_ms: 0,
+            last_output_monotonic_ms: 0,
+            last_screen_change_monotonic_ms: 0,
             screen_change_log: Vec::new(),
+            screen_change_monotonic_log: Vec::new(),
             last_output_instant: now,
             last_screen_change_instant: now,
         }
@@ -73,6 +80,7 @@ impl BackendEventClock {
     pub fn on_output(&mut self) {
         self.output_seq += 1;
         self.last_output_at_ms = super::line_types::now_ms();
+        self.last_output_monotonic_ms = crate::events::monotonic_ms();
         self.last_output_instant = Instant::now();
     }
 
@@ -81,12 +89,16 @@ impl BackendEventClock {
     /// bounded per-change log, dropping the head on overflow.
     pub fn on_screen_change(&mut self) {
         self.last_screen_change_at_ms = super::line_types::now_ms();
+        self.last_screen_change_monotonic_ms = crate::events::monotonic_ms();
         self.last_screen_change_instant = Instant::now();
         if self.screen_change_log.len() == SCREEN_CHANGE_LOG_CAP {
             self.screen_change_log.remove(0);
+            self.screen_change_monotonic_log.remove(0);
         }
         self.screen_change_log
             .push((self.screen_seq, self.last_screen_change_at_ms));
+        self.screen_change_monotonic_log
+            .push((self.screen_seq, self.last_screen_change_monotonic_ms));
     }
 
     /// Text-only change (fingerprint unchanged): bump `content_seq`.
@@ -129,6 +141,17 @@ impl BackendEventClock {
     /// latency is derived from. Empty when nothing changed since.
     pub fn changes_since(&self, after_seq: u64) -> Vec<(u64, u64)> {
         self.screen_change_log
+            .iter()
+            .filter(|(seq, _)| *seq > after_seq)
+            .copied()
+            .collect()
+    }
+
+    /// Audit finding 45: `(screen_seq, monotonic_ms)` for every screen
+    /// change at/after a sequence. Latency math uses THIS monotonic
+    /// domain; `changes_since` is human-correlation only.
+    pub fn monotonic_changes_since(&self, after_seq: u64) -> Vec<(u64, u64)> {
+        self.screen_change_monotonic_log
             .iter()
             .filter(|(seq, _)| *seq > after_seq)
             .copied()
@@ -204,7 +227,10 @@ impl BackendEventClock {
         self.last_query_answered_seq = 0;
         self.last_output_at_ms = 0;
         self.last_screen_change_at_ms = 0;
+        self.last_output_monotonic_ms = 0;
+        self.last_screen_change_monotonic_ms = 0;
         self.screen_change_log.clear();
+        self.screen_change_monotonic_log.clear();
         let now = Instant::now();
         self.last_output_instant = now;
         self.last_screen_change_instant = now;

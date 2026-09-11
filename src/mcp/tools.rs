@@ -293,13 +293,14 @@ impl TuiLabServer {
         self.admit_under_lease(id)?;
         let sink = crate::execution::RunEvidenceSink::capture(&self.run);
         let ticket = sink.ticket().clone();
+        let sink = std::sync::Arc::new(sink);
         let out = self
             .with_sess_leased(
                 id,
                 move |sess| {
-                    sess.install_evidence_sink(sink);
+                    sess.install_evidence_sink_arc(sink);
                     let out = job(sess, ticket);
-                    sess.take_evidence_sink();
+                    let _installed = sess.take_evidence_sink();
                     out
                 },
                 &lease,
@@ -307,6 +308,34 @@ impl TuiLabServer {
             .await;
         drop(lease);
         out
+    }
+
+    /// The single entry point for session jobs that write run state. It is
+    /// `with_sess_authorized` under a name that states the invariant: the
+    /// lifecycle lease and admission happen FIRST, then the evidence sink
+    /// is captured, installed on the actor, used by the job, and removed.
+    /// Handlers must not construct `RunEvidenceSink::capture` themselves.
+    async fn with_sess_evidenced<R, F>(
+        &self,
+        id: Option<&str>,
+        job: F,
+    ) -> Result<R, rmcp::model::CallToolResult>
+    where
+        R: Send + 'static,
+        F: FnOnce(
+                &mut crate::session::Session,
+                std::sync::Arc<crate::execution::RunEvidenceSink>,
+            ) -> R
+            + Send
+            + 'static,
+    {
+        let run = self.run.clone();
+        self.with_sess_authorized(id, move |sess, ticket| {
+            let sink =
+                std::sync::Arc::new(crate::execution::RunEvidenceSink::with_ticket(run, ticket));
+            job(sess, sink)
+        })
+        .await
     }
 
     /// Bind a freshly launched session to the current run, and its owner on

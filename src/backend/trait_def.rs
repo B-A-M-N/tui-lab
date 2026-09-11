@@ -5,8 +5,8 @@
 //! screen actually stayed quiet.
 
 use super::{
-    BackendResult, Capabilities, CommandState, Input, InputModes, ObserveResult, SearchHit,
-    TerminalEventState, WaitCond, WaitOutcome,
+    BackendError, BackendResult, Capabilities, CommandState, Input, InputModes, ObserveResult,
+    SearchHit, TerminalEventState, WaitCond, WaitOutcome,
 };
 use crate::screen::{ProcessState, ScreenState};
 use std::time::Duration;
@@ -56,6 +56,49 @@ pub struct StartupOutcome {
     pub elapsed_ms: u64,
     /// Whether a render was observed (may be legitimately blank).
     pub render_observed: bool,
+}
+
+/// The typed result of one transport dispatch (audit findings 1/4): the
+/// backend classifies whether a write was entered and preserves the original
+/// error. This is the ONE place the write boundary is decided; the executor
+/// maps it onto [`crate::execution::DispatchStatus`] without re-inferring.
+#[derive(Debug, Clone)]
+pub struct DispatchOutcome {
+    /// `Ok(())` = the complete payload was written. `Err` carries the
+    /// backend's original error verbatim.
+    pub result: BackendResult<()>,
+    /// Whether the transport write was ENTERED. `true` only when partial
+    /// delivery cannot be ruled out; encoding/preflight/unsupported
+    /// failures happen before any byte could land and report `false`.
+    pub write_entered: bool,
+}
+
+impl DispatchOutcome {
+    /// A failure proven to have happened before the write boundary
+    /// (preflight/encoding/unsupported failures).
+    pub fn failed_before_write(err: BackendError) -> Self {
+        DispatchOutcome {
+            result: Err(err),
+            write_entered: false,
+        }
+    }
+
+    /// A failure at or after the write boundary (an I/O error surfaced by
+    /// the write itself, where partial delivery cannot be ruled out).
+    pub fn failed_in_write(err: BackendError) -> Self {
+        DispatchOutcome {
+            result: Err(err),
+            write_entered: true,
+        }
+    }
+
+    /// A successful dispatch.
+    pub fn ok() -> Self {
+        DispatchOutcome {
+            result: Ok(()),
+            write_entered: false,
+        }
+    }
 }
 
 pub trait TerminalBackend: Send {
@@ -117,6 +160,24 @@ pub trait TerminalBackend: Send {
 
     /// Send an input event to the PTY. Encoding is mode-aware (spec section 4).
     fn send_input(&mut self, input: Input) -> BackendResult<()>;
+
+    /// Typed dispatch (audit findings 1/4): the backend classifies whether
+    /// the transport write was entered, so the executor can prove "no bytes
+    /// landed" for preflight failures and must treat I/O failures at the
+    /// write boundary as partial-unknown. The default uses the backend's
+    /// `supported_inputs` capability family to classify preflight
+    /// unsupported errors: only a backend that overrides with exact
+    /// write-boundary knowledge can claim `FailedBeforeWrite` for an I/O
+    /// path. Spawning backends (portable/line/pipe) override this with
+    /// their real boundary; tmux uses the command-level all-or-nothing
+    /// contract.
+    fn dispatch(&mut self, input: Input) -> DispatchOutcome {
+        match self.send_input(input) {
+            Ok(()) => DispatchOutcome::ok(),
+            Err(e @ BackendError::Unsupported(_)) => DispatchOutcome::failed_before_write(e),
+            Err(e) => DispatchOutcome::failed_in_write(e),
+        }
+    }
 
     /// Resize the pty/terminal. Implementations MUST resize both the OS PTY
     /// and the `vt100` parser dimensions (spec section 3).
@@ -225,6 +286,24 @@ pub trait TerminalBackend: Send {
     /// `after_seq`, oldest first — the measured evidence for an action's
     /// first-frame latency. Empty when the engine keeps no per-change log.
     fn screen_changes_since(&mut self, _after_seq: u64) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Audit finding 45: `(screen_seq, monotonic_ms)` for every screen
+    /// change at/after a sequence. This is the authoritative latency
+    /// domain; the wall-clock log exists only for human correlation.
+    fn screen_monotonic_changes_since(&mut self, _after_seq: u64) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Finding 38: pane output retained by a backend's persistent event
+    /// transport, at/after the caller's sequence. Empty from polling-only
+    /// engines; the capability matrix/fidelity object remains the source of
+    /// truth about whether this transport is active.
+    fn tmux_control_events(
+        &mut self,
+        _after_seq: u64,
+    ) -> Vec<crate::backend::tmux::TmuxControlEvent> {
         Vec::new()
     }
 

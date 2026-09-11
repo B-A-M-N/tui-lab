@@ -103,6 +103,8 @@ channel. Get the adapter snippet with `tui_framework action=adapter_snippet`.
 - `tui://runs/{run_id}/scenarios/{scenario_id}` — One scenario by id (or unambiguous name) — the full recorded step list, addressable as evidence.
 - `tui://runs/{run_id}/transactions` — The declared-replay transaction ledger (bounded retained window + lifetime count). Citable as the run's interaction history.
 - `tui://runs/{run_id}/transactions/{seq}` — One transaction by ledger seq: action, settle verdict, before/after structure, changed cells, render evidence.
+- `tui://runs/{run_id}/frames` — Committed frame records in the hot ring (audit P0-11): every `frame:N` cited by timeline entries is a registered, resolvable resource. Evicted ids resolve through frames.jsonl on persistent runs.
+- `tui://runs/{run_id}/frames/{frame_id}` — One frame record by citable id (hot ring first, then frames.jsonl): frame_id, session/generation provenance, screen/output seqs, structure/visual/semantic identity, commit time.
 - `tui://sessions/{session_id}/semantic` — Live semantic screen: regions, controls, focus, affordances, components.
 - `tui://sessions/{session_id}/screen` — Live screen text + geometry.
 - `tui://sessions/{session_id}/terminal-profile` — Evidence-backed terminal capability report (review §12): reads the live backend capabilities without forcing a screen settle — observationally pure, unlike the screen-backed views.

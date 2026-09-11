@@ -177,6 +177,12 @@ impl Session {
         self.backend.screen_changes_since(after_seq)
     }
 
+    /// Audit finding 45: monotonic per-change log. Causal latency uses
+    /// this, never the Unix-millisecond correlation log.
+    pub fn screen_monotonic_changes_since(&mut self, after_seq: u64) -> Vec<(u64, u64)> {
+        self.backend.screen_monotonic_changes_since(after_seq)
+    }
+
     /// Wave-2 (streams): the pipe engine's genuine stdout/stderr line
     /// separation. Returns `(stdout, stderr)`; `(empty, empty)` on engines
     /// that interleave by construction.
@@ -382,6 +388,13 @@ impl Session {
     /// channel is a stable `None`.
     pub fn native_revision(&self) -> Option<u64> {
         self.native.revision()
+    }
+
+    /// Test seam: make the native channel declare focus without changing
+    /// the parsed grid. This is exactly the drift class the pre-dispatch
+    /// guard must catch (native-only focus move, no pixels changed).
+    pub fn test_declare_native_focus(&mut self, control_id: &str) {
+        self.native.test_declare_focus_for_drift_fixture(control_id);
     }
 
     /// THE authoritative per-frame analysis (re-review P0.4): one struct

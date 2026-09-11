@@ -24,6 +24,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         Ok(s) => s,
         Err(e) => {
             findings.push(Finding {
+                kind: crate::audit::FindingKind::Defect,
                 id: "COLOR-ERR".into(),
                 rule_id: None,
                 severity: Severity::Error,
@@ -53,6 +54,7 @@ pub fn color_audit(session: &mut Session) -> Vec<Finding> {
         })
         .count();
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "COLOR-INVENTORY".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -89,6 +91,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
     let mut findings = Vec::new();
     let Some((trace, nbytes, dropped)) = decode_raw(session) else {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "REND-NOSRC".into(),
             rule_id: None,
             severity: Severity::Info,
@@ -181,6 +184,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
     };
 
     findings.push(Finding {
+        kind: crate::audit::FindingKind::Defect,
         id: "REND-STYLE".into(),
         rule_id: None,
         severity: Severity::Info,
@@ -210,6 +214,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
     // negotiation is the classic tear/flicker complaint source.
     if full_erasers >= 2 && sync_on == 0 {
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "REND-FLICKER".into(),
             rule_id: None,
             severity: Severity::Warn,
@@ -251,6 +256,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             )
         };
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "REND-SYNC-UNBALANCED".into(),
             rule_id: None,
             severity,
@@ -295,6 +301,7 @@ pub fn rendering_audit(session: &mut Session) -> Vec<Finding> {
             )
         };
         findings.push(Finding {
+            kind: crate::audit::FindingKind::Defect,
             id: "REND-CURSOR-LEAK".into(),
             rule_id: None,
             severity,

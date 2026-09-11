@@ -113,6 +113,16 @@ impl ScenarioLaunch {
             isolation: self.isolation.clone(),
         }
     }
+
+    /// The launch contract compared by `ScenarioRunner`. Terminal personas
+    /// change TUI-Lab's behavior contract and may add owned environment
+    /// declarations; they do not change the recorded child target, so the
+    /// internal `TUI_LAB_PERSONA` binding is excluded from ownership.
+    pub fn to_ownership_spec(&self) -> crate::session::state::LaunchSpec {
+        let mut spec = self.to_launch_spec();
+        spec.env.retain(|(key, _)| key != "TUI_LAB_PERSONA");
+        spec
+    }
 }
 
 fn default_cols() -> u16 {
@@ -143,7 +153,15 @@ pub struct ScenarioStep {
 /// lands. If the app has drifted — a modal opened, the list reordered, focus
 /// moved — the step FAILS with `stale_state` instead of sending a keystroke
 /// into the wrong UI and corrupting both the app and the replay verdict.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// The precondition a replayed step must hold before its input lands
+/// (audit P1-20 V2 schema): structure hash, focus, and visible/history
+/// text — plus the generation, native revision and fused semantic
+/// identity captured with the original observation, so a replay guard is
+/// as strong as the guard the LIVE execution would have compiled. V1
+/// scenarios (structure/focus/text only) migrate safely: every new field
+/// is optional with serde defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepExpect {
     /// Structure hash observed at capture time (layout skeleton, normalized).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,9 +169,35 @@ pub struct StepExpect {
     /// Focused control id at capture time, when one was resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_control_id: Option<String>,
-    /// Text the step required to be present at capture time.
+    /// Text the step required to be present at capture time (legacy V1
+    /// field: viewport OR scrollback — kept for migration; new recordings
+    /// emit the V2 split fields below). `recorded_visible` marks whether
+    /// this legacy text was observed in the viewport at capture time;
+    /// without the flag, an old file keeps its permissive OR semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_present: Option<String>,
+    /// Whether [`Self::text_present`] was observed in the viewport at
+    /// capture time. New recordings set this; legacy files without it keep
+    /// the old viewport-OR-history semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_visible: Option<bool>,
+    /// Visible (viewport) text the step required to be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_text_present: Option<String>,
+    /// Scrollback/history text the step required to be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_text_present: Option<String>,
+    /// Session generation the observation came from. A restart between
+    /// capture and replay fails the compiled guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+    /// Native semantic channel revision at capture time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_revision: Option<u64>,
+    /// Fused semantic identity (structure + interaction + native overlay)
+    /// at capture time — the strongest "same world" statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

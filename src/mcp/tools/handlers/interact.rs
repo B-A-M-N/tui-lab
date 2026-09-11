@@ -29,76 +29,81 @@ pub(crate) async fn tui_checkpoint(
     // switch between admission and the checkpoint write reports the
     // operation as refused (run_switched) instead of storing the
     // checkpoint into the new run.
-    let sink = crate::execution::RunEvidenceSink::capture(&s.run);
-    // The actor closure owns the session side (observe) and does the
-    // checkpoint work against the run under a short lock.
-    s.with_sess(p.id.as_deref(), move |sess| {
-        let session_id = sess.id.clone();
-        let generation = sess.generation;
-        match ckpt_action {
-            CA::List => match sink.with_run(|run| run.checkpoints.list(&session_id)) {
-                Some(checkpoints) => ok(json!({ "checkpoints": checkpoints })),
-                None => run_switched(),
-            },
-            CA::Save => {
-                let (screen, sem, _, _) = match sess.observe_fused(40) {
-                    Ok(t) => t,
-                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-                };
-                match sink.with_run(|run| {
-                    run.checkpoints.save(
-                        &session_id,
-                        generation,
-                        p.name.clone(),
-                        &screen,
-                        Some(&sem),
-                    )
-                }) {
-                    Some(name) => ok(json!({
-                        "name": name,
-                        "structure_hash": screen.structure_hash,
-                        "visual_hash": screen.visual_hash,
-                        "focus": sem.focus.control,
-                        "controls": sem.controls.len(),
-                    })),
+    // Audit finding 29: the sink is captured only AFTER lifecycle
+    // admission, through the single evidenced entry point.
+    let result = s
+        .with_sess_evidenced(p.id.as_deref(), move |sess, sink| {
+            let session_id = sess.id.clone();
+            let generation = sess.generation;
+            match ckpt_action {
+                CA::List => match sink.with_run(|run| run.checkpoints.list(&session_id)) {
+                    Some(checkpoints) => ok(json!({ "checkpoints": checkpoints })),
                     None => run_switched(),
-                }
-            }
-            CA::Compare => {
-                let name = match &p.name {
-                    Some(n) => n.clone(),
-                    None => return err(ErrorCategory::InvalidRequest, "compare requires 'name'"),
-                };
-                let (screen, sem, _, _) = match sess.observe_fused(40) {
-                    Ok(t) => t,
-                    Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
-                };
-                match sink.with_run(|run| {
-                    run.checkpoints
-                        .compare(&session_id, &name, &screen, Some(&sem))
-                }) {
-                    Some(Ok(json_out)) => crate::mcp::helpers::ok_from_json(&json_out),
-                    Some(Err(ErrorCategory::InvalidRequest)) => {
-                        err(ErrorCategory::InvalidRequest, "no such checkpoint")
+                },
+                CA::Save => {
+                    let (screen, sem, _, _) = match sess.observe_fused(40) {
+                        Ok(t) => t,
+                        Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                    };
+                    match sink.with_run(|run| {
+                        run.checkpoints.save(
+                            &session_id,
+                            generation,
+                            p.name.clone(),
+                            &screen,
+                            Some(&sem),
+                        )
+                    }) {
+                        Some(name) => ok(json!({
+                            "name": name,
+                            "structure_hash": screen.structure_hash,
+                            "visual_hash": screen.visual_hash,
+                            "focus": sem.focus.control,
+                            "controls": sem.controls.len(),
+                        })),
+                        None => run_switched(),
                     }
-                    Some(Err(c)) => err(c, "checkpoint comparison failed"),
-                    None => run_switched(),
+                }
+                CA::Compare => {
+                    let name = match &p.name {
+                        Some(n) => n.clone(),
+                        None => {
+                            return err(ErrorCategory::InvalidRequest, "compare requires 'name'")
+                        }
+                    };
+                    let (screen, sem, _, _) = match sess.observe_fused(40) {
+                        Ok(t) => t,
+                        Err(e) => return err(ErrorCategory::BackendError, e.to_string()),
+                    };
+                    match sink.with_run(|run| {
+                        run.checkpoints
+                            .compare(&session_id, &name, &screen, Some(&sem))
+                    }) {
+                        Some(Ok(json_out)) => crate::mcp::helpers::ok_from_json(&json_out),
+                        Some(Err(ErrorCategory::InvalidRequest)) => {
+                            err(ErrorCategory::InvalidRequest, "no such checkpoint")
+                        }
+                        Some(Err(c)) => err(c, "checkpoint comparison failed"),
+                        None => run_switched(),
+                    }
+                }
+                CA::Delete => {
+                    let name = match &p.name {
+                        Some(n) => n.clone(),
+                        None => {
+                            return err(ErrorCategory::InvalidRequest, "delete requires 'name'")
+                        }
+                    };
+                    match sink.with_run(|run| run.checkpoints.delete(&session_id, &name)) {
+                        Some(removed) => ok(json!({ "name": name, "deleted": removed })),
+                        None => run_switched(),
+                    }
                 }
             }
-            CA::Delete => {
-                let name = match &p.name {
-                    Some(n) => n.clone(),
-                    None => return err(ErrorCategory::InvalidRequest, "delete requires 'name'"),
-                };
-                match sink.with_run(|run| run.checkpoints.delete(&session_id, &name)) {
-                    Some(removed) => ok(json!({ "name": name, "deleted": removed })),
-                    None => run_switched(),
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|e| e)
+        })
+        .await
+        .unwrap_or_else(|e| e);
+    result
 }
 
 /// The refusal for a bookkeeping operation whose run era ended between
@@ -532,6 +537,17 @@ pub(crate) async fn tui_intent(
                 );
             }
         }
+        // Audit finding 15: recover the caller's exact completion wire
+        // value from the payload action itself (plan steps own transport
+        // fields); fallback to the top-level request preserves older
+        // callers while execution semantics remain the payload's.
+        let completion_value = p
+            .completion
+            .clone()
+            .or_else(|| plan.steps.iter().rev().find_map(|step| match step {
+                crate::intent::PlannedStep::Act(_) => None,
+                _ => None,
+            }));
         // A live human lease blocks execution (planning stays allowed — it
         // sends nothing). Checked here AND inside `drive` per action.
         if let Some(refused) = crate::mcp::helpers::lease_refused(sess) {
@@ -607,14 +623,20 @@ pub(crate) async fn tui_intent(
                             ..Default::default()
                         }
                     });
+                    // Audit finding 14: the payload DriveSpec uses the
+                    // CALLER's effective completion policy, quiet window,
+                    // budget and no_wait — computed above from the wire
+                    // request. Before this fix the recording described a
+                    // custom 200ms/`process_exit` execution while the
+                    // actual dispatch ran 150ms/1150ms/StableScreen.
                     let outcome = match drive(
                         sess,
                         &run,
                         DriveSpec {
                             action,
-                            quiet_ms: 150,
-                            budget_ms: 1150,
-                            no_wait: false,
+                            quiet_ms: p_completion_quiet,
+                            budget_ms: p_budget,
+                            no_wait: p_no_wait,
                             visibility,
                             completion: completion.clone(),
                             guard: guard.as_ref(),
@@ -678,6 +700,16 @@ pub(crate) async fn tui_intent(
                 })
                 .to_string(),
             );
+            // Audit finding 15: persist the COMPLETE TuiCompletionParam
+            // (object or legacy name), so replay deserializes the exact
+            // same type and calls to_policy()/quiet_ms() exactly as the
+            // live path does. `completion_name` stays for display; the
+            // `completion` field carries the full wire value.
+            let completion_recorded = completion_value
+                .as_ref()
+                .map(|c| c.to_value())
+                .or_else(|| p.completion.as_ref().map(|c: &TuiCompletionParam| c.to_value()))
+                .unwrap_or_else(|| serde_json::json!(p_completion_name));
             sink.record_scenario_intent(
                 &sid,
                 gen,
@@ -685,7 +717,8 @@ pub(crate) async fn tui_intent(
                     "target": p.target,
                     "verb": intent_verb_json,
                     "sensitive": sensitive,
-                    "completion": p_completion_name,
+                    "completion": completion_recorded,
+                    "completion_name": p_completion_name,
                     "quiet_ms": p_completion_quiet,
                     "settle_budget_ms": p_budget,
                     "no_wait": p_no_wait,

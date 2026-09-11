@@ -381,14 +381,7 @@ impl RunContext {
                 }
                 match std::fs::read(&path) {
                     Ok(bytes) => {
-                        match crate::run::formats::Envelope::unwrap(
-                            &bytes,
-                            crate::run::formats::tags::SCENARIO,
-                        )
-                        .and_then(|v| {
-                            serde_json::from_value::<crate::scenario::model::Scenario>(v)
-                                .map_err(anyhow::Error::from)
-                        }) {
+                        match crate::run::scenario_impl::read_scenario_bytes(&bytes, &path) {
                             Ok(sc) => {
                                 run.scenarios.insert_loaded(sc);
                             }

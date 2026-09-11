@@ -333,6 +333,7 @@ fn diagnostic_context_keys_verification_on_rule_identity() {
 
 fn crate_shim_finding(rule: &str, inst: &str) -> tui_lab::audit::Finding {
     tui_lab::audit::Finding {
+        kind: tui_lab::audit::FindingKind::Defect,
         id: inst.into(),
         rule_id: Some(rule.into()),
         severity: tui_lab::audit::Severity::Warn,
@@ -470,6 +471,7 @@ fn coverage_event_with_identity_attests_source_locus() {
     // And the enricher: a finding whose evidence names this control gains
     // the app-attested locus through the pure explain-time join.
     let f = tui_lab::audit::Finding {
+        kind: tui_lab::audit::FindingKind::Defect,
         id: "MOUSE-001".into(),
         rule_id: Some("MOUSE-001".into()),
         severity: tui_lab::audit::Severity::Warn,
